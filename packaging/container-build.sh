@@ -5,25 +5,31 @@
 set -euo pipefail
 export DEBIAN_FRONTEND=noninteractive
 
-if [[ ! -f /.dockerenv && ! -f /run/.containerenv && ! -f /etc/debian_version ]]; then
+if [[ ! -f /.dockerenv && ! -f /run/.containerenv && ! -f /etc/debian_version && -z "${CI:-}" ]]; then
     echo "Error: container-build.sh is meant to run inside the Ubuntu container."
     echo "Please run the container launcher instead:"
     echo "  ./build-appimage-container.sh"
     exit 1
 fi
 
-REPO_DIR="/work"
+SCRIPT_DIR="$(cd "$(dirname "$(readlink -f "${BASH_SOURCE[0]}")")" && pwd)"
+REPO_DIR="${REPO_DIR:-$(cd "$SCRIPT_DIR/.." && pwd)}"
 BUILD_DIR="$REPO_DIR/build/appimage-container"
 APP_DIR="$BUILD_DIR/AppDir"
 OUTPUT_DIR="$REPO_DIR/dist"
 BASE_VENV="$BUILD_DIR/cached-venv"
+export APP_DIR
 
 mkdir -p "$BUILD_DIR" "$OUTPUT_DIR"
 
 if ! command -v python3 >/dev/null 2>&1 || ! command -v zstd >/dev/null 2>&1 || ! command -v strip >/dev/null 2>&1; then
     echo "1. Installing base dependencies inside container..."
-    apt-get update -qq
-    apt-get install -y -qq --no-install-recommends \
+    SUDO=""
+    if [ "$(id -u)" -ne 0 ] && command -v sudo >/dev/null 2>&1; then
+        SUDO="sudo"
+    fi
+    $SUDO apt-get update -qq
+    $SUDO apt-get install -y -qq --no-install-recommends \
         python3 python3-pip python3-venv wget curl ca-certificates file libgl1 libegl1 libxkbcommon0 libpulse0 zstd binutils
 else
     echo "1. Base system dependencies already present."
@@ -55,7 +61,8 @@ import glob
 import shutil
 
 keep_modules = {"QtCore", "QtGui", "QtWidgets", "QtSvg", "QtSvgWidgets"}
-pyside_matches = glob.glob("/work/build/appimage-container/AppDir/usr/lib*/python3*/site-packages/PySide6")
+app_dir = os.environ.get("APP_DIR", "/work/build/appimage-container/AppDir")
+pyside_matches = glob.glob(f"{app_dir}/usr/lib*/python3*/site-packages/PySide6")
 if pyside_matches:
     pyside_dir = pyside_matches[0]
 
