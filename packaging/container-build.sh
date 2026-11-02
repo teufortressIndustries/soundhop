@@ -52,7 +52,12 @@ echo "  Deploying Python runtime to AppDir..."
 cp -a "$BASE_VENV" "$APP_DIR/usr"
 
 echo "3. Installing current SoundHop package..."
-"$APP_DIR/usr/bin/pip" install --no-cache-dir --no-deps "$REPO_DIR"
+"$APP_DIR/usr/bin/python3" -m pip install --no-cache-dir --no-deps --prefix "$APP_DIR/usr" "$REPO_DIR" || true
+for sdir in "$APP_DIR"/usr/lib*/python3*/site-packages; do
+    if [ -d "$sdir" ]; then
+        cp -rf "$REPO_DIR/src/soundhop" "$sdir/"
+    fi
+done
 
 echo "4. Optimizing and tree-shaking PySide6..."
 python3 - << 'PYEOF'
@@ -122,8 +127,9 @@ if pyside_matches:
         shutil.rmtree(os.path.join(pyside_dir, "Qt", unused), ignore_errors=True)
 PYEOF
 
-# Remove pip, setuptools, wheel build tools from final bundle
+# Remove pip, setuptools, wheel build tools and leftover shims from final bundle
 rm -rf "$APP_DIR/usr/lib"/python3*/site-packages/{pip,setuptools,wheel,_distutils_hack}
+find "$APP_DIR/usr" -name "distutils-precedence.pth" -delete 2>/dev/null || true
 find "$APP_DIR/usr" -type d -name "__pycache__" -exec rm -rf {} + 2>/dev/null || true
 find "$APP_DIR/usr" -type f \( -name "*.pyc" -o -name "*.pyi" \) -delete 2>/dev/null || true
 
