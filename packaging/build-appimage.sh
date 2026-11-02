@@ -178,7 +178,7 @@ fi
 ln -sf python3 "$APP_DIR/usr/bin/python"
 
 # 6. Generate the AppImage
-VERSION="1.0.0"
+VERSION="${VERSION:-$(grep -oP 'VERSION\s*=\s*"\K[^"]+' "$REPO_DIR/src/soundhop/constants.py" 2>/dev/null || python3 -c "import sys; sys.path.insert(0, '$REPO_DIR/src'); from soundhop.constants import VERSION; print(VERSION)")}"
 OUTPUT_FILE="$OUTPUT_DIR/SoundHop-$VERSION-x86_64.AppImage"
 TMP_OUTPUT="$OUTPUT_DIR/.SoundHop-$VERSION-x86_64.AppImage.tmp"
 rm -f "$TMP_OUTPUT"

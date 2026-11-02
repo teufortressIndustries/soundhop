@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "soundhop"
-version = "1.0.0"
+dynamic = ["version"]
 description = "Play any Linux device's audio on any other device on your local network."
 readme = "README.md"
 requires-python = ">=3.10"
@@ -41,6 +41,9 @@ package-dir = { "" = "src" }
 
 [tool.setuptools.packages.find]
 where = ["src"]
+
+[tool.setuptools.dynamic]
+version = {attr = "soundhop.constants.VERSION"}
 
 [tool.setuptools.package-data]
 soundhop = ["assets/*.svg"]

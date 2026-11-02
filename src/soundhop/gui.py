@@ -13,6 +13,7 @@ from concurrent.futures import Future, ThreadPoolExecutor
 from typing import Any, Callable
 
 from . import __version__
+from .android import AndroidManager, SUPPORTED_AUDIO_CODECS
 from .config import Config
 from .constants import APP_NAME
 from .ipc import DaemonNotRunning, IpcError, request
@@ -44,7 +45,7 @@ def run_tray(*, verbose: bool = False) -> int:
     app.setApplicationDisplayName(APP_NAME)
     app.setQuitOnLastWindowClosed(False)
     try:
-        app.setDesktopFileName("io.github.soundhop")
+        app.setDesktopFileName("io.github.soundhop.desktop")
     except AttributeError:
         pass
 
@@ -129,6 +130,27 @@ def _build_classes(QtCore: Any, QtGui: Any, QtWidgets: Any) -> tuple[type, type]
             layout.addRow(self.restore)
             layout.addRow(self.move)
             layout.addRow(self.disconnect_quit)
+
+            # Android audio settings
+            self.android_box = QtWidgets.QGroupBox("Android Audio (scrcpy)")
+            ab_layout = QtWidgets.QFormLayout(self.android_box)
+            self.android_path = QtWidgets.QLineEdit(getattr(config.android, "scrcpy_path", ""))
+            self.android_path.setPlaceholderText("Auto-detect / system PATH")
+            self.android_codec = QtWidgets.QComboBox()
+            for c in ("aac", "opus", "flac", "raw"):
+                self.android_codec.addItem(c.upper(), c)
+            cur_codec = getattr(config.android, "default_codec", "aac")
+            codec_idx = self.android_codec.findData(cur_codec)
+            self.android_codec.setCurrentIndex(max(0, codec_idx))
+            self.android_buffer = QtWidgets.QSpinBox()
+            self.android_buffer.setRange(10, 500)
+            self.android_buffer.setValue(getattr(config.android, "buffer_ms", 50))
+            self.android_buffer.setSuffix(" ms")
+            ab_layout.addRow("scrcpy executable", self.android_path)
+            ab_layout.addRow("Default codec", self.android_codec)
+            ab_layout.addRow("Audio buffer", self.android_buffer)
+            layout.addRow(self.android_box)
+
             note = QtWidgets.QLabel(
                 "Changing the port or security mode briefly restarts the listener."
             )
@@ -164,11 +186,451 @@ def _build_classes(QtCore: Any, QtGui: Any, QtWidgets: Any) -> tuple[type, type]
                     "disconnect_on_quit": self.disconnect_quit.isChecked(),
                     "latency_ms": lat_val if lat_val > 0 else None,
                 },
+                "android": {
+                    "scrcpy_path": self.android_path.text().strip(),
+                    "default_codec": self.android_codec.currentData(),
+                    "buffer_ms": int(self.android_buffer.value()),
+                },
             }
             self.dialog.accept()
 
         def patch(self) -> dict[str, Any]:
             return self._patch
+
+    class AndroidWizardDialog:
+        def __init__(
+            self,
+            parent: Any,
+            executor: ThreadPoolExecutor,
+            notify_fn: Callable[..., Any],
+        ) -> None:
+            self._executor = executor
+            self._notify = notify_fn
+            self.dialog = QtWidgets.QDialog(parent)
+            self.dialog.setWindowTitle("Android Audio Capture — SoundHop")
+            self.dialog.setMinimumWidth(500)
+            layout = QtWidgets.QVBoxLayout(self.dialog)
+
+            # Tool Status Box
+            self.tool_box = QtWidgets.QGroupBox("scrcpy & adb Tools")
+            tb_layout = QtWidgets.QVBoxLayout(self.tool_box)
+            self.tool_label = QtWidgets.QLabel("Detecting tools...")
+            tb_layout.addWidget(self.tool_label)
+
+            self.install_btn = QtWidgets.QPushButton("Download & Install Standalone scrcpy")
+            self.install_btn.setStyleSheet(
+                "font-weight: bold; background-color: #2b78e4; color: white; padding: 6px;"
+            )
+            self.install_btn.clicked.connect(self._install_tools)
+            self.install_btn.hide()
+            tb_layout.addWidget(self.install_btn)
+
+            self.progress = QtWidgets.QProgressBar()
+            self.progress.setRange(0, 100)
+            self.progress.hide()
+            tb_layout.addWidget(self.progress)
+            layout.addWidget(self.tool_box)
+
+            # Devices Box
+            self.dev_box = QtWidgets.QGroupBox("Connected Android Devices")
+            db_layout = QtWidgets.QVBoxLayout(self.dev_box)
+            self.dev_list = QtWidgets.QListWidget()
+            self.dev_list.currentRowChanged.connect(self._device_selected)
+            db_layout.addWidget(self.dev_list)
+
+            btn_row = QtWidgets.QHBoxLayout()
+            self.refresh_btn = QtWidgets.QPushButton("Refresh Devices")
+            self.refresh_btn.clicked.connect(self._refresh_all)
+            btn_row.addWidget(self.refresh_btn)
+
+            self.switch_wifi_btn = QtWidgets.QPushButton("Switch to Wi-Fi")
+            self.switch_wifi_btn.setEnabled(False)
+            self.switch_wifi_btn.clicked.connect(self._switch_wifi)
+            btn_row.addWidget(self.switch_wifi_btn)
+            db_layout.addLayout(btn_row)
+
+            # Manual Wi-Fi Connect row
+            wifi_row = QtWidgets.QHBoxLayout()
+            self.ip_input = QtWidgets.QLineEdit()
+            self.ip_input.setPlaceholderText("Connect via Wi-Fi IP (e.g. 192.168.1.99)")
+            self.ip_btn = QtWidgets.QPushButton("Connect IP")
+            self.ip_btn.clicked.connect(self._connect_ip)
+            wifi_row.addWidget(self.ip_input)
+            wifi_row.addWidget(self.ip_btn)
+            db_layout.addLayout(wifi_row)
+
+            tip = QtWidgets.QLabel(
+                "Tip: Enable 'USB Debugging' in Android Developer Options. "
+                "Connect via cable and accept 'Allow debugging' on phone screen."
+            )
+            tip.setWordWrap(True)
+            tip.setStyleSheet("color: palette(mid); font-size: 11px;")
+            db_layout.addWidget(tip)
+            layout.addWidget(self.dev_box)
+
+            # Capture Settings Box
+            self.cfg_box = QtWidgets.QGroupBox("Audio Capture Settings")
+            cb_layout = QtWidgets.QFormLayout(self.cfg_box)
+
+            self.codec_combo = QtWidgets.QComboBox()
+            self.codec_combo.addItem("AAC (Recommended - Low Latency)", "aac")
+            self.codec_combo.addItem("Opus (High Quality)", "opus")
+            self.codec_combo.addItem("FLAC (Lossless)", "flac")
+            self.codec_combo.addItem("Raw PCM", "raw")
+            cb_layout.addRow("Codec", self.codec_combo)
+
+            self.source_combo = QtWidgets.QComboBox()
+            self.source_combo.addItem("Output (Android 12+ System Output)", "output")
+            self.source_combo.addItem("Playback (Android 11+ App Audio)", "playback")
+            self.source_combo.addItem("Microphone (Android 10 / Mic)", "mic")
+            cb_layout.addRow("Source", self.source_combo)
+
+            self.buffer_spin = QtWidgets.QSpinBox()
+            self.buffer_spin.setRange(10, 500)
+            self.buffer_spin.setValue(50)
+            self.buffer_spin.setSuffix(" ms")
+            cb_layout.addRow("Buffer latency", self.buffer_spin)
+
+            self.dup_check = QtWidgets.QCheckBox(
+                "Duplicate audio (keep playing on device too)"
+            )
+            cb_layout.addRow(self.dup_check)
+            layout.addWidget(self.cfg_box)
+
+            # Control Row
+            ctrl_box = QtWidgets.QHBoxLayout()
+            self.status_lbl = QtWidgets.QLabel("Status: Idle")
+            ctrl_box.addWidget(self.status_lbl)
+
+            self.toggle_btn = QtWidgets.QPushButton("Start Audio Capture")
+            self.toggle_btn.setStyleSheet("font-weight: bold; padding: 6px 14px;")
+            self.toggle_btn.clicked.connect(self._toggle_capture)
+            ctrl_box.addWidget(self.toggle_btn)
+            layout.addLayout(ctrl_box)
+
+            close_btn = QtWidgets.QPushButton("Close")
+            close_btn.clicked.connect(self.dialog.accept)
+            layout.addWidget(close_btn)
+
+            self._devices: list[dict[str, Any]] = []
+            self._is_capturing = False
+            self._mgr = AndroidManager()
+            self._session: Any = None
+
+            self._timer = QtCore.QTimer(self.dialog)
+            self._timer.setInterval(1000)
+            self._timer.timeout.connect(self._poll_status)
+            self._timer.start()
+
+            self._refresh_all()
+
+        def exec(self) -> int:
+            return int(self.dialog.exec())
+
+        def _refresh_all(self) -> None:
+            try:
+                tools = self._mgr.get_tool_status()
+                if tools.scrcpy_path:
+                    self.tool_label.setText(
+                        f"✓ scrcpy {tools.scrcpy_version} ({tools.scrcpy_path})\n"
+                        f"✓ adb {tools.adb_version} ({tools.adb_path})"
+                    )
+                    self.tool_label.setStyleSheet("color: #2e7d32;")
+                    self.install_btn.hide()
+                else:
+                    self.tool_label.setText("scrcpy is not installed on this system.")
+                    self.tool_label.setStyleSheet("color: #d32f2f;")
+                    self.install_btn.show()
+            except Exception as exc:
+                self.tool_label.setText(f"Error checking tools: {exc}")
+
+            self.dev_list.clear()
+            try:
+                self._devices = [
+                    {
+                        "serial": d.serial,
+                        "display_name": d.display_name,
+                        "is_wifi": d.is_wifi,
+                        "state": d.state,
+                        "android_version": d.android_version,
+                        "sdk_version": d.sdk_version,
+                    }
+                    for d in self._mgr.list_devices()
+                ]
+                if not self._devices:
+                    self.dev_list.addItem("No connected devices found")
+                else:
+                    for d in self._devices:
+                        kind = "Wi-Fi" if d["is_wifi"] else "USB"
+                        ver = f"Android {d['android_version']}" if d.get("android_version") else ""
+                        item = QtWidgets.QListWidgetItem(
+                            f"{d['display_name']} [{kind}] {ver} — {d['state']}"
+                        )
+                        self.dev_list.addItem(item)
+                    self.dev_list.setCurrentRow(0)
+            except Exception as exc:
+                self.dev_list.addItem(f"Error listing devices: {exc}")
+
+            self._poll_status()
+
+        def _device_selected(self, row: int) -> None:
+            if 0 <= row < len(self._devices):
+                dev = self._devices[row]
+                self.switch_wifi_btn.setEnabled(not dev["is_wifi"] and dev["state"] == "device")
+                sdk = dev.get("sdk_version", 0)
+                if sdk >= 31:
+                    idx = self.source_combo.findData("output")
+                    if idx >= 0:
+                        self.source_combo.setCurrentIndex(idx)
+                elif sdk == 30:
+                    idx = self.source_combo.findData("playback")
+                    if idx >= 0:
+                        self.source_combo.setCurrentIndex(idx)
+                elif sdk > 0 and sdk < 30:
+                    idx = self.source_combo.findData("mic")
+                    if idx >= 0:
+                        self.source_combo.setCurrentIndex(idx)
+            else:
+                self.switch_wifi_btn.setEnabled(False)
+
+        def _switch_wifi(self) -> None:
+            row = self.dev_list.currentRow()
+            if not (0 <= row < len(self._devices)):
+                return
+            dev = self._devices[row]
+            serial = dev["serial"]
+            self.switch_wifi_btn.setEnabled(False)
+
+            def work() -> tuple[bool, str]:
+                ip = self._mgr.get_device_wifi_ip(serial)
+                ok, msg = self._mgr.enable_tcpip(serial)
+                if ok and ip:
+                    import time
+                    time.sleep(1.0)
+                    conn_ok, conn_msg = self._mgr.connect_wifi(ip)
+                    if conn_ok:
+                        return True, f"Connected to {ip}:5555"
+                return ok, msg
+
+            def done(res: Any) -> None:
+                if isinstance(res, tuple):
+                    ok_f, msg = res
+                    if ok_f:
+                        self._notify(APP_NAME, f"Switched to Wi-Fi: {msg}")
+                    else:
+                        self._notify(APP_NAME, f"Wi-Fi switch error: {msg}", warning=True)
+                self._refresh_all()
+
+            future = self._executor.submit(work)
+
+            def poll() -> None:
+                if not future.done():
+                    QtCore.QTimer.singleShot(100, poll)
+                else:
+                    done(future.result())
+
+            QtCore.QTimer.singleShot(50, poll)
+
+        def _connect_ip(self) -> None:
+            ip = self.ip_input.text().strip()
+            if not ip:
+                return
+
+            def work() -> tuple[bool, str]:
+                return self._mgr.connect_wifi(ip)
+
+            def done(res: Any) -> None:
+                if isinstance(res, tuple):
+                    ok_f, msg = res
+                    if ok_f:
+                        self._notify(APP_NAME, msg)
+                    else:
+                        self._notify(APP_NAME, f"Connection failed: {msg}", warning=True)
+                self._refresh_all()
+
+            future = self._executor.submit(work)
+
+            def poll() -> None:
+                if not future.done():
+                    QtCore.QTimer.singleShot(100, poll)
+                else:
+                    done(future.result())
+
+            QtCore.QTimer.singleShot(50, poll)
+
+        def _install_tools(self) -> None:
+            self.install_btn.setEnabled(False)
+            self.progress.show()
+            self.progress.setValue(0)
+
+            def work() -> Path:
+                def prog(cur: int, tot: int) -> None:
+                    if tot > 0:
+                        QtCore.QMetaObject.invokeMethod(
+                            self.progress,
+                            "setValue",
+                            QtCore.Qt.ConnectionType.QueuedConnection,
+                            QtCore.Q_ARG(int, int((cur / tot) * 100)),
+                        )
+
+                return self._mgr.install_scrcpy(progress_cb=prog)
+
+            def done(res: Any) -> None:
+                self.progress.hide()
+                self.install_btn.setEnabled(True)
+                self._notify(APP_NAME, "Standalone scrcpy installed successfully!")
+                self._refresh_all()
+
+            future = self._executor.submit(work)
+
+            def poll() -> None:
+                if not future.done():
+                    QtCore.QTimer.singleShot(100, poll)
+                else:
+                    try:
+                        done(future.result())
+                    except Exception as exc:
+                        self.progress.hide()
+                        self.install_btn.setEnabled(True)
+                        self._notify(APP_NAME, f"Install failed: {exc}", warning=True)
+
+            QtCore.QTimer.singleShot(50, poll)
+
+        def _toggle_capture(self) -> None:
+            if self._is_capturing:
+                def work() -> dict[str, Any]:
+                    if self._session is not None:
+                        try:
+                            self._session.stop()
+                        except Exception:
+                            pass
+                        self._session = None
+                    try:
+                        return request("android_stop", timeout=4.0)
+                    except Exception:
+                        from .util import run as r_run
+
+                        r_run(["killall", "-q", "scrcpy"])
+                        return {}
+
+                def done(_: Any) -> None:
+                    self._is_capturing = False
+                    self._poll_status()
+
+                future = self._executor.submit(work)
+
+                def poll() -> None:
+                    if not future.done():
+                        QtCore.QTimer.singleShot(100, poll)
+                    else:
+                        done(future.result())
+
+                QtCore.QTimer.singleShot(50, poll)
+            else:
+                row = self.dev_list.currentRow()
+                if not (0 <= row < len(self._devices)):
+                    self._notify(
+                        APP_NAME, "Please select an Android device first.", warning=True
+                    )
+                    return
+                dev = self._devices[row]
+                serial = dev["serial"]
+                codec = self.codec_combo.currentData()
+                source = self.source_combo.currentData()
+                buffer_ms = int(self.buffer_spin.value())
+                dup = self.dup_check.isChecked()
+
+                def work() -> dict[str, Any]:
+                    try:
+                        return request(
+                            "android_start",
+                            timeout=10.0,
+                            serial=serial,
+                            name=dev["display_name"],
+                            codec=codec,
+                            source=source,
+                            buffer_ms=buffer_ms,
+                            duplicate=dup,
+                        )
+                    except (DaemonNotRunning, IpcError, OSError):
+                        from .android import AndroidCaptureSession
+
+                        self._session = AndroidCaptureSession(self._mgr)
+                        return self._session.start(
+                            serial,
+                            device_name=dev["display_name"],
+                            codec=codec,
+                            source=source,
+                            buffer_ms=buffer_ms,
+                            duplicate=dup,
+                        )
+
+                def done(res: Any) -> None:
+                    self._poll_status()
+
+                future = self._executor.submit(work)
+
+                def poll() -> None:
+                    if not future.done():
+                        QtCore.QTimer.singleShot(100, poll)
+                    else:
+                        try:
+                            done(future.result())
+                        except Exception as exc:
+                            self._notify(
+                                APP_NAME, f"Capture failed: {exc}", warning=True
+                            )
+
+                QtCore.QTimer.singleShot(50, poll)
+
+        def _poll_status(self) -> None:
+            def work() -> dict[str, Any]:
+                if self._session is not None and self._session.is_active:
+                    return {"session": self._session.status()}
+                try:
+                    return request("android_status", timeout=2.0)
+                except Exception:
+                    from .util import process_running
+
+                    return {"session": {"active": process_running("scrcpy")}}
+
+            def done(res: Any) -> None:
+                if not isinstance(res, dict):
+                    return
+                session = res.get("session", {})
+                active = bool(session.get("active"))
+                self._is_capturing = active
+                if active:
+                    name = session.get("device_name") or session.get("serial", "Android")
+                    codec = str(session.get("codec", "")).upper()
+                    uptime = format_duration(session.get("uptime_s"))
+                    self.status_lbl.setText(
+                        f"Status: Streaming from {name} ({codec}, {uptime})"
+                    )
+                    self.status_lbl.setStyleSheet("color: #2e7d32; font-weight: bold;")
+                    self.toggle_btn.setText("Stop Audio Capture")
+                    self.toggle_btn.setStyleSheet(
+                        "font-weight: bold; background-color: #d32f2f; color: white; padding: 6px 14px;"
+                    )
+                else:
+                    self.status_lbl.setText("Status: Idle")
+                    self.status_lbl.setStyleSheet(
+                        "color: palette(windowText); font-weight: normal;"
+                    )
+                    self.toggle_btn.setText("Start Audio Capture")
+                    self.toggle_btn.setStyleSheet(
+                        "font-weight: bold; background-color: #2e7d32; color: white; padding: 6px 14px;"
+                    )
+
+            future = self._executor.submit(work)
+
+            def poll() -> None:
+                if not future.done():
+                    QtCore.QTimer.singleShot(100, poll)
+                else:
+                    done(future.result())
+
+            QtCore.QTimer.singleShot(30, poll)
 
     class Tray(QtCore.QObject):
         def __init__(self, *, verbose: bool = False) -> None:
@@ -264,6 +726,18 @@ def _build_classes(QtCore: Any, QtGui: Any, QtWidgets: Any) -> tuple[type, type]
             self.disconnect_action = self._action(
                 self.menu, "Disconnect remote audio", callback=self._disconnect
             )
+            self.menu.addSeparator()
+            self.android_capture_action = self._action(
+                self.menu,
+                "Capture Android audio…",
+                callback=self._open_android_wizard,
+            )
+            self.android_stop_action = self._action(
+                self.menu,
+                "Stop Android audio",
+                callback=self._stop_android,
+            )
+            self.android_stop_action.setVisible(False)
             self.menu.addSeparator()
             self.auto_action = self._action(
                 self.menu,
@@ -412,6 +886,18 @@ def _build_classes(QtCore: Any, QtGui: Any, QtWidgets: Any) -> tuple[type, type]
                 self.tray.setToolTip(
                     f"{APP_NAME} — {'sharing' if sharing.get('enabled') else 'not sharing'}"
                 )
+
+            android = status.get("android") or {}
+            if android.get("active"):
+                dev_name = (
+                    android.get("device_name") or android.get("serial", "Android")
+                )
+                self.android_stop_action.setText(f"Stop Android audio ({dev_name})")
+                self.android_stop_action.setVisible(True)
+                self.android_capture_action.setText("Android audio settings…")
+            else:
+                self.android_stop_action.setVisible(False)
+                self.android_capture_action.setText("Capture Android audio…")
 
         def _rebuild_devices(self) -> None:
             self.devices_menu.clear()
@@ -641,6 +1127,27 @@ def _build_classes(QtCore: Any, QtGui: Any, QtWidgets: Any) -> tuple[type, type]
                 QtWidgets.QMessageBox.information(
                     None, f"{APP_NAME} diagnostics", "\n".join(lines)
                 )
+
+            self._run_async(work, done)
+
+        def _open_android_wizard(self) -> None:
+            dialog = AndroidWizardDialog(None, self._executor, self._notify)
+            dialog.exec()
+            self.refresh()
+
+        def _stop_android(self) -> None:
+            def work() -> dict[str, Any]:
+                try:
+                    return request("android_stop", timeout=3.0)
+                except Exception:
+                    from .util import run as r_run
+
+                    r_run(["killall", "-q", "scrcpy"])
+                    return {}
+
+            def done(_: Any) -> None:
+                self._notify(APP_NAME, "Stopped Android audio capture.")
+                self.refresh()
 
             self._run_async(work, done)
 

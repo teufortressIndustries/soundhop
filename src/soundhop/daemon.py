@@ -164,6 +164,8 @@ class Daemon:
                     pause_auto=False,
                     notify_user=False,
                 )
+            if self.controller.android_session.is_active:
+                self.controller.android_stop_capture()
             self.controller.stop_listener(notify_user=False)
         except Exception:  # noqa: BLE001 - shutdown must always finish
             log.debug("Cleanup during shutdown failed", exc_info=True)
@@ -225,6 +227,57 @@ class Daemon:
             return self._handle_config(request)
         if command in {"system", "info", "doctor"}:
             return self._system_info()
+        if command in {"android_status"}:
+            return {
+                "session": self.controller.android_session.status(),
+                "tools": self.controller.android_tool_status(),
+                "devices": self.controller.android_list_devices(),
+                **self._daemon_info(),
+            }
+        if command in {"android_devices"}:
+            return {
+                "devices": self.controller.android_list_devices(),
+                **self._daemon_info(),
+            }
+        if command in {"android_wifi"}:
+            action = request.get("action", "connect")
+            if action == "switch":
+                ok, msg = self.controller.android_switch_wifi(
+                    str(request.get("serial", "")),
+                    port=int(request.get("port", 5555) or 5555),
+                )
+            elif action == "disconnect":
+                ok, msg = self.controller.android_disconnect_wifi(
+                    request.get("target"),
+                )
+            else:
+                ok, msg = self.controller.android_connect_wifi(
+                    str(request.get("host", "") or request.get("ip", "")),
+                    port=int(request.get("port", 5555) or 5555),
+                )
+            return {"ok": ok, "message": msg, **self._daemon_info()}
+        if command in {"android_encoders"}:
+            return {
+                **self.controller.android_list_encoders(request.get("serial")),
+                **self._daemon_info(),
+            }
+        if command in {"android_start", "android_capture"}:
+            res = self.controller.android_start_capture(
+                str(request.get("serial", "")),
+                device_name=str(request.get("name", "")),
+                codec=request.get("codec"),
+                source=request.get("source"),
+                buffer_ms=request.get("buffer_ms"),
+                bit_rate=request.get("bit_rate"),
+                duplicate=request.get("duplicate"),
+            )
+            return {**res, **self._daemon_info()}
+        if command in {"android_stop", "android_stop_capture"}:
+            res = self.controller.android_stop_capture()
+            return {**res, **self._daemon_info()}
+        if command in {"android_install"}:
+            res = self.controller.android_install_scrcpy()
+            return {**res, **self._daemon_info()}
         if command in {"shutdown", "stop", "quit"}:
             self.request_stop()
             return {"stopping": True, **self._daemon_info()}

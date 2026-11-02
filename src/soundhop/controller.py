@@ -10,6 +10,11 @@ from dataclasses import asdict
 from pathlib import Path
 from typing import Any
 
+from .android import (
+    AndroidCaptureSession,
+    AndroidError,
+    AndroidManager,
+)
 from .backend import (
     AudioBackend,
     BackendError,
@@ -59,6 +64,11 @@ class Controller:
         self._state_path = state_path
         self._notify_enabled = notify_enabled
         self.lock = threading.RLock()
+        self.android_manager = AndroidManager(
+            scrcpy_path=self.config.android.scrcpy_path,
+            adb_path=self.config.android.adb_path,
+        )
+        self.android_session = AndroidCaptureSession(self.android_manager)
 
     # -- persistence -----------------------------------------------------
 
@@ -70,6 +80,8 @@ class Controller:
         with self.lock:
             new = Config.load(self._config_path)
             self.config = new
+            self.android_manager.custom_scrcpy = new.android.scrcpy_path
+            self.android_manager.custom_adb = new.android.adb_path
             return new
 
     # -- status ----------------------------------------------------------
@@ -98,6 +110,7 @@ class Controller:
                     "paused": bool(self.state.auto_paused),
                     "last_peer": self.config.connection.last_peer,
                 },
+                "android": self.android_session.status(),
                 "connection": None,
                 "peers": [p.to_dict() for p in (peers or [])],
                 "known_peers": [
@@ -635,6 +648,135 @@ class Controller:
         except (BackendError, OSError) as exc:
             data["error"] = str(exc)
         return data
+
+    # -- android capture -------------------------------------------------
+
+    def android_tool_status(self) -> dict[str, Any]:
+        with self.lock:
+            status = self.android_manager.get_tool_status()
+            return {
+                "scrcpy_path": str(status.scrcpy_path) if status.scrcpy_path else None,
+                "scrcpy_version": status.scrcpy_version,
+                "adb_path": str(status.adb_path) if status.adb_path else None,
+                "adb_version": status.adb_version,
+                "is_managed": status.is_managed,
+                "ready": status.ready,
+            }
+
+    def android_list_devices(self) -> list[dict[str, Any]]:
+        with self.lock:
+            devices = self.android_manager.list_devices()
+            return [asdict(d) for d in devices]
+
+    def android_switch_wifi(self, serial: str, port: int = 5555) -> tuple[bool, str]:
+        with self.lock:
+            # First find wifi IP if possible
+            ip = self.android_manager.get_device_wifi_ip(serial)
+            ok, msg = self.android_manager.enable_tcpip(serial, port)
+            if not ok:
+                return False, msg
+            if ip:
+                time.sleep(1.0)
+                conn_ok, conn_msg = self.android_manager.connect_wifi(ip, port)
+                if conn_ok:
+                    return True, f"Switched to Wi-Fi mode and connected to {ip}:{port}"
+                return True, f"Switched to TCP mode, but Wi-Fi connect to {ip}:{port} failed: {conn_msg}"
+            return True, f"Switched to TCP mode on port {port}. Please connect via Wi-Fi IP."
+
+    def android_connect_wifi(self, host: str, port: int = 5555) -> tuple[bool, str]:
+        with self.lock:
+            return self.android_manager.connect_wifi(host, port)
+
+    def android_disconnect_wifi(self, target: str | None = None) -> tuple[bool, str]:
+        with self.lock:
+            return self.android_manager.disconnect_wifi(target)
+
+    def android_list_encoders(self, serial: str | None = None) -> dict[str, Any]:
+        with self.lock:
+            encoders = self.android_manager.list_encoders(serial)
+            return {
+                "codecs": encoders.codecs,
+                "available_codecs": encoders.available_codecs,
+            }
+
+    def android_start_capture(
+        self,
+        serial: str,
+        *,
+        device_name: str = "",
+        codec: str | None = None,
+        source: str | None = None,
+        buffer_ms: int | None = None,
+        bit_rate: int | None = None,
+        duplicate: bool | None = None,
+    ) -> dict[str, Any]:
+        with self.lock:
+            codec_val = codec or self.config.android.default_codec
+            source_val = source or self.config.android.default_source
+            buf_val = buffer_ms or self.config.android.buffer_ms
+            br_val = bit_rate or self.config.android.bit_rate
+            dup_val = duplicate if duplicate is not None else self.config.android.duplicate_audio
+
+            result = self.android_session.start(
+                serial,
+                device_name=device_name,
+                codec=codec_val,
+                source=source_val,
+                buffer_ms=buf_val,
+                bit_rate=br_val,
+                duplicate=dup_val,
+            )
+
+            # Persist state
+            self.state.android_active = True
+            self.state.android_serial = serial
+            self.state.android_model = device_name
+            self.state.android_codec = codec_val
+            self.state.android_pid = result.get("pid", 0)
+            self.state.android_since = result.get("started_at", time.time())
+            self.config.android.last_serial = serial
+            self.save()
+
+            if self._should_notify(None):
+                notify(
+                    "SoundHop: Android audio connected",
+                    f"Streaming audio from {device_name or serial} ({codec_val.upper()})",
+                )
+
+            return result
+
+    def android_stop_capture(self) -> dict[str, Any]:
+        with self.lock:
+            old_name = self.state.android_model or self.state.android_serial
+            result = self.android_session.stop()
+            self.state.android_active = False
+            self.state.android_serial = ""
+            self.state.android_model = ""
+            self.state.android_codec = ""
+            self.state.android_pid = 0
+            self.state.android_since = 0.0
+            self.save()
+
+            if old_name and self._should_notify(None):
+                notify(
+                    "SoundHop: Android audio disconnected",
+                    f"Stopped streaming audio from {old_name}",
+                )
+
+            return result
+
+    def android_install_scrcpy(
+        self,
+        *,
+        progress_cb: Any | None = None,
+    ) -> dict[str, Any]:
+        with self.lock:
+            installed = self.android_manager.install_scrcpy(progress_cb=progress_cb)
+            status = self.android_tool_status()
+            return {
+                "installed_path": str(installed),
+                "tools": status,
+            }
 
     # -- internal --------------------------------------------------------
 

@@ -109,6 +109,19 @@ soundhop share <on|off|status>  # Enable or disable receiving audio from other d
 soundhop tray                   # Launch Qt system tray icon (KDE Plasma / GNOME)
 ```
 
+### Android Audio Capture (scrcpy)
+Capture and stream audio from Android devices directly to your Linux speakers over Wi-Fi or USB.
+```bash
+soundhop android                # Interactive setup wizard & device pairing
+soundhop android 192.168.1.99   # Connect directly to a specific phone IP or serial
+soundhop android stop           # Stop running audio capture session
+soundhop android status         # Show scrcpy / adb tool paths and active sessions
+soundhop android devices        # List detected Android devices and Android versions
+soundhop android encoders       # List hardware/software audio encoders supported by your phone
+soundhop android wifi           # Switch a plugged-in USB phone to wireless Wi-Fi mode
+soundhop android install        # Download & install standalone official scrcpy (zero-bloat, on-demand)
+```
+
 ### Automation & Services
 ```bash
 soundhop auto <on|off>          # Toggle automatic reconnection to your last paired machine
@@ -173,7 +186,7 @@ We build a universal, standalone AppImage using a clean Ubuntu 22.04 container (
 ```bash
 ./build-appimage-container.sh
 ```
-The finished binary will be placed at `dist/SoundHop-1.0.0-universal-x86_64.AppImage`.
+The finished binary will be placed at `dist/SoundHop-1.1.0-universal-x86_64.AppImage`.
 
 ---
 

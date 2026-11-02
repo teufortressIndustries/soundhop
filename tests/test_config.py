@@ -54,6 +54,13 @@ class ConfigTest(unittest.TestCase):
             self.assertFalse(loaded.connection.auto_connect)
             self.assertFalse(loaded.connection.disconnect_on_quit)
 
+            cfg.android.default_codec = "flac"
+            cfg.android.buffer_ms = 80
+            cfg.save()
+            loaded2 = Config.load(cfg_path)
+            self.assertEqual(loaded2.android.default_codec, "flac")
+            self.assertEqual(loaded2.android.buffer_ms, 80)
+
     def test_normalize_validation(self) -> None:
         cfg = Config(Path("/tmp/test.toml"))
         cfg.sharing.security = "invalid-security-mode"

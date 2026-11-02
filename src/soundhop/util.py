@@ -136,6 +136,11 @@ def state_dir() -> Path:
     return (Path(base) if base else _home() / ".local" / "state") / APP_SLUG
 
 
+def data_dir() -> Path:
+    base = os.environ.get("XDG_DATA_HOME")
+    return (Path(base) if base else _home() / ".local" / "share") / APP_SLUG
+
+
 def runtime_dir() -> Path:
     base = os.environ.get("XDG_RUNTIME_DIR")
     if base:

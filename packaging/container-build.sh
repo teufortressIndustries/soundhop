@@ -157,12 +157,20 @@ chmod +x "$APP_DIR/AppRun"
 cp "$REPO_DIR/packaging/io.github.soundhop.desktop" "$APP_DIR/io.github.soundhop.desktop"
 ln -sf io.github.soundhop.desktop "$APP_DIR/soundhop.desktop"
 cp "$REPO_DIR/src/soundhop/assets/soundhop.svg" "$APP_DIR/soundhop.svg"
-ln -sf soundhop.svg "$APP_DIR/.DirIcon"
+if [ -f "$REPO_DIR/src/soundhop/assets/soundhop.png" ]; then
+    cp "$REPO_DIR/src/soundhop/assets/soundhop.png" "$APP_DIR/soundhop.png"
+    cp "$REPO_DIR/src/soundhop/assets/soundhop.png" "$APP_DIR/.DirIcon"
+else
+    ln -sf soundhop.svg "$APP_DIR/.DirIcon"
+fi
 
-mkdir -p "$APP_DIR/usr/share/applications" "$APP_DIR/usr/share/icons/hicolor/scalable/apps"
+mkdir -p "$APP_DIR/usr/share/applications" "$APP_DIR/usr/share/icons/hicolor/scalable/apps" "$APP_DIR/usr/share/icons/hicolor/256x256/apps"
 cp "$REPO_DIR/packaging/io.github.soundhop.desktop" "$APP_DIR/usr/share/applications/io.github.soundhop.desktop"
 ln -sf io.github.soundhop.desktop "$APP_DIR/usr/share/applications/soundhop.desktop"
 cp "$REPO_DIR/src/soundhop/assets/soundhop.svg" "$APP_DIR/usr/share/icons/hicolor/scalable/apps/soundhop.svg"
+if [ -f "$REPO_DIR/src/soundhop/assets/soundhop.png" ]; then
+    cp "$REPO_DIR/src/soundhop/assets/soundhop.png" "$APP_DIR/usr/share/icons/hicolor/256x256/apps/soundhop.png"
+fi
 
 echo "6. Ensuring official runtime & appimagetool..."
 cd "$BUILD_DIR"
@@ -177,7 +185,11 @@ if [ ! -f "appimagetool" ]; then
     ./appimagetool --appimage-extract >/dev/null 2>&1
 fi
 
-echo "7. Generating universal AppImage..."
-ARCH=x86_64 "$BUILD_DIR/squashfs-root/AppRun" --runtime-file "$BUILD_DIR/runtime-x86_64" "$APP_DIR" "$OUTPUT_DIR/SoundHop-1.0.0-universal-x86_64.AppImage"
-chmod +x "$OUTPUT_DIR/SoundHop-1.0.0-universal-x86_64.AppImage"
-echo "✓ Successfully built: dist/SoundHop-1.0.0-universal-x86_64.AppImage"
+VERSION="${VERSION:-$(grep -oP 'VERSION\s*=\s*"\K[^"]+' "$REPO_DIR/src/soundhop/constants.py" 2>/dev/null || python3 -c "import sys; sys.path.insert(0, '$REPO_DIR/src'); from soundhop.constants import VERSION; print(VERSION)")}"
+echo "7. Generating universal AppImage (version: $VERSION)..."
+TMP_OUTPUT="$OUTPUT_DIR/.SoundHop-$VERSION-universal-x86_64.AppImage.tmp"
+rm -f "$TMP_OUTPUT"
+ARCH=x86_64 "$BUILD_DIR/squashfs-root/AppRun" --runtime-file "$BUILD_DIR/runtime-x86_64" "$APP_DIR" "$TMP_OUTPUT"
+chmod +x "$TMP_OUTPUT"
+mv -f "$TMP_OUTPUT" "$OUTPUT_DIR/SoundHop-$VERSION-universal-x86_64.AppImage"
+echo "✓ Successfully built: dist/SoundHop-$VERSION-universal-x86_64.AppImage"

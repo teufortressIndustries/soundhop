@@ -5,7 +5,7 @@ from __future__ import annotations
 APP_NAME = "SoundHop"
 APP_SLUG = "soundhop"
 APP_ID = "io.github.soundhop"
-VERSION = "1.0.0"
+VERSION = "1.1.0"
 
 #: Version of the on-the-wire discovery protocol.  Bump only for breaking
 #: changes; peers with a different version are still displayed but are not

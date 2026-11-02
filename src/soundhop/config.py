@@ -92,6 +92,19 @@ class UiConfig:
 
 
 @dataclass
+class AndroidConfig:
+    scrcpy_path: str = ""
+    adb_path: str = ""
+    default_codec: str = "aac"
+    default_source: str = "output"
+    buffer_ms: int = 50
+    bit_rate: int = 128000
+    duplicate_audio: bool = False
+    auto_switch_wifi: bool = True
+    last_serial: str = ""
+
+
+@dataclass
 class Config:
     path: Path
     device: DeviceConfig = field(default_factory=DeviceConfig)
@@ -99,6 +112,7 @@ class Config:
     connection: ConnectionConfig = field(default_factory=ConnectionConfig)
     discovery: DiscoveryConfig = field(default_factory=DiscoveryConfig)
     ui: UiConfig = field(default_factory=UiConfig)
+    android: AndroidConfig = field(default_factory=AndroidConfig)
 
     # -- loading ---------------------------------------------------------
 
@@ -134,6 +148,7 @@ class Config:
         _apply_dataclass(cfg.connection, section("connection"), "connection")
         _apply_dataclass(cfg.discovery, section("discovery"), "discovery")
         _apply_dataclass(cfg.ui, section("ui"), "ui")
+        _apply_dataclass(cfg.android, section("android"), "android")
         cfg.normalize()
         return cfg
 
@@ -199,6 +214,16 @@ class Config:
         self.ui.notifications = _as_bool(self.ui.notifications, True)
         self.ui.start_tray = _as_bool(self.ui.start_tray, False)
 
+        self.android.scrcpy_path = str(self.android.scrcpy_path or "").strip()
+        self.android.adb_path = str(self.android.adb_path or "").strip()
+        self.android.default_codec = str(self.android.default_codec or "aac").strip().lower()
+        self.android.default_source = str(self.android.default_source or "output").strip().lower()
+        self.android.buffer_ms = max(10, int(self.android.buffer_ms or 50))
+        self.android.bit_rate = max(16000, int(self.android.bit_rate or 128000))
+        self.android.duplicate_audio = _as_bool(self.android.duplicate_audio, False)
+        self.android.auto_switch_wifi = _as_bool(self.android.auto_switch_wifi, True)
+        self.android.last_serial = str(self.android.last_serial or "").strip()
+
     # -- saving ----------------------------------------------------------
 
     def save(self, path: Path | None = None) -> Path:
@@ -246,6 +271,17 @@ class Config:
             f"notifications = {_bool(s.ui.notifications)}",
             f"start_tray = {_bool(s.ui.start_tray)}",
             "",
+            "[android]",
+            f"scrcpy_path = {_q(s.android.scrcpy_path)}",
+            f"adb_path = {_q(s.android.adb_path)}",
+            f"default_codec = {_q(s.android.default_codec)}",
+            f"default_source = {_q(s.android.default_source)}",
+            f"buffer_ms = {s.android.buffer_ms}",
+            f"bit_rate = {s.android.bit_rate}",
+            f"duplicate_audio = {_bool(s.android.duplicate_audio)}",
+            f"auto_switch_wifi = {_bool(s.android.auto_switch_wifi)}",
+            f"last_serial = {_q(s.android.last_serial)}",
+            "",
         ]
         return "\n".join(lines)
 
@@ -258,6 +294,7 @@ class Config:
             "connection": _asdict(self.connection),
             "discovery": _asdict(self.discovery),
             "ui": _asdict(self.ui),
+            "android": _asdict(self.android),
         }
 
     def get(self, dotted: str) -> Any:

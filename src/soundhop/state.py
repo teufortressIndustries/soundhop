@@ -58,6 +58,12 @@ class State:
     listener_security: str = ""
     known_peers: dict[str, KnownPeer] = field(default_factory=dict)
     daemon_last_started: float = 0.0
+    android_active: bool = False
+    android_serial: str = ""
+    android_model: str = ""
+    android_codec: str = ""
+    android_pid: int = 0
+    android_since: float = 0.0
 
     # -- persistence -----------------------------------------------------
 
@@ -82,20 +88,24 @@ class State:
             "connected_sink",
             "connected_by",
             "listener_security",
+            "android_serial",
+            "android_model",
+            "android_codec",
         ):
             setattr(state, key, str(raw.get(key, "") or ""))
-        for key in ("connected_port", "connected_module", "listener_module", "listener_port"):
+        for key in ("connected_port", "connected_module", "listener_module", "listener_port", "android_pid"):
             try:
                 setattr(state, key, int(raw.get(key, 0) or 0))
             except (TypeError, ValueError):
                 pass
-        for key in ("connected_since", "daemon_last_started"):
+        for key in ("connected_since", "daemon_last_started", "android_since"):
             try:
                 setattr(state, key, float(raw.get(key, 0) or 0))
             except (TypeError, ValueError):
                 pass
         state.auto_paused = bool(raw.get("auto_paused", False))
         state.listener_created = bool(raw.get("listener_created", False))
+        state.android_active = bool(raw.get("android_active", False))
         peers = raw.get("known_peers", {})
         if isinstance(peers, dict):
             for peer_id, value in peers.items():
