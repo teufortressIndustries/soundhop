@@ -40,6 +40,7 @@ from .config import (
 from .constants import (
     APP_NAME,
     DEFAULT_AUDIO_PORT,
+    ISSUES_URL,
     PROTOCOL_VERSION,
     SINK_PREFIX,
     VERSION,
@@ -1746,7 +1747,7 @@ def cmd_bug_report(args: argparse.Namespace) -> int:
 """
     if getattr(args, "open_browser", False):
         encoded_body = urllib.parse.quote(report)
-        issue_url = f"https://github.com/soundhop/soundhop/issues/new?body={encoded_body}"
+        issue_url = f"{ISSUES_URL}/new?body={encoded_body}"
         if command_exists("xdg-open"):
             subprocess.call(["xdg-open", issue_url], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
             print("Opening browser to submit bug report...")

@@ -15,7 +15,7 @@ from typing import Any, Callable
 from . import __version__
 from .android import AndroidManager, SUPPORTED_AUDIO_CODECS
 from .config import Config
-from .constants import APP_NAME
+from .constants import APP_NAME, ISSUES_URL
 from .ipc import DaemonNotRunning, IpcError, request
 from .service import tray_dependency_hint
 from .util import config_path, format_duration
@@ -1161,7 +1161,7 @@ def _build_classes(QtCore: Any, QtGui: Any, QtWidgets: Any) -> tuple[type, type]
 
         def _report_issue(self) -> None:
             QtGui.QDesktopServices.openUrl(
-                QtCore.QUrl("https://github.com/soundhop/soundhop/issues/new")
+                QtCore.QUrl(f"{ISSUES_URL}/new")
             )
 
         def _quit(self) -> None:

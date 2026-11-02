@@ -34,7 +34,9 @@ soundhop = "soundhop.cli:main"
 shop = "soundhop.cli:main"
 
 [project.urls]
-Homepage = "https://github.com/example/soundhop"
+Homepage = "https://github.com/teufortressIndustries/soundhop"
+Issues = "https://github.com/teufortressIndustries/soundhop/issues"
+Repository = "https://github.com/teufortressIndustries/soundhop"
 
 [tool.setuptools]
 package-dir = { "" = "src" }

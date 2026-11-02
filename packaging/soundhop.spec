@@ -4,7 +4,7 @@ Release:        1%{?dist}
 Summary:        Seamless cross-distro local network audio sharing for Linux
 
 License:        MIT
-URL:            https://github.com/example/soundhop
+URL:            https://github.com/teufortressIndustries/soundhop
 Source0:        %{name}-%{version}.tar.gz
 
 BuildArch:      noarch
