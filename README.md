@@ -2,10 +2,10 @@
 
 > Hop audio between Linux boxes on your local network without manual `pactl` plumbing or broken streams.
 
-[![CI](https://github.com/example/soundhop/actions/workflows/ci.yml/badge.svg)](https://github.com/example/soundhop/actions/workflows/ci.yml)
+[![CI](https://github.com/teufortressIndustries/soundhop/actions/workflows/ci.yml/badge.svg)](https://github.com/teufortressIndustries/soundhop/actions/workflows/ci.yml)
 [![License: MIT](https://img.shields.io/badge/License-MIT-blue.svg)](LICENSE)
 
-[**Download Latest AppImage (Releases)**](https://github.com/example/soundhop/releases) • [**Quickstart**](#quickstart) • [**Requirements**](#requirements) • [**CLI Commands**](#cli-command-reference) • [**Building from Source**](#building-from-source) • [**How It Works**](#how-it-works-under-the-hood)
+[**Download Latest AppImage (Releases)**](https://github.com/teufortressIndustries/soundhop/releases) • [**Quickstart**](#quickstart) • [**Requirements**](#requirements) • [**CLI Commands**](#cli-command-reference) • [**Building from Source**](#building-from-source) • [**How It Works**](#how-it-works-under-the-hood)
 
 ---
 
@@ -24,7 +24,7 @@ PulseAudio and PipeWire already implement native TCP network streaming modules (
 ## Quickstart
 
 ### 1. Grab the executable
-Either download the standalone **[SoundHop AppImage](https://github.com/example/soundhop/releases)** (no installation required) or clone and run:
+Either download the standalone **[SoundHop AppImage](https://github.com/teufortressIndustries/soundhop/releases)** (no installation required) or clone and run:
 ```bash
 ./install.sh
 ```
@@ -148,7 +148,7 @@ If you want to hack on SoundHop or run straight from git:
 
 ### 1. Clone repository
 ```bash
-git clone https://github.com/example/soundhop.git
+git clone https://github.com/teufortressIndustries/soundhop.git
 cd soundhop
 ```
 
