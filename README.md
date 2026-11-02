@@ -225,14 +225,16 @@ mdns = true                     # Enable mDNS fallback browsing
 
 ## Roadmap
 
-- [x] **v1.0 (Current)**:
+- [x] **v1.0**:
   - PipeWire & PulseAudio TCP audio transport
   - Fast UDP + mDNS LAN discovery
   - Native Wayland + X11 Qt system tray GUI
   - Full CLI (`soundhop` / `shop`) and shell autocompletions
   - Disconnect-on-quit toggle, buffer latency presets, and DSP detection (EasyEffects)
   - Portable AppImage & containerized multi-distro build pipeline
-- [ ] **v1.1 (Upcoming)**:
+- [x] **v1.1 (Current)**:
+  - **Android Support (scrcpy)**: Connect and listen your android device.
+- [ ] **v1.2 (Upcoming)**:
   - **Per-Application Stream Routing**: Direct specific apps (e.g. Spotify or Firefox) to remote speakers without moving your whole desktop audio.
   - **Microphone Pass-Through**: Stream microphone input back to the sender for remote calls and Discord.
   - **Remote Volume Sync**: Control receiver volume directly from the sender's media keys.
