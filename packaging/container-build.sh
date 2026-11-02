@@ -36,12 +36,12 @@ else
 fi
 
 echo "2. Preparing Python environment..."
-if [ ! -d "$BASE_VENV" ] || [ ! -f "$BASE_VENV/bin/python3" ]; then
+if [ ! -d "$BASE_VENV" ] || [ ! -f "$BASE_VENV/bin/python3" ] || ! "$BASE_VENV/bin/python3" -c "import tomli" >/dev/null 2>&1; then
     echo "  Creating cached Python runtime with PySide6 (one-time download)..."
     rm -rf "$BASE_VENV"
     python3 -m venv "$BASE_VENV"
     "$BASE_VENV/bin/pip" install --upgrade pip setuptools wheel
-    "$BASE_VENV/bin/pip" install "PySide6-Essentials>=6.5" zeroconf
+    "$BASE_VENV/bin/pip" install "PySide6-Essentials>=6.5" zeroconf "tomli>=2.0"
 else
     echo "  Using cached Python runtime (skipping wheel downloads)."
 fi

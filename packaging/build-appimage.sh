@@ -174,6 +174,12 @@ if ! "$APP_DIR/usr/bin/python3" -c "import zeroconf" >/dev/null 2>&1; then
     "$APP_DIR/usr/bin/python3" -m pip install --no-warn-script-location zeroconf >/dev/null 2>&1 || true
 fi
 
+# Ensure tomli is present if Python < 3.11
+if ! "$APP_DIR/usr/bin/python3" -c "import tomli" >/dev/null 2>&1 && ! "$APP_DIR/usr/bin/python3" -c "import tomllib" >/dev/null 2>&1; then
+    echo "Installing tomli for Python < 3.11..."
+    "$APP_DIR/usr/bin/python3" -m pip install --no-warn-script-location "tomli>=2.0" >/dev/null 2>&1 || true
+fi
+
 # Ensure python binary symlink
 ln -sf python3 "$APP_DIR/usr/bin/python"
 
