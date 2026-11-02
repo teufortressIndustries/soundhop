@@ -92,7 +92,7 @@ class AudioBackend:
     # -- low-level -------------------------------------------------------
 
     def available(self) -> bool:
-        if not command_exists(self.pactl):
+        if self._run is run and not command_exists(self.pactl):
             return False
         try:
             return self._pactl("info", check=False).ok

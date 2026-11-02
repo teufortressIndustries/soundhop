@@ -15,8 +15,9 @@ from soundhop.util import Result
 
 
 class ControllerTest(unittest.TestCase):
+    @patch("soundhop.backend.command_exists", return_value=True)
     @patch("soundhop.controller.tcp_reachable", return_value=True)
-    def test_controller_lifecycle(self, mock_tcp) -> None:
+    def test_controller_lifecycle(self, mock_tcp, mock_cmd) -> None:
         with tempfile.TemporaryDirectory() as tmpdir:
             cfg_path = Path(tmpdir) / "config.toml"
             state_path = Path(tmpdir) / "state.json"
