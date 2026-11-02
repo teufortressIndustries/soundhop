@@ -1,0 +1,12 @@
+[Desktop Entry]
+Type=Application
+Version=1.0
+Name=SoundHop
+GenericName=Local Audio Sharing
+Comment=Stream and share audio between local Linux machines seamlessly
+Exec=soundhop tray
+Icon=soundhop
+Terminal=false
+Categories=AudioVideo;Audio;
+StartupNotify=false
+Keywords=audio;sound;streaming;pipewire;pulseaudio;sharing;network;lan;
