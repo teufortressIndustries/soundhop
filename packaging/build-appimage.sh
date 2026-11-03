@@ -29,6 +29,10 @@ fi
 PY_VER="$(python3 -c 'import sys; print(f"python{sys.version_info.major}.{sys.version_info.minor}")')"
 echo "Host Python environment: $PY_VER"
 
+VERSION="${VERSION:-$(grep -oP 'VERSION\s*=\s*"\K[^"]+' "$REPO_DIR/src/soundhop/constants.py" 2>/dev/null || python3 -c "import sys; sys.path.insert(0, '$REPO_DIR/src'); from soundhop.constants import VERSION; print(VERSION)")}"
+UPDATE_REPO="${UPDATE_REPO:-teufortressIndustries/soundhop}"
+UPDATE_INFO="gh-releases-zsync|${UPDATE_REPO%/*}|${UPDATE_REPO#*/}|latest|SoundHop-*x86_64.AppImage.zsync"
+
 mkdir -p "$BUILD_DIR" "$OUTPUT_DIR"
 
 # 1. Ensure official static-pie runtime-x86_64
@@ -124,6 +128,17 @@ if [[ -f "$PNG_ICON" ]]; then
     cp "$PNG_ICON" "$APP_DIR/usr/share/icons/hicolor/256x256/apps/soundhop.png"
 fi
 
+# Ensure X-AppImage-Version in AppDir's desktop file(s) is set to $VERSION
+for dfile in "$APP_DIR/io.github.soundhop.desktop" "$APP_DIR/usr/share/applications/io.github.soundhop.desktop"; do
+    if [[ -f "$dfile" ]]; then
+        if grep -q '^X-AppImage-Version=' "$dfile"; then
+            sed -i "s|^X-AppImage-Version=.*|X-AppImage-Version=$VERSION|" "$dfile"
+        else
+            echo "X-AppImage-Version=$VERSION" >> "$dfile"
+        fi
+    fi
+done
+
 # 4. Bundle Python Environment into AppDir
 echo "Setting up Python environment inside AppDir..."
 # Create venv with system site-packages so it does not block system libraries
@@ -184,21 +199,21 @@ fi
 ln -sf python3 "$APP_DIR/usr/bin/python"
 
 # 6. Generate the AppImage
-VERSION="${VERSION:-$(grep -oP 'VERSION\s*=\s*"\K[^"]+' "$REPO_DIR/src/soundhop/constants.py" 2>/dev/null || python3 -c "import sys; sys.path.insert(0, '$REPO_DIR/src'); from soundhop.constants import VERSION; print(VERSION)")}"
 OUTPUT_FILE="$OUTPUT_DIR/SoundHop-$VERSION-x86_64.AppImage"
-TMP_OUTPUT="$OUTPUT_DIR/.SoundHop-$VERSION-x86_64.AppImage.tmp"
-rm -f "$TMP_OUTPUT"
+rm -f "$OUTPUT_FILE" "$OUTPUT_FILE.zsync"
+trap 'rm -f "$OUTPUT_FILE" "$OUTPUT_FILE.zsync"' ERR INT TERM
 
 echo -e "\n${BOLD}Packaging AppImage...${NC}"
-ARCH=x86_64 "$APPIMAGETOOL_EXEC" --runtime-file "$RUNTIME_FILE" "$APP_DIR" "$TMP_OUTPUT"
+ARCH=x86_64 "$APPIMAGETOOL_EXEC" -u "$UPDATE_INFO" --runtime-file "$RUNTIME_FILE" "$APP_DIR" "$OUTPUT_FILE"
 
-if [[ -f "$TMP_OUTPUT" ]]; then
-    chmod +x "$TMP_OUTPUT"
-    mv -f "$TMP_OUTPUT" "$OUTPUT_FILE"
+if [[ -f "$OUTPUT_FILE" ]]; then
+    chmod +x "$OUTPUT_FILE"
+    trap - ERR INT TERM
     echo -e "\n${GREEN}${BOLD}✓ Successfully generated:${NC} $OUTPUT_FILE"
     echo -e "You can run it directly: ${CYAN}$OUTPUT_FILE${NC}"
     echo -e "Or double-click it on any Linux desktop to launch the system tray."
 else
+    trap - ERR INT TERM
     echo -e "${RED}Error: AppImage generation failed.${NC}"
     exit 1
 fi

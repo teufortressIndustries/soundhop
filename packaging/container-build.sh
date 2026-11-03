@@ -157,6 +157,10 @@ done
 echo "Stripping binary symbols..."
 find "$APP_DIR/usr" -type f \( -name "*.so" -o -name "*.so.*" \) -exec strip --strip-unneeded {} + 2>/dev/null || true
 
+VERSION="${VERSION:-$(grep -oP 'VERSION\s*=\s*"\K[^"]+' "$REPO_DIR/src/soundhop/constants.py" 2>/dev/null || python3 -c "import sys; sys.path.insert(0, '$REPO_DIR/src'); from soundhop.constants import VERSION; print(VERSION)")}"
+UPDATE_REPO="${UPDATE_REPO:-teufortressIndustries/soundhop}"
+UPDATE_INFO="gh-releases-zsync|${UPDATE_REPO%/*}|${UPDATE_REPO#*/}|latest|SoundHop-*x86_64.AppImage.zsync"
+
 echo "5. Populating AppDir metadata..."
 cp "$REPO_DIR/packaging/AppRun" "$APP_DIR/AppRun"
 chmod +x "$APP_DIR/AppRun"
@@ -178,6 +182,17 @@ if [ -f "$REPO_DIR/src/soundhop/assets/soundhop.png" ]; then
     cp "$REPO_DIR/src/soundhop/assets/soundhop.png" "$APP_DIR/usr/share/icons/hicolor/256x256/apps/soundhop.png"
 fi
 
+# Ensure X-AppImage-Version in AppDir's desktop file(s) is set to $VERSION
+for dfile in "$APP_DIR/io.github.soundhop.desktop" "$APP_DIR/usr/share/applications/io.github.soundhop.desktop"; do
+    if [ -f "$dfile" ]; then
+        if grep -q '^X-AppImage-Version=' "$dfile"; then
+            sed -i "s|^X-AppImage-Version=.*|X-AppImage-Version=$VERSION|" "$dfile"
+        else
+            echo "X-AppImage-Version=$VERSION" >> "$dfile"
+        fi
+    fi
+done
+
 echo "6. Ensuring official runtime & appimagetool..."
 cd "$BUILD_DIR"
 if [ ! -f "runtime-x86_64" ]; then
@@ -191,11 +206,19 @@ if [ ! -f "appimagetool" ]; then
     ./appimagetool --appimage-extract >/dev/null 2>&1
 fi
 
-VERSION="${VERSION:-$(grep -oP 'VERSION\s*=\s*"\K[^"]+' "$REPO_DIR/src/soundhop/constants.py" 2>/dev/null || python3 -c "import sys; sys.path.insert(0, '$REPO_DIR/src'); from soundhop.constants import VERSION; print(VERSION)")}"
+OUTPUT_FILE="$OUTPUT_DIR/SoundHop-$VERSION-universal-x86_64.AppImage"
 echo "7. Generating universal AppImage (version: $VERSION)..."
-TMP_OUTPUT="$OUTPUT_DIR/.SoundHop-$VERSION-universal-x86_64.AppImage.tmp"
-rm -f "$TMP_OUTPUT"
-ARCH=x86_64 "$BUILD_DIR/squashfs-root/AppRun" --runtime-file "$BUILD_DIR/runtime-x86_64" "$APP_DIR" "$TMP_OUTPUT"
-chmod +x "$TMP_OUTPUT"
-mv -f "$TMP_OUTPUT" "$OUTPUT_DIR/SoundHop-$VERSION-universal-x86_64.AppImage"
-echo "✓ Successfully built: dist/SoundHop-$VERSION-universal-x86_64.AppImage"
+rm -f "$OUTPUT_FILE" "$OUTPUT_FILE.zsync"
+trap 'rm -f "$OUTPUT_FILE" "$OUTPUT_FILE.zsync"' ERR INT TERM
+
+ARCH=x86_64 "$BUILD_DIR/squashfs-root/AppRun" -u "$UPDATE_INFO" --runtime-file "$BUILD_DIR/runtime-x86_64" "$APP_DIR" "$OUTPUT_FILE"
+if [ -f "$OUTPUT_FILE" ]; then
+    chmod +x "$OUTPUT_FILE"
+    trap - ERR INT TERM
+    echo "✓ Successfully built: dist/SoundHop-$VERSION-universal-x86_64.AppImage"
+else
+    trap - ERR INT TERM
+    rm -f "$OUTPUT_FILE" "$OUTPUT_FILE.zsync"
+    echo "Error: AppImage generation failed."
+    exit 1
+fi

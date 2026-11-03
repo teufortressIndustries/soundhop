@@ -68,7 +68,9 @@ jobs:
         uses: actions/upload-artifact@v4
         with:
           name: SoundHop-x86_64.AppImage
-          path: dist/*.AppImage
+          path: |
+            dist/*.AppImage
+            dist/*.zsync
           if-no-files-found: error
 
   release:
@@ -92,5 +94,7 @@ jobs:
       - name: Create GitHub Release
         uses: softprops/action-gh-release@v2
         with:
-          files: dist/*.AppImage
+          files: |
+            dist/*.AppImage
+            dist/*.zsync
           generate_release_notes: true

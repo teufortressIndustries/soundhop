@@ -43,6 +43,7 @@ fi
 chmod +x "$REPO_DIR/packaging/container-build.sh"
 
 $CONTAINER_CMD run --rm -it \
+    ${UPDATE_REPO:+-e UPDATE_REPO="$UPDATE_REPO"} \
     -v "$REPO_DIR:/work:Z" \
     -w /work \
     "$IMAGE_NAME" /work/packaging/container-build.sh
