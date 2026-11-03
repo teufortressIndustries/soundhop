@@ -5,7 +5,7 @@
 [![CI](https://github.com/teufortressIndustries/soundhop/actions/workflows/ci.yml/badge.svg)](https://github.com/teufortressIndustries/soundhop/actions/workflows/ci.yml)
 [![License: MIT](https://img.shields.io/badge/License-MIT-blue.svg)](LICENSE)
 
-[**Download Latest AppImage (Releases)**](https://github.com/teufortressIndustries/soundhop/releases) • [**Quickstart**](#quickstart) • [**Requirements**](#requirements) • [**CLI Commands**](#cli-command-reference) • [**Building from Source**](#building-from-source) • [**How It Works**](#how-it-works-under-the-hood)
+[**Download Latest AppImage (Releases)**](https://github.com/teufortressIndustries/soundhop/releases) • [**Quickstart**](#quickstart) • [**CLI Commands**](#cli-command-reference) • [**Requirements**](#requirements) • [**Building from Source**](#building-from-source) • [**How It Works**](#how-it-works-under-the-hood)
 
 ---
 
@@ -17,26 +17,61 @@ PulseAudio and PipeWire already implement native TCP network streaming modules (
 - Live audio streams not automatically moving over when a tunnel connects.
 - Ghost tunnels and frozen audio when a remote laptop suspends or Wi-Fi drops.
 
-**SoundHop** fixes this. It wraps PipeWire and PulseAudio in an automatic, self-healing workflow with zero-configuration LAN discovery, an interactive CLI (`soundhop` or the short alias `shop`), and an optional Qt system tray for KDE Plasma and GNOME.
+**SoundHop** fixes this. It wraps PipeWire and PulseAudio in an automatic, self-healing workflow with zero-configuration LAN discovery, an intuitive desktop system tray for KDE Plasma and GNOME (**the preferred and easiest way to use SoundHop**), and a full-featured CLI (`soundhop` or the short alias `shop`) for headless environments and scripts.
 
 ---
 
 ## Quickstart
 
-### 1. Grab the executable
-Either download the standalone **[SoundHop AppImage](https://github.com/teufortressIndustries/soundhop/releases)** (no installation required) or clone and run:
-```bash
-./install.sh
-```
+The primary and recommended way to use SoundHop is through the native desktop system tray widget. It runs seamlessly on KDE Plasma, GNOME, and other Linux desktop environments.
 
-### 2. Receiver (e.g. your laptop with the good speakers)
+### 1. Launch SoundHop
+Download and run the standalone **[SoundHop AppImage](https://github.com/teufortressIndustries/soundhop/releases)** (no installation needed) or run:
+```bash
+soundhop tray
+```
+*(Or launch **SoundHop** directly from your desktop application launcher)*.
+
+### 2. Receiver (e.g. your laptop with good speakers)
+Click the SoundHop tray icon and toggle **Accept incoming audio** on.
+
+### 3. Sender (e.g. your desktop PC or workstation)
+Click the SoundHop tray icon, hover over **Play audio on**, and select your target machine (e.g. `pbjj`).
+Active playback streams (Spotify, Firefox, mpv, games) immediately switch over to the remote machine.
+
+To bring your sound back to local speakers or headphones at any time, simply select **Play audio on > This device (disconnect)**.
+
+| Sender (PC — CachyOS KDE) | Receiver (Laptop — Fedora KDE) |
+| :---: | :---: |
+| ![SoundHop Tray GUI on PC (CachyOS KDE)](docs/screenshots/tray-pc-local.png) | ![SoundHop Tray GUI on Laptop (Fedora KDE)](docs/screenshots/tray-laptop-connected.png) |
+| *Select **Play audio on > This device (disconnect)** to keep sound local or switch outputs* | *Connected to sender (`pbjj (192.168.1.174:4713)`) with instant stream routing* |
+
+### Android Audio Streaming & GUI Settings
+
+SoundHop also provides dedicated GUI windows accessible directly from the tray menu:
+
+| Android Audio Capture | Preferences & Audio Buffer Tuning |
+| :---: | :---: |
+| ![Android Audio Capture Window](docs/screenshots/android-audio-capture.png) | ![SoundHop Settings Window](docs/screenshots/settings.png) |
+| *Stream mobile audio via USB or Wi-Fi with selectable encoders & bitrates* | *Configure device identity, buffer latency presets, and LAN security* |
+
+- **Capture Android Audio...**: Effortlessly stream Android audio directly to your Linux speakers using official `scrcpy` over USB or Wi-Fi. Choose your preferred encoder (Opus, AAC, FLAC, RAW) and sample rate.
+- **Settings...**: Customize your broadcast device name, configure RFC1918 subnet security, select buffer latency presets (low latency vs. Wi-Fi stability buffer), and toggle auto-reconnection.
+
+---
+
+## Headless & CLI Usage
+
+Prefer working from the terminal, running on a headless server, or scripting integrations for Waybar or Polybar? SoundHop provides a first-class CLI (`soundhop` or `shop`):
+
+### 1. Receiver (Laptop / Speakers)
 Turn on audio sharing:
 ```bash
 soundhop share on
 ```
 *(If you have an active firewall like firewalld or ufw, run `soundhop firewall open`)*.
 
-### 3. Sender (e.g. your desktop / workstation)
+### 2. Sender (Desktop / Workstation)
 Connect and pick the target machine:
 ```bash
 soundhop connect
@@ -47,15 +82,12 @@ Discovered devices:
 Select device [1]: 1
 ✓ Audio is now playing on thinkpad-cachy.
 ```
-Your active playback streams (Spotify, Firefox, mpv, games) immediately switch to the remote machine.
 
-### 4. Disconnect
+### 3. Disconnect
 ```bash
 soundhop disconnect
 ```
 Audio falls straight back to your local speakers or headphones without missing a beat.
-
-> **Prefer a GUI?** Run `soundhop tray` (or double-click the AppImage) to get a system tray widget with one-click toggles and audio output switching.
 
 ---
 

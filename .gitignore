@@ -23,6 +23,7 @@ ENV/
 .coverage
 htmlcov/
 .tox/
+.private/
 
 # Logs and runtime databases
 *.log
