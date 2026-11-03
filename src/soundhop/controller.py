@@ -32,6 +32,7 @@ from .discovery import Peer
 from .state import State
 from .util import (
     format_duration,
+    is_private_address,
     local_addresses,
     notify,
     short_id,
@@ -334,6 +335,10 @@ class Controller:
                 raise ControllerError("Invalid peer: missing device id")
             if peer.id == self.config.device.id:
                 raise ControllerError("That is this device")
+            if not is_private_address(peer.host):
+                raise ControllerError(
+                    f"Refusing to connect to non-private address {peer.host}"
+                )
             if not peer.compatible:
                 raise ControllerError(
                     f"{peer.display_name} speaks SoundHop protocol {peer.protocol}; "

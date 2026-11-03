@@ -60,6 +60,70 @@ class UtilTest(unittest.TestCase):
             atomic_write(target, "updated\n")
             self.assertEqual(target.read_text(), "updated\n")
 
+    def test_atomic_write_concurrency(self) -> None:
+        import concurrent.futures
+        with tempfile.TemporaryDirectory() as tmpdir:
+            target = Path(tmpdir) / "concurrent.txt"
+
+            def writer(idx: int) -> None:
+                atomic_write(target, f"thread-{idx}\n", mode=0o600)
+
+            with concurrent.futures.ThreadPoolExecutor(max_workers=8) as ex:
+                futures = [ex.submit(writer, i) for i in range(50)]
+                for f in concurrent.futures.as_completed(futures):
+                    f.result()
+
+            self.assertTrue(target.exists())
+            content = target.read_text()
+            self.assertTrue(content.startswith("thread-"))
+            self.assertEqual(target.stat().st_mode & 0o777, 0o600)
+
+    def test_is_private_address(self) -> None:
+        from soundhop.util import is_private_address
+        # Private IPv4
+        self.assertTrue(is_private_address("127.0.0.1"))
+        self.assertTrue(is_private_address("192.168.1.1"))
+        self.assertTrue(is_private_address("10.0.0.1"))
+        self.assertTrue(is_private_address("172.16.0.1"))
+        self.assertTrue(is_private_address("169.254.1.1"))
+        # Localhost string
+        self.assertTrue(is_private_address("localhost"))
+        # Private IPv6 & bracketed
+        self.assertTrue(is_private_address("::1"))
+        self.assertTrue(is_private_address("[::1]"))
+        self.assertTrue(is_private_address("fe80::1"))
+        self.assertTrue(is_private_address("[fe80::1]"))
+        self.assertTrue(is_private_address("fe80::1%eth0"))
+        self.assertTrue(is_private_address("fd00::1"))
+        # Public IP & bracketed
+        self.assertFalse(is_private_address("8.8.8.8"))
+        self.assertFalse(is_private_address("[8.8.8.8]"))
+        self.assertFalse(is_private_address("1.1.1.1"))
+        self.assertFalse(is_private_address("93.184.216.34"))
+        # Empty or invalid
+        self.assertFalse(is_private_address(""))
+        self.assertFalse(is_private_address("invalid-host-that-does-not-exist-12345.xyz"))
+
+    def test_broadcast_addresses_cache(self) -> None:
+        from soundhop.util import broadcast_addresses, invalidate_broadcast_cache
+        from unittest.mock import patch
+        invalidate_broadcast_cache()
+        addrs1 = broadcast_addresses()
+        self.assertIn("127.0.0.1", addrs1)
+        self.assertIn("255.255.255.255", addrs1)
+
+        # Call again with run patched to fail; should return cached targets without spawning subprocess
+        with patch("soundhop.util.run", side_effect=RuntimeError("Subprocess should not be called")):
+            addrs2 = broadcast_addresses(include_loopback=False)
+            self.assertNotIn("127.0.0.1", addrs2)
+            self.assertIn("255.255.255.255", addrs2)
+
+        # Invalidate cache; next call without loopback must call run again
+        invalidate_broadcast_cache()
+        addrs3 = broadcast_addresses(include_loopback=False)
+        self.assertIn("255.255.255.255", addrs3)
+
 
 if __name__ == "__main__":
     unittest.main()
+

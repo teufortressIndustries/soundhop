@@ -75,6 +75,41 @@ class CliTest(unittest.TestCase):
             self.assertIn("soundhop", output)
             self.assertIn("shop", output)
 
+    def test_android_stop_targeted_kill_behavior(self) -> None:
+        import signal
+        from unittest.mock import MagicMock, patch
+        from soundhop.cli import cmd_android_stop
+        import argparse
+
+        args = argparse.Namespace()
+
+        # Case 1: Daemon running and request("android_stop") succeeds.
+        # os.kill must NOT be called even though active PID is 12345.
+        with patch("soundhop.cli.is_running", return_value=True), \
+             patch("soundhop.cli.request") as mock_req, \
+             patch("os.kill") as mock_kill:
+            mock_req.side_effect = [
+                {"session": {"pid": 12345}},  # android_status
+                {"ok": True},                  # android_stop
+            ]
+            ret = cmd_android_stop(args)
+            self.assertEqual(ret, 0)
+            mock_kill.assert_not_called()
+
+        # Case 2: Daemon running but request("android_stop") raises error.
+        # Fallback should kill active PID 12345.
+        with patch("soundhop.cli.is_running", return_value=True), \
+             patch("soundhop.cli.request") as mock_req, \
+             patch("os.kill") as mock_kill:
+            mock_req.side_effect = [
+                {"session": {"pid": 12345}},       # android_status
+                RuntimeError("daemon timeout"),     # android_stop
+            ]
+            ret = cmd_android_stop(args)
+            self.assertEqual(ret, 0)
+            mock_kill.assert_called_once_with(12345, signal.SIGTERM)
+
 
 if __name__ == "__main__":
     unittest.main()
+

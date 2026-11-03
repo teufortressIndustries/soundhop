@@ -75,8 +75,68 @@ class DiscoveryTest(unittest.TestCase):
         pruned = store.prune()
         self.assertEqual(len(pruned), 1)
         self.assertEqual(pruned[0], "p3")
+        self.assertEqual(removed_ids, ["p1", "p3"])
         self.assertEqual(len(store.snapshot()), 1)
+
+    def test_peer_store_rejects_public_ip(self) -> None:
+        store = PeerStore()
+        public_peer = Peer(id="bad-actor", name="Hacker", host="8.8.8.8", port=4713)
+        self.assertFalse(store.update(public_peer))
+        self.assertIsNone(store.get("bad-actor"))
+        self.assertEqual(len(store.snapshot()), 0)
+
+    def test_udp_service_probe_reply_port_sanitization(self) -> None:
+        from soundhop.discovery import UdpBeaconService
+        service = UdpBeaconService(
+            device_id="my-dev",
+            name="My Device",
+            audio_port=4713,
+            discovery_port=47777,
+        )
+        sent_destinations = []
+        service._send_beacon = lambda dest: sent_destinations.append(dest)
+
+        # 1. Probe from public WAN host should be dropped immediately
+        public_probe = json.dumps({"magic": "soundhop", "type": "probe", "reply_port": 50000}).encode()
+        service._handle(public_probe, "8.8.8.8")
+        self.assertEqual(len(sent_destinations), 0)
+
+        # 2. Probe with invalid reply_port from LAN host should default to discovery_port
+        bad_port_probe = json.dumps({"magic": "soundhop", "type": "probe", "reply_port": "not-a-port"}).encode()
+        service._handle(bad_port_probe, "192.168.1.50")
+        self.assertEqual(len(sent_destinations), 1)
+        self.assertEqual(sent_destinations[-1], ("192.168.1.50", 47777))
+
+        # 3. Probe with out-of-range reply_port should default to discovery_port
+        oor_probe = json.dumps({"magic": "soundhop", "type": "probe", "reply_port": 999999}).encode()
+        service._handle(oor_probe, "192.168.1.50")
+        self.assertEqual(len(sent_destinations), 2)
+        self.assertEqual(sent_destinations[-1], ("192.168.1.50", 47777))
+
+        # 4. Probe with valid reply_port should use specified port
+        valid_probe = json.dumps({"magic": "soundhop", "type": "probe", "reply_port": 54321}).encode()
+        service._handle(valid_probe, "192.168.1.50")
+        self.assertEqual(len(sent_destinations), 3)
+        self.assertEqual(sent_destinations[-1], ("192.168.1.50", 54321))
+
+        # 5. Probe with boolean reply_port (True) should default to discovery_port, NOT 1
+        bool_probe = json.dumps({"magic": "soundhop", "type": "probe", "reply_port": True}).encode()
+        service._handle(bool_probe, "192.168.1.50")
+        self.assertEqual(len(sent_destinations), 4)
+        self.assertEqual(sent_destinations[-1], ("192.168.1.50", 47777))
+
+    def test_beacon_bool_and_oversized_validation(self) -> None:
+        # Boolean port must be rejected
+        raw_bool_port = json.dumps({"magic": "soundhop", "type": "offer", "id": "dev1", "port": True}).encode()
+        _, peer = parse_beacon(raw_bool_port, host="192.168.1.50")
+        self.assertIsNone(peer)
+
+        # Oversized ID must be rejected
+        raw_huge_id = json.dumps({"magic": "soundhop", "type": "offer", "id": "x" * 200, "port": 4713}).encode()
+        _, peer = parse_beacon(raw_huge_id, host="192.168.1.50")
+        self.assertIsNone(peer)
 
 
 if __name__ == "__main__":
     unittest.main()
+

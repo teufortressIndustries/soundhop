@@ -61,6 +61,13 @@ class AdbDevice:
         return self.state == "device"
 
     @property
+    def major_version(self) -> int:
+        if not self.android_version:
+            return 0
+        m = re.match(r"^(\d+)", self.android_version.strip())
+        return int(m.group(1)) if m else 0
+
+    @property
     def display_name(self) -> str:
         parts: list[str] = []
         if self.manufacturer:
@@ -273,6 +280,7 @@ class AndroidManager:
 
         # Extract archive safely into dest_dir
         try:
+            dest_dir_resolved = dest_dir.resolve()
             with tarfile.open(archive_path, "r:gz") as tar:
                 # Extract members directly flattening if single folder
                 members = tar.getmembers()
@@ -287,18 +295,65 @@ class AndroidManager:
                         continue
                     # Security check: avoid directory traversal
                     target_path = (dest_dir / target_name).resolve()
-                    if not str(target_path).startswith(str(dest_dir.resolve())):
+                    try:
+                        if os.path.commonpath([dest_dir_resolved, target_path]) != str(dest_dir_resolved):
+                            continue
+                    except ValueError:
                         continue
-                    if m.isdir():
+
+                    if m.issym():
+                        target_path.parent.mkdir(parents=True, exist_ok=True)
+                        if os.path.isabs(m.linkname):
+                            continue
+                        link_target_path = (target_path.parent / m.linkname).resolve()
+                        try:
+                            if os.path.commonpath([dest_dir_resolved, link_target_path]) != str(dest_dir_resolved):
+                                continue
+                        except ValueError:
+                            continue
+                        if target_path.is_dir() and not target_path.is_symlink():
+                            shutil.rmtree(target_path)
+                        else:
+                            target_path.unlink(missing_ok=True)
+                        target_path.symlink_to(m.linkname)
+                    elif m.islnk():
+                        target_path.parent.mkdir(parents=True, exist_ok=True)
+                        link_target_name = (
+                            m.linkname[len(prefix) :]
+                            if prefix and m.linkname.startswith(prefix)
+                            else m.linkname
+                        )
+                        link_target_path = (dest_dir / link_target_name).resolve()
+                        try:
+                            if os.path.commonpath([dest_dir_resolved, link_target_path]) != str(dest_dir_resolved):
+                                continue
+                        except ValueError:
+                            continue
+                        try:
+                            if target_path.is_dir() and not target_path.is_symlink():
+                                shutil.rmtree(target_path)
+                            else:
+                                target_path.unlink(missing_ok=True)
+                            os.link(link_target_path, target_path)
+                        except OSError as exc:
+                            log.debug("Hardlink creation failed for %s -> %s: %s", target_path, link_target_path, exc)
+                    elif m.isdir():
                         target_path.mkdir(parents=True, exist_ok=True)
                     else:
                         target_path.parent.mkdir(parents=True, exist_ok=True)
                         extracted = tar.extractfile(m)
                         if extracted:
+                            if target_path.is_dir() and not target_path.is_symlink():
+                                shutil.rmtree(target_path)
+                            else:
+                                target_path.unlink(missing_ok=True)
                             with open(target_path, "wb") as f:
                                 shutil.copyfileobj(extracted, f)
-                            if m.name.endswith("scrcpy") or m.name.endswith("adb"):
-                                os.chmod(target_path, 0o755)
+                            if m.name.endswith("scrcpy") or m.name.endswith("adb") or (m.mode & 0o111):
+                                try:
+                                    os.chmod(target_path, 0o755)
+                                except OSError:
+                                    pass
         except Exception as exc:
             raise AndroidError(f"Failed to extract scrcpy archive: {exc}") from exc
         finally:

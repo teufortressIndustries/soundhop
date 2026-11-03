@@ -376,17 +376,26 @@ def _build_classes(QtCore: Any, QtGui: Any, QtWidgets: Any) -> tuple[type, type]
         def _device_selected(self, row: int) -> None:
             if 0 <= row < len(self._devices):
                 dev = self._devices[row]
-                self.switch_wifi_btn.setEnabled(not dev["is_wifi"] and dev["state"] == "device")
-                sdk = dev.get("sdk_version", 0)
-                if sdk >= 31:
+                try:
+                    sdk = int(dev.get("sdk_version", 0) or 0)
+                except (ValueError, TypeError):
+                    sdk = 0
+                major_v = 0
+                ver_str = dev.get("android_version", "")
+                if ver_str:
+                    m = re.match(r"^(\d+)", str(ver_str).strip())
+                    if m:
+                        major_v = int(m.group(1))
+
+                if sdk >= 31 or major_v >= 12:
                     idx = self.source_combo.findData("output")
                     if idx >= 0:
                         self.source_combo.setCurrentIndex(idx)
-                elif sdk == 30:
+                elif sdk == 30 or major_v >= 11:
                     idx = self.source_combo.findData("playback")
                     if idx >= 0:
                         self.source_combo.setCurrentIndex(idx)
-                elif sdk > 0 and sdk < 30:
+                elif (0 < sdk < 30) or (0 < major_v < 11):
                     idx = self.source_combo.findData("mic")
                     if idx >= 0:
                         self.source_combo.setCurrentIndex(idx)
@@ -499,8 +508,11 @@ def _build_classes(QtCore: Any, QtGui: Any, QtWidgets: Any) -> tuple[type, type]
         def _toggle_capture(self) -> None:
             if self._is_capturing:
                 def work() -> dict[str, Any]:
+                    active_pid = getattr(self, "_active_pid", 0)
                     if self._session is not None:
                         try:
+                            if getattr(self._session, "_proc", None):
+                                active_pid = self._session._proc.pid
                             self._session.stop()
                         except Exception:
                             pass
@@ -508,13 +520,17 @@ def _build_classes(QtCore: Any, QtGui: Any, QtWidgets: Any) -> tuple[type, type]
                     try:
                         return request("android_stop", timeout=4.0)
                     except Exception:
-                        from .util import run as r_run
-
-                        r_run(["killall", "-q", "scrcpy"])
+                        if active_pid > 0:
+                            import signal
+                            try:
+                                os.kill(active_pid, signal.SIGTERM)
+                            except OSError:
+                                pass
                         return {}
 
                 def done(_: Any) -> None:
                     self._is_capturing = False
+                    self._active_pid = 0
                     self._poll_status()
 
                 future = self._executor.submit(work)
@@ -600,6 +616,7 @@ def _build_classes(QtCore: Any, QtGui: Any, QtWidgets: Any) -> tuple[type, type]
                 session = res.get("session", {})
                 active = bool(session.get("active"))
                 self._is_capturing = active
+                self._active_pid = int(session.get("pid", 0) or 0)
                 if active:
                     name = session.get("device_name") or session.get("serial", "Android")
                     codec = str(session.get("codec", "")).upper()
@@ -1136,13 +1153,19 @@ def _build_classes(QtCore: Any, QtGui: Any, QtWidgets: Any) -> tuple[type, type]
             self.refresh()
 
         def _stop_android(self) -> None:
+            android = (self._status or {}).get("android") or {}
+            active_pid = int(android.get("pid", 0) or 0)
+
             def work() -> dict[str, Any]:
                 try:
                     return request("android_stop", timeout=3.0)
                 except Exception:
-                    from .util import run as r_run
-
-                    r_run(["killall", "-q", "scrcpy"])
+                    if active_pid > 0:
+                        import signal
+                        try:
+                            os.kill(active_pid, signal.SIGTERM)
+                        except OSError:
+                            pass
                     return {}
 
             def done(_: Any) -> None:

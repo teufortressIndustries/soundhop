@@ -29,6 +29,7 @@ from .constants import (
 from .util import (
     broadcast_addresses,
     hostname_name,
+    is_private_address,
     local_addresses,
     now,
     slugify,
@@ -97,7 +98,7 @@ class PeerStore:
         self.on_remove: RemovalCallback | None = None
 
     def update(self, peer: Peer) -> bool:
-        if not peer.id:
+        if not peer.id or not is_private_address(peer.host):
             return False
         changed = False
         with self._lock:
@@ -137,12 +138,9 @@ class PeerStore:
             return self._peers.get(peer_id)
 
     def snapshot(self, *, prune: bool = True) -> list[Peer]:
+        if prune:
+            self.prune()
         with self._lock:
-            if prune:
-                cutoff = now() - self.timeout
-                stale = [pid for pid, p in self._peers.items() if p.last_seen < cutoff]
-                for pid in stale:
-                    self._peers.pop(pid, None)
             peers = list(self._peers.values())
         return sorted(peers, key=lambda p: (not p.compatible, p.display_name.lower()))
 
@@ -152,6 +150,12 @@ class PeerStore:
             stale = [pid for pid, p in self._peers.items() if p.last_seen < cutoff]
             for pid in stale:
                 self._peers.pop(pid, None)
+        if self.on_remove is not None:
+            for pid in stale:
+                try:
+                    self.on_remove(pid)
+                except Exception:
+                    log.exception("Peer removal callback failed")
         return stale
 
 
@@ -183,6 +187,8 @@ def make_beacon(
 
 
 def parse_beacon(data: bytes, *, host: str, source: str = "udp") -> tuple[dict[str, Any] | None, Peer | None]:
+    if not is_private_address(host):
+        return None, None
     try:
         payload = json.loads(data.decode("utf-8"))
     except (UnicodeDecodeError, ValueError):
@@ -192,10 +198,15 @@ def parse_beacon(data: bytes, *, host: str, source: str = "udp") -> tuple[dict[s
     message_type = payload.get("type", "offer")
     if message_type != "offer":
         return payload, None
+    if isinstance(payload.get("port"), bool) or isinstance(payload.get("proto"), bool):
+        return payload, None
+    raw_id = str(payload.get("id", "")).strip()
+    if not raw_id or len(raw_id) > 128:
+        return payload, None
     try:
         peer = Peer(
-            id=str(payload["id"]),
-            name=str(payload.get("name") or hostname_name()),
+            id=raw_id,
+            name=str(payload.get("name") or hostname_name())[:100],
             host=host,
             port=int(payload["port"]),
             version=str(payload.get("ver", "")),
@@ -206,7 +217,7 @@ def parse_beacon(data: bytes, *, host: str, source: str = "udp") -> tuple[dict[s
         )
     except (KeyError, TypeError, ValueError):
         return payload, None
-    if not peer.id or not (1 <= peer.port <= 65535):
+    if not (1 <= peer.port <= 65535):
         return None, None
     return payload, peer
 
@@ -288,15 +299,29 @@ class UdpBeaconService:
                 data, addr = sock.recvfrom(8192)
             except OSError:
                 continue
-            self._handle(data, addr[0])
+            try:
+                self._handle(data, addr[0])
+            except Exception:
+                log.debug("Error handling UDP packet from %s", addr[0], exc_info=True)
 
     def _handle(self, data: bytes, host: str) -> None:
+        if not is_private_address(host):
+            return
         payload, peer = parse_beacon(data, host=host, source="udp")
         if payload is None:
             return
         if payload.get("type") == "probe":
             if self._advertising:
-                self._send_beacon((host, int(payload.get("reply_port", self.discovery_port))))
+                reply_port = self.discovery_port
+                raw_port = payload.get("reply_port")
+                if raw_port is not None and not isinstance(raw_port, bool):
+                    try:
+                        p = int(raw_port)
+                        if 1 <= p <= 65535:
+                            reply_port = p
+                    except (ValueError, TypeError):
+                        pass
+                self._send_beacon((host, reply_port))
             return
         if payload.get("type") in {"bye", "goodbye"}:
             peer_id = str(payload.get("id", ""))
@@ -465,7 +490,7 @@ class MdnsService:
                     except Exception:
                         addresses = []
                 host = _pick_address(addresses)
-                if not host:
+                if not host or not is_private_address(host):
                     return
                 peer_id = props.get("id", "") or info.name
                 try:
@@ -576,13 +601,13 @@ def _decode_props(properties: dict[Any, Any]) -> dict[str, str]:
 
 
 def _pick_address(addresses: Iterable[str]) -> str:
-    first = ""
     for address in addresses:
-        if not first:
-            first = address
-        if not address.startswith("127.") and address != "::1":
+        if is_private_address(address) and not address.startswith("127.") and address != "::1":
             return address
-    return first
+    for address in addresses:
+        if is_private_address(address):
+            return address
+    return ""
 
 
 # ---------------------------------------------------------------------------
@@ -639,7 +664,7 @@ class UdpProbe:
                 except OSError:
                     break
                 _, peer = parse_beacon(data, host=addr[0], source="udp")
-                if peer is not None and peer.id != self.device_id:
+                if peer is not None and is_private_address(peer.host) and peer.id != self.device_id:
                     store.update(peer)
             return store.snapshot()
         finally:

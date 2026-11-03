@@ -155,6 +155,101 @@ class AndroidTest(unittest.TestCase):
             self.assertFalse(st_stop["active"])
             fake_proc.terminate.assert_called_once()
 
+    def test_adb_device_major_version(self) -> None:
+        d1 = AdbDevice(serial="s1", state="device", android_version="15")
+        self.assertEqual(d1.major_version, 15)
+
+        d2 = AdbDevice(serial="s2", state="device", android_version="13.0_r1")
+        self.assertEqual(d2.major_version, 13)
+
+        d3 = AdbDevice(serial="s3", state="device", android_version="UpsideDownCake")
+        self.assertEqual(d3.major_version, 0)
+
+        d4 = AdbDevice(serial="s4", state="device", android_version="")
+        self.assertEqual(d4.major_version, 0)
+
+    def test_install_scrcpy_symlinks_and_traversal(self) -> None:
+        import io
+        import tarfile
+
+        with tempfile.TemporaryDirectory() as tmpdir:
+            dest_dir = Path(tmpdir) / "managed_scrcpy"
+            archive_path = Path(tmpdir) / "test_scrcpy.tar.gz"
+
+            # Create an in-memory tar.gz with:
+            # 1. scrcpy binary
+            # 2. libfoo.so.1 (regular file)
+            # 3. libfoo.so (symlink to libfoo.so.1)
+            # 4. ../../escaped.txt (traversal attempt)
+            with tarfile.open(archive_path, "w:gz") as tar:
+                # 1. scrcpy binary
+                bin_data = b"#!/bin/sh\necho scrcpy\n"
+                tinfo_bin = tarfile.TarInfo("scrcpy-bundle/scrcpy")
+                tinfo_bin.size = len(bin_data)
+                tinfo_bin.mode = 0o755
+                tar.addfile(tinfo_bin, io.BytesIO(bin_data))
+
+                # 2. libfoo.so.1
+                lib_data = b"\x7fELFfake_so"
+                tinfo_lib = tarfile.TarInfo("scrcpy-bundle/libfoo.so.1")
+                tinfo_lib.size = len(lib_data)
+                tinfo_lib.mode = 0o644
+                tar.addfile(tinfo_lib, io.BytesIO(lib_data))
+
+                # 3. libfoo.so (symlink to libfoo.so.1)
+                tinfo_sym = tarfile.TarInfo("scrcpy-bundle/libfoo.so")
+                tinfo_sym.type = tarfile.SYMTYPE
+                tinfo_sym.linkname = "libfoo.so.1"
+                tar.addfile(tinfo_sym)
+
+                # 4. Hardlink: libbar.so -> scrcpy-bundle/libfoo.so.1
+                tinfo_lnk = tarfile.TarInfo("scrcpy-bundle/libbar.so")
+                tinfo_lnk.type = tarfile.LNKTYPE
+                tinfo_lnk.linkname = "scrcpy-bundle/libfoo.so.1"
+                tar.addfile(tinfo_lnk)
+
+                # 5. Traversal attempt
+                esc_data = b"pwned"
+                tinfo_esc = tarfile.TarInfo("scrcpy-bundle/../../escaped.txt")
+                tinfo_esc.size = len(esc_data)
+                tar.addfile(tinfo_esc, io.BytesIO(esc_data))
+
+            # Pre-populate dest_dir with a conflicting directory at libfoo.so to ensure replacement works
+            (dest_dir / "libfoo.so").mkdir(parents=True, exist_ok=True)
+
+            mgr = AndroidManager()
+            with patch.object(mgr, "managed_dir", return_value=dest_dir), \
+                 patch("platform.machine", return_value="x86_64"), \
+                 patch("urllib.request.urlopen") as mock_urlopen:
+                # Mock download to return the archive content
+                archive_bytes = archive_path.read_bytes()
+                mock_resp = MagicMock()
+                mock_resp.headers = {"Content-Length": str(len(archive_bytes))}
+                mock_resp.read.side_effect = [archive_bytes, b""]
+                mock_urlopen.return_value.__enter__.return_value = mock_resp
+
+                bin_path = mgr.install_scrcpy()
+                self.assertTrue(bin_path.exists())
+                self.assertTrue(os.access(bin_path, os.X_OK))
+
+                # Verify libfoo.so.1 exists
+                lib_path = dest_dir / "libfoo.so.1"
+                self.assertTrue(lib_path.is_file())
+
+                # Verify libfoo.so symlink replaced directory and points to libfoo.so.1
+                sym_path = dest_dir / "libfoo.so"
+                self.assertTrue(sym_path.is_symlink())
+                self.assertEqual(os.readlink(sym_path), "libfoo.so.1")
+
+                # Verify hardlink libbar.so exists
+                bar_path = dest_dir / "libbar.so"
+                self.assertTrue(bar_path.is_file())
+                self.assertEqual(bar_path.stat().st_ino, lib_path.stat().st_ino)
+
+                # Verify traversal attempt did NOT write outside dest_dir
+                escaped = Path(tmpdir) / "escaped.txt"
+                self.assertFalse(escaped.exists())
+
 
 if __name__ == "__main__":
     unittest.main()

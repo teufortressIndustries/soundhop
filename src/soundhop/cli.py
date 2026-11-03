@@ -1551,17 +1551,12 @@ def cmd_android_start(args: argparse.Namespace) -> int:
     codec = getattr(args, "codec", None) or config.android.default_codec or "aac"
     source = getattr(args, "source", None)
     if not source:
-        if target_device.sdk_version >= 31 or (
-            target_device.android_version
-            and int(target_device.android_version.split(".")[0]) >= 12
-        ):
+        major_v = target_device.major_version
+        if target_device.sdk_version >= 31 or major_v >= 12:
             source = "output"
-        elif target_device.sdk_version >= 30 or (
-            target_device.android_version
-            and int(target_device.android_version.split(".")[0]) >= 11
-        ):
+        elif target_device.sdk_version >= 30 or major_v >= 11:
             source = "playback"
-        elif target_device.sdk_version > 0 and target_device.sdk_version < 30:
+        elif 0 < target_device.sdk_version < 30 or (0 < major_v < 11):
             warning(
                 f"Android {target_device.android_version or target_device.sdk_version} does not support native internal audio capture."
             )
@@ -1634,12 +1629,25 @@ def cmd_android_start(args: argparse.Namespace) -> int:
 
 def cmd_android_stop(args: argparse.Namespace) -> int:
     if is_running():
+        pid = 0
         try:
-            res = request("android_stop", timeout=3.0)
+            status = request("android_status", timeout=2.0)
+            pid = int(status.get("session", {}).get("pid", 0) or 0)
+        except Exception:
+            pass
+        try:
+            request("android_stop", timeout=3.0)
             ok("Android audio capture stopped.")
             return 0
         except Exception:
-            pass
+            if pid > 0:
+                import signal
+                try:
+                    os.kill(pid, signal.SIGTERM)
+                except OSError:
+                    pass
+            ok("Android audio capture stopped.")
+            return 0
 
     config = Config.load()
     mgr = AndroidManager(
@@ -1647,7 +1655,6 @@ def cmd_android_stop(args: argparse.Namespace) -> int:
     )
     session = AndroidCaptureSession(mgr)
     session.stop()
-    run(["killall", "-q", "scrcpy"])
     ok("Android audio capture stopped.")
     return 0
 

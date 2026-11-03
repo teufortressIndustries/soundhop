@@ -35,6 +35,7 @@ from .discovery import DiscoveryManager, Peer
 from .ipc import IpcServer, is_running
 from .util import (
     ensure_dir,
+    is_private_address,
     lock_path,
     log_path,
     pid_path,
@@ -251,11 +252,18 @@ class Daemon:
                     request.get("target"),
                 )
             else:
+                host_val = str(request.get("host", "") or request.get("ip", "")).strip()
+                if host_val and not is_private_address(host_val):
+                    return {
+                        **self._daemon_info(),
+                        "ok": False,
+                        "message": f"Refusing to connect to non-private address {host_val}",
+                    }
                 ok, msg = self.controller.android_connect_wifi(
-                    str(request.get("host", "") or request.get("ip", "")),
+                    host_val,
                     port=int(request.get("port", 5555) or 5555),
                 )
-            return {"ok": ok, "message": msg, **self._daemon_info()}
+            return {**self._daemon_info(), "ok": ok, "message": msg}
         if command in {"android_encoders"}:
             return {
                 **self.controller.android_list_encoders(request.get("serial")),
@@ -329,12 +337,24 @@ class Daemon:
         if peer_id:
             for peer in self._peers():
                 if peer.id == peer_id:
+                    if not is_private_address(peer.host):
+                        raise ControllerError(
+                            f"Peer address {peer.host} is not a private LAN address"
+                        )
                     return peer
             known = self.controller.known_peer(peer_id)
             if known is not None:
+                if not is_private_address(known.host):
+                    raise ControllerError(
+                        f"Peer address {known.host} is not a private LAN address"
+                    )
                 return known
             # Allow an id passed with an explicit host (tray/manual use).
             if host:
+                if not is_private_address(host):
+                    raise ControllerError(
+                        f"Peer address {host} is not a private LAN address"
+                    )
                 return Peer(
                     id=peer_id,
                     name=str(request.get("name", peer_id)),
@@ -346,6 +366,10 @@ class Daemon:
                 f"Device {peer_id} is not online and is not in the known-device list"
             )
         if host:
+            if not is_private_address(host):
+                raise ControllerError(
+                    f"Peer address {host} is not a private LAN address"
+                )
             return Peer(
                 id=str(request.get("id", "") or f"manual-{host}"),
                 name=str(request.get("name", host)),
@@ -505,24 +529,28 @@ class Daemon:
         state = self.controller.state
         config = self.controller.config
         if state.connected:
-            self._offline_count = 0
             host, port = state.connected_host, state.connected_port
-            if host and port and not tcp_reachable(host, port, timeout=2.0):
-                self._offline_count += 1
-                log.debug(
-                    "Peer %s unreachable (%s/%s)",
-                    state.connected_name,
-                    self._offline_count,
-                    OFFLINE_PROBE_LIMIT,
-                )
-                if self._offline_count >= OFFLINE_PROBE_LIMIT:
-                    log.info("Peer %s went offline; restoring local audio", state.connected_name)
-                    self.controller.disconnect(
-                        restore=config.connection.restore_default,
-                        pause_auto=False,
-                        notify_user=True,
+            if host and port:
+                if not tcp_reachable(host, port, timeout=2.0):
+                    self._offline_count += 1
+                    log.debug(
+                        "Peer %s unreachable (%s/%s)",
+                        state.connected_name,
+                        self._offline_count,
+                        OFFLINE_PROBE_LIMIT,
                     )
+                    if self._offline_count >= OFFLINE_PROBE_LIMIT:
+                        log.info("Peer %s went offline; restoring local audio", state.connected_name)
+                        self.controller.disconnect(
+                            restore=config.connection.restore_default,
+                            pause_auto=False,
+                            notify_user=True,
+                        )
+                        self._offline_count = 0
+                else:
                     self._offline_count = 0
+            else:
+                self._offline_count = 0
             return
 
         self._offline_count = 0
@@ -552,6 +580,8 @@ class Daemon:
                     peer.protocol,
                     PROTOCOL_VERSION,
                 )
+            return
+        if not is_private_address(peer.host):
             return
         if not tcp_reachable(peer.host, peer.port, timeout=2.0):
             return

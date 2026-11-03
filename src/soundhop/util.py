@@ -10,6 +10,7 @@ import socket
 import subprocess
 import sys
 import tempfile
+import threading
 import time
 import unicodedata
 import uuid
@@ -183,13 +184,31 @@ def pid_path() -> Path:
 
 def atomic_write(path: Path, text: str, mode: int = 0o600) -> None:
     ensure_dir(path.parent)
-    tmp = path.with_name(f".{path.name}.{os.getpid()}.tmp")
-    tmp.write_text(text, encoding="utf-8")
+    unique_suffix = f"{os.getpid()}.{threading.get_ident()}.{uuid.uuid4().hex}"
+    tmp = path.with_name(f".{path.name}.{unique_suffix}.tmp")
     try:
-        tmp.chmod(mode)
-    except OSError:
-        pass
-    os.replace(tmp, path)
+        flags = os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_TRUNC
+        fd = os.open(tmp, flags, mode)
+        try:
+            try:
+                os.fchmod(fd, mode)
+            except OSError:
+                pass
+            with open(fd, "w", encoding="utf-8") as f:
+                f.write(text)
+        except Exception:
+            try:
+                os.close(fd)
+            except OSError:
+                pass
+            raise
+        try:
+            tmp.chmod(mode)
+        except OSError:
+            pass
+        os.replace(tmp, path)
+    finally:
+        tmp.unlink(missing_ok=True)
 
 
 # ---------------------------------------------------------------------------
@@ -380,29 +399,52 @@ def local_addresses(*, include_loopback: bool = False) -> list[str]:
     return addresses
 
 
+_broadcast_cache: tuple[float, list[str]] = (0.0, [])
+_broadcast_cache_lock = threading.Lock()
+_BROADCAST_CACHE_TTL = 30.0
+
+
+def invalidate_broadcast_cache() -> None:
+    global _broadcast_cache
+    with _broadcast_cache_lock:
+        _broadcast_cache = (0.0, [])
+
+
 def broadcast_addresses(*, include_loopback: bool = True) -> list[str]:
     """Best-effort list of broadcast destinations for discovery probes."""
 
-    targets: list[str] = ["255.255.255.255"]
-    if command_exists("ip"):
-        try:
-            result = run(["ip", "-o", "-4", "addr", "show"], timeout=2.0)
-            for line in result.stdout.splitlines():
-                match = re.search(r"\binet\s+(\d+\.\d+\.\d+\.\d+)/(\d+)", line)
-                if not match:
-                    continue
-                network = ipaddress.ip_network(
-                    f"{match.group(1)}/{match.group(2)}", strict=False
-                )
-                if network.is_loopback:
-                    continue
-                broadcast = str(network.broadcast_address)
-                if broadcast not in targets:
-                    targets.append(broadcast)
-        except (ToolMissing, CommandError, OSError, ValueError):
-            pass
-    if include_loopback:
+    global _broadcast_cache
+    now_mono = time.monotonic()
+    with _broadcast_cache_lock:
+        cache_time, cached_targets = _broadcast_cache
+        if now_mono - cache_time < _BROADCAST_CACHE_TTL and cached_targets:
+            discovered = list(cached_targets)
+        else:
+            discovered = ["255.255.255.255"]
+            if command_exists("ip"):
+                try:
+                    result = run(["ip", "-o", "-4", "addr", "show"], timeout=2.0)
+                    for line in result.stdout.splitlines():
+                        match = re.search(r"\binet\s+(\d+\.\d+\.\d+\.\d+)/(\d+)", line)
+                        if not match:
+                            continue
+                        network = ipaddress.ip_network(
+                            f"{match.group(1)}/{match.group(2)}", strict=False
+                        )
+                        if network.is_loopback:
+                            continue
+                        broadcast = str(network.broadcast_address)
+                        if broadcast not in discovered:
+                            discovered.append(broadcast)
+                except (ToolMissing, CommandError, OSError, ValueError):
+                    pass
+            _broadcast_cache = (now_mono, list(discovered))
+
+    targets = list(discovered)
+    if include_loopback and "127.0.0.1" not in targets:
         targets.append("127.0.0.1")
+    elif not include_loopback and "127.0.0.1" in targets:
+        targets.remove("127.0.0.1")
     return targets
 
 
@@ -415,11 +457,30 @@ def tcp_reachable(host: str, port: int, timeout: float = 1.5) -> bool:
 
 
 def is_private_address(value: str) -> bool:
-    try:
-        ip = ipaddress.ip_address(value)
-    except ValueError:
+    val = str(value).strip()
+    if not val:
         return False
-    return ip.is_private or ip.is_loopback or ip.is_link_local
+    if val.startswith("[") and val.endswith("]"):
+        val = val[1:-1]
+    if val.lower() == "localhost":
+        return True
+    host_clean = val.split("%", 1)[0]
+    try:
+        ip = ipaddress.ip_address(host_clean)
+        return ip.is_private or ip.is_loopback or ip.is_link_local
+    except ValueError:
+        pass
+    try:
+        infos = socket.getaddrinfo(val, None, socket.AF_UNSPEC, socket.SOCK_STREAM)
+        if not infos:
+            return False
+        for info in infos:
+            ip = ipaddress.ip_address(info[4][0])
+            if not (ip.is_private or ip.is_loopback or ip.is_link_local):
+                return False
+        return True
+    except (socket.gaierror, OSError, ValueError):
+        return False
 
 
 # ---------------------------------------------------------------------------
