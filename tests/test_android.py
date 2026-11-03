@@ -250,6 +250,102 @@ class AndroidTest(unittest.TestCase):
                 escaped = Path(tmpdir) / "escaped.txt"
                 self.assertFalse(escaped.exists())
 
+    def test_get_device_wifi_ip(self) -> None:
+        mgr = AndroidManager()
+
+        # Method 1: ip -f inet addr show wlan0
+        with patch.object(
+            mgr,
+            "_run_adb",
+            return_value=Result(
+                args=["adb"],
+                returncode=0,
+                stdout="21: wlan0: <BROADCAST,MULTICAST,UP,LOWER_UP> mtu 1500 qdisc mq state UP group default qlen 3000\n    inet 192.168.1.123/24 brd 192.168.1.255 scope global wlan0\n",
+                stderr="",
+            ),
+        ):
+            ip = mgr.get_device_wifi_ip("USB123")
+            self.assertEqual(ip, "192.168.1.123")
+
+        # Method 1b: wlan1 via general ip addr
+        with patch.object(
+            mgr,
+            "_run_adb",
+            side_effect=[
+                Result(args=["adb"], returncode=1, stdout="", stderr="Device not found"),
+                Result(
+                    args=["adb"],
+                    returncode=0,
+                    stdout="inet 192.168.1.124/24 brd 192.168.1.255 scope global wlan1\n",
+                    stderr="",
+                ),
+            ],
+        ):
+            ip = mgr.get_device_wifi_ip("USB123")
+            self.assertEqual(ip, "192.168.1.124")
+
+        # Method 2: ip route show
+        with patch.object(
+            mgr,
+            "_run_adb",
+            side_effect=[
+                Result(args=["adb"], returncode=1, stdout="", stderr=""),
+                Result(args=["adb"], returncode=1, stdout="", stderr=""),
+                Result(
+                    args=["adb"],
+                    returncode=0,
+                    stdout="192.168.1.0/24 dev wlan0 proto kernel scope link src 192.168.1.125\n",
+                    stderr="",
+                ),
+            ],
+        ):
+            ip = mgr.get_device_wifi_ip("USB123")
+            self.assertEqual(ip, "192.168.1.125")
+
+        # Method 3: getprop
+        with patch.object(
+            mgr,
+            "_run_adb",
+            side_effect=[
+                Result(args=["adb"], returncode=1, stdout="", stderr=""),
+                Result(args=["adb"], returncode=1, stdout="", stderr=""),
+                Result(args=["adb"], returncode=1, stdout="", stderr=""),
+                Result(args=["adb"], returncode=0, stdout="192.168.1.126\n", stderr=""),
+            ],
+        ):
+            ip = mgr.get_device_wifi_ip("USB123")
+            self.assertEqual(ip, "192.168.1.126")
+
+    def test_enable_tcpip_and_connect_wifi(self) -> None:
+        mgr = AndroidManager()
+        with patch.object(
+            mgr,
+            "_run_adb",
+            return_value=Result(
+                args=["adb", "tcpip", "5555"],
+                returncode=0,
+                stdout="restarting in TCP mode port: 5555",
+                stderr="",
+            ),
+        ):
+            ok, msg = mgr.enable_tcpip("USB123")
+            self.assertTrue(ok)
+            self.assertIn("5555", msg)
+
+        with patch.object(
+            mgr,
+            "_run_adb",
+            return_value=Result(
+                args=["adb", "connect", "192.168.1.50:5555"],
+                returncode=0,
+                stdout="connected to 192.168.1.50:5555",
+                stderr="",
+            ),
+        ):
+            ok, msg = mgr.connect_wifi("192.168.1.50")
+            self.assertTrue(ok)
+            self.assertIn("connected to 192.168.1.50:5555", msg.lower())
+
 
 if __name__ == "__main__":
     unittest.main()

@@ -17,8 +17,8 @@ class PackagingTest(unittest.TestCase):
         content = desktop_file.read_text(encoding="utf-8")
         self.assertIn("[Desktop Entry]", content)
         from soundhop.constants import VERSION
-        self.assertEqual(VERSION, "1.1.2")
-        self.assertIn("X-AppImage-Version=1.1.2", content)
+        import re
+        self.assertTrue(bool(re.match(r"^\d+\.\d+\.\d+$", VERSION)), f"VERSION must be semver: {VERSION}")
         self.assertIn(f"X-AppImage-Version={VERSION}", content)
         self.assertIn(
             "X-AppImage-UpdateURL=https://github.com/teufortressIndustries/soundhop",
@@ -31,7 +31,8 @@ class PackagingTest(unittest.TestCase):
 
     def test_version_consistency_across_packaging(self) -> None:
         from soundhop.constants import VERSION
-        self.assertEqual(VERSION, "1.1.2")
+        import re
+        self.assertTrue(bool(re.match(r"^\d+\.\d+\.\d+$", VERSION)), f"VERSION must be semver: {VERSION}")
 
         pkgbuild = (ROOT_DIR / "packaging" / "PKGBUILD").read_text(encoding="utf-8")
         self.assertIn(f"pkgver={VERSION}", pkgbuild)

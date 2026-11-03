@@ -399,6 +399,7 @@ class Daemon:
             restore=request.get("restore"),
             pause_auto=_as_bool(request.get("pause_auto"), True),
             all_tunnels=_as_bool(request.get("all"), False),
+            stop_android=_as_bool(request.get("stop_android"), False),
         )
         return {**result, **self._daemon_info()}
 

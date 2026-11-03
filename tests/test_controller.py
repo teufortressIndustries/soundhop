@@ -4,7 +4,7 @@ import tempfile
 import unittest
 from pathlib import Path
 
-from unittest.mock import patch
+from unittest.mock import MagicMock, PropertyMock, patch
 
 from soundhop.backend import AudioBackend
 from soundhop.config import Config
@@ -104,6 +104,16 @@ class ControllerTest(unittest.TestCase):
             self.assertTrue(disc_res["disconnected"])
             self.assertFalse(controller.state.connected)
             self.assertEqual(current_default_sink[0], "alsa_output.pci")
+
+    def test_disconnect_stops_android_session(self) -> None:
+        from pathlib import Path
+        cfg = Config(Path("/tmp/test.toml"))
+        backend = MagicMock()
+        controller = Controller(config=cfg, backend=backend)
+        with patch.object(type(controller.android_session), "is_active", new_callable=PropertyMock, return_value=True), \
+             patch.object(controller.android_session, "stop") as mock_stop:
+            controller.disconnect(stop_android=True)
+            mock_stop.assert_called_once()
 
 
 if __name__ == "__main__":

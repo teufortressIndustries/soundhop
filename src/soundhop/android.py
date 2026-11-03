@@ -491,6 +491,21 @@ class AndroidManager:
         except Exception:
             pass
 
+        # Method 1b: ip -f inet addr (any wlan interface)
+        try:
+            res = self._run_adb(
+                ["shell", "ip -f inet addr"],
+                serial=serial,
+                timeout=3.0,
+            )
+            for line in res.stdout.splitlines():
+                if "inet " in line and re.search(r"\bwlan\d*\b", line):
+                    m = re.search(r"inet\s+(\d+\.\d+\.\d+\.\d+)", line)
+                    if m and not m.group(1).startswith("127."):
+                        return m.group(1)
+        except Exception:
+            pass
+
         # Method 2: ip route show
         try:
             res = self._run_adb(
@@ -499,7 +514,7 @@ class AndroidManager:
                 timeout=3.0,
             )
             for line in res.stdout.splitlines():
-                if "wlan0" in line and "src" in line:
+                if re.search(r"\bwlan\d*\b", line) and "src" in line:
                     m = re.search(r"src\s+(\d+\.\d+\.\d+\.\d+)", line)
                     if m:
                         return m.group(1)
@@ -507,17 +522,18 @@ class AndroidManager:
             pass
 
         # Method 3: getprop
-        try:
-            res = self._run_adb(
-                ["shell", "getprop dhcp.wlan0.ipaddress"],
-                serial=serial,
-                timeout=3.0,
-            )
-            ip = res.stdout.strip()
-            if ip and re.match(r"^\d+\.\d+\.\d+\.\d+$", ip):
-                return ip
-        except Exception:
-            pass
+        for prop in ("dhcp.wlan0.ipaddress", "dhcp.wlan1.ipaddress"):
+            try:
+                res = self._run_adb(
+                    ["shell", f"getprop {prop}"],
+                    serial=serial,
+                    timeout=3.0,
+                )
+                ip = res.stdout.strip()
+                if ip and re.match(r"^\d+\.\d+\.\d+\.\d+$", ip):
+                    return ip
+            except Exception:
+                pass
 
         return None
 

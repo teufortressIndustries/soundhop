@@ -186,7 +186,7 @@ We build a universal, standalone AppImage using a clean Ubuntu 22.04 container (
 ```bash
 ./build-appimage-container.sh
 ```
-The finished binary will be placed at `dist/SoundHop-1.1.2-universal-x86_64.AppImage`.
+The finished binary will be placed at `dist/SoundHop-1.1.3-universal-x86_64.AppImage`.
 
 ---
 

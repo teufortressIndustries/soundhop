@@ -8,7 +8,11 @@ same local control socket, so it cannot get out of sync with the daemon.
 from __future__ import annotations
 
 import logging
+import os
+import re
+import signal
 import sys
+import time
 from concurrent.futures import Future, ThreadPoolExecutor
 from typing import Any, Callable
 
@@ -359,6 +363,7 @@ def _build_classes(QtCore: Any, QtGui: Any, QtWidgets: Any) -> tuple[type, type]
                 ]
                 if not self._devices:
                     self.dev_list.addItem("No connected devices found")
+                    self.switch_wifi_btn.setEnabled(False)
                 else:
                     for d in self._devices:
                         kind = "Wi-Fi" if d["is_wifi"] else "USB"
@@ -368,14 +373,19 @@ def _build_classes(QtCore: Any, QtGui: Any, QtWidgets: Any) -> tuple[type, type]
                         )
                         self.dev_list.addItem(item)
                     self.dev_list.setCurrentRow(0)
+                    self._device_selected(self.dev_list.currentRow())
             except Exception as exc:
                 self.dev_list.addItem(f"Error listing devices: {exc}")
+                self.switch_wifi_btn.setEnabled(False)
 
             self._poll_status()
 
         def _device_selected(self, row: int) -> None:
             if 0 <= row < len(self._devices):
                 dev = self._devices[row]
+                self.switch_wifi_btn.setEnabled(
+                    not dev.get("is_wifi", False) and dev.get("state") == "device"
+                )
                 try:
                     sdk = int(dev.get("sdk_version", 0) or 0)
                 except (ValueError, TypeError):
@@ -411,15 +421,25 @@ def _build_classes(QtCore: Any, QtGui: Any, QtWidgets: Any) -> tuple[type, type]
             self.switch_wifi_btn.setEnabled(False)
 
             def work() -> tuple[bool, str]:
+                try:
+                    resp = request(
+                        "android_wifi", action="switch", serial=serial, timeout=15.0
+                    )
+                    return bool(resp.get("ok", False)), str(resp.get("message", ""))
+                except (DaemonNotRunning, IpcError, OSError):
+                    pass
                 ip = self._mgr.get_device_wifi_ip(serial)
                 ok, msg = self._mgr.enable_tcpip(serial)
-                if ok and ip:
+                if not ok:
+                    return False, msg
+                if ip:
                     import time
                     time.sleep(1.0)
                     conn_ok, conn_msg = self._mgr.connect_wifi(ip)
                     if conn_ok:
                         return True, f"Connected to {ip}:5555"
-                return ok, msg
+                    return True, f"Switched to TCP mode, but Wi-Fi connect to {ip}:5555 failed: {conn_msg}"
+                return True, "Switched to TCP mode on port 5555. Please connect via Wi-Fi IP."
 
             def done(res: Any) -> None:
                 if isinstance(res, tuple):
@@ -446,7 +466,13 @@ def _build_classes(QtCore: Any, QtGui: Any, QtWidgets: Any) -> tuple[type, type]
                 return
 
             def work() -> tuple[bool, str]:
-                return self._mgr.connect_wifi(ip)
+                try:
+                    resp = request(
+                        "android_wifi", action="connect", host=ip, timeout=10.0
+                    )
+                    return bool(resp.get("ok", False)), str(resp.get("message", ""))
+                except (DaemonNotRunning, IpcError, OSError):
+                    return self._mgr.connect_wifi(ip)
 
             def done(res: Any) -> None:
                 if isinstance(res, tuple):
@@ -505,32 +531,35 @@ def _build_classes(QtCore: Any, QtGui: Any, QtWidgets: Any) -> tuple[type, type]
 
             QtCore.QTimer.singleShot(50, poll)
 
+        def stop_capture(self) -> dict[str, Any]:
+            active_pid = getattr(self, "_active_pid", 0)
+            if self._session is not None:
+                try:
+                    if getattr(self._session, "_proc", None):
+                        active_pid = self._session._proc.pid
+                    self._session.stop()
+                except Exception:
+                    pass
+                self._session = None
+            res: dict[str, Any] = {}
+            try:
+                res = request("android_stop", timeout=4.0)
+            except Exception:
+                if active_pid > 0:
+                    try:
+                        os.kill(active_pid, signal.SIGTERM)
+                    except OSError:
+                        pass
+            self._is_capturing = False
+            self._active_pid = 0
+            return res
+
         def _toggle_capture(self) -> None:
             if self._is_capturing:
                 def work() -> dict[str, Any]:
-                    active_pid = getattr(self, "_active_pid", 0)
-                    if self._session is not None:
-                        try:
-                            if getattr(self._session, "_proc", None):
-                                active_pid = self._session._proc.pid
-                            self._session.stop()
-                        except Exception:
-                            pass
-                        self._session = None
-                    try:
-                        return request("android_stop", timeout=4.0)
-                    except Exception:
-                        if active_pid > 0:
-                            import signal
-                            try:
-                                os.kill(active_pid, signal.SIGTERM)
-                            except OSError:
-                                pass
-                        return {}
+                    return self.stop_capture()
 
                 def done(_: Any) -> None:
-                    self._is_capturing = False
-                    self._active_pid = 0
                     self._poll_status()
 
                 future = self._executor.submit(work)
@@ -661,6 +690,8 @@ def _build_classes(QtCore: Any, QtGui: Any, QtWidgets: Any) -> tuple[type, type]
             self._started = False
             self._busy = False
             self._closing = False
+            self._android_dialog: Any = None
+            self._cleaned_up_on_quit = False
 
             self.icon = self._build_icon()
             self.tray = QtWidgets.QSystemTrayIcon(self.icon, self)
@@ -675,6 +706,13 @@ def _build_classes(QtCore: Any, QtGui: Any, QtWidgets: Any) -> tuple[type, type]
             self._timer.timeout.connect(self.refresh)
             self._timer.start()
             self._kickstart()
+
+            app = QtWidgets.QApplication.instance()
+            if app is not None:
+                try:
+                    app.aboutToQuit.connect(self._disconnect_on_quit_if_enabled)
+                except Exception:
+                    pass
 
         # -- construction ------------------------------------------------
 
@@ -778,6 +816,7 @@ def _build_classes(QtCore: Any, QtGui: Any, QtWidgets: Any) -> tuple[type, type]
 
         def shutdown(self) -> None:
             self._closing = True
+            self._disconnect_on_quit_if_enabled()
             self._timer.stop()
             self._executor.shutdown(wait=False, cancel_futures=True)
 
@@ -1149,6 +1188,7 @@ def _build_classes(QtCore: Any, QtGui: Any, QtWidgets: Any) -> tuple[type, type]
 
         def _open_android_wizard(self) -> None:
             dialog = AndroidWizardDialog(None, self._executor, self._notify)
+            self._android_dialog = dialog
             dialog.exec()
             self.refresh()
 
@@ -1157,11 +1197,15 @@ def _build_classes(QtCore: Any, QtGui: Any, QtWidgets: Any) -> tuple[type, type]
             active_pid = int(android.get("pid", 0) or 0)
 
             def work() -> dict[str, Any]:
+                if getattr(self, "_android_dialog", None) is not None:
+                    try:
+                        self._android_dialog.stop_capture()
+                    except Exception:
+                        pass
                 try:
                     return request("android_stop", timeout=3.0)
                 except Exception:
                     if active_pid > 0:
-                        import signal
                         try:
                             os.kill(active_pid, signal.SIGTERM)
                         except OSError:
@@ -1187,16 +1231,44 @@ def _build_classes(QtCore: Any, QtGui: Any, QtWidgets: Any) -> tuple[type, type]
                 QtCore.QUrl(f"{ISSUES_URL}/new")
             )
 
-        def _quit(self) -> None:
+        def _disconnect_on_quit_if_enabled(self) -> None:
+            if getattr(self, "_cleaned_up_on_quit", False):
+                return
+            self._cleaned_up_on_quit = True
             try:
                 config = Config.load()
-                if getattr(config.connection, "disconnect_on_quit", True):
-                    request("disconnect", timeout=4.0, restore=True)
+                if not getattr(config.connection, "disconnect_on_quit", True):
+                    return
+            except Exception:
+                return
+
+            try:
+                request("disconnect", timeout=4.0, restore=True, stop_android=True)
             except Exception:
                 pass
+            try:
+                request("android_stop", timeout=3.0)
+            except Exception:
+                pass
+            if getattr(self, "_android_dialog", None) is not None:
+                try:
+                    self._android_dialog.stop_capture()
+                except Exception:
+                    pass
+            android = (self._status or {}).get("android") or {}
+            active_pid = int(android.get("pid", 0) or 0)
+            if active_pid > 0:
+                try:
+                    os.kill(active_pid, signal.SIGTERM)
+                except OSError:
+                    pass
+
+        def _quit(self) -> None:
+            self._disconnect_on_quit_if_enabled()
             self.shutdown()
             app = QtWidgets.QApplication.instance()
             if app is not None:
                 app.quit()
 
+    Tray.AndroidWizardDialog = AndroidWizardDialog  # type: ignore[attr-defined]
     return Tray, SettingsDialog

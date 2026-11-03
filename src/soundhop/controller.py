@@ -429,6 +429,7 @@ class Controller:
         pause_auto: bool = True,
         notify_user: bool | None = None,
         all_tunnels: bool = False,
+        stop_android: bool = False,
     ) -> dict[str, Any]:
         with self.lock:
             return self._disconnect_locked(
@@ -437,6 +438,7 @@ class Controller:
                 forget=forget,
                 notify_user=notify_user,
                 all_tunnels=all_tunnels,
+                stop_android=stop_android,
             )
 
     def _disconnect_locked(
@@ -448,9 +450,16 @@ class Controller:
         notify_user: bool | None = None,
         keep_previous: bool = False,
         all_tunnels: bool = False,
+        stop_android: bool = False,
     ) -> dict[str, Any]:
         restore = self.config.connection.restore_default if restore is None else restore
         removed: list[int] = []
+        if (stop_android or all_tunnels) and getattr(self, "android_session", None) is not None:
+            if self.android_session.is_active:
+                try:
+                    self.android_session.stop()
+                except Exception as exc:
+                    log.warning("Could not stop android session during disconnect: %s", exc)
         sink_name = self.state.connected_sink
         module_id = self.state.connected_module
         if module_id:
