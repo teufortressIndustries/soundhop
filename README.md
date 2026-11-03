@@ -9,7 +9,7 @@
 
 ---
 
-Ever wanted to stream audio from your desktop gaming rig or workstation over to your laptop speakers across the room, or beam audio to an HTPC hooked up to your sound system?
+Ever wanted to stream audio from your laptop to your desktop speakers across the room, or beam audio from a workstation to an HTPC hooked up to your sound system?
 
 PulseAudio and PipeWire already implement native TCP network streaming modules (`module-native-protocol-tcp` and `module-tunnel-sink`), but setting them up by hand is tedious:
 - Manually looking up peer LAN IP addresses and remembering raw `pactl load-module` arguments.
@@ -32,31 +32,31 @@ soundhop tray
 ```
 *(Or launch **SoundHop** directly from your desktop application launcher)*.
 
-### 2. Receiver (e.g. your laptop with good speakers)
-Click the SoundHop tray icon and toggle **Accept incoming audio** on.
+### 2. Receiver (e.g. your PC or sound system with good speakers)
+Click the SoundHop tray icon and check **Share this device's speakers**.
 
-### 3. Sender (e.g. your desktop PC or workstation)
-Click the SoundHop tray icon, hover over **Play audio on**, and select your target machine (e.g. `pbjj`).
-Active playback streams (Spotify, Firefox, mpv, games) immediately switch over to the remote machine.
+### 3. Sender (e.g. your laptop)
+Click the SoundHop tray icon, hover over **Play audio on**, and select your target machine (e.g. `pbjj (192.168.1.174:4713)`).
+Active playback streams (Spotify, Firefox, mpv, games) immediately switch over to the remote speakers.
 
-To bring your sound back to local speakers or headphones at any time, simply select **Play audio on > This device (disconnect)**.
+To stop streaming and restore audio back to local speakers or headphones at any time, click **Play audio on > This device (disconnect)** or **Disconnect remote audio**.
 
-| Sender (PC — CachyOS KDE) | Receiver (Laptop — Fedora KDE) |
+| Sender (Laptop — Fedora KDE) | Receiver (PC — CachyOS KDE) |
 | :---: | :---: |
-| ![SoundHop Tray GUI on PC (CachyOS KDE)](docs/screenshots/tray-pc-local.png) | ![SoundHop Tray GUI on Laptop (Fedora KDE)](docs/screenshots/tray-laptop-connected.png) |
-| *Select **Play audio on > This device (disconnect)** to keep sound local or switch outputs* | *Connected to sender (`pbjj (192.168.1.174:4713)`) with instant stream routing* |
+| ![SoundHop Tray GUI on Laptop (Fedora KDE)](docs/screenshots/tray-sender-laptop.png) | ![SoundHop Tray GUI on PC (CachyOS KDE)](docs/screenshots/tray-receiver-pc.png) |
+| *Laptop (`nut`) playing audio remotely on `pbjj (192.168.1.174:4713)`* | *PC (`pbjj`) sharing its speakers with **Share this device's speakers** enabled* |
 
 ### Android Audio Streaming & GUI Settings
 
-SoundHop also provides dedicated GUI windows accessible directly from the tray menu:
+SoundHop also provides dedicated GUI dialogs accessible directly from the tray menu:
 
 | Android Audio Capture | Preferences & Audio Buffer Tuning |
 | :---: | :---: |
 | ![Android Audio Capture Window](docs/screenshots/android-audio-capture.png) | ![SoundHop Settings Window](docs/screenshots/settings.png) |
-| *Stream mobile audio via USB or Wi-Fi with selectable encoders & bitrates* | *Configure device identity, buffer latency presets, and LAN security* |
+| *Stream mobile audio via USB or Wi-Fi with configurable codecs, audio sources & latency* | *Configure device identity, buffer latency presets, and LAN security* |
 
-- **Capture Android Audio...**: Effortlessly stream Android audio directly to your Linux speakers using official `scrcpy` over USB or Wi-Fi. Choose your preferred encoder (Opus, AAC, FLAC, RAW) and sample rate.
-- **Settings...**: Customize your broadcast device name, configure RFC1918 subnet security, select buffer latency presets (low latency vs. Wi-Fi stability buffer), and toggle auto-reconnection.
+- **Capture Android audio...**: Effortlessly stream Android audio directly to your Linux speakers using official `scrcpy` over USB or Wi-Fi. Select your preferred codec (AAC, Opus, FLAC, Raw PCM), audio source (system output, app playback, or mic), and buffer latency.
+- **Settings...**: Customize your broadcast device name, audio port, RFC1918 subnet security, PipeWire buffer latency presets, automatic stream handoff, and scrcpy defaults.
 
 ---
 
@@ -64,23 +64,23 @@ SoundHop also provides dedicated GUI windows accessible directly from the tray m
 
 Prefer working from the terminal, running on a headless server, or scripting integrations for Waybar or Polybar? SoundHop provides a first-class CLI (`soundhop` or `shop`):
 
-### 1. Receiver (Laptop / Speakers)
+### 1. Receiver (PC / Sound System)
 Turn on audio sharing:
 ```bash
 soundhop share on
 ```
 *(If you have an active firewall like firewalld or ufw, run `soundhop firewall open`)*.
 
-### 2. Sender (Desktop / Workstation)
+### 2. Sender (Laptop / Workstation)
 Connect and pick the target machine:
 ```bash
 soundhop connect
 ```
 ```text
 Discovered devices:
-  1) thinkpad-cachy (192.168.1.105:4713) [LAN]
+  1) pbjj (192.168.1.174:4713) [LAN]
 Select device [1]: 1
-✓ Audio is now playing on thinkpad-cachy.
+✓ Audio is now playing on pbjj.
 ```
 
 ### 3. Disconnect
@@ -99,7 +99,7 @@ Audio falls straight back to your local speakers or headphones without missing a
 | **Audio Server** | PipeWire 0.3+ / PulseAudio 14+ | Must provide `pipewire-pulse` compatibility or PulseAudio |
 | **CLI Tools** | `pactl` | Standard tool from `pipewire-pulse` or `pulseaudio-utils` |
 | **Python** | 3.10+ | Required only when building from source (bundled inside AppImage) |
-| **Optional GUI** | `PySide6` (Qt 6) | Only needed for the desktop system tray icon |
+| **Desktop GUI** | `PySide6` (Qt 6) | Bundled inside AppImage; only needed when running directly from source |
 | **Optional mDNS**| `python-zeroconf` | Fallback discovery if raw UDP broadcasts are blocked on your router |
 
 ---
@@ -109,7 +109,7 @@ Audio falls straight back to your local speakers or headphones without missing a
 ```
 ┌────────────────────────────────┐         LAN UDP :47777         ┌────────────────────────────────┐
 │         Sender Device          │ ◄────────────────────────────► │        Receiver Device         │
-│   (Desktop / Workstation)      │       (Zero-Config Beacon)     │       (Laptop / Speakers)      │
+│     (e.g. Laptop / PC)         │       (Zero-Config Beacon)     │   (e.g. PC / Speakers / HTPC)  │
 │                                │                                │                                │
 │  • soundhop daemon             │                                │  • soundhop daemon             │
 │  • module-tunnel-sink          │ ═════════════════════════════► │  • module-native-protocol-tcp  │
@@ -265,7 +265,7 @@ mdns = true                     # Enable mDNS fallback browsing
   - Disconnect-on-quit toggle, buffer latency presets, and DSP detection (EasyEffects)
   - Portable AppImage & containerized multi-distro build pipeline
 - [x] **v1.1 (Current)**:
-  - **Android Support (scrcpy)**: Connect and listen your android device.
+  - **Android Support (scrcpy)**: Capture and listen to audio from Android devices over USB or Wi-Fi.
 - [ ] **v1.2 (Upcoming)**:
   - **Per-Application Stream Routing**: Direct specific apps (e.g. Spotify or Firefox) to remote speakers without moving your whole desktop audio.
   - **Microphone Pass-Through**: Stream microphone input back to the sender for remote calls and Discord.
