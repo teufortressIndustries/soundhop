@@ -12,7 +12,10 @@ CLI and the tray are just clients of the daemon.
 
 from __future__ import annotations
 
-import fcntl
+try:
+    import fcntl
+except ImportError:
+    fcntl = None  # type: ignore[assignment]
 import logging
 import os
 import signal
@@ -633,11 +636,21 @@ def configure_logging(verbose: bool = False, *, to_file: bool = False) -> None:
 def _acquire_lock() -> Any | None:
     ensure_dir(runtime_dir())
     handle = open(lock_path(), "a+")
-    try:
-        fcntl.flock(handle.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
-    except OSError:
-        handle.close()
-        return None
+    if fcntl is not None:
+        try:
+            fcntl.flock(handle.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
+        except OSError:
+            handle.close()
+            return None
+    elif sys.platform == "win32":
+        try:
+            import msvcrt
+
+            handle.seek(0)
+            msvcrt.locking(handle.fileno(), msvcrt.LK_NBLCK, 1)
+        except (OSError, IOError, ImportError):
+            handle.close()
+            return None
     handle.seek(0)
     handle.truncate()
     handle.write(f"{os.getpid()}\n")
@@ -678,9 +691,14 @@ def run_daemon(
         daemon.request_stop()
 
     try:
-        signal.signal(signal.SIGTERM, handle_signal)
-        signal.signal(signal.SIGINT, handle_signal)
-        signal.signal(signal.SIGHUP, lambda *_: daemon._reload())  # type: ignore[attr-defined]
+        if hasattr(signal, "SIGTERM"):
+            signal.signal(signal.SIGTERM, handle_signal)
+        if hasattr(signal, "SIGINT"):
+            signal.signal(signal.SIGINT, handle_signal)
+        if hasattr(signal, "SIGBREAK"):
+            signal.signal(signal.SIGBREAK, handle_signal)
+        if hasattr(signal, "SIGHUP"):
+            signal.signal(signal.SIGHUP, lambda *_: daemon._reload())  # type: ignore[attr-defined]
     except (ValueError, OSError):
         pass
 
@@ -736,22 +754,30 @@ def ensure_daemon(
     except OSError:
         log_file = subprocess.DEVNULL  # type: ignore[assignment]
     appimage = os.environ.get("APPIMAGE")
-    if appimage:
+    if getattr(sys, "frozen", False):
+        cmd = [sys.executable, "daemon"]
+    elif appimage:
         cmd = [appimage, "daemon"]
     else:
         cmd = [sys.executable, "-m", "soundhop", "daemon"]
     if verbose:
         cmd.append("--verbose")
+
+    popen_kwargs: dict[str, Any] = {
+        "stdin": subprocess.DEVNULL,
+        "stdout": log_file,
+        "stderr": log_file,
+        "env": env,
+    }
+    if sys.platform == "win32":
+        if hasattr(subprocess, "CREATE_NO_WINDOW"):
+            popen_kwargs["creationflags"] = subprocess.CREATE_NO_WINDOW
+    else:
+        popen_kwargs["start_new_session"] = True
+        popen_kwargs["close_fds"] = True
+
     try:
-        subprocess.Popen(
-            cmd,
-            stdin=subprocess.DEVNULL,
-            stdout=log_file,
-            stderr=log_file,
-            start_new_session=True,
-            close_fds=True,
-            env=env,
-        )
+        subprocess.Popen(cmd, **popen_kwargs)
     except OSError as exc:
         log.error("Could not start the daemon: %s", exc)
         return False

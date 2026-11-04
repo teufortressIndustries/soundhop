@@ -12,6 +12,9 @@ build/
 *.egg
 *.AppImage
 
+# PyInstaller spec generated in root
+/SoundHop.spec
+
 # Virtual environments
 .venv/
 venv/

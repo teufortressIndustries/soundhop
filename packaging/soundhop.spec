@@ -1,5 +1,5 @@
 Name:           soundhop
-Version:        1.1.3
+Version:        1.1.4
 Release:        1%{?dist}
 Summary:        Seamless cross-distro local network audio sharing for Linux
 

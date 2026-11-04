@@ -62,15 +62,17 @@ def run(
     if isinstance(args, str):
         args = [args]
     args = [str(a) for a in args]
+    run_kwargs: dict[str, Any] = {
+        "capture_output": True,
+        "text": True,
+        "timeout": timeout,
+        "env": dict(env) if env is not None else None,
+        "input": stdin,
+    }
+    if sys.platform == "win32" and hasattr(subprocess, "CREATE_NO_WINDOW"):
+        run_kwargs["creationflags"] = subprocess.CREATE_NO_WINDOW
     try:
-        proc = subprocess.run(
-            args,
-            capture_output=True,
-            text=True,
-            timeout=timeout,
-            env=dict(env) if env is not None else None,
-            input=stdin,
-        )
+        proc = subprocess.run(args, **run_kwargs)
     except FileNotFoundError as exc:
         raise ToolMissing(args[0]) from exc
     result = Result(args, proc.returncode, proc.stdout, proc.stderr)
@@ -93,6 +95,19 @@ def command_exists(name: str) -> bool:
 
 def process_running(name: str) -> bool:
     """Check if a process with the given name is currently running."""
+    if sys.platform == "win32":
+        try:
+            import psutil
+
+            target = name.lower()
+            target_exe = target if target.endswith(".exe") else target + ".exe"
+            for p in psutil.process_iter(["name"]):
+                pname = (p.info.get("name") or "").lower()
+                if pname in (target, target_exe):
+                    return True
+        except Exception:
+            pass
+        return False
     if shutil.which("pgrep"):
         try:
             return (
@@ -124,21 +139,27 @@ def process_running(name: str) -> bool:
 
 
 def _home() -> Path:
-    return Path(os.environ.get("HOME") or Path.home())
+    return Path(os.environ.get("HOME") or os.environ.get("USERPROFILE") or Path.home())
 
 
 def config_dir() -> Path:
     base = os.environ.get("XDG_CONFIG_HOME")
+    if not base and sys.platform == "win32":
+        base = os.environ.get("APPDATA") or os.environ.get("LOCALAPPDATA")
     return (Path(base) if base else _home() / ".config") / APP_SLUG
 
 
 def state_dir() -> Path:
     base = os.environ.get("XDG_STATE_HOME")
+    if not base and sys.platform == "win32":
+        base = os.environ.get("LOCALAPPDATA")
     return (Path(base) if base else _home() / ".local" / "state") / APP_SLUG
 
 
 def data_dir() -> Path:
     base = os.environ.get("XDG_DATA_HOME")
+    if not base and sys.platform == "win32":
+        base = os.environ.get("LOCALAPPDATA")
     return (Path(base) if base else _home() / ".local" / "share") / APP_SLUG
 
 
@@ -146,7 +167,8 @@ def runtime_dir() -> Path:
     base = os.environ.get("XDG_RUNTIME_DIR")
     if base:
         return Path(base) / APP_SLUG
-    return Path(tempfile.gettempdir()) / f"{APP_SLUG}-{os.getuid()}"
+    user_id = str(os.getuid()) if hasattr(os, "getuid") else os.environ.get("USERNAME", "user")
+    return Path(tempfile.gettempdir()) / f"{APP_SLUG}-{user_id}"
 
 
 def ensure_dir(path: Path, mode: int = 0o700) -> Path:
@@ -190,10 +212,11 @@ def atomic_write(path: Path, text: str, mode: int = 0o600) -> None:
         flags = os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_TRUNC
         fd = os.open(tmp, flags, mode)
         try:
-            try:
-                os.fchmod(fd, mode)
-            except OSError:
-                pass
+            if hasattr(os, "fchmod"):
+                try:
+                    os.fchmod(fd, mode)
+                except OSError:
+                    pass
             with open(fd, "w", encoding="utf-8") as f:
                 f.write(text)
         except Exception:
@@ -202,10 +225,11 @@ def atomic_write(path: Path, text: str, mode: int = 0o600) -> None:
             except OSError:
                 pass
             raise
-        try:
-            tmp.chmod(mode)
-        except OSError:
-            pass
+        if hasattr(tmp, "chmod"):
+            try:
+                tmp.chmod(mode)
+            except OSError:
+                pass
         os.replace(tmp, path)
     finally:
         tmp.unlink(missing_ok=True)
@@ -421,7 +445,18 @@ def broadcast_addresses(*, include_loopback: bool = True) -> list[str]:
             discovered = list(cached_targets)
         else:
             discovered = ["255.255.255.255"]
-            if command_exists("ip"):
+            if sys.platform == "win32":
+                try:
+                    import psutil
+
+                    for iface_addrs in psutil.net_if_addrs().values():
+                        for snic in iface_addrs:
+                            if snic.family == socket.AF_INET and getattr(snic, "broadcast", None):
+                                if snic.broadcast and snic.broadcast not in discovered:
+                                    discovered.append(snic.broadcast)
+                except Exception:
+                    pass
+            elif command_exists("ip"):
                 try:
                     result = run(["ip", "-o", "-4", "addr", "show"], timeout=2.0)
                     for line in result.stdout.splitlines():
@@ -493,6 +528,43 @@ def notify(title: str, body: str, *, urgency: str = "normal") -> None:
 
     if os.environ.get("SOUNDHOP_NO_NOTIFY"):
         return
+    if sys.platform == "win32":
+        try:
+            import xml.sax.saxutils as saxutils
+
+            esc_title = saxutils.escape(title).replace("'", "''").replace('"', '`"')
+            esc_body = saxutils.escape(body).replace("'", "''").replace('"', '`"')
+            raw_title = title.replace("'", "''").replace('"', '`"')
+            raw_body = body.replace("'", "''").replace('"', '`"')
+            # Modern Windows 10/11 Toast via WinRT with fallback to Windows Forms balloon tip
+            cmd = (
+                f"$ErrorActionPreference = 'SilentlyContinue';"
+                f"try {{"
+                f"  [Windows.UI.Notifications.ToastNotificationManager, Windows.UI.Notifications, ContentType = WindowsRuntime] | Out-Null;"
+                f"  [Windows.Data.Xml.Dom.XmlDocument, Windows.Data.Xml.Dom.XmlDocument, ContentType = WindowsRuntime] | Out-Null;"
+                f"  $xml = New-Object Windows.Data.Xml.Dom.XmlDocument;"
+                f"  $xml.LoadXml('<toast><visual><binding template=\"ToastGeneric\"><text>{esc_title}</text><text>{esc_body}</text></binding></visual></toast>');"
+                f"  $toast = [Windows.UI.Notifications.ToastNotification]::new($xml);"
+                f"  [Windows.UI.Notifications.ToastNotificationManager]::CreateToastNotifier('SoundHop').Show($toast);"
+                f"}} catch {{"
+                f"  [reflection.assembly]::loadwithpartialname('System.Windows.Forms') | Out-Null;"
+                f"  $n = New-Object System.Windows.Forms.NotifyIcon;"
+                f"  $n.Icon = [System.Drawing.SystemIcons]::Information;"
+                f"  $n.Visible = $True;"
+                f"  $n.ShowBalloonTip(4000, '{raw_title}', '{raw_body}', [System.Windows.Forms.ToolTipIcon]::Info);"
+                f"  Start-Sleep -Milliseconds 500;"
+                f"}}"
+            )
+            ps_flags = subprocess.CREATE_NO_WINDOW if hasattr(subprocess, "CREATE_NO_WINDOW") else 0
+            threading.Thread(
+                target=subprocess.run,
+                args=(["powershell", "-NoProfile", "-NonInteractive", "-Command", cmd],),
+                kwargs={"stdout": subprocess.DEVNULL, "stderr": subprocess.DEVNULL, "timeout": 5.0, "creationflags": ps_flags},
+                daemon=True,
+            ).start()
+            return
+        except Exception:
+            pass
     if command_exists("notify-send"):
         try:
             run(
@@ -520,6 +592,12 @@ def notify(title: str, body: str, *, urgency: str = "normal") -> None:
 def open_path(path: Path) -> None:
     """Open a file with the desktop's default handler, if possible."""
 
+    if sys.platform == "win32":
+        try:
+            os.startfile(str(path))
+            return
+        except OSError:
+            pass
     if command_exists("xdg-open"):
         try:
             run(["xdg-open", str(path)], timeout=3.0)

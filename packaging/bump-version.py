@@ -22,7 +22,15 @@ import subprocess
 import sys
 from pathlib import Path
 
-ROOT_DIR = Path(__file__).resolve().parent.parent
+def _find_repo_root() -> Path:
+    current = Path(__file__).resolve().parent
+    for candidate in [current, current.parent]:
+        if (candidate / "src" / "soundhop" / "constants.py").is_file():
+            return candidate
+    return current.parent
+
+
+ROOT_DIR = _find_repo_root()
 
 
 def get_current_version() -> str:

@@ -13,10 +13,12 @@ import platform
 import re
 import shutil
 import subprocess
+import sys
 import tarfile
 import threading
 import time
 import urllib.request
+import zipfile
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any, Callable, Sequence
@@ -119,13 +121,17 @@ class AndroidManager:
         if self.custom_scrcpy:
             candidates.append(Path(self.custom_scrcpy).expanduser())
 
+        names = ["scrcpy.exe", "scrcpy"] if sys.platform == "win32" else ["scrcpy"]
+
         # Managed SoundHop directory
         managed = self.managed_dir()
-        candidates.append(managed / "scrcpy")
+        for name in names:
+            candidates.append(managed / name)
         if managed.is_dir():
             try:
-                for sub in managed.glob("scrcpy*/scrcpy"):
-                    candidates.append(sub)
+                for name in names:
+                    for sub in managed.glob(f"scrcpy*/{name}"):
+                        candidates.append(sub)
             except OSError:
                 pass
 
@@ -134,21 +140,24 @@ class AndroidManager:
         apps_dir = home / "Applications"
         if apps_dir.is_dir():
             try:
-                for sub in apps_dir.glob("scrcpy*/scrcpy"):
-                    candidates.append(sub)
-                candidates.append(apps_dir / "scrcpy" / "scrcpy")
+                for name in names:
+                    for sub in apps_dir.glob(f"scrcpy*/{name}"):
+                        candidates.append(sub)
+                    candidates.append(apps_dir / "scrcpy" / name)
             except OSError:
                 pass
 
-        candidates.append(home / ".local" / "bin" / "scrcpy")
+        for name in names:
+            candidates.append(home / ".local" / "bin" / name)
 
         for candidate in candidates:
-            if candidate.is_file() and os.access(candidate, os.X_OK):
+            if candidate.is_file() and (sys.platform == "win32" or os.access(candidate, os.X_OK)):
                 return candidate.resolve()
 
-        path_bin = shutil.which("scrcpy")
-        if path_bin:
-            return Path(path_bin).resolve()
+        for name in names:
+            path_bin = shutil.which(name)
+            if path_bin:
+                return Path(path_bin).resolve()
 
         return None
 
@@ -158,17 +167,22 @@ class AndroidManager:
         if self.custom_adb:
             candidates.append(Path(self.custom_adb).expanduser())
 
+        adb_names = ["adb.exe", "adb"] if sys.platform == "win32" else ["adb"]
+
         # If scrcpy was found, check if adb is right next to it (official release bundles it)
         scrcpy_bin = self.find_scrcpy()
         if scrcpy_bin:
-            candidates.append(scrcpy_bin.parent / "adb")
+            for name in adb_names:
+                candidates.append(scrcpy_bin.parent / name)
 
         managed = self.managed_dir()
-        candidates.append(managed / "adb")
+        for name in adb_names:
+            candidates.append(managed / name)
         if managed.is_dir():
             try:
-                for sub in managed.glob("scrcpy*/adb"):
-                    candidates.append(sub)
+                for name in adb_names:
+                    for sub in managed.glob(f"scrcpy*/{name}"):
+                        candidates.append(sub)
             except OSError:
                 pass
 
@@ -176,20 +190,23 @@ class AndroidManager:
         apps_dir = home / "Applications"
         if apps_dir.is_dir():
             try:
-                for sub in apps_dir.glob("scrcpy*/adb"):
-                    candidates.append(sub)
+                for name in adb_names:
+                    for sub in apps_dir.glob(f"scrcpy*/{name}"):
+                        candidates.append(sub)
             except OSError:
                 pass
 
-        candidates.append(home / ".local" / "bin" / "adb")
+        for name in adb_names:
+            candidates.append(home / ".local" / "bin" / name)
 
         for candidate in candidates:
-            if candidate.is_file() and os.access(candidate, os.X_OK):
+            if candidate.is_file() and (sys.platform == "win32" or os.access(candidate, os.X_OK)):
                 return candidate.resolve()
 
-        path_bin = shutil.which("adb")
-        if path_bin:
-            return Path(path_bin).resolve()
+        for name in adb_names:
+            path_bin = shutil.which(name)
+            if path_bin:
+                return Path(path_bin).resolve()
 
         return None
 
@@ -238,21 +255,25 @@ class AndroidManager:
         Downloads the prebuilt tarball from Genymobile's GitHub releases, which contains
         scrcpy, scrcpy-server, bundled adb, ffmpeg/sdl dependencies, and the Apache 2.0 license.
         """
-        raw_arch = platform.machine().lower()
-        if raw_arch in ("x86_64", "amd64"):
-            arch = "x86_64"
-        elif raw_arch in ("aarch64", "arm64"):
-            arch = "aarch64"
-        else:
-            raise AndroidError(
-                f"Unsupported architecture for prebuilt scrcpy: {raw_arch}. "
-                "Please install scrcpy using your system package manager."
-            )
-
-        url = SCRCPY_DOWNLOAD_URL.format(version=version, arch=arch)
         dest_dir = self.managed_dir()
         dest_dir.mkdir(parents=True, exist_ok=True)
-        archive_path = dest_dir / f"scrcpy-{arch}-{version}.tar.gz"
+        if sys.platform == "win32":
+            url = f"https://github.com/Genymobile/scrcpy/releases/download/v{version}/scrcpy-win64-v{version}.zip"
+            archive_path = dest_dir / f"scrcpy-win64-{version}.zip"
+        else:
+            raw_arch = platform.machine().lower()
+            if raw_arch in ("x86_64", "amd64"):
+                arch = "x86_64"
+            elif raw_arch in ("aarch64", "arm64"):
+                arch = "aarch64"
+            else:
+                raise AndroidError(
+                    f"Unsupported architecture for prebuilt scrcpy: {raw_arch}. "
+                    "Please install scrcpy using your system package manager."
+                )
+
+            url = SCRCPY_DOWNLOAD_URL.format(version=version, arch=arch)
+            archive_path = dest_dir / f"scrcpy-{arch}-{version}.tar.gz"
 
         log.info("Downloading scrcpy %s from %s to %s", version, url, archive_path)
         try:
@@ -281,79 +302,106 @@ class AndroidManager:
         # Extract archive safely into dest_dir
         try:
             dest_dir_resolved = dest_dir.resolve()
-            with tarfile.open(archive_path, "r:gz") as tar:
-                # Extract members directly flattening if single folder
-                members = tar.getmembers()
-                prefix = ""
-                if members and "/" in members[0].name:
-                    prefix = members[0].name.split("/")[0] + "/"
-
-                for m in members:
-                    # Strip top-level directory prefix so binaries sit directly in dest_dir
-                    target_name = m.name[len(prefix) :] if prefix and m.name.startswith(prefix) else m.name
-                    if not target_name:
-                        continue
-                    # Security check: avoid directory traversal
-                    target_path = (dest_dir / target_name).resolve()
-                    try:
-                        if os.path.commonpath([dest_dir_resolved, target_path]) != str(dest_dir_resolved):
-                            continue
-                    except ValueError:
-                        continue
-
-                    if m.issym():
-                        target_path.parent.mkdir(parents=True, exist_ok=True)
-                        if os.path.isabs(m.linkname):
-                            continue
-                        link_target_path = (target_path.parent / m.linkname).resolve()
-                        try:
-                            if os.path.commonpath([dest_dir_resolved, link_target_path]) != str(dest_dir_resolved):
-                                continue
-                        except ValueError:
-                            continue
-                        if target_path.is_dir() and not target_path.is_symlink():
-                            shutil.rmtree(target_path)
-                        else:
-                            target_path.unlink(missing_ok=True)
-                        target_path.symlink_to(m.linkname)
-                    elif m.islnk():
-                        target_path.parent.mkdir(parents=True, exist_ok=True)
-                        link_target_name = (
-                            m.linkname[len(prefix) :]
-                            if prefix and m.linkname.startswith(prefix)
-                            else m.linkname
+            if sys.platform == "win32":
+                with zipfile.ZipFile(archive_path, "r") as z:
+                    names = z.namelist()
+                    prefix = ""
+                    if names and "/" in names[0]:
+                        prefix = names[0].split("/")[0] + "/"
+                    for member in z.infolist():
+                        target_name = (
+                            member.filename[len(prefix) :]
+                            if prefix and member.filename.startswith(prefix)
+                            else member.filename
                         )
-                        link_target_path = (dest_dir / link_target_name).resolve()
+                        if not target_name:
+                            continue
+                        target_path = (dest_dir / target_name).resolve()
                         try:
-                            if os.path.commonpath([dest_dir_resolved, link_target_path]) != str(dest_dir_resolved):
+                            if os.path.commonpath([dest_dir_resolved, target_path]) != str(dest_dir_resolved):
                                 continue
                         except ValueError:
                             continue
+                        if member.is_dir():
+                            target_path.mkdir(parents=True, exist_ok=True)
+                        else:
+                            target_path.parent.mkdir(parents=True, exist_ok=True)
+                            with z.open(member) as src, open(target_path, "wb") as dst:
+                                shutil.copyfileobj(src, dst)
+            else:
+                with tarfile.open(archive_path, "r:gz") as tar:
+                    # Extract members directly flattening if single folder
+                    members = tar.getmembers()
+                    prefix = ""
+                    if members and "/" in members[0].name:
+                        prefix = members[0].name.split("/")[0] + "/"
+
+                    for m in members:
+                        # Strip top-level directory prefix so binaries sit directly in dest_dir
+                        target_name = m.name[len(prefix) :] if prefix and m.name.startswith(prefix) else m.name
+                        if not target_name:
+                            continue
+                        # Security check: avoid directory traversal
+                        target_path = (dest_dir / target_name).resolve()
                         try:
+                            if os.path.commonpath([dest_dir_resolved, target_path]) != str(dest_dir_resolved):
+                                continue
+                        except ValueError:
+                            continue
+
+                        if m.issym():
+                            target_path.parent.mkdir(parents=True, exist_ok=True)
+                            if os.path.isabs(m.linkname):
+                                continue
+                            link_target_path = (target_path.parent / m.linkname).resolve()
+                            try:
+                                if os.path.commonpath([dest_dir_resolved, link_target_path]) != str(dest_dir_resolved):
+                                    continue
+                            except ValueError:
+                                continue
                             if target_path.is_dir() and not target_path.is_symlink():
                                 shutil.rmtree(target_path)
                             else:
                                 target_path.unlink(missing_ok=True)
-                            os.link(link_target_path, target_path)
-                        except OSError as exc:
-                            log.debug("Hardlink creation failed for %s -> %s: %s", target_path, link_target_path, exc)
-                    elif m.isdir():
-                        target_path.mkdir(parents=True, exist_ok=True)
-                    else:
-                        target_path.parent.mkdir(parents=True, exist_ok=True)
-                        extracted = tar.extractfile(m)
-                        if extracted:
-                            if target_path.is_dir() and not target_path.is_symlink():
-                                shutil.rmtree(target_path)
-                            else:
-                                target_path.unlink(missing_ok=True)
-                            with open(target_path, "wb") as f:
-                                shutil.copyfileobj(extracted, f)
-                            if m.name.endswith("scrcpy") or m.name.endswith("adb") or (m.mode & 0o111):
-                                try:
-                                    os.chmod(target_path, 0o755)
-                                except OSError:
-                                    pass
+                            target_path.symlink_to(m.linkname)
+                        elif m.islnk():
+                            target_path.parent.mkdir(parents=True, exist_ok=True)
+                            link_target_name = (
+                                m.linkname[len(prefix) :]
+                                if prefix and m.linkname.startswith(prefix)
+                                else m.linkname
+                            )
+                            link_target_path = (dest_dir / link_target_name).resolve()
+                            try:
+                                if os.path.commonpath([dest_dir_resolved, link_target_path]) != str(dest_dir_resolved):
+                                    continue
+                            except ValueError:
+                                continue
+                            try:
+                                if target_path.is_dir() and not target_path.is_symlink():
+                                    shutil.rmtree(target_path)
+                                else:
+                                    target_path.unlink(missing_ok=True)
+                                os.link(link_target_path, target_path)
+                            except OSError as exc:
+                                log.debug("Hardlink creation failed for %s -> %s: %s", target_path, link_target_path, exc)
+                        elif m.isdir():
+                            target_path.mkdir(parents=True, exist_ok=True)
+                        else:
+                            target_path.parent.mkdir(parents=True, exist_ok=True)
+                            extracted = tar.extractfile(m)
+                            if extracted:
+                                if target_path.is_dir() and not target_path.is_symlink():
+                                    shutil.rmtree(target_path)
+                                else:
+                                    target_path.unlink(missing_ok=True)
+                                with open(target_path, "wb") as f:
+                                    shutil.copyfileobj(extracted, f)
+                                if m.name.endswith("scrcpy") or m.name.endswith("adb") or (m.mode & 0o111):
+                                    try:
+                                        os.chmod(target_path, 0o755)
+                                    except OSError:
+                                        pass
         except Exception as exc:
             raise AndroidError(f"Failed to extract scrcpy archive: {exc}") from exc
         finally:
@@ -734,14 +782,17 @@ class AndroidCaptureSession:
             )
 
             log.info("Starting scrcpy audio capture: %s", " ".join(args))
+            popen_kwargs: dict[str, Any] = {
+                "stdout": subprocess.PIPE,
+                "stderr": subprocess.STDOUT,
+                "text": True,
+                "bufsize": 1,
+            }
+            if sys.platform == "win32" and hasattr(subprocess, "CREATE_NO_WINDOW"):
+                popen_kwargs["creationflags"] = subprocess.CREATE_NO_WINDOW
+
             try:
-                self._proc = subprocess.Popen(
-                    args,
-                    stdout=subprocess.PIPE,
-                    stderr=subprocess.STDOUT,
-                    text=True,
-                    bufsize=1,
-                )
+                self._proc = subprocess.Popen(args, **popen_kwargs)
             except Exception as exc:
                 self._last_error = str(exc)
                 raise AndroidError(f"Failed to start scrcpy: {exc}") from exc

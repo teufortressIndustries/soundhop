@@ -195,9 +195,13 @@ done
         # Verify upload-artifact includes .zsync
         self.assertIn("dist/*.AppImage", ci_content)
         self.assertIn("dist/*.zsync", ci_content)
-        # Verify release step includes .zsync
+        # Verify Windows build job and artifact
+        self.assertIn("build-windows:", ci_content)
+        self.assertIn("SoundHop-Windows-x86_64.exe", ci_content)
+        # Verify release step includes .zsync and Windows executable
         release_block = ci_content.split("name: Publish GitHub Release", 1)[1]
         self.assertIn("dist/*.zsync", release_block)
+        self.assertIn("dist/SoundHop.exe", release_block)
 
 
 if __name__ == "__main__":

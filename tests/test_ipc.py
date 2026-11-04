@@ -39,6 +39,41 @@ class IpcTest(unittest.TestCase):
             with self.assertRaises(DaemonNotRunning):
                 request("ping", path=sock_path)
 
+    def test_ipc_tcp_fallback(self) -> None:
+        """Test Windows loopback TCP fallback when AF_UNIX is unavailable."""
+        from unittest.mock import patch
+        import socket
+
+        with tempfile.TemporaryDirectory() as tmpdir:
+            sock_path = Path(tmpdir) / "test.sock"
+
+            def handler(req: dict) -> dict:
+                return {"pong": True, "tcp": True}
+
+            # Simulate absence of AF_UNIX or error on AF_UNIX bind
+            orig_socket = socket.socket
+
+            def fake_socket(family, *args, **kwargs):
+                if family == getattr(socket, "AF_UNIX", None):
+                    raise OSError("AF_UNIX not supported on this platform")
+                return orig_socket(family, *args, **kwargs)
+
+            with patch("socket.socket", side_effect=fake_socket):
+                server = IpcServer(handler, path=sock_path)
+                server.start()
+                try:
+                    self.assertTrue(server._is_tcp)
+                    self.assertTrue(sock_path.with_suffix(".port").exists())
+                    self.assertTrue(is_running(sock_path))
+
+                    res = request("ping", path=sock_path)
+                    self.assertTrue(res.get("pong"))
+                    self.assertTrue(res.get("tcp"))
+                finally:
+                    server.stop()
+
+            self.assertFalse(sock_path.with_suffix(".port").exists())
+
 
 if __name__ == "__main__":
     unittest.main()

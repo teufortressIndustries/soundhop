@@ -135,6 +135,8 @@ def main(argv: Sequence[str] | None = None) -> int:
     if args.no_color:
         os.environ["NO_COLOR"] = "1"
     if not getattr(args, "func", None):
+        if getattr(sys, "frozen", False):
+            return cmd_tray(args)
         parser.print_help()
         return 0
     try:

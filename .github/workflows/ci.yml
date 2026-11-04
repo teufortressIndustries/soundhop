@@ -73,10 +73,48 @@ jobs:
             dist/*.zsync
           if-no-files-found: error
 
+  build-windows:
+    name: Build Windows Executable
+    runs-on: windows-latest
+    needs: test
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+          cache: "pip"
+
+      - name: Install dependencies
+        run: |
+          python -m pip install --upgrade pip
+          python -m pip install -e ".[all]"
+          python -m pip install pyinstaller
+
+      - name: Build Windows Executable
+        run: |
+          python packaging/build-windows-exe.py
+
+      - name: Verify Executable Created
+        shell: pwsh
+        run: |
+          if (!(Test-Path "dist/SoundHop.exe")) {
+            throw "dist/SoundHop.exe was not created!"
+          }
+
+      - name: Upload Windows Executable Artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: SoundHop-Windows-x86_64.exe
+          path: dist/SoundHop.exe
+          if-no-files-found: error
+
   release:
     name: Publish GitHub Release
     if: startsWith(github.ref, 'refs/tags/v')
-    needs: build-appimage
+    needs: [build-appimage, build-windows]
     runs-on: ubuntu-latest
 
     permissions:
@@ -91,10 +129,17 @@ jobs:
           name: SoundHop-x86_64.AppImage
           path: dist
 
+      - name: Download Windows Executable Artifact
+        uses: actions/download-artifact@v4
+        with:
+          name: SoundHop-Windows-x86_64.exe
+          path: dist
+
       - name: Create GitHub Release
         uses: softprops/action-gh-release@v2
         with:
           files: |
             dist/*.AppImage
             dist/*.zsync
+            dist/SoundHop.exe
           generate_release_notes: true

@@ -60,12 +60,26 @@ def _run_doctor() -> dict[str, Any]:
         f"{platform.python_version()} ({sys.executable})",
         "SoundHop needs Python 3.10 or newer.",
     )
-    add(
-        "pactl",
-        command_exists("pactl"),
-        shutil.which("pactl") or "not found",
-        "Install pipewire-pulse or pulseaudio-utils.",
-    )
+    if sys.platform != "win32":
+        add(
+            "pactl",
+            command_exists("pactl"),
+            shutil.which("pactl") or "not found",
+            "Install pipewire-pulse or pulseaudio-utils.",
+        )
+    else:
+        try:
+            import sounddevice  # noqa: F401
+
+            has_sd = True
+        except ImportError:
+            has_sd = False
+        add(
+            "sounddevice",
+            has_sd,
+            "installed" if has_sd else "not installed",
+            "Run 'pip install sounddevice' for low-latency WASAPI output.",
+        )
 
     backend = AudioBackend()
     backend_ok = backend.available()
@@ -73,10 +87,13 @@ def _run_doctor() -> dict[str, Any]:
         "Audio server",
         backend_ok,
         backend.server_label() if backend_ok else "not reachable",
-        "Start PipeWire/WirePlumber or PulseAudio.",
+        "Start PipeWire/WirePlumber or PulseAudio." if sys.platform != "win32" else "Verify Windows Audio service (Audiosrv).",
     )
     if backend_ok:
-        add("PipeWire", backend.is_pipewire(), backend.server_name(), "PulseAudio also works.")
+        if sys.platform != "win32":
+            add("PipeWire", backend.is_pipewire(), backend.server_name(), "PulseAudio also works.")
+        else:
+            add("WASAPI", True, backend.server_name(), "Windows Core Audio driver.")
         default = backend.default_sink()
         add(
             "Default sink",

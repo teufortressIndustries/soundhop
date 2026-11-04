@@ -218,7 +218,7 @@ We build a universal, standalone AppImage using a clean Ubuntu 22.04 container (
 ```bash
 ./build-appimage-container.sh
 ```
-The finished binary will be placed at `dist/SoundHop-1.1.3-universal-x86_64.AppImage`.
+The finished binary will be placed at `dist/SoundHop-1.1.4-universal-x86_64.AppImage`.
 
 ---
 
@@ -249,9 +249,9 @@ mdns = true                     # Enable mDNS fallback browsing
 
 ## Limitations & Honest Notes
 
-- **Linux only**: We rely directly on Linux PipeWire / PulseAudio native protocol streaming. Windows and macOS are not supported.
+- **Supported Platforms**: Linux (PipeWire / PulseAudio) and Windows 10/11 (WASAPI / sounddevice). macOS is currently not supported.
 - **LAN-oriented**: Designed for local Wi-Fi, Ethernet, and peer-to-peer networks. If you want to stream across the open Internet, run over [Tailscale](https://tailscale.com) or WireGuard.
-- **ALSA-only systems**: If your setup does not run PipeWire or PulseAudio, SoundHop will not work.
+- **ALSA-only systems**: If your Linux setup does not run PipeWire or PulseAudio, SoundHop will not work.
 
 ---
 
@@ -265,7 +265,8 @@ mdns = true                     # Enable mDNS fallback browsing
   - Disconnect-on-quit toggle, buffer latency presets, and DSP detection (EasyEffects)
   - Portable AppImage & containerized multi-distro build pipeline
 - [x] **v1.1 (Current)**:
-  - **Android Support (scrcpy)**: Capture and listen to audio from Android devices over USB or Wi-Fi.
+  - **Android Support (scrcpy)**: Capture and listen to the audio from your Android devices over USB or Wi-Fi.
+  - **Windows Support (EXPERIMENTAL)**: Experimental support for Windows OS.
 - [ ] **v1.2 (Upcoming)**:
   - **Per-Application Stream Routing**: Direct specific apps (e.g. Spotify or Firefox) to remote speakers without moving your whole desktop audio.
   - **Microphone Pass-Through**: Stream microphone input back to the sender for remote calls and Discord.

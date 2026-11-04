@@ -10,9 +10,10 @@ from __future__ import annotations
 
 import logging
 import re
+import sys
 import time
 from dataclasses import dataclass
-from typing import Callable, Sequence
+from typing import Any, Callable, Sequence
 
 from .constants import (
     DEFAULT_LAN_NETWORKS,
@@ -77,6 +78,18 @@ class Listener:
 
 
 class AudioBackend:
+    def __new__(cls, *args: Any, **kwargs: Any) -> Any:
+        if (
+            cls is AudioBackend
+            and sys.platform == "win32"
+            and "runner" not in kwargs
+            and "pactl" not in kwargs
+        ):
+            from .platform.windows.backend import WindowsAudioBackend
+
+            return super().__new__(WindowsAudioBackend)
+        return super().__new__(cls)
+
     def __init__(
         self,
         *,
@@ -473,3 +486,7 @@ def listener_security(args: str) -> str:
     if "auth-ip-acl" in args:
         return "trusted-lan"
     return "open"
+
+
+LinuxAudioBackend = AudioBackend
+

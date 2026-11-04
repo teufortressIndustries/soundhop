@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "soundhop"
-version = "1.1.3"
+version = "1.1.4"
 description = "Play any Linux device's audio on any other device on your local network."
 readme = "README.md"
 requires-python = ">=3.10"
@@ -17,11 +17,16 @@ classifiers = [
   "Intended Audience :: End Users/Desktop",
   "License :: OSI Approved :: MIT License",
   "Operating System :: POSIX :: Linux",
+  "Operating System :: Microsoft :: Windows",
   "Programming Language :: Python :: 3",
   "Topic :: Multimedia :: Sound/Audio",
 ]
 dependencies = [
   "tomli>=2.0; python_version < '3.11'",
+  "sounddevice>=0.4.6; sys_platform == 'win32'",
+  "soundcard>=0.4.3; sys_platform == 'win32'",
+  "numpy>=1.20; sys_platform == 'win32'",
+  "psutil>=5.9.0; sys_platform == 'win32'",
 ]
 
 [project.optional-dependencies]
@@ -45,4 +50,4 @@ package-dir = { "" = "src" }
 where = ["src"]
 
 [tool.setuptools.package-data]
-soundhop = ["assets/*.svg"]
+soundhop = ["assets/*"]

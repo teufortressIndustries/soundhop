@@ -49,7 +49,43 @@ class FirewallResult:
         }
 
 
+def is_admin() -> bool:
+    if hasattr(os, "geteuid"):
+        return os.geteuid() == 0
+    try:
+        import ctypes
+
+        return bool(ctypes.windll.shell32.IsUserAnAdmin())
+    except Exception:
+        return False
+
+
 def detect() -> FirewallState:
+    if sys.platform == "win32":
+        if shutil.which("netsh"):
+            try:
+                run_kwargs: dict[str, Any] = {
+                    "capture_output": True,
+                    "text": True,
+                    "timeout": 5,
+                }
+                if hasattr(subprocess, "CREATE_NO_WINDOW"):
+                    run_kwargs["creationflags"] = subprocess.CREATE_NO_WINDOW
+                result = subprocess.run(
+                    ["netsh", "advfirewall", "show", "allprofiles", "state"],
+                    **run_kwargs,
+                )
+                if result.returncode == 0:
+                    out = result.stdout.lower()
+                    active = "state" in out and "on" in out
+                    return FirewallState(
+                        "windows-defender",
+                        active,
+                        "Windows Defender Firewall is active" if active else "Windows Defender Firewall is off",
+                    )
+            except (OSError, subprocess.TimeoutExpired):
+                pass
+        return FirewallState("none", False, "Windows Defender Firewall state could not be determined")
     if shutil.which("ufw"):
         try:
             result = subprocess.run(
@@ -83,7 +119,7 @@ def detect() -> FirewallState:
 
 
 def _sudo_prefix() -> list[str]:
-    if os.geteuid() == 0:
+    if is_admin():
         return []
     if not shutil.which("sudo"):
         return []
@@ -158,6 +194,13 @@ def open_ports(
             ])
             result.commands.append([*sudo, "firewall-cmd", *zone_args, "--add-service=mdns", "--permanent"])
         result.commands.append([*sudo, "firewall-cmd", "--reload"])
+    elif state.kind == "windows-defender":
+        result.commands = [
+            ["netsh", "advfirewall", "firewall", "add", "rule", f"name=SoundHop Audio ({audio_port}/tcp)", "dir=in", "action=allow", "protocol=TCP", f"localport={audio_port}"],
+            ["netsh", "advfirewall", "firewall", "add", "rule", f"name=SoundHop Discovery ({discovery_port}/udp)", "dir=in", "action=allow", "protocol=UDP", f"localport={discovery_port}"],
+        ]
+        if include_mdns:
+            result.commands.append(["netsh", "advfirewall", "firewall", "add", "rule", f"name=SoundHop mDNS ({MDNS_PORT}/udp)", "dir=in", "action=allow", "protocol=UDP", f"localport={MDNS_PORT}"])
     else:
         result.note = (
             "nftables detected. Add these rules yourself (or use ufw/firewalld):\\n"
@@ -173,19 +216,21 @@ def open_ports(
         result.note = "Dry run: no firewall changes made"
         return result
 
-    if not sudo and os.geteuid() != 0:
+    if not sudo and not is_admin():
         result.ok = False
         result.errors.append("sudo is not installed; run the commands manually")
         return result
 
     for command in result.commands:
         try:
-            proc = subprocess.run(
-                command,
-                capture_output=True,
-                text=True,
-                timeout=30,
-            )
+            cmd_kwargs: dict[str, Any] = {
+                "capture_output": True,
+                "text": True,
+                "timeout": 30,
+            }
+            if hasattr(subprocess, "CREATE_NO_WINDOW"):
+                cmd_kwargs["creationflags"] = subprocess.CREATE_NO_WINDOW
+            proc = subprocess.run(command, **cmd_kwargs)
         except (OSError, subprocess.TimeoutExpired) as exc:
             result.ok = False
             result.errors.append(f"{' '.join(command)}: {exc}")
@@ -241,6 +286,13 @@ def close_ports(
                 [*sudo, "firewall-cmd", *zone_args, "--remove-service=mdns", "--permanent"]
             )
         result.commands.append([*sudo, "firewall-cmd", "--reload"])
+    elif state.kind == "windows-defender":
+        result.commands = [
+            ["netsh", "advfirewall", "firewall", "delete", "rule", f"name=SoundHop Audio ({audio_port}/tcp)"],
+            ["netsh", "advfirewall", "firewall", "delete", "rule", f"name=SoundHop Discovery ({discovery_port}/udp)"],
+        ]
+        if include_mdns:
+            result.commands.append(["netsh", "advfirewall", "firewall", "delete", "rule", f"name=SoundHop mDNS ({MDNS_PORT}/udp)"])
     else:
         result.note = "Remove the SoundHop nftables rules manually."
         result.ok = False
@@ -250,7 +302,10 @@ def close_ports(
         return result
     for command in result.commands:
         try:
-            proc = subprocess.run(command, capture_output=True, text=True, timeout=30)
+            cmd_kwargs = {"capture_output": True, "text": True, "timeout": 30}
+            if hasattr(subprocess, "CREATE_NO_WINDOW"):
+                cmd_kwargs["creationflags"] = subprocess.CREATE_NO_WINDOW
+            proc = subprocess.run(command, **cmd_kwargs)
         except (OSError, subprocess.TimeoutExpired) as exc:
             result.ok = False
             result.errors.append(str(exc))

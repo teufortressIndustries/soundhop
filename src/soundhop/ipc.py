@@ -33,20 +33,49 @@ class IpcServer:
         self._sock: socket.socket | None = None
         self._thread: threading.Thread | None = None
         self._stop = threading.Event()
+        self._is_tcp = False
 
     def start(self) -> None:
         ensure_dir(self.path.parent)
         try:
-            if self.path.exists() or self.path.is_socket():
+            if self.path.exists() or (hasattr(self.path, "is_socket") and self.path.is_socket()):
                 self.path.unlink()
         except OSError:
             pass
-        sock = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
-        sock.bind(str(self.path))
+
+        port_file = self.path.with_suffix(".port")
         try:
-            os.chmod(self.path, 0o600)
+            if port_file.exists():
+                port_file.unlink()
         except OSError:
             pass
+
+        sock: socket.socket | None = None
+        use_unix = hasattr(socket, "AF_UNIX")
+        if use_unix:
+            try:
+                sock = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+                sock.bind(str(self.path))
+                if hasattr(os, "chmod"):
+                    try:
+                        os.chmod(self.path, 0o600)
+                    except OSError:
+                        pass
+                self._is_tcp = False
+            except OSError:
+                if sock:
+                    sock.close()
+                sock = None
+
+        if sock is None:
+            # Fallback to localhost TCP for Windows builds without AF_UNIX support
+            sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+            sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+            sock.bind(("127.0.0.1", 0))
+            bound_port = sock.getsockname()[1]
+            port_file.write_text(f"{bound_port}\n", encoding="utf-8")
+            self._is_tcp = True
+
         sock.listen(16)
         sock.settimeout(0.5)
         self._sock = sock
@@ -128,6 +157,12 @@ class IpcServer:
                 self.path.unlink()
         except OSError:
             pass
+        try:
+            port_file = self.path.with_suffix(".port")
+            if port_file.exists():
+                port_file.unlink()
+        except OSError:
+            pass
 
 
 def request(
@@ -141,10 +176,36 @@ def request(
 
     target = path or socket_path()
     request_data = {"cmd": command, **payload}
-    sock = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
-    sock.settimeout(timeout)
+    port_file = target.with_suffix(".port")
+
+    sock: socket.socket | None = None
+    if port_file.exists():
+        try:
+            port_str = port_file.read_text(encoding="utf-8").strip()
+            if port_str.isdigit():
+                sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+                sock.settimeout(timeout)
+                sock.connect(("127.0.0.1", int(port_str)))
+        except (OSError, ValueError):
+            if sock:
+                sock.close()
+            sock = None
+
+    if sock is None:
+        if not hasattr(socket, "AF_UNIX"):
+            raise DaemonNotRunning("SoundHop daemon is not running")
+        sock = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+        sock.settimeout(timeout)
+        try:
+            sock.connect(str(target))
+        except (FileNotFoundError, ConnectionRefusedError) as exc:
+            sock.close()
+            raise DaemonNotRunning("SoundHop daemon is not running") from exc
+        except OSError as exc:
+            sock.close()
+            raise DaemonNotRunning(f"SoundHop daemon is not reachable: {exc}") from exc
+
     try:
-        sock.connect(str(target))
         sock.sendall(json.dumps(request_data).encode("utf-8") + b"\n")
         data = b""
         while b"\n" not in data and len(data) < _MAX_REQUEST:
@@ -152,8 +213,6 @@ def request(
             if not chunk:
                 break
             data += chunk
-    except (FileNotFoundError, ConnectionRefusedError) as exc:
-        raise DaemonNotRunning("SoundHop daemon is not running") from exc
     except socket.timeout as exc:
         raise IpcError("The SoundHop daemon did not respond in time") from exc
     except OSError as exc:

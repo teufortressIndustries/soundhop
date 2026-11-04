@@ -18,6 +18,85 @@ UNIT_NAME = "soundhop.service"
 AUTOSTART_NAME = "soundhop-tray.desktop"
 
 
+WINREG_RUN_KEY = r"Software\Microsoft\Windows\CurrentVersion\Run"
+WINREG_APP_NAME = "SoundHop"
+
+
+def windows_autostart_command() -> str:
+    exe = python_executable()
+    if getattr(sys, "frozen", False):
+        return f'"{exe}" tray'
+    p = Path(exe)
+    pythonw = p.with_name("pythonw.exe")
+    runner = str(pythonw) if pythonw.is_file() else str(p)
+    return f'"{runner}" -m soundhop tray'
+
+
+def winreg_query_run(name: str = WINREG_APP_NAME) -> str | None:
+    try:
+        import winreg
+
+        with winreg.OpenKey(
+            winreg.HKEY_CURRENT_USER, WINREG_RUN_KEY, 0, winreg.KEY_QUERY_VALUE
+        ) as key:
+            val, _ = winreg.QueryValueEx(key, name)
+            return str(val)
+    except Exception:
+        return None
+
+
+def winreg_write_run(name: str = WINREG_APP_NAME, command: str | None = None) -> bool:
+    cmd = command or windows_autostart_command()
+    try:
+        import winreg
+
+        with winreg.OpenKey(
+            winreg.HKEY_CURRENT_USER, WINREG_RUN_KEY, 0, winreg.KEY_SET_VALUE
+        ) as key:
+            winreg.SetValueEx(key, name, 0, winreg.REG_SZ, cmd)
+        return True
+    except Exception:
+        return False
+
+
+def winreg_delete_run(name: str = WINREG_APP_NAME) -> bool:
+    try:
+        import winreg
+
+        with winreg.OpenKey(
+            winreg.HKEY_CURRENT_USER, WINREG_RUN_KEY, 0, winreg.KEY_SET_VALUE
+        ) as key:
+            winreg.DeleteValue(key, name)
+        return True
+    except Exception:
+        return False
+
+
+def windows_startup_dir() -> Path:
+    return (
+        Path(os.environ.get("APPDATA", Path.home() / "AppData" / "Roaming"))
+        / "Microsoft"
+        / "Windows"
+        / "Start Menu"
+        / "Programs"
+        / "Startup"
+    )
+
+
+def windows_startup_path() -> Path:
+    return windows_startup_dir() / "soundhop-tray.vbs"
+
+
+def windows_startup_text() -> str:
+    exe = python_executable().replace('"', '')
+    args = " tray" if getattr(sys, "frozen", False) else " -m soundhop tray"
+    return (
+        f'Set WshShell = CreateObject("WScript.Shell")\r\n'
+        f'WshShell.Run chr(34) & "{exe}" & chr(34) & "{args}", 0\r\n'
+        f"Set WshShell = Nothing\r\n"
+    )
+
+
 def systemd_dir() -> Path:
     return Path(os.environ.get("XDG_CONFIG_HOME", Path.home() / ".config")) / "systemd" / "user"
 
@@ -137,6 +216,19 @@ def install(
     start: bool = True,
     tray: bool = False,
 ) -> dict[str, Any]:
+    if sys.platform == "win32":
+        should_install = tray or enable
+        tray_written = install_tray_autostart() if should_install else False
+        has_reg = winreg_query_run() is not None
+        unit_label = "Windows Registry (HKCU Run)" if has_reg else "Windows Startup Folder"
+        tray_target = winreg_query_run() or (str(windows_startup_path()) if windows_startup_path().exists() else "")
+        return {
+            "unit": unit_label,
+            "daemon_reloaded": False,
+            "enabled": tray_written,
+            "started": False,
+            "tray_autostart": tray_target if tray_written else "",
+        }
     ensure_dir(systemd_dir())
     path = unit_path()
     path.write_text(unit_text(), encoding="utf-8")
@@ -155,6 +247,16 @@ def install(
 
 
 def uninstall(*, remove_tray: bool = True) -> dict[str, Any]:
+    if sys.platform == "win32":
+        tray_removed = remove_tray_autostart() if remove_tray else False
+        return {
+            "unit": "Windows Autostart",
+            "stopped": False,
+            "disabled": False,
+            "removed": tray_removed,
+            "daemon_reloaded": False,
+            "tray_removed": tray_removed,
+        }
     stopped = stop_service()
     disabled = disable_service()
     removed = False
@@ -210,6 +312,21 @@ def restart_service() -> bool:
 
 
 def service_status() -> dict[str, Any]:
+    if sys.platform == "win32":
+        reg_entry = winreg_query_run()
+        file_entry = windows_startup_path().exists()
+        autostart_active = bool(reg_entry or file_entry)
+        return {
+            "installed": autostart_active,
+            "loaded": autostart_active,
+            "active": autostart_active,
+            "sub": "active" if autostart_active else "dead",
+            "enabled": "enabled" if autostart_active else "disabled",
+            "running": autostart_active,
+            "main_pid": "",
+            "since": "",
+            "result": "",
+        }
     status: dict[str, Any] = {
         "systemd": systemctl_available(),
         "installed": unit_installed(),
@@ -250,6 +367,20 @@ def service_status() -> dict[str, Any]:
 
 
 def install_tray_autostart() -> bool:
+    if sys.platform == "win32":
+        if winreg_write_run():
+            try:
+                if windows_startup_path().exists():
+                    windows_startup_path().unlink()
+            except OSError:
+                pass
+            return True
+        try:
+            ensure_dir(windows_startup_dir())
+            windows_startup_path().write_text(windows_startup_text(), encoding="utf-8")
+            return True
+        except OSError:
+            return False
     ensure_dir(autostart_dir())
     try:
         autostart_path().write_text(autostart_text(), encoding="utf-8")
@@ -260,6 +391,15 @@ def install_tray_autostart() -> bool:
 
 
 def remove_tray_autostart() -> bool:
+    if sys.platform == "win32":
+        removed = winreg_delete_run()
+        try:
+            if windows_startup_path().exists():
+                windows_startup_path().unlink()
+                removed = True
+        except OSError:
+            pass
+        return removed
     try:
         if autostart_path().exists():
             autostart_path().unlink()
