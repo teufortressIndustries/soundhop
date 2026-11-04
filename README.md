@@ -233,17 +233,18 @@ name = "Fedora-Desktop"          # Display name broadcasted to other devices
 [sharing]
 enabled = false                 # Whether this device accepts incoming audio
 security = "trusted-lan"        # "trusted-lan" (RFC1918 subnets), "cookie" (auth cookie), or "open"
-buffer_latency_ms = 0           # 0 = automatic default (or 50 for low-latency, 100 balanced, 200 Wi-Fi buffer)
 
 [connection]
-auto_reconnect = true           # Automatically reconnect to last paired device when seen
+auto_connect = true             # Automatically reconnect to last paired device when seen
 disconnect_on_quit = true       # Drop remote tunnel and restore local audio when tray app exits
-fallback_sink = ""              # Specific sink to restore to (empty = restore previous default)
+latency_ms = 0                  # 0 = automatic default (or 50 for low-latency, 100 balanced, 200 Wi-Fi buffer)
 
 [discovery]
 port = 47777                    # UDP broadcast discovery port
 mdns = true                     # Enable mDNS fallback browsing
 ```
+
+*(SoundHop automatically tracks your hardware outputs and restores audio to your previous default sink on disconnect).*
 
 ---
 

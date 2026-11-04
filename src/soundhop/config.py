@@ -42,6 +42,13 @@ _SECURITY_ALIASES = {
 }
 
 
+_CONFIG_ALIASES = {
+    "connection.auto_reconnect": "connection.auto_connect",
+    "connection.buffer_latency_ms": "connection.latency_ms",
+    "sharing.buffer_latency_ms": "connection.latency_ms",
+}
+
+
 class ConfigError(ValueError):
     pass
 
@@ -143,9 +150,15 @@ class Config:
             return value if isinstance(value, dict) else {}
 
         cfg = cls(path=path or config_path())
+        # Support legacy / alternate sharing.buffer_latency_ms
+        sharing_dict = section("sharing")
+        connection_dict = section("connection")
+        if "buffer_latency_ms" in sharing_dict and "latency_ms" not in connection_dict:
+            connection_dict["latency_ms"] = sharing_dict["buffer_latency_ms"]
+
         _apply_dataclass(cfg.device, section("device"), "device")
-        _apply_dataclass(cfg.sharing, section("sharing"), "sharing")
-        _apply_dataclass(cfg.connection, section("connection"), "connection")
+        _apply_dataclass(cfg.sharing, sharing_dict, "sharing")
+        _apply_dataclass(cfg.connection, connection_dict, "connection")
         _apply_dataclass(cfg.discovery, section("discovery"), "discovery")
         _apply_dataclass(cfg.ui, section("ui"), "ui")
         _apply_dataclass(cfg.android, section("android"), "android")
@@ -298,6 +311,7 @@ class Config:
         }
 
     def get(self, dotted: str) -> Any:
+        dotted = _CONFIG_ALIASES.get(dotted, dotted)
         current: Any = self
         for part in dotted.split("."):
             if not hasattr(current, part):
@@ -306,6 +320,7 @@ class Config:
         return current
 
     def set(self, dotted: str, value: Any) -> None:
+        dotted = _CONFIG_ALIASES.get(dotted, dotted)
         parts = dotted.split(".")
         if len(parts) != 2:
             raise ConfigError("Use section.key, for example connection.auto_connect")
@@ -337,7 +352,13 @@ class Config:
 
 def _apply_dataclass(target: Any, raw: dict[str, Any], section: str) -> None:
     valid = {f.name for f in fields(target)}
-    for key, value in raw.items():
+    data = dict(raw)
+    if section == "connection":
+        if "auto_reconnect" in data and "auto_connect" not in data:
+            data["auto_connect"] = data["auto_reconnect"]
+        if "buffer_latency_ms" in data and "latency_ms" not in data:
+            data["latency_ms"] = data["buffer_latency_ms"]
+    for key, value in data.items():
         if key in valid:
             setattr(target, key, value)
 

@@ -74,6 +74,34 @@ class CliTest(unittest.TestCase):
             output = buf.getvalue()
             self.assertIn("soundhop", output)
             self.assertIn("shop", output)
+            self.assertIn("android", output)
+
+    def test_auto_pause_resume_parsing(self) -> None:
+        parser = build_parser()
+        args_pause = parser.parse_args(["auto", "pause"])
+        self.assertEqual(args_pause.action, "pause")
+        args_resume = parser.parse_args(["auto", "resume"])
+        self.assertEqual(args_resume.action, "resume")
+
+    def test_android_direct_target_parsing(self) -> None:
+        parser = build_parser()
+        args = parser.parse_args(["android", "192.168.1.99"])
+        self.assertEqual(args.subaction, "192.168.1.99")
+        self.assertIsNone(args.target)
+
+    def test_auto_pause_resume_execution_offline(self) -> None:
+        from unittest.mock import patch
+        from soundhop.state import State
+        with patch("soundhop.cli.core_cmds._is_running", return_value=False):
+            ret_pause = main(["auto", "pause"])
+            self.assertEqual(ret_pause, 0)
+            state = State.load()
+            self.assertTrue(state.auto_paused)
+
+            ret_resume = main(["auto", "resume"])
+            self.assertEqual(ret_resume, 0)
+            state = State.load()
+            self.assertFalse(state.auto_paused)
 
     def test_android_stop_targeted_kill_behavior(self) -> None:
         import signal

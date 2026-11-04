@@ -38,6 +38,28 @@ def _request(method: str, timeout: float = 15.0, **params: Any) -> Any:
 
 def cmd_android(args: argparse.Namespace) -> int:
     sub = getattr(args, "subaction", None)
+    known_actions = {
+        "start",
+        "capture",
+        "connect",
+        "stop",
+        "disconnect",
+        "status",
+        "devices",
+        "wifi",
+        "encoders",
+        "codecs",
+        "install",
+    }
+    if sub is not None and sub not in known_actions:
+        if getattr(args, "target", None) is None:
+            args.target = sub
+            sub = "start"
+            args.subaction = "start"
+        else:
+            error(f"Unknown android action: {sub}")
+            return 1
+
     if sub in ("stop", "disconnect"):
         return cmd_android_stop(args)
     if sub == "status":
@@ -319,11 +341,11 @@ def cmd_android_start(args: argparse.Namespace) -> int:
             if d.serial == target_str or (d.ip and d.ip == target_str):
                 target_device = d
                 break
-        if not target_device and ":" in target_str:
+        if not target_device and (":" in target_str or "." in target_str):
             mgr.connect_wifi(target_str)
             devices = mgr.list_devices()
             for d in devices:
-                if d.serial == target_str or d.ip == target_str:
+                if d.serial == target_str or d.ip == target_str or (d.ip and target_str.startswith(d.ip)):
                     target_device = d
                     break
 
@@ -516,9 +538,11 @@ def cmd_android_start(args: argparse.Namespace) -> int:
     except KeyboardInterrupt:
         print()
         info("Stopping audio capture...")
+    except Exception as exc:
+        error(str(exc))
+        return 1
     finally:
         session.stop()
-        ok("Audio capture stopped.")
     return 0
 
 

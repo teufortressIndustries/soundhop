@@ -388,6 +388,25 @@ def cmd_auto(args: argparse.Namespace) -> int:
             print(f"  Last device: {payload['last_peer']}")
         return 0
 
+    if action in ("pause", "resume"):
+        paused = action == "pause"
+        if _is_running():
+            try:
+                result = _request("pause_auto", timeout=10.0, paused=paused)
+            except (DaemonNotRunning, IpcError, OSError) as exc:
+                error(str(exc))
+                return 1
+        else:
+            state = State.load()
+            state.auto_paused = paused
+            state.save()
+            result = {"paused": paused}
+        if _json_enabled(args):
+            emit_json(result)
+            return 0
+        ok(f"Auto-connect {'paused' if paused else 'resumed'}.")
+        return 0
+
     enabled = action == "on"
     if _is_running():
         try:
@@ -684,7 +703,7 @@ def cmd_logs(args: argparse.Namespace) -> int:
 def cmd_completions(args: argparse.Namespace) -> int:
     commands = (
         "setup status discover devices connect disconnect share auto daemon stop "
-        "service firewall config doctor tray logs bug-report version completions"
+        "service firewall config doctor tray logs bug-report version completions android"
     )
     if args.shell == "bash":
         print(
@@ -705,6 +724,8 @@ _soundhop() {{
     COMPREPLY=( $(compgen -W "on off status toggle" -- "$cur") )
   elif [[ "$prev" == "auto" ]]; then
     COMPREPLY=( $(compgen -W "on off pause resume status" -- "$cur") )
+  elif [[ "$prev" == "android" ]]; then
+    COMPREPLY=( $(compgen -W "start capture connect stop disconnect status devices wifi encoders codecs install" -- "$cur") )
   fi
 }}
 complete -F _soundhop soundhop shop"""
@@ -725,6 +746,7 @@ _soundhop() {{
         config) _values 'action' path show get set edit reload ;;
         share) _values 'action' on off status toggle ;;
         auto) _values 'action' on off pause resume status ;;
+        android) _values 'action' start capture connect stop disconnect status devices wifi encoders codecs install ;;
       esac
       ;;
   esac
@@ -741,6 +763,7 @@ for cmd in soundhop shop
     complete -c $cmd -n "__fish_seen_subcommand_from config" -a "path show get set edit reload"
     complete -c $cmd -n "__fish_seen_subcommand_from share" -a "on off status toggle"
     complete -c $cmd -n "__fish_seen_subcommand_from auto" -a "on off pause resume status"
+    complete -c $cmd -n "__fish_seen_subcommand_from android" -a "start capture connect stop disconnect status devices wifi encoders codecs install"
 end"""
         )
     return 0

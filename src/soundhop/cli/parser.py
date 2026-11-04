@@ -152,7 +152,10 @@ def build_parser() -> argparse.ArgumentParser:
 
     p = add("auto", "control auto-connect", cmd_auto)
     p.add_argument(
-        "action", nargs="?", choices=("on", "off", "status"), default="status"
+        "action",
+        nargs="?",
+        choices=("on", "off", "pause", "resume", "status"),
+        default="status",
     )
 
     p = add("daemon", "run the background daemon", cmd_daemon)
@@ -240,21 +243,8 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument(
         "subaction",
         nargs="?",
-        choices=(
-            "start",
-            "capture",
-            "connect",
-            "stop",
-            "disconnect",
-            "status",
-            "devices",
-            "wifi",
-            "encoders",
-            "codecs",
-            "install",
-        ),
         default=None,
-        help="android subcommand (default: interactive capture wizard)",
+        help="action (start, connect, stop, status, devices, wifi, encoders, install) or device IP/serial",
     )
     p.add_argument("target", nargs="?", help="device serial, IP address, or number")
     p.add_argument(
