@@ -60,6 +60,11 @@ class PackagingTest(unittest.TestCase):
         self.assertIn(f"X-AppImage-Version={VERSION}", desktop)
         self.assertNotIn("0.2.1", desktop)
 
+        metainfo = (ROOT_DIR / "packaging" / "io.github.soundhop.metainfo.xml").read_text(
+            encoding="utf-8"
+        )
+        self.assertIn(f'<release version="{VERSION}"', metainfo)
+
     def test_bump_version_updates_pyproject_toml(self) -> None:
         import re
 

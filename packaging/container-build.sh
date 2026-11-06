@@ -30,7 +30,7 @@ if ! command -v python3 >/dev/null 2>&1 || ! command -v zstd >/dev/null 2>&1 || 
     fi
     $SUDO apt-get update -qq
     $SUDO apt-get install -y -qq --no-install-recommends \
-        python3 python3-pip python3-venv wget curl ca-certificates file libgl1 libegl1 libxkbcommon0 libpulse0 zstd binutils
+        python3 python3-pip python3-venv wget curl ca-certificates file libgl1 libegl1 libxkbcommon0 libpulse0 zstd binutils appstream
 else
     echo "1. Base system dependencies already present."
 fi
@@ -174,9 +174,13 @@ else
     ln -sf soundhop.svg "$APP_DIR/.DirIcon"
 fi
 
-mkdir -p "$APP_DIR/usr/share/applications" "$APP_DIR/usr/share/icons/hicolor/scalable/apps" "$APP_DIR/usr/share/icons/hicolor/256x256/apps"
+mkdir -p "$APP_DIR/usr/share/applications" "$APP_DIR/usr/share/icons/hicolor/scalable/apps" "$APP_DIR/usr/share/icons/hicolor/256x256/apps" "$APP_DIR/usr/share/metainfo"
 cp "$REPO_DIR/packaging/io.github.soundhop.desktop" "$APP_DIR/usr/share/applications/io.github.soundhop.desktop"
 ln -sf io.github.soundhop.desktop "$APP_DIR/usr/share/applications/soundhop.desktop"
+if [ -f "$REPO_DIR/packaging/io.github.soundhop.metainfo.xml" ]; then
+    cp "$REPO_DIR/packaging/io.github.soundhop.metainfo.xml" "$APP_DIR/usr/share/metainfo/io.github.soundhop.metainfo.xml"
+    ln -sf io.github.soundhop.metainfo.xml "$APP_DIR/usr/share/metainfo/soundhop.appdata.xml"
+fi
 cp "$REPO_DIR/src/soundhop/assets/soundhop.svg" "$APP_DIR/usr/share/icons/hicolor/scalable/apps/soundhop.svg"
 if [ -f "$REPO_DIR/src/soundhop/assets/soundhop.png" ]; then
     cp "$REPO_DIR/src/soundhop/assets/soundhop.png" "$APP_DIR/usr/share/icons/hicolor/256x256/apps/soundhop.png"

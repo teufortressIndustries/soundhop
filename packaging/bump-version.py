@@ -143,6 +143,16 @@ def main() -> int:
             desktop_path.write_text(content.rstrip() + f"\nX-AppImage-Version={new_ver}\n", encoding="utf-8")
             changes.append(f"✓ {desktop_path.relative_to(ROOT_DIR)} (AppImage desktop entry version added)")
 
+    # 7. packaging/io.github.soundhop.metainfo.xml
+    metainfo_path = ROOT_DIR / "packaging" / "io.github.soundhop.metainfo.xml"
+    if metainfo_path.exists():
+        if update_file(
+            metainfo_path,
+            r'<release version="[^"]+"',
+            f'<release version="{new_ver}"',
+        ):
+            changes.append(f"✓ {metainfo_path.relative_to(ROOT_DIR)} (AppStream metainfo version)")
+
     if not changes:
         print(f"All files already synchronized to version {new_ver}.")
         return 0

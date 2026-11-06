@@ -1,0 +1,24 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<component type="desktop-application">
+  <id>io.github.soundhop</id>
+  <metadata_license>CC0-1.0</metadata_license>
+  <project_license>MIT</project_license>
+  <name>SoundHop</name>
+  <summary>Stream and share audio between local Linux machines seamlessly</summary>
+  <description>
+    <p>
+      SoundHop wraps PipeWire and PulseAudio in an automatic, self-healing workflow
+      with zero-configuration LAN discovery and an intuitive desktop system tray.
+    </p>
+  </description>
+  <launchable type="desktop-id">io.github.soundhop.desktop</launchable>
+  <url type="homepage">https://github.com/teufortressIndustries/soundhop</url>
+  <url type="bugtracker">https://github.com/teufortressIndustries/soundhop/issues</url>
+  <provides>
+    <binary>soundhop</binary>
+    <binary>shop</binary>
+  </provides>
+  <releases>
+    <release version="1.1.6" date="2026-11-06"/>
+  </releases>
+</component>
