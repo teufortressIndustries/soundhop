@@ -3,14 +3,12 @@
 import tempfile
 import unittest
 from pathlib import Path
-
 from unittest.mock import MagicMock, PropertyMock, patch
 
 from soundhop.backend import AudioBackend
 from soundhop.config import Config
 from soundhop.controller import Controller
 from soundhop.discovery import Peer
-from soundhop.state import State
 from soundhop.util import Result
 
 
@@ -41,15 +39,18 @@ class ControllerTest(unittest.TestCase):
                     )
                 elif "pactl list short sinks" in cmd_str:
                     lines = ["1\talsa_output.pci\tPipeWire\ts32le 2ch 48000Hz\tRUNNING"]
-                    for mod_id, (mname, margs) in loaded_modules.items():
+                    for _mod_id, (mname, margs) in loaded_modules.items():
                         if "module-tunnel-sink" in mname:
                             import re
+
                             m = re.search(r"sink_name=([^\s]+)", margs)
                             sname = m.group(1) if m else "soundhop_remote"
                             lines.append(f"100\t{sname}\tPipeWire\ts16le 2ch 44100Hz\tIDLE")
                     return Result(args=cmd, stdout="\n".join(lines) + "\n", stderr="", returncode=0)
                 elif "pactl list short modules" in cmd_str:
-                    lines = [f"{mid}\t{mname}\t{margs}" for mid, (mname, margs) in loaded_modules.items()]
+                    lines = [
+                        f"{mid}\t{mname}\t{margs}" for mid, (mname, margs) in loaded_modules.items()
+                    ]
                     return Result(args=cmd, stdout="\n".join(lines) + "\n", stderr="", returncode=0)
                 elif "pactl list short sink-inputs" in cmd_str:
                     return Result(args=cmd, stdout="", stderr="", returncode=0)
@@ -107,17 +108,25 @@ class ControllerTest(unittest.TestCase):
 
     def test_disconnect_stops_android_session(self) -> None:
         from pathlib import Path
+
         cfg = Config(Path("/tmp/test.toml"))
         backend = MagicMock()
         controller = Controller(config=cfg, backend=backend)
-        with patch.object(type(controller.android_session), "is_active", new_callable=PropertyMock, return_value=True), \
-             patch.object(controller.android_session, "stop") as mock_stop:
+        with (
+            patch.object(
+                type(controller.android_session),
+                "is_active",
+                new_callable=PropertyMock,
+                return_value=True,
+            ),
+            patch.object(controller.android_session, "stop") as mock_stop,
+        ):
             controller.disconnect(stop_android=True)
             mock_stop.assert_called_once()
 
-
     def test_reconcile_resurrects_listener_after_server_restart(self) -> None:
         from pathlib import Path
+
         from soundhop.backend import Listener
 
         cfg = Config(Path("/tmp/test.toml"))

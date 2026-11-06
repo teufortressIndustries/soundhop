@@ -62,6 +62,7 @@ class UtilTest(unittest.TestCase):
 
     def test_atomic_write_concurrency(self) -> None:
         import concurrent.futures
+
         with tempfile.TemporaryDirectory() as tmpdir:
             target = Path(tmpdir) / "concurrent.txt"
 
@@ -80,6 +81,7 @@ class UtilTest(unittest.TestCase):
 
     def test_is_private_address(self) -> None:
         from soundhop.util import is_private_address
+
         # Private IPv4
         self.assertTrue(is_private_address("127.0.0.1"))
         self.assertTrue(is_private_address("192.168.1.1"))
@@ -105,15 +107,19 @@ class UtilTest(unittest.TestCase):
         self.assertFalse(is_private_address("invalid-host-that-does-not-exist-12345.xyz"))
 
     def test_broadcast_addresses_cache(self) -> None:
-        from soundhop.util import broadcast_addresses, invalidate_broadcast_cache
         from unittest.mock import patch
+
+        from soundhop.util import broadcast_addresses, invalidate_broadcast_cache
+
         invalidate_broadcast_cache()
         addrs1 = broadcast_addresses()
         self.assertIn("127.0.0.1", addrs1)
         self.assertIn("255.255.255.255", addrs1)
 
         # Call again with run patched to fail; should return cached targets without spawning subprocess
-        with patch("soundhop.util.run", side_effect=RuntimeError("Subprocess should not be called")):
+        with patch(
+            "soundhop.util.run", side_effect=RuntimeError("Subprocess should not be called")
+        ):
             addrs2 = broadcast_addresses(include_loopback=False)
             self.assertNotIn("127.0.0.1", addrs2)
             self.assertIn("255.255.255.255", addrs2)
@@ -126,4 +132,3 @@ class UtilTest(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
-

@@ -39,7 +39,9 @@ class FirewallTest(unittest.TestCase):
     @patch("soundhop.firewall._sudo_prefix", return_value=["sudo"])
     @patch("soundhop.firewall._default_zone", return_value="FedoraWorkstation")
     def test_firewalld_commands(self, mock_zone, mock_sudo, mock_detect) -> None:
-        mock_detect.return_value = FirewallState(kind="firewalld", active=True, detail="firewalld active")
+        mock_detect.return_value = FirewallState(
+            kind="firewalld", active=True, detail="firewalld active"
+        )
 
         res = open_ports(4713, 47777, dry_run=True, include_mdns=True)
         self.assertTrue(res.ok)
@@ -58,21 +60,30 @@ class FirewallTest(unittest.TestCase):
 
     @patch("soundhop.firewall.detect")
     def test_windows_defender_commands(self, mock_detect) -> None:
-        mock_detect.return_value = FirewallState(kind="windows-defender", active=True, detail="Windows Defender active")
+        mock_detect.return_value = FirewallState(
+            kind="windows-defender", active=True, detail="Windows Defender active"
+        )
 
         res = open_ports(4713, 47777, dry_run=True, include_mdns=True)
         self.assertTrue(res.ok)
         cmds = [" ".join(c) for c in res.commands]
-        self.assertTrue(any("netsh advfirewall firewall add rule" in c and "4713" in c for c in cmds))
-        self.assertTrue(any("netsh advfirewall firewall add rule" in c and "47777" in c for c in cmds))
+        self.assertTrue(
+            any("netsh advfirewall firewall add rule" in c and "4713" in c for c in cmds)
+        )
+        self.assertTrue(
+            any("netsh advfirewall firewall add rule" in c and "47777" in c for c in cmds)
+        )
         self.assertTrue(any("5353" in c for c in cmds))
 
         close_res = close_ports(4713, 47777, dry_run=True, include_mdns=True)
         self.assertTrue(close_res.ok)
         close_cmds = [" ".join(c) for c in close_res.commands]
-        self.assertTrue(any("netsh advfirewall firewall delete rule" in c and "4713" in c for c in close_cmds))
-        self.assertTrue(any("netsh advfirewall firewall delete rule" in c and "47777" in c for c in close_cmds))
-
+        self.assertTrue(
+            any("netsh advfirewall firewall delete rule" in c and "4713" in c for c in close_cmds)
+        )
+        self.assertTrue(
+            any("netsh advfirewall firewall delete rule" in c and "47777" in c for c in close_cmds)
+        )
 
 
 if __name__ == "__main__":

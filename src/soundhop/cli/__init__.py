@@ -13,7 +13,7 @@ from __future__ import annotations
 
 import os
 import sys
-from typing import Sequence
+from collections.abc import Sequence
 
 from ..backend import BackendError
 from ..config import ConfigError

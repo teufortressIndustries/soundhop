@@ -13,6 +13,7 @@ import shutil
 import subprocess
 import sys
 from dataclasses import dataclass, field
+from typing import Any
 
 log = logging.getLogger(__name__)
 
@@ -81,16 +82,18 @@ def detect() -> FirewallState:
                     return FirewallState(
                         "windows-defender",
                         active,
-                        "Windows Defender Firewall is active" if active else "Windows Defender Firewall is off",
+                        "Windows Defender Firewall is active"
+                        if active
+                        else "Windows Defender Firewall is off",
                     )
             except (OSError, subprocess.TimeoutExpired):
                 pass
-        return FirewallState("none", False, "Windows Defender Firewall state could not be determined")
+        return FirewallState(
+            "none", False, "Windows Defender Firewall state could not be determined"
+        )
     if shutil.which("ufw"):
         try:
-            result = subprocess.run(
-                ["ufw", "status"], capture_output=True, text=True, timeout=5
-            )
+            result = subprocess.run(["ufw", "status"], capture_output=True, text=True, timeout=5)
             output = (result.stdout + result.stderr).lower()
             if "status: active" in output:
                 return FirewallState("ufw", True, "ufw is active")
@@ -101,9 +104,7 @@ def detect() -> FirewallState:
             pass
     if shutil.which("firewall-cmd"):
         try:
-            result = subprocess.run(
-                ["systemctl", "is-active", "--quiet", "firewalld"], timeout=5
-            )
+            result = subprocess.run(["systemctl", "is-active", "--quiet", "firewalld"], timeout=5)
             if result.returncode == 0:
                 return FirewallState("firewalld", True, "firewalld is active")
             return FirewallState("firewalld", False, "firewalld is installed but inactive")
@@ -185,22 +186,61 @@ def open_ports(
             ],
         ]
         if include_mdns:
-            result.commands.append([
-                *sudo,
-                "firewall-cmd",
-                *zone_args,
-                f"--add-port={MDNS_PORT}/udp",
-                "--permanent",
-            ])
-            result.commands.append([*sudo, "firewall-cmd", *zone_args, "--add-service=mdns", "--permanent"])
+            result.commands.append(
+                [
+                    *sudo,
+                    "firewall-cmd",
+                    *zone_args,
+                    f"--add-port={MDNS_PORT}/udp",
+                    "--permanent",
+                ]
+            )
+            result.commands.append(
+                [*sudo, "firewall-cmd", *zone_args, "--add-service=mdns", "--permanent"]
+            )
         result.commands.append([*sudo, "firewall-cmd", "--reload"])
     elif state.kind == "windows-defender":
         result.commands = [
-            ["netsh", "advfirewall", "firewall", "add", "rule", f"name=SoundHop Audio ({audio_port}/tcp)", "dir=in", "action=allow", "protocol=TCP", f"localport={audio_port}"],
-            ["netsh", "advfirewall", "firewall", "add", "rule", f"name=SoundHop Discovery ({discovery_port}/udp)", "dir=in", "action=allow", "protocol=UDP", f"localport={discovery_port}"],
+            [
+                "netsh",
+                "advfirewall",
+                "firewall",
+                "add",
+                "rule",
+                f"name=SoundHop Audio ({audio_port}/tcp)",
+                "dir=in",
+                "action=allow",
+                "protocol=TCP",
+                f"localport={audio_port}",
+            ],
+            [
+                "netsh",
+                "advfirewall",
+                "firewall",
+                "add",
+                "rule",
+                f"name=SoundHop Discovery ({discovery_port}/udp)",
+                "dir=in",
+                "action=allow",
+                "protocol=UDP",
+                f"localport={discovery_port}",
+            ],
         ]
         if include_mdns:
-            result.commands.append(["netsh", "advfirewall", "firewall", "add", "rule", f"name=SoundHop mDNS ({MDNS_PORT}/udp)", "dir=in", "action=allow", "protocol=UDP", f"localport={MDNS_PORT}"])
+            result.commands.append(
+                [
+                    "netsh",
+                    "advfirewall",
+                    "firewall",
+                    "add",
+                    "rule",
+                    f"name=SoundHop mDNS ({MDNS_PORT}/udp)",
+                    "dir=in",
+                    "action=allow",
+                    "protocol=UDP",
+                    f"localport={MDNS_PORT}",
+                ]
+            )
     else:
         result.note = (
             "nftables detected. Add these rules yourself (or use ufw/firewalld):\\n"
@@ -268,15 +308,19 @@ def close_ports(
             [*sudo, "ufw", "delete", "allow", f"{discovery_port}/udp"],
         ]
         if include_mdns:
-            result.commands.append(
-                [*sudo, "ufw", "delete", "allow", f"{MDNS_PORT}/udp"]
-            )
+            result.commands.append([*sudo, "ufw", "delete", "allow", f"{MDNS_PORT}/udp"])
     elif state.kind == "firewalld":
         zone = _default_zone()
         zone_args = ["--zone", zone] if zone else []
         result.commands = [
             [*sudo, "firewall-cmd", *zone_args, f"--remove-port={audio_port}/tcp", "--permanent"],
-            [*sudo, "firewall-cmd", *zone_args, f"--remove-port={discovery_port}/udp", "--permanent"],
+            [
+                *sudo,
+                "firewall-cmd",
+                *zone_args,
+                f"--remove-port={discovery_port}/udp",
+                "--permanent",
+            ],
         ]
         if include_mdns:
             result.commands.append(
@@ -288,11 +332,34 @@ def close_ports(
         result.commands.append([*sudo, "firewall-cmd", "--reload"])
     elif state.kind == "windows-defender":
         result.commands = [
-            ["netsh", "advfirewall", "firewall", "delete", "rule", f"name=SoundHop Audio ({audio_port}/tcp)"],
-            ["netsh", "advfirewall", "firewall", "delete", "rule", f"name=SoundHop Discovery ({discovery_port}/udp)"],
+            [
+                "netsh",
+                "advfirewall",
+                "firewall",
+                "delete",
+                "rule",
+                f"name=SoundHop Audio ({audio_port}/tcp)",
+            ],
+            [
+                "netsh",
+                "advfirewall",
+                "firewall",
+                "delete",
+                "rule",
+                f"name=SoundHop Discovery ({discovery_port}/udp)",
+            ],
         ]
         if include_mdns:
-            result.commands.append(["netsh", "advfirewall", "firewall", "delete", "rule", f"name=SoundHop mDNS ({MDNS_PORT}/udp)"])
+            result.commands.append(
+                [
+                    "netsh",
+                    "advfirewall",
+                    "firewall",
+                    "delete",
+                    "rule",
+                    f"name=SoundHop mDNS ({MDNS_PORT}/udp)",
+                ]
+            )
     else:
         result.note = "Remove the SoundHop nftables rules manually."
         result.ok = False

@@ -19,11 +19,12 @@ import threading
 import time
 import urllib.request
 import zipfile
+from collections.abc import Callable, Sequence
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Any, Callable, Sequence
+from typing import Any
 
-from .util import CommandError, Result, data_dir, run
+from .util import Result, data_dir, run
 
 log = logging.getLogger(__name__)
 
@@ -277,12 +278,11 @@ class AndroidManager:
 
         log.info("Downloading scrcpy %s from %s to %s", version, url, archive_path)
         try:
-            req = urllib.request.Request(
-                url, headers={"User-Agent": "SoundHop-AndroidManager"}
-            )
-            with urllib.request.urlopen(req, timeout=30.0) as resp, open(
-                archive_path, "wb"
-            ) as out_file:
+            req = urllib.request.Request(url, headers={"User-Agent": "SoundHop-AndroidManager"})
+            with (
+                urllib.request.urlopen(req, timeout=30.0) as resp,
+                open(archive_path, "wb") as out_file,
+            ):
                 total = int(resp.headers.get("Content-Length", 0))
                 downloaded = 0
                 chunk_size = 65536
@@ -318,7 +318,9 @@ class AndroidManager:
                             continue
                         target_path = (dest_dir / target_name).resolve()
                         try:
-                            if os.path.commonpath([dest_dir_resolved, target_path]) != str(dest_dir_resolved):
+                            if os.path.commonpath([dest_dir_resolved, target_path]) != str(
+                                dest_dir_resolved
+                            ):
                                 continue
                         except ValueError:
                             continue
@@ -338,13 +340,19 @@ class AndroidManager:
 
                     for m in members:
                         # Strip top-level directory prefix so binaries sit directly in dest_dir
-                        target_name = m.name[len(prefix) :] if prefix and m.name.startswith(prefix) else m.name
+                        target_name = (
+                            m.name[len(prefix) :]
+                            if prefix and m.name.startswith(prefix)
+                            else m.name
+                        )
                         if not target_name:
                             continue
                         # Security check: avoid directory traversal
                         target_path = (dest_dir / target_name).resolve()
                         try:
-                            if os.path.commonpath([dest_dir_resolved, target_path]) != str(dest_dir_resolved):
+                            if os.path.commonpath([dest_dir_resolved, target_path]) != str(
+                                dest_dir_resolved
+                            ):
                                 continue
                         except ValueError:
                             continue
@@ -355,7 +363,9 @@ class AndroidManager:
                                 continue
                             link_target_path = (target_path.parent / m.linkname).resolve()
                             try:
-                                if os.path.commonpath([dest_dir_resolved, link_target_path]) != str(dest_dir_resolved):
+                                if os.path.commonpath([dest_dir_resolved, link_target_path]) != str(
+                                    dest_dir_resolved
+                                ):
                                     continue
                             except ValueError:
                                 continue
@@ -373,7 +383,9 @@ class AndroidManager:
                             )
                             link_target_path = (dest_dir / link_target_name).resolve()
                             try:
-                                if os.path.commonpath([dest_dir_resolved, link_target_path]) != str(dest_dir_resolved):
+                                if os.path.commonpath([dest_dir_resolved, link_target_path]) != str(
+                                    dest_dir_resolved
+                                ):
                                     continue
                             except ValueError:
                                 continue
@@ -384,7 +396,12 @@ class AndroidManager:
                                     target_path.unlink(missing_ok=True)
                                 os.link(link_target_path, target_path)
                             except OSError as exc:
-                                log.debug("Hardlink creation failed for %s -> %s: %s", target_path, link_target_path, exc)
+                                log.debug(
+                                    "Hardlink creation failed for %s -> %s: %s",
+                                    target_path,
+                                    link_target_path,
+                                    exc,
+                                )
                         elif m.isdir():
                             target_path.mkdir(parents=True, exist_ok=True)
                         else:
@@ -397,7 +414,11 @@ class AndroidManager:
                                     target_path.unlink(missing_ok=True)
                                 with open(target_path, "wb") as f:
                                     shutil.copyfileobj(extracted, f)
-                                if m.name.endswith("scrcpy") or m.name.endswith("adb") or (m.mode & 0o111):
+                                if (
+                                    m.name.endswith("scrcpy")
+                                    or m.name.endswith("adb")
+                                    or (m.mode & 0o111)
+                                ):
                                     try:
                                         os.chmod(target_path, 0o755)
                                     except OSError:
@@ -508,11 +529,14 @@ class AndroidManager:
         """Fetch Android release version, SDK version, and manufacturer via getprop."""
         try:
             res = self._run_adb(
-                ["shell", "getprop ro.build.version.release; getprop ro.build.version.sdk; getprop ro.product.manufacturer; getprop ro.product.model"],
+                [
+                    "shell",
+                    "getprop ro.build.version.release; getprop ro.build.version.sdk; getprop ro.product.manufacturer; getprop ro.product.model",
+                ],
                 serial=device.serial,
                 timeout=4.0,
             )
-            lines = [l.strip() for l in res.stdout.splitlines() if l.strip()]
+            lines = [line.strip() for line in res.stdout.splitlines() if line.strip()]
             if len(lines) >= 1 and lines[0]:
                 device.android_version = lines[0]
             if len(lines) >= 2 and lines[1].isdigit():

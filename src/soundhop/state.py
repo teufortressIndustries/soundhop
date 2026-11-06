@@ -28,7 +28,7 @@ class KnownPeer:
     security: str = "trusted-lan"
 
     @classmethod
-    def from_dict(cls, raw: dict[str, Any]) -> "KnownPeer":
+    def from_dict(cls, raw: dict[str, Any]) -> KnownPeer:
         return cls(
             id=str(raw.get("id", "")),
             name=str(raw.get("name", "")),
@@ -68,7 +68,7 @@ class State:
     # -- persistence -----------------------------------------------------
 
     @classmethod
-    def load(cls, path: Path | None = None) -> "State":
+    def load(cls, path: Path | None = None) -> State:
         path = path or state_path()
         if not path.exists():
             return cls()
@@ -93,7 +93,13 @@ class State:
             "android_codec",
         ):
             setattr(state, key, str(raw.get(key, "") or ""))
-        for key in ("connected_port", "connected_module", "listener_module", "listener_port", "android_pid"):
+        for key in (
+            "connected_port",
+            "connected_module",
+            "listener_module",
+            "listener_port",
+            "android_pid",
+        ):
             try:
                 setattr(state, key, int(raw.get(key, 0) or 0))
             except (TypeError, ValueError):
@@ -163,9 +169,7 @@ class State:
             return
         cutoff = daemon_time() - max_age
         keep = {
-            peer_id: peer
-            for peer_id, peer in self.known_peers.items()
-            if peer.last_seen >= cutoff
+            peer_id: peer for peer_id, peer in self.known_peers.items() if peer.last_seen >= cutoff
         }
         if len(keep) > limit:
             newest = sorted(keep.values(), key=lambda p: p.last_seen, reverse=True)[:limit]

@@ -70,16 +70,12 @@ def build_parser() -> argparse.ArgumentParser:
     sub = parser.add_subparsers(dest="command", metavar="COMMAND")
 
     def add(name: str, help_text: str, func: Any) -> argparse.ArgumentParser:
-        p = sub.add_parser(
-            name, help=help_text, description=help_text, parents=[common]
-        )
+        p = sub.add_parser(name, help=help_text, description=help_text, parents=[common])
         p.set_defaults(func=func)
         return p
 
     p = add("setup", "configure this device for local audio sharing", cmd_setup)
-    p.add_argument(
-        "--yes", action="store_true", help="accept defaults (non-interactive)"
-    )
+    p.add_argument("--yes", action="store_true", help="accept defaults (non-interactive)")
     p.add_argument("--name", help="this device's advertised name")
     p.add_argument("--port", type=int, help="audio port (default 4713)")
     p.add_argument("--security", choices=SECURITY_MODES, help="listener security mode")
@@ -90,25 +86,15 @@ def build_parser() -> argparse.ArgumentParser:
         default=None,
         help="enable auto-connect",
     )
-    p.add_argument(
-        "--no-auto", dest="auto", action="store_false", help="disable auto-connect"
-    )
-    p.add_argument(
-        "--no-firewall", action="store_true", help="do not touch the firewall"
-    )
+    p.add_argument("--no-auto", dest="auto", action="store_false", help="disable auto-connect")
+    p.add_argument("--no-firewall", action="store_true", help="do not touch the firewall")
     p.add_argument("--no-mdns", action="store_true", help="do not open the mDNS port")
-    p.add_argument(
-        "--no-service", action="store_true", help="do not install a user service"
-    )
-    p.add_argument(
-        "--no-tray", action="store_true", help="do not add tray autostart"
-    )
+    p.add_argument("--no-service", action="store_true", help="do not install a user service")
+    p.add_argument("--no-tray", action="store_true", help="do not add tray autostart")
 
     add("status", "show daemon, sharing, peers and current output", cmd_status)
     p = add("discover", "find devices on the local network", cmd_discover)
-    p.add_argument(
-        "--timeout", type=float, default=2.5, help="seconds to scan (default 2.5)"
-    )
+    p.add_argument("--timeout", type=float, default=2.5, help="seconds to scan (default 2.5)")
     add("devices", "alias for discover", cmd_discover).add_argument(
         "--timeout", type=float, default=2.5
     )
@@ -130,15 +116,9 @@ def build_parser() -> argparse.ArgumentParser:
     )
 
     p = add("disconnect", "stop playing on the remote device", cmd_disconnect)
-    p.add_argument(
-        "peer", nargs="?", help="device name or id (default: current/all)"
-    )
-    p.add_argument(
-        "--all", action="store_true", help="remove all SoundHop tunnel sinks"
-    )
-    p.add_argument(
-        "--forget", action="store_true", help="also forget the last device"
-    )
+    p.add_argument("peer", nargs="?", help="device name or id (default: current/all)")
+    p.add_argument("--all", action="store_true", help="remove all SoundHop tunnel sinks")
+    p.add_argument("--forget", action="store_true", help="also forget the last device")
     p.add_argument(
         "--no-restore",
         action="store_true",
@@ -146,9 +126,7 @@ def build_parser() -> argparse.ArgumentParser:
     )
 
     p = add("share", "share this device's speakers", cmd_share)
-    p.add_argument(
-        "action", nargs="?", choices=("on", "off", "status"), default="status"
-    )
+    p.add_argument("action", nargs="?", choices=("on", "off", "status"), default="status")
 
     p = add("auto", "control auto-connect", cmd_auto)
     p.add_argument(
@@ -159,9 +137,7 @@ def build_parser() -> argparse.ArgumentParser:
     )
 
     p = add("daemon", "run the background daemon", cmd_daemon)
-    p.add_argument(
-        "--detach", action="store_true", help="start in the background and return"
-    )
+    p.add_argument("--detach", action="store_true", help="start in the background and return")
 
     add("stop", "stop the background daemon", cmd_stop)
 
@@ -182,18 +158,12 @@ def build_parser() -> argparse.ArgumentParser:
         default="status",
     )
     p.add_argument("--no-enable", action="store_true", help="do not enable at login")
-    p.add_argument(
-        "--no-start", action="store_true", help="do not start immediately"
-    )
+    p.add_argument("--no-start", action="store_true", help="do not start immediately")
     p.add_argument("--tray", action="store_true", help="also add tray autostart")
 
     p = add("firewall", "open or inspect the required firewall ports", cmd_firewall)
-    p.add_argument(
-        "action", choices=("open", "close", "status"), nargs="?", default="status"
-    )
-    p.add_argument(
-        "--dry-run", action="store_true", help="print commands without running them"
-    )
+    p.add_argument("action", choices=("open", "close", "status"), nargs="?", default="status")
+    p.add_argument("--dry-run", action="store_true", help="print commands without running them")
     p.add_argument("--no-mdns", action="store_true", help="do not open UDP 5353")
 
     p = add("config", "inspect or edit the configuration", cmd_config)
@@ -211,9 +181,7 @@ def build_parser() -> argparse.ArgumentParser:
     add("gui", "alias for tray", cmd_tray)
 
     p = add("logs", "show the daemon log", cmd_logs)
-    p.add_argument(
-        "--lines", type=int, default=100, help="number of lines (default 100)"
-    )
+    p.add_argument("--lines", type=int, default=100, help="number of lines (default 100)")
     p.add_argument("-f", "--follow", action="store_true", help="follow the log")
 
     p = add(
@@ -228,9 +196,9 @@ def build_parser() -> argparse.ArgumentParser:
         help="open GitHub issues in browser",
     )
     p.add_argument("-o", "--output", dest="output_file", help="save report to file")
-    sub.add_parser(
-        "report", parents=[common], help="alias for bug-report"
-    ).set_defaults(func=cmd_bug_report)
+    sub.add_parser("report", parents=[common], help="alias for bug-report").set_defaults(
+        func=cmd_bug_report
+    )
 
     p = add("completions", "print shell completion code", cmd_completions)
     p.add_argument("shell", choices=("bash", "zsh", "fish"))

@@ -6,21 +6,15 @@ import unittest
 from soundhop.platform.windows.protocol import (
     PA_COMMAND_AUTH,
     PA_COMMAND_CREATE_PLAYBACK_STREAM,
-    PA_COMMAND_GET_SERVER_INFO,
     PA_COMMAND_REPLY,
-    PA_COMMAND_SET_CLIENT_NAME,
-    PA_CONTROL_CHANNEL,
     PA_SAMPLE_S16LE,
-    Packet,
     SampleSpec,
     TagStructReader,
     TagStructWriter,
     make_command_auth,
     make_command_create_playback_stream,
-    make_command_set_client_name,
     make_reply_auth,
     make_reply_create_playback_stream,
-    make_reply_ok,
     make_reply_server_info,
     read_packet,
     write_packet,
@@ -148,6 +142,7 @@ class WindowsProtocolTest(unittest.TestCase):
 
     def test_skip_value_and_volume(self) -> None:
         from soundhop.platform.windows.protocol import PA_TAG_VOLUME
+
         writer = TagStructWriter()
         # Write PA_TAG_VOLUME manually
         writer.stream.write(bytes([PA_TAG_VOLUME]))
@@ -161,6 +156,7 @@ class WindowsProtocolTest(unittest.TestCase):
 
     def test_skip_value_timeval(self) -> None:
         from soundhop.platform.windows.protocol import PA_TAG_TIMEVAL
+
         writer = TagStructWriter()
         self.assertEqual(PA_TAG_TIMEVAL, ord("e"))
         writer.stream.write(bytes([PA_TAG_TIMEVAL]))
@@ -188,7 +184,9 @@ class WindowsProtocolTest(unittest.TestCase):
             def read(self, n: int = -1) -> bytes:
                 if self.pos >= len(self.raw):
                     return b""
-                take = min(n if n > 0 else self.chunk_size, self.chunk_size, len(self.raw) - self.pos)
+                take = min(
+                    n if n > 0 else self.chunk_size, self.chunk_size, len(self.raw) - self.pos
+                )
                 res = self.raw[self.pos : self.pos + take]
                 self.pos += take
                 return res
@@ -223,6 +221,7 @@ class WindowsProtocolTest(unittest.TestCase):
 
     def test_make_reply_server_info_uses_constants_version(self) -> None:
         from soundhop.constants import VERSION
+
         info_bytes = make_reply_server_info(tag=5)
         pkt = read_packet(io.BytesIO(info_bytes))
         self.assertIsNotNone(pkt)

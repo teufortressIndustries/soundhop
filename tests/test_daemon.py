@@ -3,12 +3,11 @@
 import tempfile
 import unittest
 from pathlib import Path
-from unittest.mock import MagicMock, patch
+from unittest.mock import patch
 
 from soundhop.constants import OFFLINE_PROBE_LIMIT
-from soundhop.controller import Controller, ControllerError
+from soundhop.controller import ControllerError
 from soundhop.daemon import Daemon
-from soundhop.discovery import Peer
 
 
 class DaemonTest(unittest.TestCase):
@@ -32,9 +31,11 @@ class DaemonTest(unittest.TestCase):
             self.assertTrue(daemon.controller.state.connected)
 
             # Mock tcp_reachable to return False (simulating peer going offline)
-            with patch("soundhop.daemon.tcp_reachable", return_value=False), \
-                 patch.object(daemon.controller, "reconcile"), \
-                 patch.object(daemon.controller, "disconnect") as mock_disconnect:
+            with (
+                patch("soundhop.daemon.tcp_reachable", return_value=False),
+                patch.object(daemon.controller, "reconcile"),
+                patch.object(daemon.controller, "disconnect") as mock_disconnect,
+            ):
                 # Tick 1: count should become 1
                 daemon._supervise()
                 self.assertEqual(daemon._offline_count, 1)
@@ -112,4 +113,3 @@ class DaemonTest(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
-

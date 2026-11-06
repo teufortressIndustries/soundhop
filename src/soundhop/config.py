@@ -64,9 +64,7 @@ class SharingConfig:
     enabled: bool = True
     port: int = DEFAULT_AUDIO_PORT
     security: str = "trusted-lan"
-    allowed_networks: list[str] = field(
-        default_factory=lambda: list(DEFAULT_LAN_NETWORKS)
-    )
+    allowed_networks: list[str] = field(default_factory=lambda: list(DEFAULT_LAN_NETWORKS))
 
 
 @dataclass
@@ -124,7 +122,7 @@ class Config:
     # -- loading ---------------------------------------------------------
 
     @classmethod
-    def load(cls, path: Path | None = None) -> "Config":
+    def load(cls, path: Path | None = None) -> Config:
         path = path or config_path()
         if not path.exists():
             cfg = cls(path=path)
@@ -144,7 +142,7 @@ class Config:
         return cfg
 
     @classmethod
-    def from_dict(cls, raw: dict[str, Any], *, path: Path | None = None) -> "Config":
+    def from_dict(cls, raw: dict[str, Any], *, path: Path | None = None) -> Config:
         def section(name: str) -> dict[str, Any]:
             value = raw.get(name, {})
             return value if isinstance(value, dict) else {}
@@ -199,30 +197,18 @@ class Config:
         self.discovery.timeout_s = max(5.0, float(self.discovery.timeout_s))
 
         self.connection.auto_connect = _as_bool(self.connection.auto_connect, True)
-        self.connection.switch_default = _as_bool(
-            self.connection.switch_default, True
-        )
-        self.connection.restore_default = _as_bool(
-            self.connection.restore_default, True
-        )
+        self.connection.switch_default = _as_bool(self.connection.switch_default, True)
+        self.connection.restore_default = _as_bool(self.connection.restore_default, True)
         self.connection.move_streams = _as_bool(self.connection.move_streams, True)
-        self.connection.disconnect_on_quit = _as_bool(
-            self.connection.disconnect_on_quit, True
-        )
-        self.connection.reconnect_delay_ms = max(
-            0, int(self.connection.reconnect_delay_ms)
-        )
+        self.connection.disconnect_on_quit = _as_bool(self.connection.disconnect_on_quit, True)
+        self.connection.reconnect_delay_ms = max(0, int(self.connection.reconnect_delay_ms))
         if self.connection.latency_ms is not None:
             latency = int(self.connection.latency_ms)
             self.connection.latency_ms = latency if latency > 0 else None
         if not isinstance(self.connection.extra_tunnel_args, list):
             raise ConfigError("connection.extra_tunnel_args must be a list")
-        self.connection.extra_tunnel_args = [
-            str(x) for x in self.connection.extra_tunnel_args
-        ]
-        self.connection.disconnect_grace_s = max(
-            3.0, float(self.connection.disconnect_grace_s)
-        )
+        self.connection.extra_tunnel_args = [str(x) for x in self.connection.extra_tunnel_args]
+        self.connection.disconnect_grace_s = max(3.0, float(self.connection.disconnect_grace_s))
 
         self.ui.notifications = _as_bool(self.ui.notifications, True)
         self.ui.start_tray = _as_bool(self.ui.start_tray, False)
@@ -346,7 +332,7 @@ class Config:
                 setattr(section, key, value)
         self.normalize()
 
-    def copy(self) -> "Config":
+    def copy(self) -> Config:
         return copy.deepcopy(self)
 
 
@@ -376,9 +362,7 @@ def _security(value: Any) -> str:
         return "trusted-lan"
     value = _SECURITY_ALIASES.get(value.strip().lower(), value.strip().lower())
     if value not in SECURITY_MODES:
-        raise ConfigError(
-            f"sharing.security must be one of {', '.join(SECURITY_MODES)}"
-        )
+        raise ConfigError(f"sharing.security must be one of {', '.join(SECURITY_MODES)}")
     return value
 
 
@@ -448,7 +432,7 @@ def parse_config_value(raw: str) -> Any:
     except ValueError:
         pass
     try:
-        return shlex.split(text)[0] if text.startswith(("\"", "'")) else text
+        return shlex.split(text)[0] if text.startswith(('"', "'")) else text
     except ValueError:
         return text
 

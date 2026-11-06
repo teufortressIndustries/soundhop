@@ -8,8 +8,9 @@ import os
 import secrets
 import socket
 import threading
+from collections.abc import Callable
 from pathlib import Path
-from typing import Any, Callable
+from typing import Any
 
 from .util import ensure_dir, socket_path
 
@@ -96,9 +97,7 @@ class IpcServer:
         sock.settimeout(0.5)
         self._sock = sock
         self._stop.clear()
-        self._thread = threading.Thread(
-            target=self._accept_loop, name="soundhop-ipc", daemon=True
-        )
+        self._thread = threading.Thread(target=self._accept_loop, name="soundhop-ipc", daemon=True)
         self._thread.start()
 
     def _accept_loop(self) -> None:
@@ -108,7 +107,7 @@ class IpcServer:
                 break
             try:
                 conn, _ = sock.accept()
-            except socket.timeout:
+            except TimeoutError:
                 continue
             except OSError:
                 break
@@ -140,7 +139,10 @@ class IpcServer:
                 if not isinstance(request, dict):
                     response = {"ok": False, "error": "Request must be a JSON object"}
                 elif self._is_tcp and request.get("auth") != self._auth_token:
-                    response = {"ok": False, "error": "Unauthorized: invalid or missing IPC authentication token"}
+                    response = {
+                        "ok": False,
+                        "error": "Unauthorized: invalid or missing IPC authentication token",
+                    }
                 else:
                     try:
                         response = self.handler(request)
@@ -240,7 +242,7 @@ def request(
             if not chunk:
                 break
             data += chunk
-    except socket.timeout as exc:
+    except TimeoutError as exc:
         raise IpcError("The SoundHop daemon did not respond in time") from exc
     except OSError as exc:
         raise DaemonNotRunning(f"SoundHop daemon is not reachable: {exc}") from exc

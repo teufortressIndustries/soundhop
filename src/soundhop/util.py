@@ -14,9 +14,10 @@ import threading
 import time
 import unicodedata
 import uuid
+from collections.abc import Iterable, Mapping, Sequence
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Iterable, Mapping, Sequence
+from typing import Any
 
 from .constants import APP_SLUG
 
@@ -559,7 +560,12 @@ def notify(title: str, body: str, *, urgency: str = "normal") -> None:
             threading.Thread(
                 target=subprocess.run,
                 args=(["powershell", "-NoProfile", "-NonInteractive", "-Command", cmd],),
-                kwargs={"stdout": subprocess.DEVNULL, "stderr": subprocess.DEVNULL, "timeout": 5.0, "creationflags": ps_flags},
+                kwargs={
+                    "stdout": subprocess.DEVNULL,
+                    "stderr": subprocess.DEVNULL,
+                    "timeout": 5.0,
+                    "creationflags": ps_flags,
+                },
                 daemon=True,
             ).start()
             return

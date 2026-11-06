@@ -1,6 +1,7 @@
 """Tests for systemd and autostart text generation."""
 
 import unittest
+
 from soundhop.service import autostart_text, unit_text
 
 
@@ -24,15 +25,19 @@ class ServiceTest(unittest.TestCase):
     def test_appimage_text_structure(self) -> None:
         import os
         from unittest.mock import patch
-        with patch.dict(os.environ, {"APPIMAGE": "/home/user/Applications/SoundHop-x86_64.AppImage"}):
+
+        with patch.dict(
+            os.environ, {"APPIMAGE": "/home/user/Applications/SoundHop-x86_64.AppImage"}
+        ):
             unit = unit_text()
-            self.assertIn('ExecStart=/home/user/Applications/SoundHop-x86_64.AppImage daemon', unit)
+            self.assertIn("ExecStart=/home/user/Applications/SoundHop-x86_64.AppImage daemon", unit)
             autostart = autostart_text()
-            self.assertIn('Exec=/home/user/Applications/SoundHop-x86_64.AppImage tray', autostart)
+            self.assertIn("Exec=/home/user/Applications/SoundHop-x86_64.AppImage tray", autostart)
 
     def test_windows_autostart_registry_and_fallback(self) -> None:
         import sys
         from unittest.mock import MagicMock, patch
+
         from soundhop.service import (
             install,
             install_tray_autostart,
@@ -56,11 +61,12 @@ class ServiceTest(unittest.TestCase):
             def fake_delete(name="SoundHop"):
                 return fake_reg_store.pop(name, None) is not None
 
-            with patch("soundhop.service.winreg_write_run", side_effect=fake_write), \
-                 patch("soundhop.service.winreg_query_run", side_effect=fake_query), \
-                 patch("soundhop.service.winreg_delete_run", side_effect=fake_delete), \
-                 patch("soundhop.service.windows_startup_path") as mock_vbs_path:
-
+            with (
+                patch("soundhop.service.winreg_write_run", side_effect=fake_write),
+                patch("soundhop.service.winreg_query_run", side_effect=fake_query),
+                patch("soundhop.service.winreg_delete_run", side_effect=fake_delete),
+                patch("soundhop.service.windows_startup_path") as mock_vbs_path,
+            ):
                 mock_vbs = MagicMock()
                 mock_vbs.exists.return_value = False
                 mock_vbs_path.return_value = mock_vbs
@@ -82,12 +88,13 @@ class ServiceTest(unittest.TestCase):
                 self.assertNotIn("SoundHop", fake_reg_store)
 
             # 2. Registry fails, falls back to startup folder
-            with patch("soundhop.service.winreg_write_run", return_value=False), \
-                 patch("soundhop.service.winreg_query_run", return_value=None), \
-                 patch("soundhop.service.winreg_delete_run", return_value=False), \
-                 patch("soundhop.service.windows_startup_path") as mock_vbs_path, \
-                 patch("soundhop.service.windows_startup_dir") as mock_dir:
-
+            with (
+                patch("soundhop.service.winreg_write_run", return_value=False),
+                patch("soundhop.service.winreg_query_run", return_value=None),
+                patch("soundhop.service.winreg_delete_run", return_value=False),
+                patch("soundhop.service.windows_startup_path") as mock_vbs_path,
+                patch("soundhop.service.windows_startup_dir"),
+            ):
                 mock_vbs = MagicMock()
                 mock_vbs.exists.return_value = True
                 mock_vbs_path.return_value = mock_vbs
@@ -105,19 +112,23 @@ class ServiceTest(unittest.TestCase):
 
     def test_windows_service_install_defaults(self) -> None:
         import sys
-        from unittest.mock import MagicMock, patch
+        from unittest.mock import patch
+
         from soundhop.service import install
 
         with patch.object(sys, "platform", "win32"):
-            with patch("soundhop.service.install_tray_autostart", return_value=True) as mock_inst, \
-                 patch("soundhop.service.winreg_query_run", return_value="soundhop.exe tray"):
+            with (
+                patch("soundhop.service.install_tray_autostart", return_value=True) as mock_inst,
+                patch("soundhop.service.winreg_query_run", return_value="soundhop.exe tray"),
+            ):
                 res = install()  # tray defaults to False, enable defaults to True
                 self.assertTrue(res["enabled"])
                 mock_inst.assert_called_once()
 
     def test_windows_notification_escaping(self) -> None:
         import sys
-        from unittest.mock import MagicMock, patch
+        from unittest.mock import patch
+
         from soundhop.util import notify
 
         with patch.object(sys, "platform", "win32"):

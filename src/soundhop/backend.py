@@ -12,8 +12,9 @@ import logging
 import re
 import sys
 import time
+from collections.abc import Callable, Sequence
 from dataclasses import dataclass
-from typing import Any, Callable, Sequence
+from typing import Any
 
 from .constants import (
     DEFAULT_LAN_NETWORKS,
@@ -116,8 +117,7 @@ class AudioBackend:
         result = self._run([self.pactl, *args], timeout=timeout)
         if check and not result.ok:
             raise BackendError(
-                (result.stderr or result.stdout).strip()
-                or f"pactl {' '.join(args)} failed"
+                (result.stderr or result.stdout).strip() or f"pactl {' '.join(args)} failed"
             )
         return result
 
@@ -150,7 +150,9 @@ class AudioBackend:
         return f"{name} {version}".strip()
 
     def is_pipewire(self) -> bool:
-        return "pipewire" in self.server_name().lower() or "pipewire" in self.server_version().lower()
+        return (
+            "pipewire" in self.server_name().lower() or "pipewire" in self.server_version().lower()
+        )
 
     def default_sink(self) -> str:
         return self.info().get("Default Sink", "")
@@ -317,9 +319,7 @@ class AudioBackend:
         for item in self.sink_inputs():
             if wanted_sink_id is not None and item.sink != wanted_sink_id:
                 continue
-            result = self._pactl(
-                "move-sink-input", str(item.id), target, check=False
-            )
+            result = self._pactl("move-sink-input", str(item.id), target, check=False)
             if result.ok:
                 moved += 1
             else:
@@ -474,9 +474,7 @@ class AudioBackend:
             "server": self.server_label(),
             "pipewire": self.is_pipewire(),
             "default_sink": self.default_sink(),
-            "sinks": [
-                {"name": s.name, "state": s.state, "spec": s.spec} for s in self.sinks()
-            ],
+            "sinks": [{"name": s.name, "state": s.state, "spec": s.spec} for s in self.sinks()],
         }
 
 
@@ -489,4 +487,3 @@ def listener_security(args: str) -> str:
 
 
 LinuxAudioBackend = AudioBackend
-

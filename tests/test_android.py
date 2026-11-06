@@ -9,10 +9,8 @@ from unittest.mock import MagicMock, patch
 from soundhop.android import (
     AdbDevice,
     AndroidCaptureSession,
-    AndroidError,
     AndroidManager,
     AudioEncoderInfo,
-    ToolStatus,
 )
 from soundhop.util import Result
 
@@ -87,8 +85,10 @@ class AndroidTest(unittest.TestCase):
         )
 
         mgr = AndroidManager()
-        with patch.object(mgr, "find_adb", return_value=Path("/usr/bin/adb")), \
-             patch.object(mgr, "enrich_device_info") as mock_enrich:
+        with (
+            patch.object(mgr, "find_adb", return_value=Path("/usr/bin/adb")),
+            patch.object(mgr, "enrich_device_info") as mock_enrich,
+        ):
             devices = mgr.list_devices()
             self.assertEqual(len(devices), 2)
             self.assertEqual(devices[0].serial, "192.168.1.99:5555")
@@ -218,9 +218,11 @@ class AndroidTest(unittest.TestCase):
             (dest_dir / "libfoo.so").mkdir(parents=True, exist_ok=True)
 
             mgr = AndroidManager()
-            with patch.object(mgr, "managed_dir", return_value=dest_dir), \
-                 patch("platform.machine", return_value="x86_64"), \
-                 patch("urllib.request.urlopen") as mock_urlopen:
+            with (
+                patch.object(mgr, "managed_dir", return_value=dest_dir),
+                patch("platform.machine", return_value="x86_64"),
+                patch("urllib.request.urlopen") as mock_urlopen,
+            ):
                 # Mock download to return the archive content
                 archive_bytes = archive_path.read_bytes()
                 mock_resp = MagicMock()

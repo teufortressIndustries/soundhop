@@ -8,7 +8,7 @@ import platform
 import subprocess
 import sys
 import time
-from typing import Any, Sequence
+from typing import Any
 
 from .. import ipc
 from ..backend import AudioBackend, BackendError
@@ -17,7 +17,8 @@ from ..constants import APP_NAME, DEFAULT_AUDIO_PORT, PROTOCOL_VERSION, VERSION
 from ..controller import Controller, ControllerError
 from ..daemon import daemon_log_tail, ensure_daemon, run_daemon
 from ..discovery import Peer, discover_once
-from ..firewall import close_ports, detect as detect_firewall, open_ports
+from ..firewall import close_ports, open_ports
+from ..firewall import detect as detect_firewall
 from ..ipc import DaemonNotRunning, IpcError
 from ..service import (
     autostart_path,
@@ -38,7 +39,6 @@ from .ui import (
     _select_peer,
     emit_json,
     error,
-    info,
     ok,
     print_peers,
     print_status,
@@ -689,9 +689,7 @@ def cmd_logs(args: argparse.Namespace) -> int:
             try:
                 while True:
                     time.sleep(1)
-                    new_lines = path.read_text(
-                        encoding="utf-8", errors="replace"
-                    ).splitlines()
+                    new_lines = path.read_text(encoding="utf-8", errors="replace").splitlines()
                     for line in new_lines[len(lines) :]:
                         print(line)
                     lines = new_lines
@@ -827,9 +825,7 @@ def cmd_setup(args: argparse.Namespace) -> int:
             print("  2) Cookie — requires copying ~/.config/pulse/cookie to other devices")
             print("  3) Open — any host that can reach the port (not recommended)")
             choice = ask("Choose 1-3", "1")
-            security = {"1": "trusted-lan", "2": "cookie", "3": "open"}.get(
-                choice, "trusted-lan"
-            )
+            security = {"1": "trusted-lan", "2": "cookie", "3": "open"}.get(choice, "trusted-lan")
         else:
             security = "trusted-lan"
 
@@ -842,12 +838,8 @@ def cmd_setup(args: argparse.Namespace) -> int:
     config.sharing.security = security
     config.sharing.enabled = True
     config.connection.auto_connect = auto
-    config.connection.switch_default = ask_yes(
-        "Switch the default output automatically?", True
-    )
-    config.connection.restore_default = ask_yes(
-        "Restore local audio when disconnecting?", True
-    )
+    config.connection.switch_default = ask_yes("Switch the default output automatically?", True)
+    config.connection.restore_default = ask_yes("Restore local audio when disconnecting?", True)
     config.normalize()
     config.save()
     ok(f"Saved configuration to {config.path}")
@@ -908,9 +900,7 @@ def cmd_setup(args: argparse.Namespace) -> int:
             install_service = False
     else:
         if not args.no_service:
-            print(
-                "systemd user services are not available; starting a background daemon instead."
-            )
+            print("systemd user services are not available; starting a background daemon instead.")
         install_service = False
 
     if not install_service:

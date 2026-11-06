@@ -16,8 +16,9 @@ import select
 import socket
 import threading
 import time
+from collections.abc import Callable, Iterable
 from dataclasses import asdict, dataclass, field
-from typing import Any, Callable, Iterable
+from typing import Any
 
 from .constants import (
     BEACON_INTERVAL,
@@ -186,7 +187,9 @@ def make_beacon(
     return json.dumps(payload, separators=(",", ":")).encode("utf-8")
 
 
-def parse_beacon(data: bytes, *, host: str, source: str = "udp") -> tuple[dict[str, Any] | None, Peer | None]:
+def parse_beacon(
+    data: bytes, *, host: str, source: str = "udp"
+) -> tuple[dict[str, Any] | None, Peer | None]:
     if not is_private_address(host):
         return None, None
     try:
@@ -265,15 +268,11 @@ class UdpBeaconService:
                 sock.bind((self.bind_host, self.discovery_port))
             except OSError as exc:
                 sock.close()
-                raise DiscoveryError(
-                    f"Cannot listen on UDP {self.discovery_port}: {exc}"
-                ) from exc
+                raise DiscoveryError(f"Cannot listen on UDP {self.discovery_port}: {exc}") from exc
             sock.settimeout(0.5)
             self._sock = sock
         self._stop.clear()
-        self._thread = threading.Thread(
-            target=self._loop, name="soundhop-discovery", daemon=True
-        )
+        self._thread = threading.Thread(target=self._loop, name="soundhop-discovery", daemon=True)
         self._thread.start()
         self._send_beacon()
 
@@ -342,9 +341,11 @@ class UdpBeaconService:
             self.audio_port,
             security=self.security,
         )
-        destinations = [destination] if destination else [
-            (target, self.discovery_port) for target in self._targets_now()
-        ]
+        destinations = (
+            [destination]
+            if destination
+            else [(target, self.discovery_port) for target in self._targets_now()]
+        )
         for dest in destinations:
             if dest is None:
                 continue
@@ -440,8 +441,7 @@ class MdnsService:
             from zeroconf import ServiceBrowser, Zeroconf
         except ModuleNotFoundError as exc:  # pragma: no cover - depends on extra
             raise MdnsUnavailable(
-                "mDNS needs the optional 'zeroconf' package "
-                "(pip install 'soundhop[mdns]')"
+                "mDNS needs the optional 'zeroconf' package (pip install 'soundhop[mdns]')"
             ) from exc
         if self._zc is None:
             self._zc = Zeroconf()
@@ -517,8 +517,7 @@ class MdnsService:
             from zeroconf import ServiceInfo
         except ModuleNotFoundError as exc:  # pragma: no cover
             raise MdnsUnavailable(
-                "mDNS needs the optional 'zeroconf' package "
-                "(pip install 'soundhop[mdns]')"
+                "mDNS needs the optional 'zeroconf' package (pip install 'soundhop[mdns]')"
             ) from exc
         if self._zc is None:
             from zeroconf import Zeroconf
@@ -577,7 +576,9 @@ class MdnsService:
                 pass
             self._zc = None
 
-    def update(self, *, name: str | None = None, audio_port: int | None = None, security: str | None = None) -> None:
+    def update(
+        self, *, name: str | None = None, audio_port: int | None = None, security: str | None = None
+    ) -> None:
         if name is not None:
             self.name = name
         if audio_port is not None:
@@ -635,8 +636,8 @@ class UdpProbe:
         sock.settimeout(0.25)
         self._sock = sock
         try:
-            destinations = list(targets) if targets is not None else broadcast_addresses(
-                include_loopback=True
+            destinations = (
+                list(targets) if targets is not None else broadcast_addresses(include_loopback=True)
             )
             payload = make_beacon(
                 self.device_id or "probe",
@@ -659,7 +660,7 @@ class UdpProbe:
                     next_send = time.monotonic() + 0.7
                 try:
                     data, addr = sock.recvfrom(8192)
-                except socket.timeout:
+                except TimeoutError:
                     continue
                 except OSError:
                     break

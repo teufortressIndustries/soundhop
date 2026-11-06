@@ -13,7 +13,6 @@ from .. import ipc
 from ..android import (
     AndroidCaptureSession,
     AndroidManager,
-    SUPPORTED_AUDIO_CODECS,
 )
 from ..config import Config
 from ..constants import APP_NAME
@@ -77,9 +76,7 @@ def cmd_android(args: argparse.Namespace) -> int:
 
 def cmd_android_install(args: argparse.Namespace) -> int:
     config = Config.load()
-    mgr = AndroidManager(
-        scrcpy_path=config.android.scrcpy_path, adb_path=config.android.adb_path
-    )
+    mgr = AndroidManager(scrcpy_path=config.android.scrcpy_path, adb_path=config.android.adb_path)
     print(style("Installing standalone scrcpy and adb...", "bold"))
     print("Source: Genymobile GitHub release (Apache 2.0 license)")
 
@@ -176,11 +173,7 @@ def cmd_android_status(args: argparse.Namespace) -> int:
                 if d.get("state") == "device"
                 else style(d.get("state", "unknown"), "yellow")
             )
-            ver = (
-                f"(Android {d.get('android_version')})"
-                if d.get("android_version")
-                else ""
-            )
+            ver = f"(Android {d.get('android_version')})" if d.get("android_version") else ""
             print(
                 f"  • {d.get('manufacturer', '')} {d.get('model', d.get('serial'))} [{kind}] {ver} — {state_style}"
             )
@@ -191,9 +184,7 @@ def cmd_android_status(args: argparse.Namespace) -> int:
 
 def cmd_android_devices(args: argparse.Namespace) -> int:
     config = Config.load()
-    mgr = AndroidManager(
-        scrcpy_path=config.android.scrcpy_path, adb_path=config.android.adb_path
-    )
+    mgr = AndroidManager(scrcpy_path=config.android.scrcpy_path, adb_path=config.android.adb_path)
     devices = mgr.list_devices()
     if _json_enabled(args):
         emit_json([asdict(d) for d in devices])
@@ -207,21 +198,15 @@ def cmd_android_devices(args: argparse.Namespace) -> int:
     print(style("Connected Android devices:", "bold"))
     for idx, d in enumerate(devices, 1):
         transport = "Wi-Fi" if d.is_wifi else "USB"
-        status_col = (
-            style("ready", "green") if d.is_ready else style(d.state, "yellow")
-        )
+        status_col = style("ready", "green") if d.is_ready else style(d.state, "yellow")
         ver_info = f"Android {d.android_version}" if d.android_version else ""
-        print(
-            f"  {idx}) {d.display_name:<24} [{transport}] {ver_info} ({d.serial}) — {status_col}"
-        )
+        print(f"  {idx}) {d.display_name:<24} [{transport}] {ver_info} ({d.serial}) — {status_col}")
     return 0
 
 
 def cmd_android_wifi(args: argparse.Namespace) -> int:
     config = Config.load()
-    mgr = AndroidManager(
-        scrcpy_path=config.android.scrcpy_path, adb_path=config.android.adb_path
-    )
+    mgr = AndroidManager(scrcpy_path=config.android.scrcpy_path, adb_path=config.android.adb_path)
     target = getattr(args, "target", None)
     if target:
         ok_flag, msg = mgr.connect_wifi(target)
@@ -252,9 +237,7 @@ def cmd_android_wifi(args: argparse.Namespace) -> int:
         if conn_ok:
             ok(f"Connected wirelessly to {ip}:5555. You can now unplug the USB cable!")
             return 0
-        warning(
-            f"Device switched to TCP mode, but connecting to {ip}:5555 failed: {conn_msg}"
-        )
+        warning(f"Device switched to TCP mode, but connecting to {ip}:5555 failed: {conn_msg}")
         return 0
     ok("Device switched to TCP mode on port 5555. Connect using: soundhop android wifi <phone-ip>")
     return 0
@@ -262,9 +245,7 @@ def cmd_android_wifi(args: argparse.Namespace) -> int:
 
 def cmd_android_encoders(args: argparse.Namespace) -> int:
     config = Config.load()
-    mgr = AndroidManager(
-        scrcpy_path=config.android.scrcpy_path, adb_path=config.android.adb_path
-    )
+    mgr = AndroidManager(scrcpy_path=config.android.scrcpy_path, adb_path=config.android.adb_path)
     target = getattr(args, "target", None)
     try:
         encs = mgr.list_encoders(target)
@@ -289,9 +270,7 @@ def cmd_android_encoders(args: argparse.Namespace) -> int:
 
 def cmd_android_start(args: argparse.Namespace) -> int:
     config = Config.load()
-    mgr = AndroidManager(
-        scrcpy_path=config.android.scrcpy_path, adb_path=config.android.adb_path
-    )
+    mgr = AndroidManager(scrcpy_path=config.android.scrcpy_path, adb_path=config.android.adb_path)
     tools = mgr.get_tool_status()
 
     interactive = sys.stdin.isatty() and not getattr(args, "yes", False)
@@ -345,7 +324,11 @@ def cmd_android_start(args: argparse.Namespace) -> int:
             mgr.connect_wifi(target_str)
             devices = mgr.list_devices()
             for d in devices:
-                if d.serial == target_str or d.ip == target_str or (d.ip and target_str.startswith(d.ip)):
+                if (
+                    d.serial == target_str
+                    or d.ip == target_str
+                    or (d.ip and target_str.startswith(d.ip))
+                ):
                     target_device = d
                     break
 
@@ -389,9 +372,7 @@ def cmd_android_start(args: argparse.Namespace) -> int:
         if unauthorized and not ready:
             print()
             warning(f"Device {unauthorized[0].serial} is connected but UNAUTHORIZED.")
-            print(
-                "Please unlock your phone, check the screen, and tap 'Allow USB debugging'."
-            )
+            print("Please unlock your phone, check the screen, and tap 'Allow USB debugging'.")
             if not interactive:
                 return 1
             try:
@@ -442,9 +423,7 @@ def cmd_android_start(args: argparse.Namespace) -> int:
     if not target_device.is_wifi and not getattr(args, "usb", False) and interactive:
         try:
             sw = (
-                input(
-                    f"Device is connected via USB. Switch to wireless (Wi-Fi) mode? [Y/n]: "
-                )
+                input("Device is connected via USB. Switch to wireless (Wi-Fi) mode? [Y/n]: ")
                 .strip()
                 .lower()
             )
@@ -570,9 +549,7 @@ def cmd_android_stop(args: argparse.Namespace) -> int:
             return 0
 
     config = Config.load()
-    mgr = AndroidManager(
-        scrcpy_path=config.android.scrcpy_path, adb_path=config.android.adb_path
-    )
+    mgr = AndroidManager(scrcpy_path=config.android.scrcpy_path, adb_path=config.android.adb_path)
     session = AndroidCaptureSession(mgr)
     session.stop()
     ok("Android audio capture stopped.")

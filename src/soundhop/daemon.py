@@ -17,13 +17,13 @@ try:
 except ImportError:
     fcntl = None  # type: ignore[assignment]
 import logging
-from logging.handlers import RotatingFileHandler
 import os
 import signal
 import subprocess
 import sys
 import threading
 import time
+from logging.handlers import RotatingFileHandler
 from pathlib import Path
 from typing import Any
 
@@ -349,16 +349,12 @@ class Daemon:
             known = self.controller.known_peer(peer_id)
             if known is not None:
                 if not is_private_address(known.host):
-                    raise ControllerError(
-                        f"Peer address {known.host} is not a private LAN address"
-                    )
+                    raise ControllerError(f"Peer address {known.host} is not a private LAN address")
                 return known
             # Allow an id passed with an explicit host (tray/manual use).
             if host:
                 if not is_private_address(host):
-                    raise ControllerError(
-                        f"Peer address {host} is not a private LAN address"
-                    )
+                    raise ControllerError(f"Peer address {host} is not a private LAN address")
                 return Peer(
                     id=peer_id,
                     name=str(request.get("name", peer_id)),
@@ -371,9 +367,7 @@ class Daemon:
             )
         if host:
             if not is_private_address(host):
-                raise ControllerError(
-                    f"Peer address {host} is not a private LAN address"
-                )
+                raise ControllerError(f"Peer address {host} is not a private LAN address")
             return Peer(
                 id=str(request.get("id", "") or f"manual-{host}"),
                 name=str(request.get("name", host)),
@@ -545,7 +539,9 @@ class Daemon:
                         OFFLINE_PROBE_LIMIT,
                     )
                     if self._offline_count >= OFFLINE_PROBE_LIMIT:
-                        log.info("Peer %s went offline; restoring local audio", state.connected_name)
+                        log.info(
+                            "Peer %s went offline; restoring local audio", state.connected_name
+                        )
                         self.controller.disconnect(
                             restore=config.connection.restore_default,
                             pause_auto=False,
@@ -654,7 +650,7 @@ def _acquire_lock() -> Any | None:
 
             handle.seek(0)
             msvcrt.locking(handle.fileno(), msvcrt.LK_NBLCK, 1)
-        except (OSError, IOError, ImportError):
+        except (OSError, ImportError):
             handle.close()
             return None
     handle.seek(0)

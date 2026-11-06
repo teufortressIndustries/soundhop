@@ -6,8 +6,9 @@ import argparse
 import json
 import sys
 import time
+from collections.abc import Iterable, Sequence
 from dataclasses import fields
-from typing import Any, Iterable, Sequence
+from typing import Any
 
 from ..constants import APP_NAME, VERSION
 from ..discovery import Peer
@@ -97,8 +98,7 @@ def print_peers(peers: Iterable[Peer], known: Iterable[Peer] = ()) -> None:
     # Do not count ANSI escapes when sizing the icon column.
     widths[0] = 2
     header_line = "  ".join(
-        style(h.ljust(widths[i]), "dim") if h else " " * widths[i]
-        for i, h in enumerate(headers)
+        style(h.ljust(widths[i]), "dim") if h else " " * widths[i] for i, h in enumerate(headers)
     )
     print(header_line)
     for row in rows:
@@ -146,10 +146,7 @@ def print_status(data: dict[str, Any]) -> None:
 
     if sharing.get("enabled"):
         security = sharing.get("security", "trusted-lan")
-        print(
-            f"  {'Sharing':<12} {style('on', 'green')} "
-            f"port {sharing.get('port')} ({security})"
-        )
+        print(f"  {'Sharing':<12} {style('on', 'green')} port {sharing.get('port')} ({security})")
         addresses = sharing.get("addresses") or []
         if addresses:
             print(f"  {'Addresses':<12} {', '.join(addresses)}")
@@ -161,10 +158,7 @@ def print_status(data: dict[str, Any]) -> None:
         host = connection.get("host", "")
         port = connection.get("port", "")
         duration = connection.get("duration", "")
-        print(
-            f"  {'Output':<12} {style(name, 'cyan')} "
-            f"({host}:{port}, {duration})"
-        )
+        print(f"  {'Output':<12} {style(name, 'cyan')} ({host}:{port}, {duration})")
     else:
         print(f"  {'Output':<12} this device")
 

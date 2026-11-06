@@ -51,9 +51,7 @@ def _run_doctor() -> dict[str, Any]:
     config = Config.load()
 
     def add(name: str, ok_: bool, detail: str, hint: str = "", warn: bool = False) -> None:
-        checks.append(
-            {"name": name, "ok": ok_, "detail": detail, "hint": hint, "warn": warn}
-        )
+        checks.append({"name": name, "ok": ok_, "detail": detail, "hint": hint, "warn": warn})
 
     add(
         "Python",
@@ -88,7 +86,9 @@ def _run_doctor() -> dict[str, Any]:
         "Audio server",
         backend_ok,
         backend.server_label() if backend_ok else "not reachable",
-        "Start PipeWire/WirePlumber or PulseAudio." if sys.platform != "win32" else "Verify Windows Audio service (Audiosrv).",
+        "Start PipeWire/WirePlumber or PulseAudio."
+        if sys.platform != "win32"
+        else "Verify Windows Audio service (Audiosrv).",
     )
     if backend_ok:
         if sys.platform != "win32":
@@ -187,11 +187,7 @@ def _run_doctor() -> dict[str, Any]:
     add(
         "Daemon",
         daemon is not None,
-        (
-            f"running (pid {daemon.get('daemon', {}).get('pid')})"
-            if daemon
-            else "not running"
-        ),
+        (f"running (pid {daemon.get('daemon', {}).get('pid')})" if daemon else "not running"),
         "Run 'soundhop daemon' or install the user service.",
         warn=daemon is None,
     )
@@ -337,7 +333,7 @@ def cmd_bug_report(args: argparse.Namespace) -> int:
         try:
             for line in os_rel.read_text(errors="ignore").splitlines():
                 if line.startswith("PRETTY_NAME="):
-                    distro = line.split("=", 1)[1].strip('"\'')
+                    distro = line.split("=", 1)[1].strip("\"'")
                     break
         except OSError:
             pass
@@ -365,14 +361,14 @@ def cmd_bug_report(args: argparse.Namespace) -> int:
 - **Desktop**: {desktop} ({session_type}, Wayland: {wayland})
 - **Python**: {platform.python_version()}
 - **SoundHop Version**: {VERSION} (protocol {PROTOCOL_VERSION})
-- **Audio Server**: {backend.server_label() if backend.available() else 'Not reachable'}
+- **Audio Server**: {backend.server_label() if backend.available() else "Not reachable"}
 
 ### Diagnostic Checks (`soundhop doctor`)
 {checks_summary}
 
 ### Recent Daemon Logs
 ```text
-{log_tail or '(no recent logs)'}
+{log_tail or "(no recent logs)"}
 ```
 """
     if getattr(args, "open_browser", False):

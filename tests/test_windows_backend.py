@@ -83,8 +83,12 @@ class WindowsBackendTest(unittest.TestCase):
         backend = WindowsAudioBackend()
         with patch.object(backend, "load_module", side_effect=[201, 202]):
             with patch("soundhop.platform.windows.backend._ActiveTunnelSession.start"):
-                backend.connect_tunnel(host="1.1.1.1", port=4713, sink_name="soundhop_node1", description="node1")
-                backend.connect_tunnel(host="1.1.1.2", port=4713, sink_name="soundhop_node2", description="node2")
+                backend.connect_tunnel(
+                    host="1.1.1.1", port=4713, sink_name="soundhop_node1", description="node1"
+                )
+                backend.connect_tunnel(
+                    host="1.1.1.2", port=4713, sink_name="soundhop_node2", description="node2"
+                )
                 self.assertEqual(len(backend._active_senders), 2)
 
                 removed = backend.unload_tunnels()
@@ -92,8 +96,9 @@ class WindowsBackendTest(unittest.TestCase):
                 self.assertEqual(len(backend._active_senders), 0)
 
     def test_backend_subclass_and_dispatch(self) -> None:
-        from soundhop.backend import AudioBackend
         import sys
+
+        from soundhop.backend import AudioBackend
 
         self.assertTrue(issubclass(WindowsAudioBackend, AudioBackend))
 
@@ -112,11 +117,12 @@ class WindowsBackendTest(unittest.TestCase):
             self.assertNotIsInstance(linux_backend, WindowsAudioBackend)
 
     def test_active_tunnel_handshake_flow(self) -> None:
+        import io
+
         from soundhop.platform.windows.backend import _ActiveTunnelSession
         from soundhop.platform.windows.protocol import (
             PA_COMMAND_AUTH,
             PA_COMMAND_CREATE_PLAYBACK_STREAM,
-            PA_COMMAND_REPLY,
             PA_COMMAND_SET_CLIENT_NAME,
             TagStructReader,
             make_reply_auth,
@@ -124,7 +130,6 @@ class WindowsBackendTest(unittest.TestCase):
             make_reply_ok,
             read_packet,
         )
-        import io
 
         session = _ActiveTunnelSession(
             host="127.0.0.1",
@@ -154,7 +159,9 @@ class WindowsBackendTest(unittest.TestCase):
                     elif cmd == PA_COMMAND_SET_CLIENT_NAME:
                         self._write_reply(make_reply_ok(tag))
                     elif cmd == PA_COMMAND_CREATE_PLAYBACK_STREAM:
-                        self._write_reply(make_reply_create_playback_stream(tag, stream_index=1, channel=3))
+                        self._write_reply(
+                            make_reply_create_playback_stream(tag, stream_index=1, channel=3)
+                        )
 
             def _write_reply(self, reply_bytes: bytes):
                 pos = self._stream.tell()
@@ -177,11 +184,13 @@ class WindowsBackendTest(unittest.TestCase):
                 mock_rec = MagicMock()
                 mock_rec.is_alive.return_value = True
                 mock_rec_cls.return_value = mock_rec
+
                 # Run sender loop once
                 def stop_after_delay():
                     session._stop.set()
 
                 import threading
+
                 threading.Timer(0.1, stop_after_delay).start()
                 session._run_sender()
 
@@ -209,8 +218,9 @@ class WindowsBackendTest(unittest.TestCase):
                 mock_rec.start.assert_called_once()
 
     def test_tunnel_reconnect_on_remote_disconnect(self) -> None:
-        from soundhop.platform.windows.backend import _ActiveTunnelSession
         import socket
+
+        from soundhop.platform.windows.backend import _ActiveTunnelSession
 
         session = _ActiveTunnelSession(
             host="127.0.0.1",

@@ -41,8 +41,8 @@ class IpcTest(unittest.TestCase):
 
     def test_ipc_tcp_fallback(self) -> None:
         """Test Windows loopback TCP fallback when AF_UNIX is unavailable."""
-        from unittest.mock import patch
         import socket
+        from unittest.mock import patch
 
         with tempfile.TemporaryDirectory() as tmpdir:
             sock_path = Path(tmpdir) / "test.sock"
@@ -79,6 +79,7 @@ class IpcTest(unittest.TestCase):
                     resp = raw_sock.recv(4096)
                     raw_sock.close()
                     import json
+
                     resp_json = json.loads(resp.decode("utf-8"))
                     self.assertFalse(resp_json.get("ok"))
                     self.assertIn("Unauthorized", resp_json.get("error", ""))

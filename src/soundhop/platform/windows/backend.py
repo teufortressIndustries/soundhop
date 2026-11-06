@@ -7,19 +7,18 @@ to/from Linux SoundHop nodes.
 
 from __future__ import annotations
 
-import io
 import ipaddress
 import logging
 import select
 import socket
-import struct
 import threading
 import time
-from typing import Any, Callable, Sequence
+from collections.abc import Sequence
+from typing import Any
 
 from ...backend import AudioBackend, BackendError, Listener, Module, Sink, SinkInput
 from ...constants import DEFAULT_LAN_NETWORKS, SINK_PREFIX
-from ...util import Result, sanitize_sink_name
+from ...util import sanitize_sink_name
 from .audio import WindowsLoopbackRecorder, WindowsPlayer, list_audio_endpoints
 from .protocol import (
     PA_COMMAND_AUTH,
@@ -27,9 +26,7 @@ from .protocol import (
     PA_COMMAND_GET_SERVER_INFO,
     PA_COMMAND_REPLY,
     PA_COMMAND_SET_CLIENT_NAME,
-    PA_CONTROL_CHANNEL,
     PA_SAMPLE_S16LE,
-    Packet,
     SampleSpec,
     TagStructReader,
     make_command_auth,
@@ -222,7 +219,9 @@ class WindowsAudioBackend(AudioBackend):
                     removed.append(session.module_id)
                     self._modules = [m for m in self._modules if m.id != session.module_id]
             for m in list(self._modules):
-                if m.name.startswith("module-tunnel-") and m.arg("sink_name").startswith(sink_prefix):
+                if m.name.startswith("module-tunnel-") and m.arg("sink_name").startswith(
+                    sink_prefix
+                ):
                     if m.id not in removed:
                         removed.append(m.id)
                     self._modules.remove(m)
@@ -280,7 +279,9 @@ class WindowsAudioBackend(AudioBackend):
 
             mod_args = f"port={port} auth-anonymous=1"
             self._modules = [m for m in self._modules if m.id != self._listener_id]
-            self._modules.append(Module(id=self._listener_id, name="module-native-protocol-tcp", args=mod_args))
+            self._modules.append(
+                Module(id=self._listener_id, name="module-native-protocol-tcp", args=mod_args)
+            )
 
             return Listener(
                 module_id=self._listener_id,
@@ -308,7 +309,9 @@ class WindowsAudioBackend(AudioBackend):
             self._listener_thread.join(timeout=1.0)
             self._listener_thread = None
 
-    def _listener_loop(self, server_sock: socket.socket, security: str, allowed_networks: list[str]) -> None:
+    def _listener_loop(
+        self, server_sock: socket.socket, security: str, allowed_networks: list[str]
+    ) -> None:
         while not self._listener_stop.is_set():
             try:
                 res = server_sock.accept()
@@ -316,7 +319,7 @@ class WindowsAudioBackend(AudioBackend):
                     continue
                 conn, addr = res
                 client_ip = addr[0] if isinstance(addr, tuple) and len(addr) > 0 else "127.0.0.1"
-            except socket.timeout:
+            except TimeoutError:
                 continue
             except OSError:
                 break
@@ -381,7 +384,11 @@ class WindowsAudioBackend(AudioBackend):
                             player.close()
                             player = WindowsPlayer(sample_rate=spec.rate, channels=spec.channels)
                             player.start()
-                        conn.sendall(make_reply_create_playback_stream(tag, stream_index=0, channel=stream_channel, spec=spec))
+                        conn.sendall(
+                            make_reply_create_playback_stream(
+                                tag, stream_index=0, channel=stream_channel, spec=spec
+                            )
+                        )
                     else:
                         conn.sendall(make_reply_ok(tag))
                 else:
@@ -530,7 +537,9 @@ class _ActiveTunnelSession:
                     raise ConnectionError("Server rejected PA_COMMAND_AUTH credentials")
 
                 # 2. Client Name
-                sock.sendall(make_command_set_client_name(tag=1, client_name="SoundHop Windows Sender"))
+                sock.sendall(
+                    make_command_set_client_name(tag=1, client_name="SoundHop Windows Sender")
+                )
                 name_rep = read_packet(sock_file)
                 if not name_rep or not name_rep.is_control:
                     raise ConnectionError("No response to PA_COMMAND_SET_CLIENT_NAME")
@@ -568,7 +577,9 @@ class _ActiveTunnelSession:
                 self._session_error.clear()
                 while not self._stop.is_set() and not self._session_error.is_set():
                     if self._recorder and not self._recorder.is_alive():
-                        log.warning("WASAPI loopback recorder exited unexpectedly for %s", self.sink_name)
+                        log.warning(
+                            "WASAPI loopback recorder exited unexpectedly for %s", self.sink_name
+                        )
                         break
                     if hasattr(sock, "fileno"):
                         try:
@@ -578,11 +589,15 @@ class _ActiveTunnelSession:
                                 if r:
                                     peek = sock.recv(1, socket.MSG_PEEK)
                                     if not peek:
-                                        log.info("Remote receiver %s:%s closed connection", self.host, self.port)
+                                        log.info(
+                                            "Remote receiver %s:%s closed connection",
+                                            self.host,
+                                            self.port,
+                                        )
                                         break
                             else:
                                 time.sleep(0.1)
-                        except (OSError, socket.error):
+                        except OSError:
                             break
                     else:
                         time.sleep(0.1)

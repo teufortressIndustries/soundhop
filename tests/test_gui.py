@@ -7,6 +7,7 @@ from unittest.mock import MagicMock, patch
 
 try:
     from PySide6 import QtCore, QtGui, QtWidgets
+
     HAVE_QT = True
 except ImportError:
     HAVE_QT = False
@@ -23,8 +24,9 @@ class GuiAndroidWizardTest(unittest.TestCase):
 
     def setUp(self) -> None:
         from soundhop.gui import _build_classes
+
         Tray, _ = _build_classes(QtCore, QtGui, QtWidgets)
-        self.AndroidWizardDialog = getattr(Tray, "AndroidWizardDialog")
+        self.AndroidWizardDialog = Tray.AndroidWizardDialog
         self.executor = ThreadPoolExecutor(max_workers=1)
         self.notifications: list[str] = []
 
@@ -109,7 +111,6 @@ class GuiAndroidWizardTest(unittest.TestCase):
             self.assertTrue(wizard.switch_wifi_btn.isEnabled())
 
     def test_switch_wifi_action_daemon_ipc(self) -> None:
-        from soundhop.android import AdbDevice
 
         wizard = self.AndroidWizardDialog(None, self.executor, self._notify)
         wizard._devices = [
@@ -136,6 +137,7 @@ class GuiAndroidWizardTest(unittest.TestCase):
 
     def test_disconnect_on_quit_enabled(self) -> None:
         from pathlib import Path
+
         from soundhop.config import Config
         from soundhop.gui import _build_classes
 
@@ -150,8 +152,10 @@ class GuiAndroidWizardTest(unittest.TestCase):
         tray._android_dialog = mock_dialog
         tray._status = {"android": {"active": True, "pid": 0}}
 
-        with patch("soundhop.gui.Config.load", return_value=cfg), \
-             patch("soundhop.gui.request") as mock_request:
+        with (
+            patch("soundhop.gui.Config.load", return_value=cfg),
+            patch("soundhop.gui.request") as mock_request,
+        ):
             tray._disconnect_on_quit_if_enabled()
 
             mock_request.assert_any_call("disconnect", timeout=4.0, restore=True, stop_android=True)
@@ -162,6 +166,7 @@ class GuiAndroidWizardTest(unittest.TestCase):
 
     def test_disconnect_on_quit_disabled(self) -> None:
         from pathlib import Path
+
         from soundhop.config import Config
         from soundhop.gui import _build_classes
 
@@ -175,8 +180,10 @@ class GuiAndroidWizardTest(unittest.TestCase):
         mock_dialog = MagicMock()
         tray._android_dialog = mock_dialog
 
-        with patch("soundhop.gui.Config.load", return_value=cfg), \
-             patch("soundhop.gui.request") as mock_request:
+        with (
+            patch("soundhop.gui.Config.load", return_value=cfg),
+            patch("soundhop.gui.request") as mock_request,
+        ):
             tray._disconnect_on_quit_if_enabled()
 
             mock_request.assert_not_called()

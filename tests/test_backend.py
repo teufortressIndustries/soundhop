@@ -1,7 +1,8 @@
 """Tests for AudioBackend parsing and pactl interactions."""
 
 import unittest
-from soundhop.backend import AudioBackend, BackendError, Module, Sink, listener_security
+
+from soundhop.backend import AudioBackend, Module, listener_security
 from soundhop.util import Result
 
 

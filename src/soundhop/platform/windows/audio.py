@@ -8,8 +8,7 @@ from __future__ import annotations
 
 import logging
 import threading
-import time
-from typing import Callable, Sequence
+from collections.abc import Callable
 
 log = logging.getLogger(__name__)
 
@@ -39,7 +38,11 @@ class WindowsPlayer:
                     latency="low",
                 )
                 self._stream.start()
-                log.debug("Opened sounddevice RawOutputStream (%s Hz, %s ch)", self.sample_rate, self.channels)
+                log.debug(
+                    "Opened sounddevice RawOutputStream (%s Hz, %s ch)",
+                    self.sample_rate,
+                    self.channels,
+                )
             except Exception as exc:
                 log.warning("Could not open sounddevice audio output: %s", exc)
                 self._stream = None
@@ -84,7 +87,9 @@ class WindowsLoopbackRecorder:
         self._thread: threading.Thread | None = None
 
     def is_alive(self) -> bool:
-        return self._thread is not None and self._thread.is_alive() and not self._stop_event.is_set()
+        return (
+            self._thread is not None and self._thread.is_alive() and not self._stop_event.is_set()
+        )
 
     def start(self) -> None:
         if self._thread is not None and self._thread.is_alive():
@@ -106,6 +111,7 @@ class WindowsLoopbackRecorder:
     def _record_loop(self) -> None:
         try:
             import soundcard as sc
+
             try:
                 import numpy as np
             except ImportError:
@@ -122,7 +128,9 @@ class WindowsLoopbackRecorder:
                 return
 
             log.info("Capturing audio from %s in loopback mode", speaker.name)
-            with loopback.recorder(samplerate=self.sample_rate, channels=self.channels, blocksize=self.block_size) as rec:
+            with loopback.recorder(
+                samplerate=self.sample_rate, channels=self.channels, blocksize=self.block_size
+            ) as rec:
                 while not self._stop_event.is_set():
                     data = rec.record(numframes=self.block_size)
                     if np is not None:
@@ -166,13 +174,33 @@ def list_audio_endpoints() -> list[dict[str, str]]:
                 if not name or name in seen_names:
                     continue
                 seen_names.add(name)
-                devices.append({
-                    "id": str(idx),
-                    "name": name,
-                    "channels": str(dev.get("max_output_channels", 2)),
-                    "default_samplerate": str(int(dev.get("default_samplerate", 48000))),
-                })
-        return devices if devices else [{"id": "0", "name": "Default Windows Audio Device", "channels": "2", "default_samplerate": "48000"}]
+                devices.append(
+                    {
+                        "id": str(idx),
+                        "name": name,
+                        "channels": str(dev.get("max_output_channels", 2)),
+                        "default_samplerate": str(int(dev.get("default_samplerate", 48000))),
+                    }
+                )
+        return (
+            devices
+            if devices
+            else [
+                {
+                    "id": "0",
+                    "name": "Default Windows Audio Device",
+                    "channels": "2",
+                    "default_samplerate": "48000",
+                }
+            ]
+        )
     except Exception as exc:
         log.debug("Failed querying audio endpoints via sounddevice: %s", exc)
-        return [{"id": "0", "name": "Default Windows Audio Device", "channels": "2", "default_samplerate": "48000"}]
+        return [
+            {
+                "id": "0",
+                "name": "Default Windows Audio Device",
+                "channels": "2",
+                "default_samplerate": "48000",
+            }
+        ]

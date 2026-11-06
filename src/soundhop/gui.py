@@ -12,12 +12,13 @@ import os
 import re
 import signal
 import sys
-import time
+from collections.abc import Callable
 from concurrent.futures import Future, ThreadPoolExecutor
-from typing import Any, Callable
+from pathlib import Path
+from typing import Any
 
 from . import __version__
-from .android import AndroidManager, SUPPORTED_AUDIO_CODECS
+from .android import AndroidManager
 from .config import Config
 from .constants import APP_NAME, ISSUES_URL
 from .ipc import DaemonNotRunning, IpcError, request
@@ -31,9 +32,7 @@ def _import_qt() -> tuple[Any, Any, Any]:
     try:
         from PySide6 import QtCore, QtGui, QtWidgets
     except ModuleNotFoundError as exc:  # pragma: no cover - depends on extra
-        raise ImportError(
-            "PySide6 is not installed. " + tray_dependency_hint()
-        ) from exc
+        raise ImportError("PySide6 is not installed. " + tray_dependency_hint()) from exc
     return QtCore, QtGui, QtWidgets
 
 
@@ -92,28 +91,18 @@ def _build_classes(QtCore: Any, QtGui: Any, QtWidgets: Any) -> tuple[type, type]
                 self.security.addItem(label, value)
             index = self.security.findData(config.sharing.security)
             self.security.setCurrentIndex(max(0, index))
-            self.share_enabled = QtWidgets.QCheckBox(
-                "Share this device's speakers"
-            )
+            self.share_enabled = QtWidgets.QCheckBox("Share this device's speakers")
             self.share_enabled.setChecked(config.sharing.enabled)
             self.auto = QtWidgets.QCheckBox("Auto-connect to the last device")
             self.auto.setChecked(config.connection.auto_connect)
-            self.switch = QtWidgets.QCheckBox(
-                "Switch the default output automatically"
-            )
+            self.switch = QtWidgets.QCheckBox("Switch the default output automatically")
             self.switch.setChecked(config.connection.switch_default)
-            self.restore = QtWidgets.QCheckBox(
-                "Restore local audio on disconnect"
-            )
+            self.restore = QtWidgets.QCheckBox("Restore local audio on disconnect")
             self.restore.setChecked(config.connection.restore_default)
             self.move = QtWidgets.QCheckBox("Move currently playing audio")
             self.move.setChecked(config.connection.move_streams)
-            self.disconnect_quit = QtWidgets.QCheckBox(
-                "Disconnect remote audio when quitting"
-            )
-            self.disconnect_quit.setChecked(
-                getattr(config.connection, "disconnect_on_quit", True)
-            )
+            self.disconnect_quit = QtWidgets.QCheckBox("Disconnect remote audio when quitting")
+            self.disconnect_quit.setChecked(getattr(config.connection, "disconnect_on_quit", True))
 
             self.latency = QtWidgets.QComboBox()
             self.latency.addItem("Auto (default PipeWire buffer)", 0)
@@ -295,9 +284,7 @@ def _build_classes(QtCore: Any, QtGui: Any, QtWidgets: Any) -> tuple[type, type]
             self.buffer_spin.setSuffix(" ms")
             cb_layout.addRow("Buffer latency", self.buffer_spin)
 
-            self.dup_check = QtWidgets.QCheckBox(
-                "Duplicate audio (keep playing on device too)"
-            )
+            self.dup_check = QtWidgets.QCheckBox("Duplicate audio (keep playing on device too)")
             cb_layout.addRow(self.dup_check)
             layout.addWidget(self.cfg_box)
 
@@ -422,9 +409,7 @@ def _build_classes(QtCore: Any, QtGui: Any, QtWidgets: Any) -> tuple[type, type]
 
             def work() -> tuple[bool, str]:
                 try:
-                    resp = request(
-                        "android_wifi", action="switch", serial=serial, timeout=15.0
-                    )
+                    resp = request("android_wifi", action="switch", serial=serial, timeout=15.0)
                     return bool(resp.get("ok", False)), str(resp.get("message", ""))
                 except (DaemonNotRunning, IpcError, OSError):
                     pass
@@ -434,11 +419,15 @@ def _build_classes(QtCore: Any, QtGui: Any, QtWidgets: Any) -> tuple[type, type]
                     return False, msg
                 if ip:
                     import time
+
                     time.sleep(1.0)
                     conn_ok, conn_msg = self._mgr.connect_wifi(ip)
                     if conn_ok:
                         return True, f"Connected to {ip}:5555"
-                    return True, f"Switched to TCP mode, but Wi-Fi connect to {ip}:5555 failed: {conn_msg}"
+                    return (
+                        True,
+                        f"Switched to TCP mode, but Wi-Fi connect to {ip}:5555 failed: {conn_msg}",
+                    )
                 return True, "Switched to TCP mode on port 5555. Please connect via Wi-Fi IP."
 
             def done(res: Any) -> None:
@@ -467,9 +456,7 @@ def _build_classes(QtCore: Any, QtGui: Any, QtWidgets: Any) -> tuple[type, type]
 
             def work() -> tuple[bool, str]:
                 try:
-                    resp = request(
-                        "android_wifi", action="connect", host=ip, timeout=10.0
-                    )
+                    resp = request("android_wifi", action="connect", host=ip, timeout=10.0)
                     return bool(resp.get("ok", False)), str(resp.get("message", ""))
                 except (DaemonNotRunning, IpcError, OSError):
                     return self._mgr.connect_wifi(ip)
@@ -556,6 +543,7 @@ def _build_classes(QtCore: Any, QtGui: Any, QtWidgets: Any) -> tuple[type, type]
 
         def _toggle_capture(self) -> None:
             if self._is_capturing:
+
                 def work() -> dict[str, Any]:
                     return self.stop_capture()
 
@@ -574,9 +562,7 @@ def _build_classes(QtCore: Any, QtGui: Any, QtWidgets: Any) -> tuple[type, type]
             else:
                 row = self.dev_list.currentRow()
                 if not (0 <= row < len(self._devices)):
-                    self._notify(
-                        APP_NAME, "Please select an Android device first.", warning=True
-                    )
+                    self._notify(APP_NAME, "Please select an Android device first.", warning=True)
                     return
                 dev = self._devices[row]
                 serial = dev["serial"]
@@ -622,9 +608,7 @@ def _build_classes(QtCore: Any, QtGui: Any, QtWidgets: Any) -> tuple[type, type]
                         try:
                             done(future.result())
                         except Exception as exc:
-                            self._notify(
-                                APP_NAME, f"Capture failed: {exc}", warning=True
-                            )
+                            self._notify(APP_NAME, f"Capture failed: {exc}", warning=True)
 
                 QtCore.QTimer.singleShot(50, poll)
 
@@ -650,9 +634,7 @@ def _build_classes(QtCore: Any, QtGui: Any, QtWidgets: Any) -> tuple[type, type]
                     name = session.get("device_name") or session.get("serial", "Android")
                     codec = str(session.get("codec", "")).upper()
                     uptime = format_duration(session.get("uptime_s"))
-                    self.status_lbl.setText(
-                        f"Status: Streaming from {name} ({codec}, {uptime})"
-                    )
+                    self.status_lbl.setText(f"Status: Streaming from {name} ({codec}, {uptime})")
                     self.status_lbl.setStyleSheet("color: #2e7d32; font-weight: bold;")
                     self.toggle_btn.setText("Stop Audio Capture")
                     self.toggle_btn.setStyleSheet(
@@ -682,9 +664,7 @@ def _build_classes(QtCore: Any, QtGui: Any, QtWidgets: Any) -> tuple[type, type]
         def __init__(self, *, verbose: bool = False) -> None:
             super().__init__()
             self.verbose = verbose
-            self._executor = ThreadPoolExecutor(
-                max_workers=2, thread_name_prefix="soundhop-tray"
-            )
+            self._executor = ThreadPoolExecutor(max_workers=2, thread_name_prefix="soundhop-tray")
             self._status: dict[str, Any] | None = None
             self._refreshing = False
             self._started = False
@@ -763,12 +743,8 @@ def _build_classes(QtCore: Any, QtGui: Any, QtWidgets: Any) -> tuple[type, type]
 
         def _build_menu(self) -> None:
             self.menu.clear()
-            self.header_action = self._action(
-                self.menu, f"{APP_NAME} {__version__}", enabled=False
-            )
-            self.output_action = self._action(
-                self.menu, "Output: this device", enabled=False
-            )
+            self.header_action = self._action(self.menu, f"{APP_NAME} {__version__}", enabled=False)
+            self.output_action = self._action(self.menu, "Output: this device", enabled=False)
             self.menu.addSeparator()
 
             self.share_action = self._action(
@@ -929,13 +905,10 @@ def _build_classes(QtCore: Any, QtGui: Any, QtWidgets: Any) -> tuple[type, type]
             self.auto_action.blockSignals(False)
             if connection:
                 self.output_action.setText(
-                    f"Output: {connection.get('name', 'remote')} "
-                    f"({connection.get('duration', '')})"
+                    f"Output: {connection.get('name', 'remote')} ({connection.get('duration', '')})"
                 )
                 self.disconnect_action.setEnabled(True)
-                self.tray.setToolTip(
-                    f"{APP_NAME} — playing on {connection.get('name', 'remote')}"
-                )
+                self.tray.setToolTip(f"{APP_NAME} — playing on {connection.get('name', 'remote')}")
             else:
                 self.output_action.setText("Output: this device")
                 self.disconnect_action.setEnabled(False)
@@ -945,9 +918,7 @@ def _build_classes(QtCore: Any, QtGui: Any, QtWidgets: Any) -> tuple[type, type]
 
             android = status.get("android") or {}
             if android.get("active"):
-                dev_name = (
-                    android.get("device_name") or android.get("serial", "Android")
-                )
+                dev_name = android.get("device_name") or android.get("serial", "Android")
                 self.android_stop_action.setText(f"Stop Android audio ({dev_name})")
                 self.android_stop_action.setVisible(True)
                 self.android_capture_action.setText("Android audio settings…")
@@ -980,25 +951,19 @@ def _build_classes(QtCore: Any, QtGui: Any, QtWidgets: Any) -> tuple[type, type]
                 for peer in peers:
                     label = f"{peer.get('name') or peer.get('id', 'device')}"
                     address = f"{peer.get('host', '')}:{peer.get('port', '')}"
-                    action = QtGui.QAction(
-                        f"{label}  ({address})", self.devices_menu
-                    )
+                    action = QtGui.QAction(f"{label}  ({address})", self.devices_menu)
                     action.setCheckable(True)
                     action.setChecked(peer.get("id") == current_id)
                     if not peer.get("compatible", True):
                         action.setEnabled(False)
                         action.setText(action.text() + " — update needed")
-                    action.triggered.connect(
-                        lambda checked=False, p=peer: self._connect_peer(p)
-                    )
+                    action.triggered.connect(lambda checked=False, p=peer: self._connect_peer(p))
                     self.devices_menu.addAction(action)
             elif known:
                 self.devices_menu.addSeparator()
                 for peer in known[:5]:
                     label = peer.get("name") or peer.get("id", "device")
-                    action = QtGui.QAction(
-                        f"{label}  (last seen)", self.devices_menu
-                    )
+                    action = QtGui.QAction(f"{label}  (last seen)", self.devices_menu)
                     action.setEnabled(False)
                     self.devices_menu.addAction(action)
             else:
@@ -1080,9 +1045,7 @@ def _build_classes(QtCore: Any, QtGui: Any, QtWidgets: Any) -> tuple[type, type]
             def done(result: Any) -> None:
                 self._busy = False
                 if isinstance(result, dict) and result.get("restored_to"):
-                    self._notify(
-                        APP_NAME, f"Audio restored to {result['restored_to']}"
-                    )
+                    self._notify(APP_NAME, f"Audio restored to {result['restored_to']}")
                 self.refresh()
 
             self._run_async(work, done)
@@ -1180,9 +1143,7 @@ def _build_classes(QtCore: Any, QtGui: Any, QtWidgets: Any) -> tuple[type, type]
                 ]
                 for item in result.get("warnings", []) or []:
                     lines.append(f"Warning: {item}")
-                QtWidgets.QMessageBox.information(
-                    None, f"{APP_NAME} diagnostics", "\n".join(lines)
-                )
+                QtWidgets.QMessageBox.information(None, f"{APP_NAME} diagnostics", "\n".join(lines))
 
             self._run_async(work, done)
 
@@ -1227,9 +1188,7 @@ def _build_classes(QtCore: Any, QtGui: Any, QtWidgets: Any) -> tuple[type, type]
             QtGui.QDesktopServices.openUrl(QtCore.QUrl.fromLocalFile(str(path)))
 
         def _report_issue(self) -> None:
-            QtGui.QDesktopServices.openUrl(
-                QtCore.QUrl(f"{ISSUES_URL}/new")
-            )
+            QtGui.QDesktopServices.openUrl(QtCore.QUrl(f"{ISSUES_URL}/new"))
 
         def _disconnect_on_quit_if_enabled(self) -> None:
             if getattr(self, "_cleaned_up_on_quit", False):

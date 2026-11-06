@@ -87,7 +87,6 @@ class ConfigTest(unittest.TestCase):
         )
         self.assertEqual(parse_config_value("hello world"), "hello world")
 
-
     def test_config_aliases(self) -> None:
         cfg = Config(Path("/tmp/test.toml"))
         cfg.set("connection.auto_reconnect", False)
@@ -101,10 +100,12 @@ class ConfigTest(unittest.TestCase):
         self.assertEqual(cfg.get("connection.latency_ms"), 120)
 
         # Test from_dict loading aliases
-        loaded = Config.from_dict({
-            "connection": {"auto_reconnect": False},
-            "sharing": {"buffer_latency_ms": 75},
-        })
+        loaded = Config.from_dict(
+            {
+                "connection": {"auto_reconnect": False},
+                "sharing": {"buffer_latency_ms": 75},
+            }
+        )
         self.assertFalse(loaded.connection.auto_connect)
         self.assertEqual(loaded.connection.latency_ms, 75)
 

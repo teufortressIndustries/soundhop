@@ -28,6 +28,7 @@ class CliTest(unittest.TestCase):
         else:
             os.environ.pop("XDG_STATE_HOME", None)
         self.tmpdir.cleanup()
+
     def test_parser_subcommands(self) -> None:
         parser = build_parser()
         # Verify subcommands parse cleanly
@@ -91,7 +92,9 @@ class CliTest(unittest.TestCase):
 
     def test_auto_pause_resume_execution_offline(self) -> None:
         from unittest.mock import patch
+
         from soundhop.state import State
+
         with patch("soundhop.cli.core_cmds._is_running", return_value=False):
             ret_pause = main(["auto", "pause"])
             self.assertEqual(ret_pause, 0)
@@ -104,21 +107,24 @@ class CliTest(unittest.TestCase):
             self.assertFalse(state.auto_paused)
 
     def test_android_stop_targeted_kill_behavior(self) -> None:
-        import signal
-        from unittest.mock import MagicMock, patch
-        from soundhop.cli import cmd_android_stop
         import argparse
+        import signal
+        from unittest.mock import patch
+
+        from soundhop.cli import cmd_android_stop
 
         args = argparse.Namespace()
 
         # Case 1: Daemon running and request("android_stop") succeeds.
         # os.kill must NOT be called even though active PID is 12345.
-        with patch("soundhop.cli.is_running", return_value=True), \
-             patch("soundhop.cli.request") as mock_req, \
-             patch("os.kill") as mock_kill:
+        with (
+            patch("soundhop.cli.is_running", return_value=True),
+            patch("soundhop.cli.request") as mock_req,
+            patch("os.kill") as mock_kill,
+        ):
             mock_req.side_effect = [
                 {"session": {"pid": 12345}},  # android_status
-                {"ok": True},                  # android_stop
+                {"ok": True},  # android_stop
             ]
             ret = cmd_android_stop(args)
             self.assertEqual(ret, 0)
@@ -126,12 +132,14 @@ class CliTest(unittest.TestCase):
 
         # Case 2: Daemon running but request("android_stop") raises error.
         # Fallback should kill active PID 12345.
-        with patch("soundhop.cli.is_running", return_value=True), \
-             patch("soundhop.cli.request") as mock_req, \
-             patch("os.kill") as mock_kill:
+        with (
+            patch("soundhop.cli.is_running", return_value=True),
+            patch("soundhop.cli.request") as mock_req,
+            patch("os.kill") as mock_kill,
+        ):
             mock_req.side_effect = [
-                {"session": {"pid": 12345}},       # android_status
-                RuntimeError("daemon timeout"),     # android_stop
+                {"session": {"pid": 12345}},  # android_status
+                RuntimeError("daemon timeout"),  # android_stop
             ]
             ret = cmd_android_stop(args)
             self.assertEqual(ret, 0)
@@ -140,4 +148,3 @@ class CliTest(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
-

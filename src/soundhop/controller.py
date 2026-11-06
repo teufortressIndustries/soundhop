@@ -12,7 +12,6 @@ from typing import Any
 
 from .android import (
     AndroidCaptureSession,
-    AndroidError,
     AndroidManager,
 )
 from .backend import (
@@ -115,7 +114,8 @@ class Controller:
                 "connection": None,
                 "peers": [p.to_dict() for p in (peers or [])],
                 "known_peers": [
-                    asdict(p) for p in sorted(
+                    asdict(p)
+                    for p in sorted(
                         self.state.known_peers.values(),
                         key=lambda p: p.last_seen,
                         reverse=True,
@@ -150,7 +150,11 @@ class Controller:
                 module = None
                 try:
                     sink = self.backend.sink(self.state.connected_sink)
-                    module = self.backend.module(self.state.connected_module) if self.state.connected_module else None
+                    module = (
+                        self.backend.module(self.state.connected_module)
+                        if self.state.connected_module
+                        else None
+                    )
                 except (BackendError, OSError):
                     pass
                 data["connection"] = {
@@ -336,9 +340,7 @@ class Controller:
             if peer.id == self.config.device.id:
                 raise ControllerError("That is this device")
             if not is_private_address(peer.host):
-                raise ControllerError(
-                    f"Refusing to connect to non-private address {peer.host}"
-                )
+                raise ControllerError(f"Refusing to connect to non-private address {peer.host}")
             if not peer.compatible:
                 raise ControllerError(
                     f"{peer.display_name} speaks SoundHop protocol {peer.protocol}; "
@@ -346,7 +348,11 @@ class Controller:
                 )
             existing = self.state.connected_peer
             if existing == peer.id and self.state.connected:
-                module = self._find_module(self.state.connected_module) if self.state.connected_module else None
+                module = (
+                    self._find_module(self.state.connected_module)
+                    if self.state.connected_module
+                    else None
+                )
                 if module is not None and self.backend.sink_exists(self.state.connected_sink):
                     if switch_default is None:
                         switch_default = self.config.connection.switch_default
@@ -369,9 +375,7 @@ class Controller:
             self._remember_previous_default()
             sink_name = self.sink_name_for(peer)
             switch_default = (
-                self.config.connection.switch_default
-                if switch_default is None
-                else switch_default
+                self.config.connection.switch_default if switch_default is None else switch_default
             )
             move = self.config.connection.move_streams if move_streams is None else move_streams
 
@@ -415,7 +419,13 @@ class Controller:
 
             if self._should_notify(notify_user):
                 notify("SoundHop", f"Audio is now playing on {peer.display_name}")
-            log.info("Connected to %s (%s:%s) via module %s", peer.display_name, peer.host, peer.port, module_id)
+            log.info(
+                "Connected to %s (%s:%s) via module %s",
+                peer.display_name,
+                peer.host,
+                peer.port,
+                module_id,
+            )
             result = self._connection_dict()
             if switch_warning:
                 result["warning"] = switch_warning
@@ -562,7 +572,11 @@ class Controller:
             self.state.previous_default_sink = ""
 
     def _local_default_candidate(self, preferred: str = "") -> str:
-        if preferred and self.backend.sink_exists(preferred) and not preferred.startswith(SINK_PREFIX):
+        if (
+            preferred
+            and self.backend.sink_exists(preferred)
+            and not preferred.startswith(SINK_PREFIX)
+        ):
             return preferred
         for sink in self.backend.sinks():
             if sink.name.startswith(SINK_PREFIX):
@@ -632,7 +646,9 @@ class Controller:
                             except BackendError:
                                 pass
                     self.state.save(self._state_path)
-                elif module.id != self.state.connected_module and module.name.startswith("module-tunnel-"):
+                elif module.id != self.state.connected_module and module.name.startswith(
+                    "module-tunnel-"
+                ):
                     self.state.connected_module = module.id
                     actions.append("adopted tunnel module id")
                     self.state.save(self._state_path)
@@ -655,16 +671,13 @@ class Controller:
         data = self.status()
         try:
             data["modules"] = [
-                {"id": m.id, "name": m.name, "args": m.args}
-                for m in self.backend.modules()
+                {"id": m.id, "name": m.name, "args": m.args} for m in self.backend.modules()
             ]
             data["soundhop_modules"] = [
                 {"id": m.id, "name": m.name, "args": m.args}
                 for m in self.backend.soundhop_modules()
             ]
-            data["sink_inputs"] = [
-                asdict(item) for item in self.backend.sink_inputs()
-            ]
+            data["sink_inputs"] = [asdict(item) for item in self.backend.sink_inputs()]
         except (BackendError, OSError) as exc:
             data["error"] = str(exc)
         return data
@@ -700,7 +713,10 @@ class Controller:
                 conn_ok, conn_msg = self.android_manager.connect_wifi(ip, port)
                 if conn_ok:
                     return True, f"Switched to Wi-Fi mode and connected to {ip}:{port}"
-                return True, f"Switched to TCP mode, but Wi-Fi connect to {ip}:{port} failed: {conn_msg}"
+                return (
+                    True,
+                    f"Switched to TCP mode, but Wi-Fi connect to {ip}:{port} failed: {conn_msg}",
+                )
             return True, f"Switched to TCP mode on port {port}. Please connect via Wi-Fi IP."
 
     def android_connect_wifi(self, host: str, port: int = 5555) -> tuple[bool, str]:

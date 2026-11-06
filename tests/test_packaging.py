@@ -16,9 +16,13 @@ class PackagingTest(unittest.TestCase):
 
         content = desktop_file.read_text(encoding="utf-8")
         self.assertIn("[Desktop Entry]", content)
-        from soundhop.constants import VERSION
         import re
-        self.assertTrue(bool(re.match(r"^\d+\.\d+\.\d+$", VERSION)), f"VERSION must be semver: {VERSION}")
+
+        from soundhop.constants import VERSION
+
+        self.assertTrue(
+            bool(re.match(r"^\d+\.\d+\.\d+$", VERSION)), f"VERSION must be semver: {VERSION}"
+        )
         self.assertIn(f"X-AppImage-Version={VERSION}", content)
         self.assertIn(
             "X-AppImage-UpdateURL=https://github.com/teufortressIndustries/soundhop",
@@ -30,9 +34,13 @@ class PackagingTest(unittest.TestCase):
         )
 
     def test_version_consistency_across_packaging(self) -> None:
-        from soundhop.constants import VERSION
         import re
-        self.assertTrue(bool(re.match(r"^\d+\.\d+\.\d+$", VERSION)), f"VERSION must be semver: {VERSION}")
+
+        from soundhop.constants import VERSION
+
+        self.assertTrue(
+            bool(re.match(r"^\d+\.\d+\.\d+$", VERSION)), f"VERSION must be semver: {VERSION}"
+        )
 
         pkgbuild = (ROOT_DIR / "packaging" / "PKGBUILD").read_text(encoding="utf-8")
         self.assertIn(f"pkgver={VERSION}", pkgbuild)
@@ -46,12 +54,15 @@ class PackagingTest(unittest.TestCase):
         pyproject = (ROOT_DIR / "pyproject.toml").read_text(encoding="utf-8")
         self.assertIn(f'version = "{VERSION}"', pyproject)
 
-        desktop = (ROOT_DIR / "packaging" / "io.github.soundhop.desktop").read_text(encoding="utf-8")
+        desktop = (ROOT_DIR / "packaging" / "io.github.soundhop.desktop").read_text(
+            encoding="utf-8"
+        )
         self.assertIn(f"X-AppImage-Version={VERSION}", desktop)
         self.assertNotIn("0.2.1", desktop)
 
     def test_bump_version_updates_pyproject_toml(self) -> None:
         import re
+
         bump_script = ROOT_DIR / "packaging" / "bump-version.py"
         spec = importlib.util.spec_from_file_location("bump_version", bump_script)
         self.assertIsNotNone(spec)
@@ -123,6 +134,7 @@ class PackagingTest(unittest.TestCase):
             )
             content = tmp_desktop.read_text(encoding="utf-8")
             import re
+
             if not re.search(r"X-AppImage-Version=[^\r\n]*", content):
                 tmp_desktop.write_text(
                     content.rstrip() + "\nX-AppImage-Version=1.2.3\n",
