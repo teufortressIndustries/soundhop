@@ -116,5 +116,34 @@ class ControllerTest(unittest.TestCase):
             mock_stop.assert_called_once()
 
 
+    def test_reconcile_resurrects_listener_after_server_restart(self) -> None:
+        from pathlib import Path
+        from soundhop.backend import Listener
+
+        cfg = Config(Path("/tmp/test.toml"))
+        cfg.sharing.enabled = True
+        backend = MagicMock()
+        backend.available.return_value = True
+        # Simulate that listener module 42 died (e.g. PipeWire restarted)
+        backend.module.return_value = None
+        backend.ensure_tcp_listener.return_value = Listener(
+            module_id=99,
+            created=True,
+            args="port=4713",
+            port=4713,
+            security="lan",
+        )
+
+        controller = Controller(config=cfg, backend=backend)
+        controller.state.listener_module = 42
+        controller.state.listener_created = True
+
+        res = controller.reconcile()
+        self.assertTrue(res["available"])
+        self.assertIn("cleared stale listener state", res["actions"])
+        self.assertTrue(any("resurrected audio listener" in a for a in res["actions"]))
+        self.assertEqual(controller.state.listener_module, 99)
+
+
 if __name__ == "__main__":
     unittest.main()

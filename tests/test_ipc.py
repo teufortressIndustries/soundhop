@@ -64,15 +64,29 @@ class IpcTest(unittest.TestCase):
                 try:
                     self.assertTrue(server._is_tcp)
                     self.assertTrue(sock_path.with_suffix(".port").exists())
+                    self.assertTrue(sock_path.with_suffix(".auth").exists())
                     self.assertTrue(is_running(sock_path))
 
                     res = request("ping", path=sock_path)
                     self.assertTrue(res.get("pong"))
                     self.assertTrue(res.get("tcp"))
+
+                    # Verify raw unauthenticated request over TCP is rejected
+                    port = int(sock_path.with_suffix(".port").read_text(encoding="utf-8").strip())
+                    raw_sock = orig_socket(socket.AF_INET, socket.SOCK_STREAM)
+                    raw_sock.connect(("127.0.0.1", port))
+                    raw_sock.sendall(b'{"cmd": "ping"}\n')
+                    resp = raw_sock.recv(4096)
+                    raw_sock.close()
+                    import json
+                    resp_json = json.loads(resp.decode("utf-8"))
+                    self.assertFalse(resp_json.get("ok"))
+                    self.assertIn("Unauthorized", resp_json.get("error", ""))
                 finally:
                     server.stop()
 
             self.assertFalse(sock_path.with_suffix(".port").exists())
+            self.assertFalse(sock_path.with_suffix(".auth").exists())
 
 
 if __name__ == "__main__":

@@ -26,6 +26,7 @@ from ..service import (
     tray_dependency_hint,
 )
 from ..util import (
+    broadcast_addresses,
     command_exists,
     log_path,
     process_running,
@@ -270,6 +271,26 @@ def _run_doctor() -> dict[str, Any]:
             "Enable USB debugging on your phone and connect via USB or Wi-Fi.",
             warn=not ready_devices,
         )
+    targets = broadcast_addresses(include_loopback=False)
+    add(
+        "Broadcast route",
+        bool(targets),
+        (
+            f"{len(targets)} active ({', '.join(targets[:3])}{'...' if len(targets) > 3 else ''})"
+            if targets
+            else "none detected"
+        ),
+        "Discovery beacons need at least one active network interface with broadcast.",
+        warn=not targets,
+    )
+
+    lp = log_path()
+    if lp.exists():
+        size_kb = lp.stat().st_size / 1024
+        add("Logs", True, f"{size_kb:.1f} KB (RotatingFileHandler active)")
+    else:
+        add("Logs", True, f"not created yet ({lp})")
+
     add(
         "Config",
         True,

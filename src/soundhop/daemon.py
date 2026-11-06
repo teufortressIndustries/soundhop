@@ -17,6 +17,7 @@ try:
 except ImportError:
     fcntl = None  # type: ignore[assignment]
 import logging
+from logging.handlers import RotatingFileHandler
 import os
 import signal
 import subprocess
@@ -622,7 +623,12 @@ def configure_logging(verbose: bool = False, *, to_file: bool = False) -> None:
         root.removeHandler(handler)
     if to_file:
         ensure_dir(log_path().parent)
-        handler: logging.Handler = logging.FileHandler(log_path(), encoding="utf-8")
+        handler: logging.Handler = RotatingFileHandler(
+            log_path(),
+            maxBytes=5 * 1024 * 1024,
+            backupCount=3,
+            encoding="utf-8",
+        )
         try:
             log_path().chmod(0o600)
         except OSError:

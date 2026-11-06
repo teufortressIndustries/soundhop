@@ -643,6 +643,12 @@ class Controller:
                     self.state.listener_created = False
                     actions.append("cleared stale listener state")
                     self.state.save(self._state_path)
+            if self.config.sharing.enabled and not self.state.listener_module:
+                try:
+                    self._ensure_listener()
+                    actions.append("resurrected audio listener after audio server restart")
+                except Exception as exc:
+                    actions.append(f"could not resurrect audio listener: {exc}")
             return {"available": True, "actions": actions}
 
     def system_info(self) -> dict[str, Any]:

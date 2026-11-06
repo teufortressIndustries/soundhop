@@ -1,0 +1,41 @@
+app-id: io.github.soundhop.SoundHop
+runtime: org.freedesktop.Platform
+runtime-version: '23.08'
+sdk: org.freedesktop.Sdk
+command: soundhop
+command-args:
+  - tray
+
+finish-args:
+  # Network access for UDP 47777 discovery and TCP 4713 audio streaming
+  - --share=network
+  # Audio system access (PulseAudio & PipeWire compatibility socket)
+  - --socket=pulseaudio
+  # Display servers
+  - --socket=wayland
+  - --socket=fallback-x11
+  # System tray integration
+  - --talk-name=org.kde.StatusNotifierWatcher
+  # Desktop notifications
+  - --talk-name=org.freedesktop.Notifications
+  # Access to user config and state directories
+  - --persist=.config/soundhop
+  - --persist=.local/state/soundhop
+
+modules:
+  - name: python3-zeroconf
+    buildsystem: simple
+    build-commands:
+      - pip3 install --no-index --find-links="file://${PWD}" --prefix=${FLATPAK_DEST} zeroconf
+    sources: []
+
+  - name: soundhop
+    buildsystem: simple
+    build-commands:
+      - pip3 install --no-deps --prefix=${FLATPAK_DEST} .
+      - install -Dm644 packaging/io.github.soundhop.desktop ${FLATPAK_DEST}/share/applications/io.github.soundhop.SoundHop.desktop
+      - install -Dm644 src/soundhop/assets/soundhop.png ${FLATPAK_DEST}/share/icons/hicolor/256x256/apps/io.github.soundhop.SoundHop.png
+      - install -Dm644 src/soundhop/assets/soundhop.svg ${FLATPAK_DEST}/share/icons/hicolor/scalable/apps/io.github.soundhop.SoundHop.svg
+    sources:
+      - type: dir
+        path: ../

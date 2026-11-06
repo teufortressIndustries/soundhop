@@ -5,6 +5,7 @@ from __future__ import annotations
 import json
 import logging
 import os
+import secrets
 import socket
 import threading
 from pathlib import Path
@@ -34,6 +35,7 @@ class IpcServer:
         self._thread: threading.Thread | None = None
         self._stop = threading.Event()
         self._is_tcp = False
+        self._auth_token: str | None = None
 
     def start(self) -> None:
         ensure_dir(self.path.parent)
@@ -44,9 +46,15 @@ class IpcServer:
             pass
 
         port_file = self.path.with_suffix(".port")
+        auth_file = self.path.with_suffix(".auth")
         try:
             if port_file.exists():
                 port_file.unlink()
+        except OSError:
+            pass
+        try:
+            if auth_file.exists():
+                auth_file.unlink()
         except OSError:
             pass
 
@@ -73,7 +81,15 @@ class IpcServer:
             sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
             sock.bind(("127.0.0.1", 0))
             bound_port = sock.getsockname()[1]
+            token = secrets.token_hex(32)
+            self._auth_token = token
             port_file.write_text(f"{bound_port}\n", encoding="utf-8")
+            auth_file.write_text(f"{token}\n", encoding="utf-8")
+            if hasattr(os, "chmod"):
+                try:
+                    os.chmod(auth_file, 0o600)
+                except OSError:
+                    pass
             self._is_tcp = True
 
         sock.listen(16)
@@ -123,6 +139,8 @@ class IpcServer:
             else:
                 if not isinstance(request, dict):
                     response = {"ok": False, "error": "Request must be a JSON object"}
+                elif self._is_tcp and request.get("auth") != self._auth_token:
+                    response = {"ok": False, "error": "Unauthorized: invalid or missing IPC authentication token"}
                 else:
                     try:
                         response = self.handler(request)
@@ -163,6 +181,12 @@ class IpcServer:
                 port_file.unlink()
         except OSError:
             pass
+        try:
+            auth_file = self.path.with_suffix(".auth")
+            if auth_file.exists():
+                auth_file.unlink()
+        except OSError:
+            pass
 
 
 def request(
@@ -177,6 +201,7 @@ def request(
     target = path or socket_path()
     request_data = {"cmd": command, **payload}
     port_file = target.with_suffix(".port")
+    auth_file = target.with_suffix(".auth")
 
     sock: socket.socket | None = None
     if port_file.exists():
@@ -186,6 +211,8 @@ def request(
                 sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
                 sock.settimeout(timeout)
                 sock.connect(("127.0.0.1", int(port_str)))
+                if auth_file.exists():
+                    request_data["auth"] = auth_file.read_text(encoding="utf-8").strip()
         except (OSError, ValueError):
             if sock:
                 sock.close()
