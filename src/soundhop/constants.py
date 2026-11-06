@@ -5,7 +5,7 @@ from __future__ import annotations
 APP_NAME = "SoundHop"
 APP_SLUG = "soundhop"
 APP_ID = "io.github.soundhop"
-VERSION = "1.1.5"
+VERSION = "1.1.6"
 REPO_URL = "https://github.com/teufortressIndustries/soundhop"
 ISSUES_URL = "https://github.com/teufortressIndustries/soundhop/issues"
 
