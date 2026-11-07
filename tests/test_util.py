@@ -1,5 +1,6 @@
 """Tests for utility helpers."""
 
+import sys
 import tempfile
 import unittest
 from pathlib import Path
@@ -77,7 +78,8 @@ class UtilTest(unittest.TestCase):
             self.assertTrue(target.exists())
             content = target.read_text()
             self.assertTrue(content.startswith("thread-"))
-            self.assertEqual(target.stat().st_mode & 0o777, 0o600)
+            if sys.platform != "win32":
+                self.assertEqual(target.stat().st_mode & 0o777, 0o600)
 
     def test_is_private_address(self) -> None:
         from soundhop.util import is_private_address

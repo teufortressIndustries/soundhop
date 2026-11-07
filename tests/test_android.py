@@ -1,6 +1,7 @@
 """Unit tests for soundhop.android."""
 
 import os
+import sys
 import tempfile
 import unittest
 from pathlib import Path
@@ -57,7 +58,7 @@ class AndroidTest(unittest.TestCase):
                 bit_rate=192000,
                 duplicate=True,
             )
-            self.assertEqual(args[0], "/usr/bin/scrcpy")
+            self.assertEqual(args[0], str(Path("/usr/bin/scrcpy")))
             self.assertIn("-s", args)
             self.assertIn("192.168.1.99:5555", args)
             self.assertIn("--no-video", args)
@@ -168,6 +169,7 @@ class AndroidTest(unittest.TestCase):
         d4 = AdbDevice(serial="s4", state="device", android_version="")
         self.assertEqual(d4.major_version, 0)
 
+    @unittest.skipIf(sys.platform == "win32", "POSIX tar symlink/hardlink extraction test")
     def test_install_scrcpy_symlinks_and_traversal(self) -> None:
         import io
         import tarfile
@@ -258,6 +260,36 @@ class AndroidTest(unittest.TestCase):
                 mock_resp.read.side_effect = [archive_bytes, b""]
                 with self.assertRaises(AndroidError):
                     mgr.install_scrcpy(expected_sha256="0" * 64)
+
+    def test_install_scrcpy_windows_zip_and_traversal(self) -> None:
+        import zipfile
+
+        with tempfile.TemporaryDirectory() as tmpdir:
+            dest_dir = Path(tmpdir) / "managed_scrcpy"
+            archive_path = Path(tmpdir) / "test_scrcpy.zip"
+
+            with zipfile.ZipFile(archive_path, "w") as zf:
+                zf.writestr("scrcpy-win64-v5.0.1/scrcpy.exe", b"MZfake_exe")
+                zf.writestr("scrcpy-win64-v5.0.1/adb.exe", b"MZfake_adb")
+                zf.writestr("scrcpy-win64-v5.0.1/../../escaped_win.txt", b"pwned")
+
+            mgr = AndroidManager()
+            with (
+                patch.object(mgr, "managed_dir", return_value=dest_dir),
+                patch("soundhop.android.sys.platform", "win32"),
+                patch("urllib.request.urlopen") as mock_urlopen,
+            ):
+                archive_bytes = archive_path.read_bytes()
+                mock_resp = MagicMock()
+                mock_resp.headers = {"Content-Length": str(len(archive_bytes))}
+                mock_resp.read.side_effect = [archive_bytes, b""]
+                mock_urlopen.return_value.__enter__.return_value = mock_resp
+
+                bin_path = mgr.install_scrcpy()
+                self.assertTrue(bin_path.exists())
+                self.assertEqual(bin_path.name, "scrcpy.exe")
+                self.assertTrue((dest_dir / "adb.exe").is_file())
+                self.assertFalse((Path(tmpdir) / "escaped_win.txt").exists())
 
     def test_get_device_wifi_ip(self) -> None:
         mgr = AndroidManager()

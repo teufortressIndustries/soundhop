@@ -446,15 +446,23 @@ class AndroidManager:
         finally:
             archive_path.unlink(missing_ok=True)
 
-        scrcpy_bin = dest_dir / "scrcpy"
-        if not (scrcpy_bin.is_file() and os.access(scrcpy_bin, os.X_OK)):
-            # Check subfolder
-            for sub in dest_dir.glob("**/scrcpy"):
-                if sub.is_file() and os.access(sub, os.X_OK):
-                    scrcpy_bin = sub
+        names = ["scrcpy.exe", "scrcpy"] if sys.platform == "win32" else ["scrcpy"]
+        scrcpy_bin: Path | None = None
+        for name in names:
+            candidate = dest_dir / name
+            if candidate.is_file() and (sys.platform == "win32" or os.access(candidate, os.X_OK)):
+                scrcpy_bin = candidate
+                break
+        if scrcpy_bin is None:
+            for name in names:
+                for sub in dest_dir.glob(f"**/{name}"):
+                    if sub.is_file() and (sys.platform == "win32" or os.access(sub, os.X_OK)):
+                        scrcpy_bin = sub
+                        break
+                if scrcpy_bin is not None:
                     break
 
-        if not scrcpy_bin.exists():
+        if scrcpy_bin is None or not scrcpy_bin.exists():
             raise AndroidError("scrcpy binary not found after extraction")
 
         return scrcpy_bin

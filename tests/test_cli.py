@@ -95,7 +95,13 @@ class CliTest(unittest.TestCase):
 
         from soundhop.state import State
 
-        with patch("soundhop.cli.core_cmds._is_running", return_value=False):
+        # Simulate Windows cp1252 stdout stream to ensure Unicode output (e.g. '✓') never raises UnicodeEncodeError
+        raw_buf = io.BytesIO()
+        cp1252_stream = io.TextIOWrapper(raw_buf, encoding="cp1252", errors="strict")
+        with (
+            patch("soundhop.cli.core_cmds._is_running", return_value=False),
+            redirect_stdout(cp1252_stream),
+        ):
             ret_pause = main(["auto", "pause"])
             self.assertEqual(ret_pause, 0)
             state = State.load()

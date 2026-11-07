@@ -30,7 +30,7 @@ if ! command -v python3 >/dev/null 2>&1 || ! command -v zstd >/dev/null 2>&1 || 
     fi
     $SUDO apt-get update -qq
     $SUDO apt-get install -y -qq --no-install-recommends \
-        python3 python3-pip python3-venv wget curl ca-certificates file libgl1 libegl1 libxkbcommon0 libpulse0 zstd binutils appstream
+        python3 python3-pip python3-venv wget curl ca-certificates file libgl1 libegl1 libxkbcommon0 libpulse0 zstd zsync binutils appstream
 else
     echo "1. Base system dependencies already present."
 fi

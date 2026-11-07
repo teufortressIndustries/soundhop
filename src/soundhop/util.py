@@ -205,6 +205,9 @@ def pid_path() -> Path:
     return runtime_dir() / "daemon.pid"
 
 
+_atomic_write_lock = threading.Lock()
+
+
 def atomic_write(path: Path, text: str, mode: int = 0o600) -> None:
     ensure_dir(path.parent)
     unique_suffix = f"{os.getpid()}.{threading.get_ident()}.{uuid.uuid4().hex}"
@@ -231,7 +234,15 @@ def atomic_write(path: Path, text: str, mode: int = 0o600) -> None:
                 tmp.chmod(mode)
             except OSError:
                 pass
-        os.replace(tmp, path)
+        with _atomic_write_lock:
+            for attempt in range(5):
+                try:
+                    os.replace(tmp, path)
+                    break
+                except PermissionError:
+                    if sys.platform != "win32" or attempt == 4:
+                        raise
+                    time.sleep(0.01 * (attempt + 1))
     finally:
         tmp.unlink(missing_ok=True)
 

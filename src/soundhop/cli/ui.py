@@ -15,28 +15,52 @@ from ..discovery import Peer
 from ..util import format_age, format_duration, style
 
 
+def _configure_console_streams() -> None:
+    """Ensure stdout/stderr never fail with UnicodeEncodeError on Windows cp1252 consoles."""
+    for stream in (sys.stdout, sys.stderr):
+        reconf = getattr(stream, "reconfigure", None)
+        if callable(reconf):
+            try:
+                reconf(encoding="utf-8", errors="replace")
+            except Exception:
+                pass
+
+
+_configure_console_streams()
+
+
+def _safe_print(text: str = "", *, file: Any = None, end: str = "\n") -> None:
+    target = file if file is not None else sys.stdout
+    try:
+        print(text, file=target, end=end)
+    except UnicodeEncodeError:
+        enc = getattr(target, "encoding", None) or "ascii"
+        safe_text = text.encode(enc, errors="replace").decode(enc, errors="replace")
+        print(safe_text, file=target, end=end)
+
+
 def _json_enabled(args: argparse.Namespace) -> bool:
     return bool(getattr(args, "json", False))
 
 
 def emit_json(data: Any) -> None:
-    print(json.dumps(data, indent=2, default=str, sort_keys=False))
+    _safe_print(json.dumps(data, indent=2, default=str, sort_keys=False))
 
 
 def error(message: str) -> None:
-    print(f"{style('error:', 'red', 'bold')} {message}", file=sys.stderr)
+    _safe_print(f"{style('error:', 'red', 'bold')} {message}", file=sys.stderr)
 
 
 def info(message: str) -> None:
-    print(message)
+    _safe_print(message)
 
 
 def warning(message: str) -> None:
-    print(f"{style('warning:', 'yellow', 'bold')} {message}", file=sys.stderr)
+    _safe_print(f"{style('warning:', 'yellow', 'bold')} {message}", file=sys.stderr)
 
 
 def ok(message: str) -> None:
-    print(f"{style('✓', 'green')} {message}")
+    _safe_print(f"{style('✓', 'green')} {message}")
 
 
 def _status_icon(peer: Peer) -> str:
