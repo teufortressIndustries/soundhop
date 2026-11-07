@@ -44,6 +44,9 @@ def main() -> int:
         "soundhop.platform.windows.protocol",
         "soundhop.cli",
         "soundhop.gui",
+        "soundhop.gui.android_dialog",
+        "soundhop.gui.settings",
+        "soundhop.gui.tray",
     ]
     for opt_mod in (
         "sounddevice",
