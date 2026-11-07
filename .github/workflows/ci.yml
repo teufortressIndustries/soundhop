@@ -9,12 +9,20 @@ on:
 
 jobs:
   test:
-    name: Test (Python ${{ matrix.python-version }})
-    runs-on: ubuntu-latest
+    name: Test (${{ matrix.os }} / Python ${{ matrix.python-version }})
+    runs-on: ${{ matrix.os }}
     strategy:
       fail-fast: false
       matrix:
+        os: ["ubuntu-latest", "windows-latest"]
         python-version: ["3.10", "3.11", "3.12", "3.13"]
+        exclude:
+          - os: "windows-latest"
+            python-version: "3.10"
+          - os: "windows-latest"
+            python-version: "3.12"
+          - os: "windows-latest"
+            python-version: "3.13"
 
     steps:
       - uses: actions/checkout@v4
@@ -29,9 +37,11 @@ jobs:
           python -m pip install --upgrade pip
           python -m pip install -e ".[all,dev]"
 
-      - name: Code quality & linting
+      - name: Code quality, type checking & security linting
         run: |
           ruff check src tests
+          mypy src
+          bandit -r src -ll -q
 
       - name: Run test suite
         env:
