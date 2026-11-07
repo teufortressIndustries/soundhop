@@ -106,6 +106,8 @@ class AndroidConfig:
     bit_rate: int = 128000
     duplicate_audio: bool = False
     auto_switch_wifi: bool = True
+    auto_reconnect: bool = True
+    mdns_discovery: bool = True
     last_serial: str = ""
 
 
@@ -221,6 +223,8 @@ class Config:
         self.android.bit_rate = max(16000, int(self.android.bit_rate or 128000))
         self.android.duplicate_audio = _as_bool(self.android.duplicate_audio, False)
         self.android.auto_switch_wifi = _as_bool(self.android.auto_switch_wifi, True)
+        self.android.auto_reconnect = _as_bool(self.android.auto_reconnect, True)
+        self.android.mdns_discovery = _as_bool(self.android.mdns_discovery, True)
         self.android.last_serial = str(self.android.last_serial or "").strip()
 
     # -- saving ----------------------------------------------------------
@@ -279,6 +283,8 @@ class Config:
             f"bit_rate = {s.android.bit_rate}",
             f"duplicate_audio = {_bool(s.android.duplicate_audio)}",
             f"auto_switch_wifi = {_bool(s.android.auto_switch_wifi)}",
+            f"auto_reconnect = {_bool(s.android.auto_reconnect)}",
+            f"mdns_discovery = {_bool(s.android.mdns_discovery)}",
             f"last_serial = {_q(s.android.last_serial)}",
             "",
         ]

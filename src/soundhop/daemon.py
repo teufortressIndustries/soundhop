@@ -18,6 +18,7 @@ except ImportError:
     fcntl = None  # type: ignore[assignment]
 import logging
 import os
+import select
 import signal
 import subprocess
 import sys
@@ -38,6 +39,7 @@ from .controller import Controller, ControllerError
 from .discovery import DiscoveryManager, Peer
 from .ipc import IpcServer, is_running
 from .util import (
+    command_exists,
     ensure_dir,
     is_private_address,
     lock_path,
@@ -48,6 +50,112 @@ from .util import (
 )
 
 log = logging.getLogger(__name__)
+
+
+class AudioEventMonitor:
+    """Monitors live audio server events (via pactl subscribe) to sync volume and enforce app routing."""
+
+    def __init__(self, controller: Controller, stop_event: threading.Event) -> None:
+        self.controller = controller
+        self.stop_event = stop_event
+        self._thread: threading.Thread | None = None
+        self._proc: subprocess.Popen[str] | None = None
+
+    def start(self) -> None:
+        self._thread = threading.Thread(
+            target=self._run_loop, name="soundhop-audio-monitor", daemon=True
+        )
+        self._thread.start()
+
+    def stop(self) -> None:
+        if self._proc:
+            try:
+                self._proc.terminate()
+            except Exception:
+                pass
+
+    def _run_loop(self) -> None:
+        pactl_cmd = getattr(self.controller.backend, "pactl", "pactl")
+        if not command_exists(pactl_cmd):
+            self._polling_loop()
+            return
+
+        last_vol_sync = 0.0
+        last_route_enforce = 0.0
+        while not self.stop_event.is_set():
+            try:
+                self._proc = subprocess.Popen(
+                    [pactl_cmd, "subscribe"],
+                    stdout=subprocess.PIPE,
+                    stderr=subprocess.DEVNULL,
+                    text=True,
+                    bufsize=1,
+                )
+            except Exception as exc:
+                log.debug("Could not spawn pactl subscribe: %s", exc)
+                self.stop_event.wait(5.0)
+                continue
+
+            try:
+                while not self.stop_event.is_set() and self._proc.poll() is None:
+                    if self._proc.stdout is None:
+                        break
+                    if hasattr(self._proc.stdout, "fileno"):
+                        try:
+                            r, _, _ = select.select([self._proc.stdout], [], [], 0.5)
+                            if not r:
+                                continue
+                        except Exception:
+                            break
+                    line = self._proc.stdout.readline()
+                    if not line:
+                        break
+                    line_lower = line.strip().lower()
+
+                    # Handle sink volume changes
+                    if "on sink" in line_lower:
+                        now = time.monotonic()
+                        if now - last_vol_sync >= 0.05:
+                            last_vol_sync = now
+                            try:
+                                self.controller.sync_remote_volume()
+                            except Exception as exc:
+                                log.debug("Auto volume sync error: %s", exc)
+
+                    # Handle sink-input creation/changes for per-app routing
+                    elif "on sink-input" in line_lower:
+                        if "new" in line_lower or "change" in line_lower:
+                            now = time.monotonic()
+                            if now - last_route_enforce >= 0.15:
+                                last_route_enforce = now
+                                try:
+                                    self.controller.enforce_routed_apps()
+                                except Exception as exc:
+                                    log.debug("Auto app routing error: %s", exc)
+            except Exception as exc:
+                log.debug("pactl subscribe loop error: %s", exc)
+            finally:
+                if self._proc:
+                    try:
+                        self._proc.terminate()
+                        self._proc.wait(timeout=1.0)
+                    except Exception:
+                        pass
+                    self._proc = None
+
+            if not self.stop_event.is_set():
+                self.stop_event.wait(1.0)
+
+    def _polling_loop(self) -> None:
+        while not self.stop_event.is_set():
+            try:
+                if self.controller.state.connected:
+                    self.controller.sync_remote_volume()
+                    if self.controller.state.routed_apps:
+                        self.controller.enforce_routed_apps()
+            except Exception:
+                pass
+            self.stop_event.wait(0.5)
 
 
 class Daemon:
@@ -73,6 +181,7 @@ class Daemon:
         self._started = time.time()
         self._shutdown_done = threading.Event()
         self._supervisor: threading.Thread | None = None
+        self._audio_monitor: AudioEventMonitor | None = None
         self._advertising = False
         self._warnings: list[str] = []
         self._auto_failures = 0
@@ -94,6 +203,8 @@ class Daemon:
             target=self._supervisor_loop, name="soundhop-supervisor", daemon=True
         )
         self._supervisor.start()
+        self._audio_monitor = AudioEventMonitor(self.controller, self._stop)
+        self._audio_monitor.start()
         log.info(
             "SoundHop %s daemon started (pid %s, device %s, sharing=%s)",
             VERSION,
@@ -177,6 +288,9 @@ class Daemon:
         if self.discovery is not None:
             self.discovery.stop()
             self.discovery = None
+        if self._audio_monitor is not None:
+            self._audio_monitor.stop()
+            self._audio_monitor = None
         self.ipc.stop()
         try:
             if pid_path().exists():
@@ -232,6 +346,49 @@ class Daemon:
             return self._handle_config(request)
         if command in {"system", "info", "doctor"}:
             return self._system_info()
+        if command in {"apps", "apps_list", "list_apps"}:
+            return {
+                "apps": self.controller.list_apps(),
+                **self._daemon_info(),
+            }
+        if command in {"route_app", "app_route"}:
+            identifier = request.get("app") or request.get("identifier") or request.get("id")
+            target = request.get("target")
+            res = self.controller.route_app(str(identifier), target)
+            return {**res, **self._daemon_info()}
+        if command in {"enable_mic", "mic_enable"}:
+            direction = str(request.get("direction", "send")).strip().lower()
+            res = self.controller.enable_mic(direction=direction)
+            return {**res, **self._daemon_info()}
+        if command in {"disable_mic", "mic_disable"}:
+            res = self.controller.disable_mic()
+            return {**res, **self._daemon_info()}
+        if command in {"mic_status", "mic"}:
+            return {
+                "with_mic": bool(self.controller.state.connected_source),
+                "direction": self.controller.state.mic_direction,
+                "source": self.controller.state.connected_source,
+                **self._daemon_info(),
+            }
+        if command in {"volume", "get_volume"}:
+            vol_val = request.get("volume")
+            mute_val = request.get("mute")
+            if vol_val is not None or mute_val is not None:
+                res = self.controller.set_volume(
+                    volume=None if vol_val is None else int(vol_val),
+                    mute=None if mute_val is None else bool(mute_val),
+                )
+            else:
+                res = self.controller.get_volume()
+            return {**res, **self._daemon_info()}
+        if command in {"set_volume"}:
+            vol_val = request.get("volume")
+            mute_val = request.get("mute")
+            res = self.controller.set_volume(
+                volume=None if vol_val is None else int(vol_val),
+                mute=None if mute_val is None else bool(mute_val),
+            )
+            return {**res, **self._daemon_info()}
         if command in {"android_status"}:
             return {
                 "session": self.controller.android_session.status(),
@@ -240,8 +397,20 @@ class Daemon:
                 **self._daemon_info(),
             }
         if command in {"android_devices"}:
+            refresh = bool(request.get("refresh", False))
             return {
-                "devices": self.controller.android_list_devices(),
+                "devices": self.controller.android_list_devices(refresh_wifi=refresh),
+                **self._daemon_info(),
+            }
+        if command in {"android_history"}:
+            return {
+                "history": self.controller.android_history(),
+                **self._daemon_info(),
+            }
+        if command in {"android_clear_history"}:
+            ok = self.controller.android_clear_history(request.get("serial"))
+            return {
+                "ok": ok,
                 **self._daemon_info(),
             }
         if command in {"android_wifi"}:
@@ -279,6 +448,7 @@ class Daemon:
                 device_name=str(request.get("name", "")),
                 codec=request.get("codec"),
                 source=request.get("source"),
+                as_mic=_as_bool(request.get("as_mic"), False),
                 buffer_ms=request.get("buffer_ms"),
                 bit_rate=request.get("bit_rate"),
                 duplicate=request.get("duplicate"),
@@ -386,6 +556,8 @@ class Daemon:
             switch_default=None if switch_default is None else _as_bool(switch_default, True),
             move_streams=None if move_streams is None else _as_bool(move_streams, True),
             by=str(request.get("by", "manual")),
+            with_mic=_as_bool(request.get("with_mic"), False),
+            mic_direction=str(request.get("mic_direction") or "send"),
         )
         self._reset_auto_backoff()
         self._offline_count = 0

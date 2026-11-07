@@ -110,6 +110,39 @@ class DaemonTest(unittest.TestCase):
             daemon._supervise()
             self.assertEqual(daemon._offline_count, 0)
 
+    def test_audio_event_monitor_handling(self) -> None:
+        import threading
+        from unittest.mock import MagicMock
+        from soundhop.daemon import AudioEventMonitor
+        from soundhop.controller import Controller
+
+        ctrl = Controller()
+        ctrl.state.connected_peer = "test-peer"
+        ctrl.state.connected_sink = "soundhop_test"
+        ctrl.state.connected_host = "192.168.1.50"
+        ctrl.state.connected_port = 4713
+        ctrl.state.routed_apps = {"spotify": "remote"}
+        stop_evt = threading.Event()
+        monitor = AudioEventMonitor(ctrl, stop_evt)
+
+        def mock_readline():
+            stop_evt.set()
+            return "Event 'change' on sink #5\n"
+
+        fake_proc = MagicMock()
+        fake_proc.poll.return_value = None
+        fake_proc.stdout.readline = mock_readline
+
+        with (
+            patch.object(ctrl, "sync_remote_volume") as mock_vol,
+            patch.object(ctrl, "enforce_routed_apps") as mock_route,
+            patch("soundhop.daemon.command_exists", return_value=True),
+            patch("subprocess.Popen", return_value=fake_proc),
+            patch("select.select", return_value=([fake_proc.stdout], [], [])),
+        ):
+            monitor._run_loop()
+            mock_vol.assert_called()
+
 
 if __name__ == "__main__":
     unittest.main()

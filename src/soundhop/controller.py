@@ -19,12 +19,14 @@ from .backend import (
     BackendError,
     Listener,
     Module,
+    create_backend,
     listener_security,
 )
 from .config import Config
 from .constants import (
     PROTOCOL_VERSION,
     SINK_PREFIX,
+    SOURCE_PREFIX,
     VERSION,
 )
 from .discovery import Peer
@@ -59,7 +61,7 @@ class Controller:
     ) -> None:
         self.config = config or Config.load(config_path)
         self.state = state or State.load(state_path)
-        self.backend = backend or AudioBackend()
+        self.backend = backend or create_backend()
         self._config_path = config_path
         self._state_path = state_path
         self._notify_enabled = notify_enabled
@@ -68,7 +70,7 @@ class Controller:
             scrcpy_path=self.config.android.scrcpy_path,
             adb_path=self.config.android.adb_path,
         )
-        self.android_session = AndroidCaptureSession(self.android_manager)
+        self.android_session = AndroidCaptureSession(self.android_manager, backend=self.backend)
 
     # -- persistence -----------------------------------------------------
 
@@ -165,6 +167,9 @@ class Controller:
                     "port": self.state.connected_port,
                     "sink": self.state.connected_sink,
                     "module": self.state.connected_module,
+                    "source": self.state.connected_source,
+                    "with_mic": bool(self.state.connected_source),
+                    "mic_direction": self.state.mic_direction,
                     "since": self.state.connected_since,
                     "duration": format_duration(
                         time.time() - self.state.connected_since
@@ -174,6 +179,13 @@ class Controller:
                     "by": self.state.connected_by,
                     "sink_present": sink is not None,
                     "module_present": module is not None,
+                }
+            if self.backend.available():
+                active_sink = self.state.connected_sink or self.backend.default_sink()
+                data["volume"] = {
+                    "level": self.backend.get_sink_volume(active_sink),
+                    "mute": self.backend.get_sink_mute(active_sink),
+                    "sink": active_sink,
                 }
             return data
 
@@ -200,6 +212,10 @@ class Controller:
     def sink_name_for(self, peer: Peer) -> str:
         label = slugify(peer.display_name, max_length=32)
         return f"{SINK_PREFIX}{label}_{short_id(peer.id, 6)}"
+
+    def source_name_for(self, peer: Peer) -> str:
+        label = slugify(peer.display_name, max_length=32)
+        return f"{SOURCE_PREFIX}{label}_{short_id(peer.id, 6)}"
 
     # -- sharing ---------------------------------------------------------
 
@@ -332,6 +348,8 @@ class Controller:
         move_streams: bool | None = None,
         by: str = "manual",
         notify_user: bool | None = None,
+        with_mic: bool = False,
+        mic_direction: str = "send",
     ) -> dict[str, Any]:
         with self.lock:
             self._ensure_backend()
@@ -403,6 +421,13 @@ class Controller:
             self.state.connected_since = time.time()
             self.state.connected_by = by
             self.state.auto_paused = False
+
+            if with_mic:
+                try:
+                    self.enable_mic(direction=mic_direction)
+                except Exception as exc:
+                    log.warning("Could not setup microphone with %s: %s", peer.display_name, exc)
+
             self.config.connection.last_peer = peer.id
             self.remember_peer(peer)
             self.save()
@@ -480,6 +505,9 @@ class Controller:
             if module is not None and module.id not in removed:
                 if self.backend.unload_module(module.id):
                     removed.append(module.id)
+
+        if self.state.connected_source or self.state.mic_direction:
+            self.disable_mic()
         # Remove any other SoundHop tunnels only when explicitly requested.
         if all_tunnels:
             for module in self.backend.soundhop_modules():
@@ -505,6 +533,7 @@ class Controller:
         self.state.clear_connection()
         if not keep_previous:
             self.state.previous_default_sink = ""
+            self.state.previous_default_source = ""
         if forget:
             if self.config.connection.last_peer == peer_id:
                 self.config.connection.last_peer = ""
@@ -571,6 +600,26 @@ class Controller:
         else:
             self.state.previous_default_sink = ""
 
+    def _remember_previous_default_source(self) -> None:
+        current = self.backend.default_source()
+        previous = self.state.previous_default_source
+        if (
+            previous
+            and self.backend.source_exists(previous)
+            and not previous.startswith(SOURCE_PREFIX)
+            and not previous.endswith(".monitor")
+        ):
+            return
+        if (
+            current
+            and not current.startswith(SOURCE_PREFIX)
+            and not current.endswith(".monitor")
+            and self.backend.source_exists(current)
+        ):
+            self.state.previous_default_source = current
+        else:
+            self.state.previous_default_source = ""
+
     def _local_default_candidate(self, preferred: str = "") -> str:
         if (
             preferred
@@ -578,16 +627,59 @@ class Controller:
             and not preferred.startswith(SINK_PREFIX)
         ):
             return preferred
-        for sink in self.backend.sinks():
-            if sink.name.startswith(SINK_PREFIX):
-                continue
-            if "auto_null" in sink.name or "dummy" in sink.name:
-                continue
-            return sink.name
-        for sink in self.backend.sinks():
-            if not sink.name.startswith(SINK_PREFIX):
-                return sink.name
-        return ""
+        sinks = [s for s in self.backend.sinks() if not s.name.startswith(SINK_PREFIX)]
+        if not sinks:
+            return ""
+        real_sinks = [s for s in sinks if "auto_null" not in s.name and "dummy" not in s.name]
+        if not real_sinks:
+            return sinks[0].name
+
+        def score(name: str) -> int:
+            n = name.lower()
+            if "speaker" in n or "analog-stereo" in n or "headphone" in n:
+                return 100
+            if "usb" in n or "pci" in n:
+                if "hdmi" in n:
+                    return 10
+                return 50
+            if "hdmi" in n:
+                return 5
+            return 20
+
+        real_sinks.sort(key=lambda s: score(s.name), reverse=True)
+        return real_sinks[0].name
+
+    def _local_default_source_candidate(self, preferred: str = "") -> str:
+        if (
+            preferred
+            and self.backend.source_exists(preferred)
+            and not preferred.startswith(SOURCE_PREFIX)
+            and not preferred.endswith(".monitor")
+        ):
+            return preferred
+        sources = [
+            s
+            for s in self.backend.sources()
+            if not s.name.startswith(SOURCE_PREFIX) and not s.name.endswith(".monitor")
+        ]
+        if not sources:
+            return ""
+        real_sources = [s for s in sources if "auto_null" not in s.name and "dummy" not in s.name]
+        if not real_sources:
+            return sources[0].name
+
+        def score(name: str) -> int:
+            n = name.lower()
+            if "mic1" in n or "internal" in n:
+                return 110
+            if "mic" in n or "input" in n:
+                return 100
+            if "usb" in n:
+                return 80
+            return 20
+
+        real_sources.sort(key=lambda s: score(s.name), reverse=True)
+        return real_sources[0].name
 
     def _make_default(self, sink_name: str, *, move: bool | None = None) -> None:
         if move is None:
@@ -608,9 +700,190 @@ class Controller:
             "port": self.state.connected_port,
             "sink": self.state.connected_sink,
             "module": self.state.connected_module,
+            "source": self.state.connected_source,
+            "with_mic": bool(self.state.connected_source),
+            "mic_direction": self.state.mic_direction,
             "since": self.state.connected_since,
             "by": self.state.connected_by,
         }
+
+    def enable_mic(self, direction: str = "send") -> dict[str, Any]:
+        with self.lock:
+            if not self.state.connected:
+                raise ControllerError("Not connected to a remote speaker")
+            dir_val = "send" if direction in ("send", "out", "tx", "to_remote") else "receive"
+            if self.state.connected_source:
+                if self.state.mic_direction == dir_val:
+                    return {
+                        "enabled": True,
+                        "direction": dir_val,
+                        "source": self.state.connected_source,
+                    }
+                # Direction changed; disable current mic first
+                self.disable_mic()
+
+            peer = Peer(
+                id=self.state.connected_peer,
+                name=self.state.connected_name,
+                host=self.state.connected_host,
+                port=self.state.connected_port,
+            )
+
+            if dir_val == "send":
+                try:
+                    r_null, r_remap, l_tun, l_loop, r_src = self.backend.send_mic_to_remote(
+                        host=peer.host,
+                        port=peer.port,
+                        description=self.config.device.name,
+                    )
+                    self.state.connected_source = r_src
+                    self.state.connected_source_module = l_tun
+                    self.state.remote_mic_null_module = r_null
+                    self.state.remote_mic_remap_module = r_remap
+                    self.state.local_mic_loopback_module = l_loop
+                    self.state.mic_direction = "send"
+                    self.save()
+                    return {
+                        "enabled": True,
+                        "direction": "send",
+                        "source": r_src,
+                        "module_id": l_tun,
+                    }
+                except Exception as exc:
+                    raise ControllerError(
+                        f"Could not send microphone to {peer.display_name}: {exc}"
+                    ) from exc
+            else:
+                self._remember_previous_default_source()
+                source_name = self.source_name_for(peer)
+                source_mod_id = self.backend.connect_tunnel_source(
+                    host=peer.host,
+                    port=peer.port,
+                    source_name=source_name,
+                    description=peer.display_name,
+                )
+                self.state.connected_source = source_name
+                self.state.connected_source_module = source_mod_id
+                self.state.mic_direction = "receive"
+                try:
+                    self.backend.set_default_source(source_name)
+                    self.backend.move_source_outputs(source_name)
+                except BackendError as exc:
+                    log.warning("Could not set tunnel source as default: %s", exc)
+                self.save()
+                return {
+                    "enabled": True,
+                    "direction": "receive",
+                    "source": source_name,
+                    "module_id": source_mod_id,
+                }
+
+    def disable_mic(self) -> dict[str, Any]:
+        with self.lock:
+            if not self.state.connected_source and not self.state.mic_direction:
+                return {"enabled": False}
+
+            if self.state.mic_direction == "send":
+                self.backend.stop_send_mic_to_remote(
+                    host=self.state.connected_host,
+                    port=self.state.connected_port,
+                    remote_null_id=self.state.remote_mic_null_module,
+                    remote_remap_id=self.state.remote_mic_remap_module,
+                    local_tunnel_id=self.state.connected_source_module,
+                    local_loopback_id=self.state.local_mic_loopback_module,
+                )
+                self.state.remote_mic_null_module = 0
+                self.state.local_mic_loopback_module = 0
+            else:
+                src_name = self.state.connected_source
+                src_mod = self.state.connected_source_module
+                local_source = self._local_default_source_candidate(self.state.previous_default_source)
+                if local_source:
+                    try:
+                        self.backend.set_default_source(local_source)
+                        self.backend.move_source_outputs(local_source, source=src_name)
+                    except BackendError as exc:
+                        log.warning("Could not restore default source: %s", exc)
+                if src_mod:
+                    self.backend.unload_module(src_mod)
+                self.backend.disconnect_tunnel_source(src_name)
+
+            self.state.connected_source = ""
+            self.state.connected_source_module = 0
+            self.state.mic_direction = ""
+            self.save()
+            return {"enabled": False}
+
+    # -- volume management & sync ----------------------------------------
+
+    def get_volume(self) -> dict[str, Any]:
+        with self.lock:
+            sink = self.state.connected_sink or self.backend.default_sink()
+            vol = self.backend.get_sink_volume(sink)
+            mute = self.backend.get_sink_mute(sink)
+            return {
+                "volume": vol,
+                "mute": mute,
+                "sink": sink,
+                "connected": self.state.connected,
+            }
+
+    def sync_remote_volume(
+        self,
+        volume: int | None = None,
+        mute: bool | None = None,
+    ) -> bool:
+        with self.lock:
+            if not self.state.connected or not self.state.connected_host:
+                return False
+            sink = self.state.connected_sink or self.backend.default_sink()
+            vol = volume if volume is not None else self.backend.get_sink_volume(sink)
+            m = mute if mute is not None else self.backend.get_sink_mute(sink)
+            if vol == self.state.last_synced_volume and m == self.state.last_synced_mute:
+                return False
+            try:
+                self.backend.remote_set_volume(
+                    self.state.connected_host,
+                    self.state.connected_port,
+                    vol,
+                    mute=m,
+                )
+                self.state.last_synced_volume = vol
+                self.state.last_synced_mute = m
+                return True
+            except Exception as exc:
+                log.debug("Remote volume sync failed: %s", exc)
+                return False
+
+    def set_volume(
+        self,
+        volume: int | None = None,
+        mute: bool | None = None,
+        sync_remote: bool = True,
+    ) -> dict[str, Any]:
+        with self.lock:
+            sink = self.state.connected_sink or self.backend.default_sink()
+            if volume is not None:
+                self.backend.set_sink_volume(sink, volume)
+            if mute is not None:
+                self.backend.set_sink_mute(sink, mute)
+
+            if sync_remote and self.state.connected and self.state.connected_host:
+                cur_vol = volume if volume is not None else self.backend.get_sink_volume(sink)
+                cur_mute = mute if mute is not None else self.backend.get_sink_mute(sink)
+                try:
+                    self.backend.remote_set_volume(
+                        self.state.connected_host,
+                        self.state.connected_port,
+                        cur_vol,
+                        mute=cur_mute,
+                    )
+                    self.state.last_synced_volume = cur_vol
+                    self.state.last_synced_mute = cur_mute
+                except Exception as exc:
+                    log.warning("Remote volume sync failed: %s", exc)
+
+            return self.get_volume()
 
     # -- reconciliation / diagnostics ------------------------------------
 
@@ -665,6 +938,23 @@ class Controller:
                     actions.append("resurrected audio listener after audio server restart")
                 except Exception as exc:
                     actions.append(f"could not resurrect audio listener: {exc}")
+            if hasattr(self.backend, "cleanup_orphaned_remote_mic_modules"):
+                try:
+                    removed_mic_mods = self.backend.cleanup_orphaned_remote_mic_modules()
+                    if removed_mic_mods:
+                        actions.append(f"cleaned up orphaned remote mic modules {removed_mic_mods}")
+                        local_src = self._local_default_source_candidate(
+                            self.state.previous_default_source
+                        )
+                        if local_src:
+                            try:
+                                self.backend.set_default_source(local_src)
+                                self.backend.move_source_outputs(local_src)
+                                actions.append(f"restored default source to {local_src}")
+                            except BackendError:
+                                pass
+                except Exception as exc:
+                    log.debug("Orphaned remote mic cleanup failed: %s", exc)
             return {"available": True, "actions": actions}
 
     def system_info(self) -> dict[str, Any]:
@@ -682,6 +972,103 @@ class Controller:
             data["error"] = str(exc)
         return data
 
+    # -- app stream routing ----------------------------------------------
+
+    def list_apps(self) -> list[dict[str, Any]]:
+        with self.lock:
+            apps = [asdict(item) for item in self.backend.detailed_sink_inputs()]
+            known_names = {
+                (item.get("app_name") or item.get("binary") or "").lower() for item in apps
+            }
+            # Mark if application has a persistent routing rule
+            for item in apps:
+                app_key = (item.get("app_name") or item.get("binary") or "").lower()
+                rule = self.state.routed_apps.get(app_key)
+                if rule:
+                    item["routed_rule"] = rule
+
+            # Also surface remembered rules for apps that aren't actively streaming this second
+            for rule_app, target in self.state.routed_apps.items():
+                if rule_app.lower() not in known_names:
+                    apps.append(
+                        {
+                            "id": 0,
+                            "sink": 0,
+                            "sink_name": "",
+                            "app_name": rule_app.capitalize(),
+                            "binary": rule_app,
+                            "node_name": rule_app,
+                            "pid": 0,
+                            "media_name": "Saved rule",
+                            "icon_name": rule_app,
+                            "volume_percent": 100,
+                            "mute": False,
+                            "is_remote": target == "remote",
+                            "routed_rule": target,
+                        }
+                    )
+            return apps
+
+    def route_app(
+        self,
+        identifier: str | int,
+        target: str | None = None,
+    ) -> dict[str, Any]:
+        with self.lock:
+            id_str = str(identifier).strip()
+            # If identifier is numeric stream ID, resolve to app name / binary for persistent rule
+            app_rule_key = id_str
+            for inp in self.backend.detailed_sink_inputs():
+                if str(inp.id) == id_str:
+                    app_rule_key = inp.app_name or inp.binary or inp.node_name or id_str
+                    break
+
+            if target in (None, "", "remote"):
+                if not self.state.connected_sink:
+                    raise ControllerError("Not connected to a remote speaker")
+                target_sink = self.state.connected_sink
+                target_dest = "remote"
+            elif target in ("local", "default"):
+                target_sink = self._local_default_candidate(self.state.previous_default_sink)
+                if not target_sink:
+                    target_sink = self.backend.default_sink()
+                target_dest = "local"
+            else:
+                target_sink = target
+                target_dest = target
+
+            # Save in persistent routed apps
+            if target_dest == "local":
+                self.state.routed_apps.pop(app_rule_key.lower(), None)
+                self.state.routed_apps.pop(id_str.lower(), None)
+            else:
+                self.state.routed_apps[app_rule_key.lower()] = target_dest
+            self.save()
+
+            moved = self.backend.move_app_streams(identifier, target_sink)
+            return {
+                "identifier": id_str,
+                "app": app_rule_key,
+                "target_sink": target_sink,
+                "target_dest": target_dest,
+                "moved": moved,
+                "remembered": True,
+            }
+
+    def enforce_routed_apps(self) -> int:
+        with self.lock:
+            if not self.state.routed_apps:
+                return 0
+            moved = 0
+            for app_key, dest in list(self.state.routed_apps.items()):
+                if dest == "remote" and self.state.connected_sink:
+                    moved += self.backend.move_app_streams(app_key, self.state.connected_sink)
+                elif dest == "local":
+                    local_sink = self._local_default_candidate(self.state.previous_default_sink)
+                    if local_sink:
+                        moved += self.backend.move_app_streams(app_key, local_sink)
+            return moved
+
     # -- android capture -------------------------------------------------
 
     def android_tool_status(self) -> dict[str, Any]:
@@ -696,10 +1083,56 @@ class Controller:
                 "ready": status.ready,
             }
 
-    def android_list_devices(self) -> list[dict[str, Any]]:
+    def android_list_devices(self, *, refresh_wifi: bool = False) -> list[dict[str, Any]]:
         with self.lock:
+            if refresh_wifi or self.config.android.auto_reconnect:
+                known = list(self.state.known_android_devices.values())
+                if known:
+                    self.android_manager.reconnect_known_devices(known)
+            if self.config.android.mdns_discovery:
+                try:
+                    for svc_name, host, port in self.android_manager.discover_mdns_services():
+                        target = f"{host}:{port}"
+                        if target not in self.state.known_android_devices:
+                            self.state.remember_android_device(
+                                target,
+                                model=svc_name,
+                                ip=host,
+                                port=port,
+                                is_wifi=True,
+                            )
+                except Exception as exc:
+                    log.debug("mDNS discovery error: %s", exc)
+
             devices = self.android_manager.list_devices()
+            now = time.time()
+            for d in devices:
+                self.state.remember_android_device(
+                    d.serial,
+                    model=d.model,
+                    manufacturer=d.manufacturer,
+                    ip=d.ip if d.is_wifi else "",
+                    port=d.port if d.is_wifi else 5555,
+                    is_wifi=d.is_wifi,
+                    when=now,
+                )
+            self.save()
             return [asdict(d) for d in devices]
+
+    def android_history(self) -> list[dict[str, Any]]:
+        with self.lock:
+            devs = list(self.state.known_android_devices.values())
+            devs.sort(key=lambda d: max(d.last_connected, d.last_seen), reverse=True)
+            return [asdict(d) for d in devs]
+
+    def android_clear_history(self, serial: str | None = None) -> bool:
+        with self.lock:
+            if serial:
+                self.state.forget_android_device(serial)
+            else:
+                self.state.known_android_devices.clear()
+            self.save()
+            return True
 
     def android_switch_wifi(self, serial: str, port: int = 5555) -> tuple[bool, str]:
         with self.lock:
@@ -742,13 +1175,14 @@ class Controller:
         device_name: str = "",
         codec: str | None = None,
         source: str | None = None,
+        as_mic: bool = False,
         buffer_ms: int | None = None,
         bit_rate: int | None = None,
         duplicate: bool | None = None,
     ) -> dict[str, Any]:
         with self.lock:
             codec_val = codec or self.config.android.default_codec
-            source_val = source or self.config.android.default_source
+            source_val = "mic" if as_mic else (source or self.config.android.default_source)
             buf_val = buffer_ms or self.config.android.buffer_ms
             br_val = bit_rate or self.config.android.bit_rate
             dup_val = duplicate if duplicate is not None else self.config.android.duplicate_audio
@@ -758,6 +1192,7 @@ class Controller:
                 device_name=device_name,
                 codec=codec_val,
                 source=source_val,
+                as_mic=as_mic,
                 buffer_ms=buf_val,
                 bit_rate=br_val,
                 duplicate=dup_val,
@@ -765,19 +1200,40 @@ class Controller:
 
             # Persist state
             self.state.android_active = True
+            self.state.android_as_mic = as_mic
             self.state.android_serial = serial
             self.state.android_model = device_name
             self.state.android_codec = codec_val
+            self.state.android_source = source_val
             self.state.android_pid = result.get("pid", 0)
-            self.state.android_since = result.get("started_at", time.time())
+            now = result.get("started_at", time.time())
+            self.state.android_since = now
             self.config.android.last_serial = serial
+            is_wifi = ":" in serial
+            ip = serial.split(":")[0] if is_wifi else ""
+            port = int(serial.split(":")[1]) if is_wifi and serial.split(":")[1].isdigit() else 5555
+            self.state.remember_android_device(
+                serial,
+                model=device_name,
+                ip=ip,
+                port=port,
+                is_wifi=is_wifi,
+                connected=True,
+                when=now,
+            )
             self.save()
 
             if self._should_notify(None):
-                notify(
-                    "SoundHop: Android audio connected",
-                    f"Streaming audio from {device_name or serial} ({codec_val.upper()})",
-                )
+                if as_mic:
+                    notify(
+                        "SoundHop: Android Microphone Connected",
+                        f"{device_name or serial} is now active as a computer microphone",
+                    )
+                else:
+                    notify(
+                        "SoundHop: Android audio connected",
+                        f"Streaming audio from {device_name or serial} ({codec_val.upper()})",
+                    )
 
             return result
 
@@ -786,9 +1242,11 @@ class Controller:
             old_name = self.state.android_model or self.state.android_serial
             result = self.android_session.stop()
             self.state.android_active = False
+            self.state.android_as_mic = False
             self.state.android_serial = ""
             self.state.android_model = ""
             self.state.android_codec = ""
+            self.state.android_source = ""
             self.state.android_pid = 0
             self.state.android_since = 0.0
             self.save()
