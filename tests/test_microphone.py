@@ -59,8 +59,11 @@ class MicrophoneTest(unittest.TestCase):
 
     def test_controller_mic_lifecycle_receive(self) -> None:
         from soundhop.state import State
-        ctrl = Controller()
+
+        backend = AudioBackend(runner=lambda args, **kwargs: Result(args, 0, "", ""))
+        ctrl = Controller(backend=backend)
         ctrl.state = State()
+        ctrl.save = lambda: None  # type: ignore[method-assign]
         ctrl.state.connected_peer = "peer1"
         ctrl.state.connected_name = "Desktop"
         ctrl.state.connected_host = "192.168.1.100"
@@ -94,8 +97,11 @@ class MicrophoneTest(unittest.TestCase):
 
     def test_controller_mic_lifecycle_send(self) -> None:
         from soundhop.state import State
-        ctrl = Controller()
+
+        backend = AudioBackend(runner=lambda args, **kwargs: Result(args, 0, "", ""))
+        ctrl = Controller(backend=backend)
         ctrl.state = State()
+        ctrl.save = lambda: None  # type: ignore[method-assign]
         ctrl.state.connected_peer = "peer1"
         ctrl.state.connected_name = "Desktop"
         ctrl.state.connected_host = "192.168.1.100"
@@ -133,7 +139,8 @@ class MicrophoneTest(unittest.TestCase):
             )
 
     def test_local_default_source_candidate_scoring(self) -> None:
-        ctrl = Controller()
+        backend = AudioBackend(runner=lambda args, **kwargs: Result(args, 0, "", ""))
+        ctrl = Controller(backend=backend)
         sources = [
             Source(id=1, name="alsa_output.pci.monitor"),
             Source(id=2, name="alsa_input.pci.HiFi__Mic1__source"),

@@ -1,7 +1,9 @@
 """Tests for AppImage packaging, desktop entries, and version bumping."""
 
 import importlib.util
+import shutil
 import subprocess
+import sys
 import tempfile
 import unittest
 from pathlib import Path
@@ -148,6 +150,7 @@ class PackagingTest(unittest.TestCase):
             content = tmp_desktop.read_text(encoding="utf-8")
             self.assertIn("X-AppImage-Version=1.2.3", content)
 
+    @unittest.skipIf(sys.platform == "win32" or not shutil.which("bash"), "Linux bash test")
     def test_update_info_format_bash(self) -> None:
         cmd = [
             "bash",
@@ -174,6 +177,7 @@ class PackagingTest(unittest.TestCase):
             "gh-releases-zsync|custom-owner|custom-repo|latest|SoundHop-*x86_64.AppImage.zsync",
         )
 
+    @unittest.skipIf(sys.platform == "win32" or not shutil.which("bash"), "Linux bash test")
     def test_appdir_desktop_version_replacement_bash(self) -> None:
         with tempfile.TemporaryDirectory() as tmpdir:
             app_dir = Path(tmpdir)

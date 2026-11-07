@@ -130,7 +130,7 @@ class RoutingTest(unittest.TestCase):
                 return Result([], 0, "", "")
             return Result([], 0, "", "")
 
-        backend = AudioBackend()
+        backend = AudioBackend(runner=lambda args, **kwargs: Result(args, 0, "", ""))
         backend._pactl = mock_pactl
         with patch.object(backend, "detailed_sink_inputs", return_value=fake_inputs):
             # Match by app_name
@@ -165,7 +165,9 @@ class RoutingTest(unittest.TestCase):
             self.assertEqual(len(moved_calls), 0)
 
     def test_controller_route_app(self) -> None:
-        ctrl = Controller()
+        backend = AudioBackend(runner=lambda args, **kwargs: Result(args, 0, "", ""))
+        ctrl = Controller(backend=backend)
+        ctrl.save = lambda: None  # type: ignore[method-assign]
         ctrl.state.connected_sink = "soundhop-remote"
         with patch.object(ctrl.backend, "move_app_streams", return_value=1):
             res = ctrl.route_app("spotify", "remote")
@@ -179,7 +181,8 @@ class RoutingTest(unittest.TestCase):
             ctrl.route_app("spotify", "remote")
 
     def test_local_default_candidate_scoring(self) -> None:
-        ctrl = Controller()
+        backend = AudioBackend(runner=lambda args, **kwargs: Result(args, 0, "", ""))
+        ctrl = Controller(backend=backend)
         sinks = [
             Sink(id=1, name="alsa_output.pci.HiFi__HDMI3__sink"),
             Sink(id=2, name="alsa_output.pci.HiFi__Speaker__sink"),
@@ -190,7 +193,8 @@ class RoutingTest(unittest.TestCase):
             self.assertEqual(candidate, "alsa_output.pci.HiFi__Speaker__sink")
 
     def test_enforce_routed_apps(self) -> None:
-        ctrl = Controller()
+        backend = AudioBackend(runner=lambda args, **kwargs: Result(args, 0, "", ""))
+        ctrl = Controller(backend=backend)
         ctrl.state.connected_sink = "soundhop-remote"
         ctrl.state.routed_apps = {"spotify": "remote", "firefox": "local"}
         with (

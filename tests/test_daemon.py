@@ -114,10 +114,13 @@ class DaemonTest(unittest.TestCase):
         import threading
         from unittest.mock import MagicMock
 
+        from soundhop.backend import AudioBackend
         from soundhop.controller import Controller
         from soundhop.daemon import AudioEventMonitor
+        from soundhop.util import Result
 
-        ctrl = Controller()
+        backend = AudioBackend(runner=lambda args, **kwargs: Result(args, 0, "", ""))
+        ctrl = Controller(backend=backend)
         ctrl.state.connected_peer = "test-peer"
         ctrl.state.connected_sink = "soundhop_test"
         ctrl.state.connected_host = "192.168.1.50"

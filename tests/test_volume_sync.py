@@ -65,7 +65,7 @@ class VolumeSyncTest(unittest.TestCase):
                 return Result(args, 0, "Mute: no\n", "")
             return Result(args, 0, "", "")
 
-        backend = AudioBackend()
+        backend = AudioBackend(runner=lambda args, **kwargs: Result(args, 0, "", ""))
         backend._pactl = mock_pactl
 
         vol = backend.get_sink_volume("alsa_output.sink")
@@ -85,7 +85,9 @@ class VolumeSyncTest(unittest.TestCase):
         self.assertIn(("-s", "tcp:192.168.1.10:4713", "set-sink-mute", "@DEFAULT_SINK@", "0"), calls)
 
     def test_controller_volume_sync(self) -> None:
-        ctrl = Controller()
+        backend = AudioBackend(runner=lambda args, **kwargs: Result(args, 0, "", ""))
+        ctrl = Controller(backend=backend)
+        ctrl.save = lambda: None  # type: ignore[method-assign]
         ctrl.state.connected_peer = "test-peer"
         ctrl.state.connected_sink = "soundhop_sink"
         ctrl.state.connected_host = "192.168.1.10"
@@ -103,7 +105,9 @@ class VolumeSyncTest(unittest.TestCase):
             mock_remote_set.assert_called_once_with("192.168.1.10", 4713, 70, mute=False)
 
     def test_sync_remote_volume_dedup(self) -> None:
-        ctrl = Controller()
+        backend = AudioBackend(runner=lambda args, **kwargs: Result(args, 0, "", ""))
+        ctrl = Controller(backend=backend)
+        ctrl.save = lambda: None  # type: ignore[method-assign]
         ctrl.state.connected_peer = "test-peer"
         ctrl.state.connected_sink = "soundhop_sink"
         ctrl.state.connected_host = "192.168.1.10"
