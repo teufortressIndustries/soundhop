@@ -10,6 +10,7 @@ from ..config import SECURITY_MODES
 from ..constants import VERSION
 from .android_cmds import cmd_android
 from .core_cmds import (
+    cmd_apps,
     cmd_auto,
     cmd_completions,
     cmd_config,
@@ -19,13 +20,17 @@ from .core_cmds import (
     cmd_discover,
     cmd_firewall,
     cmd_logs,
+    cmd_mic,
+    cmd_route,
     cmd_service,
     cmd_setup,
     cmd_share,
     cmd_status,
     cmd_stop,
     cmd_tray,
+    cmd_unroute,
     cmd_version,
+    cmd_volume,
 )
 from .doctor import cmd_bug_report, cmd_doctor
 
@@ -114,6 +119,28 @@ def build_parser() -> argparse.ArgumentParser:
         action="store_true",
         help="do not move currently playing streams",
     )
+    p.add_argument(
+        "--selective",
+        action="store_true",
+        help="selective routing mode: keep local speakers default and only stream routed apps",
+    )
+    p.add_argument(
+        "--app",
+        help="route a specific application (e.g. spotify, firefox) to remote speakers upon connection",
+    )
+    p.add_argument(
+        "--with-mic",
+        "--mic",
+        action="store_true",
+        dest="with_mic",
+        help="stream microphone between devices upon connection",
+    )
+    p.add_argument(
+        "--mic-direction",
+        choices=("send", "receive"),
+        default="send",
+        help="microphone direction when using --with-mic ('send' sends local mic to remote PC, 'receive' streams remote mic to local device)",
+    )
 
     p = add("disconnect", "stop playing on the remote device", cmd_disconnect)
     p.add_argument("peer", nargs="?", help="device name or id (default: current/all)")
@@ -127,6 +154,36 @@ def build_parser() -> argparse.ArgumentParser:
 
     p = add("share", "share this device's speakers", cmd_share)
     p.add_argument("action", nargs="?", choices=("on", "off", "status"), default="status")
+
+    add("apps", "list active audio applications and stream routing", cmd_apps)
+
+    p = add("route", "route a specific app or stream to remote speakers or local output", cmd_route)
+    p.add_argument("app", help="app name, binary name, or stream ID")
+    p.add_argument("--local", action="store_true", help="route back to local speakers")
+    p.add_argument("--remote", action="store_true", help="route to remote speakers")
+
+    p = add("unroute", "route a specific app or stream back to local output", cmd_unroute)
+    p.add_argument("app", help="app name, binary name, or stream ID")
+
+    p = add("mic", "control microphone pass-through", cmd_mic)
+    p.add_argument(
+        "action",
+        nargs="?",
+        choices=("on", "off", "status", "enable", "disable", "send", "receive"),
+        default="status",
+        help="enable, disable, or query microphone pass-through (send: stream local mic to remote PC; receive: stream remote mic to local device)",
+    )
+    p.add_argument(
+        "--direction",
+        choices=("send", "receive"),
+        default=None,
+        help="microphone stream direction ('send' sends local mic to remote PC, 'receive' streams remote mic to local device)",
+    )
+
+    p = add("volume", "get or set output volume with remote sync", cmd_volume)
+    p.add_argument("value", nargs="?", help="volume level (0-150) or 'mute'/'unmute'")
+    p.add_argument("--mute", action="store_true", default=None, help="mute output")
+    p.add_argument("--unmute", action="store_false", dest="mute", help="unmute output")
 
     p = add("auto", "control auto-connect", cmd_auto)
     p.add_argument(
@@ -223,7 +280,17 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument(
         "--source",
         choices=("output", "playback", "mic"),
-        help="audio source (default: output for Android 12+, playback for Android 11)",
+        help="audio source (default: output for Android 12+, playback for Android 11, mic for Android 10)",
+    )
+    p.add_argument(
+        "--mic",
+        action="store_true",
+        help="capture Android device microphone directly",
+    )
+    p.add_argument(
+        "--as-mic",
+        action="store_true",
+        help="use phone as a PC microphone input for Discord, Zoom, and calls (virtual mic)",
     )
     p.add_argument(
         "--buffer",

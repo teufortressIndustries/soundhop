@@ -14,9 +14,11 @@ from ..android import (
     AndroidCaptureSession,
     AndroidManager,
 )
+from ..backend import AudioBackend
 from ..config import Config
 from ..constants import APP_NAME
 from ..controller import Controller
+from ..state import State
 from ..util import format_duration, style
 from .ui import _json_enabled, emit_json, error, info, ok, warning
 
@@ -49,6 +51,9 @@ def cmd_android(args: argparse.Namespace) -> int:
         "encoders",
         "codecs",
         "install",
+        "history",
+        "clear-history",
+        "mic",
     }
     if sub is not None and sub not in known_actions:
         if getattr(args, "target", None) is None:
@@ -59,6 +64,10 @@ def cmd_android(args: argparse.Namespace) -> int:
             error(f"Unknown android action: {sub}")
             return 1
 
+    if sub == "mic":
+        setattr(args, "mic", True)
+        setattr(args, "as_mic", True)
+        return cmd_android_start(args)
     if sub in ("stop", "disconnect"):
         return cmd_android_stop(args)
     if sub == "status":
@@ -71,6 +80,10 @@ def cmd_android(args: argparse.Namespace) -> int:
         return cmd_android_encoders(args)
     if sub == "install":
         return cmd_android_install(args)
+    if sub == "history":
+        return cmd_android_history(args)
+    if sub == "clear-history":
+        return cmd_android_clear_history(args)
     return cmd_android_start(args)
 
 
@@ -314,6 +327,14 @@ def cmd_android_start(args: argparse.Namespace) -> int:
     target_str = getattr(args, "target", None)
     devices = mgr.list_devices()
 
+    if not devices and not target_str:
+        state = State.load()
+        known = [d for d in state.known_android_devices.values() if d.last_ip or d.is_wifi]
+        if known and config.android.auto_reconnect:
+            info(f"Checking {len(known)} known Wi-Fi device(s)...")
+            mgr.reconnect_known_devices(known)
+            devices = mgr.list_devices()
+
     target_device = None
     if target_str:
         for d in devices:
@@ -445,21 +466,25 @@ def cmd_android_start(args: argparse.Namespace) -> int:
 
     # 3. Audio Codec & Compatibility Options
     codec = getattr(args, "codec", None) or config.android.default_codec or "aac"
-    source = getattr(args, "source", None)
-    if not source:
-        major_v = target_device.major_version
-        if target_device.sdk_version >= 31 or major_v >= 12:
-            source = "output"
-        elif target_device.sdk_version >= 30 or major_v >= 11:
-            source = "playback"
-        elif 0 < target_device.sdk_version < 30 or (0 < major_v < 11):
-            warning(
-                f"Android {target_device.android_version or target_device.sdk_version} does not support native internal audio capture."
-            )
-            warning("Falling back to microphone capture (--audio-source=mic).")
-            source = "mic"
-        else:
-            source = config.android.default_source or "output"
+    use_as_mic = bool(getattr(args, "as_mic", False) or getattr(args, "mic", False))
+    if use_as_mic:
+        source = "mic"
+    else:
+        source = getattr(args, "source", None)
+        if not source:
+            major_v = target_device.major_version
+            if target_device.sdk_version >= 31 or major_v >= 12:
+                source = "output"
+            elif target_device.sdk_version >= 30 or major_v >= 11:
+                source = "playback"
+            elif 0 < target_device.sdk_version < 30 or (0 < major_v < 11):
+                warning(
+                    f"Android {target_device.android_version or target_device.sdk_version} does not support native internal audio capture."
+                )
+                warning("Falling back to microphone capture (--audio-source=mic).")
+                source = "mic"
+            else:
+                source = config.android.default_source or "output"
 
     buffer_ms = getattr(args, "buffer_ms", None) or config.android.buffer_ms or 50
     bit_rate = getattr(args, "bit_rate", None) or config.android.bit_rate or 128000
@@ -476,13 +501,20 @@ def cmd_android_start(args: argparse.Namespace) -> int:
                 name=target_device.display_name,
                 codec=codec,
                 source=source,
+                as_mic=use_as_mic,
                 buffer_ms=buffer_ms,
                 bit_rate=bit_rate,
                 duplicate=duplicate,
             )
-            ok(
-                f"Audio capture started in background for {target_device.display_name} (PID {res.get('pid')})."
-            )
+            if use_as_mic:
+                ok(
+                    f"Android microphone active as PC input for {target_device.display_name} (PID {res.get('pid')})."
+                )
+                print("  Virtual microphone: soundhop_android_mic (Discord, Zoom, Meet, and games)")
+            else:
+                ok(
+                    f"Audio capture started in background for {target_device.display_name} (PID {res.get('pid')})."
+                )
             ok("Run 'soundhop android stop' to stop streaming.")
             return 0
         else:
@@ -491,7 +523,8 @@ def cmd_android_start(args: argparse.Namespace) -> int:
             )
             return 1
 
-    session = AndroidCaptureSession(mgr)
+    backend_inst = AudioBackend()
+    session = AndroidCaptureSession(mgr, backend=backend_inst)
     print()
     ok(
         f"Starting audio capture from {style(target_device.display_name, 'bold')} ({target_device.serial})"
@@ -499,8 +532,13 @@ def cmd_android_start(args: argparse.Namespace) -> int:
     print(f"  Codec:       {codec.upper()} ({bit_rate // 1000} kbps)")
     print(f"  Source:      {source}")
     print(f"  Buffer:      {buffer_ms} ms")
+    if use_as_mic:
+        print(f"  Mode:        Wireless PC Microphone (virtual source: soundhop_android_mic)")
     print()
-    print(style("Streaming audio to your speakers. Press Ctrl+C to stop.", "green"))
+    if use_as_mic:
+        print(style("Streaming phone microphone as PC input. Press Ctrl+C to stop.", "green"))
+    else:
+        print(style("Streaming audio to your speakers. Press Ctrl+C to stop.", "green"))
 
     try:
         session.start(
@@ -508,6 +546,7 @@ def cmd_android_start(args: argparse.Namespace) -> int:
             device_name=target_device.display_name,
             codec=codec,
             source=source,
+            as_mic=use_as_mic,
             buffer_ms=buffer_ms,
             bit_rate=bit_rate,
             duplicate=duplicate,
@@ -553,4 +592,42 @@ def cmd_android_stop(args: argparse.Namespace) -> int:
     session = AndroidCaptureSession(mgr)
     session.stop()
     ok("Android audio capture stopped.")
+    return 0
+
+
+def cmd_android_history(args: argparse.Namespace) -> int:
+    state = State.load()
+    devs = list(state.known_android_devices.values())
+    devs.sort(key=lambda d: max(d.last_connected, d.last_seen), reverse=True)
+    if _json_enabled(args):
+        emit_json({"history": [asdict(d) for d in devs]})
+        return 0
+    if not devs:
+        info("No Android devices in history.")
+        return 0
+    print()
+    print(style("Known Android Devices History:", "bold"))
+    for idx, d in enumerate(devs, 1):
+        target = f"{d.last_ip}:{d.last_port}" if d.last_ip else d.serial
+        mode = "Wi-Fi" if d.is_wifi else "USB"
+        last_conn = (
+            f"connected {format_duration(time.time() - d.last_connected)} ago"
+            if d.last_connected
+            else "never connected"
+        )
+        print(f"  {idx}) {d.display_name:<24} [{mode}] {target:<20} ({last_conn})")
+    print()
+    return 0
+
+
+def cmd_android_clear_history(args: argparse.Namespace) -> int:
+    state = State.load()
+    serial = getattr(args, "target", None)
+    if serial:
+        state.forget_android_device(serial)
+        ok(f"Removed {serial} from Android device history.")
+    else:
+        state.known_android_devices.clear()
+        ok("Cleared Android device history.")
+    state.save()
     return 0

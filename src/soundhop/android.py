@@ -7,6 +7,7 @@ Genymobile scrcpy and the Android Debug Bridge (adb).
 
 from __future__ import annotations
 
+import hashlib
 import logging
 import os
 import platform
@@ -249,6 +250,7 @@ class AndroidManager:
         self,
         *,
         version: str = DEFAULT_SCRCPY_VERSION,
+        expected_sha256: str | None = None,
         progress_cb: Callable[[int, int], None] | None = None,
     ) -> Path:
         """Download and install official standalone scrcpy into user data directory.
@@ -277,6 +279,8 @@ class AndroidManager:
             archive_path = dest_dir / f"scrcpy-{arch}-{version}.tar.gz"
 
         log.info("Downloading scrcpy %s from %s to %s", version, url, archive_path)
+        hasher = hashlib.sha256()
+        header_sha256 = ""
         try:
             req = urllib.request.Request(url, headers={"User-Agent": "SoundHop-AndroidManager"})
             with (
@@ -284,6 +288,7 @@ class AndroidManager:
                 open(archive_path, "wb") as out_file,
             ):
                 total = int(resp.headers.get("Content-Length", 0))
+                header_sha256 = str(resp.headers.get("X-Checksum-Sha256", "") or "").strip()
                 downloaded = 0
                 chunk_size = 65536
                 while True:
@@ -291,6 +296,7 @@ class AndroidManager:
                     if not chunk:
                         break
                     out_file.write(chunk)
+                    hasher.update(chunk)
                     downloaded += len(chunk)
                     if progress_cb:
                         progress_cb(downloaded, total)
@@ -298,6 +304,16 @@ class AndroidManager:
             if archive_path.exists():
                 archive_path.unlink(missing_ok=True)
             raise AndroidError(f"Failed to download scrcpy from {url}: {exc}") from exc
+
+        target_sha256 = (expected_sha256 or header_sha256).strip().lower()
+        if target_sha256:
+            actual_sha256 = hasher.hexdigest().lower()
+            if actual_sha256 != target_sha256:
+                archive_path.unlink(missing_ok=True)
+                raise AndroidError(
+                    f"SHA-256 checksum mismatch for {archive_path.name}: "
+                    f"expected {target_sha256}, got {actual_sha256}"
+                )
 
         # Extract archive safely into dest_dir
         try:
@@ -642,6 +658,61 @@ class AndroidManager:
         except Exception as exc:
             return False, str(exc)
 
+    def discover_mdns_services(self) -> list[tuple[str, str, int]]:
+        """Query ADB mDNS for advertising wireless debugging devices.
+
+        Returns a list of (service_name, ip, port).
+        """
+        adb_bin = self.find_adb()
+        if not adb_bin:
+            return []
+        try:
+            res = self._run_adb(["mdns", "services"], timeout=4.0)
+        except Exception as exc:
+            log.debug("adb mdns services failed: %s", exc)
+            return []
+
+        found: list[tuple[str, str, int]] = []
+        for line in res.stdout.splitlines():
+            line = line.strip()
+            if not line or "List of discoverable devices" in line or line.startswith("*"):
+                continue
+            parts = line.split()
+            for item in parts:
+                if ":" in item:
+                    host_part, port_str = item.rsplit(":", 1)
+                    if port_str.isdigit():
+                        p = int(port_str)
+                        if 1 <= p <= 65535:
+                            svc_name = parts[0] if parts[0] != item else "Android Device"
+                            found.append((svc_name, host_part, p))
+                            break
+        return found
+
+    def reconnect_known_devices(
+        self,
+        known_devices: Sequence[Any],
+        *,
+        timeout: float = 3.0,
+    ) -> list[str]:
+        """Attempt to reconnect to known Wi-Fi devices that are currently disconnected."""
+        connected: list[str] = []
+        current = {d.serial for d in self.list_devices()}
+        for d in known_devices:
+            ip = getattr(d, "last_ip", "") or getattr(d, "ip", "")
+            port = int(getattr(d, "last_port", 5555) or 5555)
+            serial = getattr(d, "serial", "")
+            target = f"{ip}:{port}" if ip else serial
+            if not ip and ":" in serial:
+                target = serial
+            if target in current or (ip and f"{ip}:{port}" in current):
+                continue
+            if ip:
+                ok, _ = self.connect_wifi(ip, port)
+                if ok:
+                    connected.append(target)
+        return connected
+
     def list_encoders(self, serial: str | None = None) -> AudioEncoderInfo:
         """Query scrcpy for supported audio encoders on the target device."""
         scrcpy_bin = self.find_scrcpy()
@@ -738,14 +809,19 @@ class AndroidManager:
 class AndroidCaptureSession:
     """Manages an active background scrcpy audio capture process."""
 
-    def __init__(self, manager: AndroidManager) -> None:
+    def __init__(self, manager: AndroidManager, backend: Any = None) -> None:
         self.manager = manager
+        self.backend = backend
         self._proc: subprocess.Popen[str] | None = None
         self._lock = threading.RLock()
         self._serial: str = ""
         self._device_name: str = ""
         self._codec: str = ""
         self._source: str = ""
+        self._as_mic: bool = False
+        self._virtual_sink_module: int = 0
+        self._virtual_source_module: int = 0
+        self._previous_default_source: str = ""
         self._started_at: float = 0.0
         self._log_lines: list[str] = []
         self._monitor_thread: threading.Thread | None = None
@@ -768,6 +844,8 @@ class AndroidCaptureSession:
                 "device_name": self._device_name if active else "",
                 "codec": self._codec if active else "",
                 "source": self._source if active else "",
+                "as_mic": self._as_mic if active else False,
+                "virtual_source": "soundhop_android_mic" if (active and self._as_mic) else "",
                 "pid": self._proc.pid if (active and self._proc) else 0,
                 "started_at": self._started_at if active else 0.0,
                 "uptime_s": elapsed,
@@ -782,6 +860,7 @@ class AndroidCaptureSession:
         device_name: str = "",
         codec: str = DEFAULT_AUDIO_CODEC,
         source: str | None = None,
+        as_mic: bool = False,
         buffer_ms: int | None = DEFAULT_AUDIO_BUFFER_MS,
         bit_rate: int | None = DEFAULT_AUDIO_BIT_RATE,
         duplicate: bool = False,
@@ -795,17 +874,19 @@ class AndroidCaptureSession:
                     "Stop the current capture before starting another."
                 )
 
+            effective_source = "mic" if as_mic else (source or "output")
+
             args = self.manager.build_capture_args(
                 serial,
                 codec=codec,
-                source=source,
+                source=effective_source,
                 buffer_ms=buffer_ms,
                 bit_rate=bit_rate,
                 duplicate=duplicate,
                 extra_args=extra_args,
             )
 
-            log.info("Starting scrcpy audio capture: %s", " ".join(args))
+            log.info("Starting scrcpy audio capture: %s (as_mic=%s)", " ".join(args), as_mic)
             popen_kwargs: dict[str, Any] = {
                 "stdout": subprocess.PIPE,
                 "stderr": subprocess.STDOUT,
@@ -815,16 +896,89 @@ class AndroidCaptureSession:
             if sys.platform == "win32" and hasattr(subprocess, "CREATE_NO_WINDOW"):
                 popen_kwargs["creationflags"] = subprocess.CREATE_NO_WINDOW
 
+            self._virtual_sink_module = 0
+            self._virtual_source_module = 0
+            self._previous_default_source = ""
+            self._as_mic = as_mic
+
+            if as_mic and self.backend is not None and hasattr(self.backend, "load_module"):
+                try:
+                    sink_name = "soundhop_android_mic_sink"
+                    source_name = "soundhop_android_mic"
+
+                    # 1. Load null-sink as virtual output sink for scrcpy audio playback
+                    sink_props = 'device.description="SoundHop-Android-Mic-Sink" device.class=sound'
+                    null_id = self.backend.load_module(
+                        "module-null-sink",
+                        [f"sink_name={sink_name}", f"sink_properties={sink_props}"],
+                    )
+                    self._virtual_sink_module = null_id
+
+                    # 2. Load module-remap-source so that all audio servers & apps see a REAL microphone input device
+                    safe_label = device_name or serial or "Android Device"
+                    remap_props = (
+                        f'device.description="Android Microphone ({safe_label})" '
+                        f'device.class=sound device.icon_name=audio-input-microphone'
+                    )
+                    remap_id = self.backend.load_module(
+                        "module-remap-source",
+                        [
+                            f"source_name={source_name}",
+                            f"master={sink_name}.monitor",
+                            f"source_properties={remap_props}",
+                        ],
+                    )
+                    self._virtual_source_module = remap_id
+
+                    # 3. Set default recording source and redirect active recording apps safely
+                    if hasattr(self.backend, "default_source"):
+                        self._previous_default_source = self.backend.default_source()
+                    if hasattr(self.backend, "set_default_source"):
+                        self.backend.set_default_source(source_name)
+                    if hasattr(self.backend, "move_source_outputs"):
+                        exclude = [self._virtual_source_module, self._virtual_sink_module]
+                        self.backend.move_source_outputs(source_name, exclude_modules=exclude)
+
+                    # 4. Route scrcpy playback stream to the null-sink
+                    env = dict(os.environ)
+                    env["SDL_AUDIODRIVER"] = "pulseaudio"
+                    env["SDL_AUDIO_DRIVER"] = "pulseaudio"
+                    env["PULSE_SINK"] = sink_name
+                    env["PIPEWIRE_NODE"] = sink_name
+                    env["PIPEWIRE_PROPS"] = f'{{ target.object = "{sink_name}" }}'
+                    popen_kwargs["env"] = env
+                except Exception as exc:
+                    log.warning("Could not create virtual microphone for Android device: %s", exc)
+
             try:
                 self._proc = subprocess.Popen(args, **popen_kwargs)
             except Exception as exc:
+                self._cleanup_virtual_mic()
                 self._last_error = str(exc)
                 raise AndroidError(f"Failed to start scrcpy: {exc}") from exc
+
+            if as_mic:
+                def _ensure_routed() -> None:
+                    target_sink = "soundhop_android_mic_sink"
+                    for _ in range(10):
+                        time.sleep(0.15)
+                        if self._proc is None or self._proc.poll() is not None:
+                            break
+                        if self.backend is not None and hasattr(self.backend, "move_app_streams"):
+                            try:
+                                if self.backend.move_app_streams("scrcpy", target_sink) > 0:
+                                    break
+                            except Exception:
+                                pass
+
+                threading.Thread(
+                    target=_ensure_routed, name="soundhop-scrcpy-router", daemon=True
+                ).start()
 
             self._serial = serial
             self._device_name = device_name or serial
             self._codec = codec
-            self._source = source or "output"
+            self._source = effective_source
             self._started_at = time.time()
             self._log_lines.clear()
             self._last_error = ""
@@ -843,9 +997,36 @@ class AndroidCaptureSession:
                 err_msg = "\n".join(self._log_lines[-10:]) or f"Process exited with code {ret}"
                 self._last_error = err_msg
                 self._proc = None
+                self._cleanup_virtual_mic()
                 raise AndroidError(f"scrcpy failed to start:\n{err_msg}")
 
             return self.status()
+
+    def _cleanup_virtual_mic(self) -> None:
+        if self.backend is None:
+            return
+        if self._virtual_source_module:
+            try:
+                self.backend.unload_module(self._virtual_source_module)
+            except Exception:
+                pass
+            self._virtual_source_module = 0
+        if self._virtual_sink_module:
+            try:
+                self.backend.unload_module(self._virtual_sink_module)
+            except Exception:
+                pass
+            self._virtual_sink_module = 0
+        if self._previous_default_source:
+            try:
+                if hasattr(self.backend, "set_default_source"):
+                    self.backend.set_default_source(self._previous_default_source)
+                if hasattr(self.backend, "move_source_outputs"):
+                    self.backend.move_source_outputs(self._previous_default_source)
+            except Exception:
+                pass
+            self._previous_default_source = ""
+        self._as_mic = False
 
     def _reader_loop(self) -> None:
         proc = self._proc
@@ -878,20 +1059,18 @@ class AndroidCaptureSession:
         """Stop running scrcpy audio capture process."""
         with self._lock:
             proc = self._proc
-            if proc is None:
-                return self.status()
-
-            if proc.poll() is None:
-                log.info("Stopping scrcpy process (PID %s)", proc.pid)
-                try:
-                    proc.terminate()
+            if proc is not None:
+                if proc.poll() is None:
+                    log.info("Stopping scrcpy process (PID %s)", proc.pid)
                     try:
-                        proc.wait(timeout=2.0)
-                    except subprocess.TimeoutExpired:
-                        proc.kill()
-                        proc.wait(timeout=1.0)
-                except Exception as exc:
-                    log.warning("Error stopping scrcpy process: %s", exc)
-
-            self._proc = None
+                        proc.terminate()
+                        try:
+                            proc.wait(timeout=2.0)
+                        except subprocess.TimeoutExpired:
+                            proc.kill()
+                            proc.wait(timeout=1.0)
+                    except Exception as exc:
+                        log.warning("Error stopping scrcpy process: %s", exc)
+                self._proc = None
+            self._cleanup_virtual_mic()
             return self.status()

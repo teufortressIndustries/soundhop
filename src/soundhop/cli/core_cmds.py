@@ -39,6 +39,7 @@ from .ui import (
     _select_peer,
     emit_json,
     error,
+    info,
     ok,
     print_peers,
     print_status,
@@ -244,27 +245,46 @@ def cmd_connect(args: argparse.Namespace) -> int:
 
     if not _ensure_daemon(verbose=args.verbose):
         return 1
+    selective_mode = bool(getattr(args, "selective", False) or getattr(args, "app", None))
+    switch_default = False if (args.no_switch or selective_mode) else True
+    move_streams = False if (args.no_move or selective_mode) else True
+
     payload: dict[str, Any] = {
         "peer": peer.id,
         "host": peer.host,
         "port": peer.port,
         "name": peer.display_name,
-        "switch_default": not args.no_switch,
-        "move_streams": not args.no_move,
+        "switch_default": switch_default,
+        "move_streams": move_streams,
         "by": "cli",
+        "with_mic": bool(getattr(args, "with_mic", False)),
+        "mic_direction": getattr(args, "mic_direction", "send"),
     }
     try:
         result = _request("connect", timeout=30.0, **payload)
     except (DaemonNotRunning, IpcError, OSError) as exc:
         error(str(exc))
         return 1
+
+    app_target = getattr(args, "app", None)
+    if app_target:
+        try:
+            _request("route_app", app=app_target, target="remote", timeout=5.0)
+            ok(f"Routed application '{app_target}' to {peer.display_name}.")
+        except Exception as exc:
+            warning(f"Could not route application '{app_target}': {exc}")
+
     if _json_enabled(args):
         emit_json(result)
         return 0
     ok(f"Audio is now playing on {style(result.get('name', peer.display_name), 'cyan')}.")
     if result.get("sink"):
         print(f"  Sink: {result['sink']}")
-    if args.no_switch:
+    if result.get("with_mic"):
+        ok(f"Microphone pass-through active: {result.get('source')}")
+    if selective_mode:
+        print("  Selective routing active: default desktop audio remains on local speakers.")
+    elif args.no_switch:
         print("  The default output was left unchanged; select the sink manually.")
     return 0
 
@@ -949,4 +969,165 @@ def cmd_version(args: argparse.Namespace) -> int:
         emit_json(data)
     else:
         print(f"{APP_NAME} {VERSION} (protocol {PROTOCOL_VERSION})")
+    return 0
+
+
+def cmd_apps(args: argparse.Namespace) -> int:
+    try:
+        data = ipc.request("apps_list", timeout=3.0)
+        apps = data.get("apps", [])
+    except Exception:
+        backend = AudioBackend()
+        apps = [item.to_dict() for item in backend.detailed_sink_inputs()]
+
+    if _json_enabled(args):
+        emit_json({"apps": apps})
+        return 0
+
+    if not apps:
+        info("No active audio playback streams found.")
+        return 0
+
+    print()
+    print(style("Active Audio Applications:", "bold"))
+    for item in apps:
+        app_name = item.get("app_name") or item.get("binary") or f"Stream #{item['id']}"
+        dest = style("Remote (SoundHop)", "cyan") if item.get("is_remote") else style("Local Speakers", "green")
+        vol = f"{item.get('volume_percent', 100)}%"
+        pid = f"PID {item.get('pid')}" if item.get('pid') else ""
+        print(f"  • {app_name:<24} [{dest}] (ID {item['id']}, {vol}, {pid})")
+    print()
+    return 0
+
+
+def cmd_route(args: argparse.Namespace) -> int:
+    target_app = getattr(args, "app", None)
+    if not target_app:
+        error("Please specify an application name, binary, or stream ID.")
+        return 1
+
+    dest = "local" if getattr(args, "local", False) else "remote"
+    try:
+        res = ipc.request("route_app", app=target_app, target=dest, timeout=4.0)
+        moved = res.get("moved", 0)
+        target_sink = res.get("target_sink", dest)
+    except Exception:
+        controller = Controller()
+        try:
+            res = controller.route_app(target_app, target=dest)
+            moved = res.get("moved", 0)
+            target_sink = res.get("target_sink", dest)
+        except Exception as exc:
+            error(f"Routing failed: {exc}")
+            return 1
+
+    if moved > 0:
+        ok(f"Routed {moved} active stream(s) for '{target_app}' to {dest} ({target_sink}).")
+        ok(f"Persistent rule saved: future audio from '{target_app}' will play on {dest}.")
+        return 0
+    ok(f"Saved persistent routing rule: audio from '{target_app}' will play on {dest} ({target_sink}).")
+    info("No active streams right now; audio will automatically route to remote when this app plays.")
+    return 0
+
+
+def cmd_unroute(args: argparse.Namespace) -> int:
+    setattr(args, "local", True)
+    return cmd_route(args)
+
+
+def cmd_mic(args: argparse.Namespace) -> int:
+    action = getattr(args, "action", "status") or "status"
+    if action == "status":
+        direction = ""
+        try:
+            res = _request("mic_status", timeout=5.0)
+            enabled = bool(res.get("with_mic"))
+            direction = res.get("direction", "")
+            src = res.get("source", "")
+        except Exception:
+            state = State.load()
+            enabled = bool(state.connected_source)
+            direction = state.mic_direction
+            src = state.connected_source
+
+        if _json_enabled(args):
+            emit_json({"enabled": enabled, "direction": direction, "source": src})
+            return 0
+        if enabled:
+            if direction == "send":
+                ok(f"Microphone pass-through is active (Sending this device's mic to remote PC): {src}")
+            elif direction == "receive":
+                ok(f"Microphone pass-through is active (Receiving remote PC mic on this device): {src}")
+            else:
+                ok(f"Microphone pass-through is active: {src}")
+        else:
+            info("Microphone pass-through is inactive.")
+        return 0
+
+    if action in ("on", "enable", "send", "receive"):
+        if action == "send":
+            direction = "send"
+        elif action == "receive":
+            direction = "receive"
+        else:
+            direction = getattr(args, "direction", None) or "send"
+
+        try:
+            res = _request("enable_mic", direction=direction, timeout=10.0)
+            if direction == "send":
+                ok(f"Microphone pass-through enabled (Sending this device's mic to remote PC): {res.get('source')}")
+            else:
+                ok(f"Microphone pass-through enabled (Receiving remote PC mic on this device): {res.get('source')}")
+        except Exception as exc:
+            error(f"Could not enable microphone pass-through: {exc}")
+            return 1
+        return 0
+
+    if action in ("off", "disable"):
+        try:
+            _request("disable_mic", timeout=10.0)
+            ok("Microphone pass-through disabled.")
+        except Exception as exc:
+            error(f"Could not disable microphone pass-through: {exc}")
+            return 1
+        return 0
+
+    error(f"Unknown mic action: {action}")
+    return 1
+
+
+def cmd_volume(args: argparse.Namespace) -> int:
+    val_str = getattr(args, "value", None)
+    mute_arg = getattr(args, "mute", None)
+
+    volume_arg = None
+    if val_str:
+        clean_val = val_str.rstrip("%")
+        if clean_val.isdigit():
+            volume_arg = int(clean_val)
+        elif val_str.lower() == "mute":
+            mute_arg = True
+        elif val_str.lower() in ("unmute", "un-mute"):
+            mute_arg = False
+
+    try:
+        if volume_arg is not None or mute_arg is not None:
+            res = _request("set_volume", volume=volume_arg, mute=mute_arg, timeout=5.0)
+        else:
+            res = _request("volume", timeout=5.0)
+    except Exception:
+        controller = Controller()
+        if volume_arg is not None or mute_arg is not None:
+            res = controller.set_volume(volume=volume_arg, mute=mute_arg)
+        else:
+            res = controller.get_volume()
+
+    if _json_enabled(args):
+        emit_json(res)
+        return 0
+
+    vol = res.get("volume", 100)
+    mute_status = " [MUTED]" if res.get("mute") else ""
+    conn_str = " (remote sync active)" if res.get("connected") else ""
+    ok(f"Volume: {vol}%{mute_status}{conn_str}")
     return 0

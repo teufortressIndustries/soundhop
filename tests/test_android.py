@@ -252,6 +252,13 @@ class AndroidTest(unittest.TestCase):
                 escaped = Path(tmpdir) / "escaped.txt"
                 self.assertFalse(escaped.exists())
 
+                # Verify SHA-256 checksum rejection on mismatch
+                from soundhop.android import AndroidError
+
+                mock_resp.read.side_effect = [archive_bytes, b""]
+                with self.assertRaises(AndroidError):
+                    mgr.install_scrcpy(expected_sha256="0" * 64)
+
     def test_get_device_wifi_ip(self) -> None:
         mgr = AndroidManager()
 
