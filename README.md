@@ -5,7 +5,7 @@
 [![CI](https://github.com/teufortressIndustries/soundhop/actions/workflows/ci.yml/badge.svg)](https://github.com/teufortressIndustries/soundhop/actions/workflows/ci.yml)
 [![License: MIT](https://img.shields.io/badge/License-MIT-blue.svg)](LICENSE)
 
-[**Download Latest AppImage (Releases)**](https://github.com/teufortressIndustries/soundhop/releases) • [**Quickstart**](#quickstart) • [**CLI Commands**](#cli-command-reference) • [**Requirements**](#requirements) • [**Building from Source**](#building-from-source) • [**How It Works**](#how-it-works-under-the-hood) • [**Production Runbook**](docs/PRODUCTION_RUNBOOK.md) • [**Security**](SECURITY.md)
+[**Download Latest AppImage (Releases)**](https://github.com/teufortressIndustries/soundhop/releases) • [**Quickstart**](#quickstart) • [**CLI Commands**](#cli-command-reference) • [**Requirements**](#requirements) • [**Building from Source**](#building-from-source) • [**How It Works**](#how-it-works-under-the-hood)
 
 ---
 
@@ -135,10 +135,23 @@ soundhop status                 # Show current connection, sharing status, disco
 soundhop status --json          # Raw JSON output for Waybar, Polybar, or scripts
 soundhop discover               # Scan LAN for online SoundHop nodes
 soundhop connect [name|ip]      # Connect interactively or directly by hostname / IP
+soundhop connect --with-mic     # Connect and enable microphone pass-through
 soundhop connect --host 192.168.1.50 --port 4713
 soundhop disconnect             # Drop remote tunnel and restore local sound output
 soundhop share <on|off|status>  # Enable or disable receiving audio from other devices
 soundhop tray                   # Launch Qt system tray icon (KDE Plasma / GNOME)
+```
+
+### Stream Routing, Mic Pass-Through & Volume Sync
+```bash
+soundhop apps                   # List active audio applications and stream routing
+soundhop route spotify          # Route Spotify to remote speakers
+soundhop route firefox --local  # Keep Firefox audio playing on local speakers
+soundhop unroute spotify        # Return Spotify to default output
+soundhop mic <on|off|status>    # Toggle or check remote microphone pass-through
+soundhop volume                 # Show volume and mute status with remote sync
+soundhop volume 80              # Set output volume to 80% (syncs to remote receiver)
+soundhop volume mute            # Mute output
 ```
 
 ### Android Audio Capture (scrcpy)
@@ -146,6 +159,8 @@ Capture and stream audio from Android devices directly to your Linux speakers ov
 ```bash
 soundhop android                # Interactive setup wizard & device pairing
 soundhop android 192.168.1.99   # Connect directly to a specific phone IP or serial
+soundhop android history        # View paired Android device connection history
+soundhop android clear-history  # Clear device history
 soundhop android stop           # Stop running audio capture session
 soundhop android status         # Show scrcpy / adb tool paths and active sessions
 soundhop android devices        # List detected Android devices and Android versions
@@ -218,7 +233,7 @@ We build a universal, standalone AppImage using a clean Ubuntu 22.04 container (
 ```bash
 ./build-appimage-container.sh
 ```
-The finished binary will be placed at `dist/SoundHop-1.1.6-universal-x86_64.AppImage`.
+The finished binary will be placed at `dist/SoundHop-1.2.0-universal-x86_64.AppImage`.
 
 ---
 
@@ -251,6 +266,10 @@ mdns = true                     # Enable mDNS fallback browsing
 ## Limitations & Honest Notes
 
 - **Supported Platforms**: Linux (PipeWire / PulseAudio) and Windows 10/11 (WASAPI / sounddevice). macOS is currently not supported.
+- **Platform Feature Matrix**:
+  - **LAN Speaker Streaming & Discovery**: Supported on both Linux and Windows 10/11.
+  - **Android Audio Capture (`scrcpy`)**: Supported on both Linux and Windows 10/11 (virtual microphone mode requires Linux).
+  - **Per-Application Stream Routing, Microphone Pass-Through & Remote Volume Sync**: Supported on Linux (PipeWire / PulseAudio) only.
 - **LAN-oriented**: Designed for local Wi-Fi, Ethernet, and peer-to-peer networks. If you want to stream across the open Internet, run over [Tailscale](https://tailscale.com) or WireGuard.
 - **ALSA-only systems**: If your Linux setup does not run PipeWire or PulseAudio, SoundHop will not work.
 
@@ -265,13 +284,14 @@ mdns = true                     # Enable mDNS fallback browsing
   - Full CLI (`soundhop` / `shop`) and shell autocompletions
   - Disconnect-on-quit toggle, buffer latency presets, and DSP detection (EasyEffects)
   - Portable AppImage & containerized multi-distro build pipeline
-- [x] **v1.1 (Current)**:
+- [x] **v1.1**:
   - **Android Support (scrcpy)**: Capture and listen to the audio from your Android devices over USB or Wi-Fi.
   - **Windows Support (EXPERIMENTAL)**: Experimental support for Windows OS.
-- [ ] **v1.2 (Upcoming)**:
+- [x] **v1.2 (Current)**:
   - **Per-Application Stream Routing**: Direct specific apps (e.g. Spotify or Firefox) to remote speakers without moving your whole desktop audio.
   - **Microphone Pass-Through**: Stream microphone input back to the sender for remote calls and Discord.
   - **Remote Volume Sync**: Control receiver volume directly from the sender's media keys.
+  - **Android Auto-Discovery & History**: ZeroConf mDNS discovery for Android Wireless Debugging and persistent device history for 1-click reconnects.
 
 ---
 

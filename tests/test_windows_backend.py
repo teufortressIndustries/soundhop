@@ -262,6 +262,22 @@ class WindowsBackendTest(unittest.TestCase):
         backend.unload_module(101)
         self.assertNotEqual(backend.default_sink(), "soundhop_test")
 
+    def test_unsupported_linux_only_features_fail_fast(self) -> None:
+        from soundhop.backend import BackendError
+
+        backend = WindowsAudioBackend()
+        with self.assertRaises(BackendError):
+            backend.connect_tunnel_source(
+                host="127.0.0.1",
+                port=4713,
+                source_name="soundhop_src",
+                description="remote",
+            )
+        with self.assertRaises(BackendError):
+            backend.send_mic_to_remote(host="127.0.0.1", port=4713, description="local")
+        with self.assertRaises(BackendError):
+            backend.move_app_streams("spotify", "remote")
+
 
 if __name__ == "__main__":
     unittest.main()

@@ -14,6 +14,7 @@ import json
 import logging
 import select
 import socket
+import sys
 import threading
 import time
 from collections.abc import Callable, Iterable
@@ -172,7 +173,9 @@ def make_beacon(
     *,
     security: str = "trusted-lan",
     message_type: str = "offer",
+    platform: str | None = None,
 ) -> bytes:
+    plat = platform or ("windows" if sys.platform == "win32" else "linux")
     payload = {
         "magic": MAGIC,
         "proto": PROTOCOL_VERSION,
@@ -182,7 +185,7 @@ def make_beacon(
         "port": int(port),
         "ver": VERSION,
         "security": security,
-        "platform": "linux",
+        "platform": plat,
     }
     return json.dumps(payload, separators=(",", ":")).encode("utf-8")
 

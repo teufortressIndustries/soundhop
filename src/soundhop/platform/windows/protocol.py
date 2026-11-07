@@ -25,7 +25,11 @@ PA_COMMAND_AUTH = 8
 PA_COMMAND_REQUEST = 9
 PA_COMMAND_DRAIN_PLAYBACK_STREAM = 14
 PA_COMMAND_GET_SERVER_INFO = 16
+PA_COMMAND_SET_SINK_VOLUME = 17
+PA_COMMAND_SET_SOURCE_VOLUME = 18
 PA_COMMAND_SET_CLIENT_NAME = 19
+PA_COMMAND_SET_SINK_MUTE = 20
+PA_COMMAND_SET_SOURCE_MUTE = 21
 PA_COMMAND_SUBSCRIBE = 23
 PA_COMMAND_SET_DEFAULT_SINK = 27
 
@@ -112,6 +116,34 @@ class TagStructReader:
         if len(raw) < 8:
             raise EOFError("Unexpected EOF reading u64")
         return struct.unpack(">Q", raw)[0]
+
+    def read_boolean(self) -> bool:
+        tag = self.stream.read(1)
+        if not tag:
+            raise EOFError("Unexpected EOF reading tag")
+        if tag[0] == PA_TAG_BOOLEAN_TRUE:
+            return True
+        if tag[0] == PA_TAG_BOOLEAN_FALSE:
+            return False
+        raise ValueError(f"Expected boolean tag, got {tag!r}")
+
+    def read_cvolume(self) -> tuple[int, list[int]]:
+        tag = self.stream.read(1)
+        if not tag:
+            raise EOFError("Unexpected EOF reading tag")
+        if tag[0] != PA_TAG_CVOLUME:
+            raise ValueError(f"Expected PA_TAG_CVOLUME, got {tag!r}")
+        raw_ch = self.stream.read(1)
+        if not raw_ch:
+            raise EOFError("Unexpected EOF reading channels")
+        channels = raw_ch[0]
+        vols: list[int] = []
+        for _ in range(channels):
+            raw_vol = self.stream.read(4)
+            if len(raw_vol) < 4:
+                raise EOFError("Unexpected EOF reading channel volume")
+            vols.append(struct.unpack(">I", raw_vol)[0])
+        return channels, vols
 
     def read_string(self) -> str | None:
         tag = self.stream.read(1)
@@ -469,4 +501,35 @@ def make_command_create_playback_stream(
     writer.write_boolean(False)  # no_move
     writer.write_boolean(False)  # variable_rate
     writer.write_proplist({"media.name": "SoundHop-Stream"})
+    return write_packet(PA_CONTROL_CHANNEL, writer.getvalue())
+
+
+def make_command_set_sink_volume(
+    tag: int,
+    volume: int,
+    sink_index: int = 0xFFFFFFFF,
+    sink_name: str | None = None,
+    channels: int = 2,
+) -> bytes:
+    writer = TagStructWriter()
+    writer.write_u32(PA_COMMAND_SET_SINK_VOLUME)
+    writer.write_u32(tag)
+    writer.write_u32(sink_index)
+    writer.write_string(sink_name)
+    writer.write_cvolume(channels, volume)
+    return write_packet(PA_CONTROL_CHANNEL, writer.getvalue())
+
+
+def make_command_set_sink_mute(
+    tag: int,
+    mute: bool,
+    sink_index: int = 0xFFFFFFFF,
+    sink_name: str | None = None,
+) -> bytes:
+    writer = TagStructWriter()
+    writer.write_u32(PA_COMMAND_SET_SINK_MUTE)
+    writer.write_u32(tag)
+    writer.write_u32(sink_index)
+    writer.write_string(sink_name)
+    writer.write_boolean(mute)
     return write_packet(PA_CONTROL_CHANNEL, writer.getvalue())

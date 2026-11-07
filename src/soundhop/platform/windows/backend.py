@@ -16,7 +16,7 @@ import time
 from collections.abc import Sequence
 from typing import Any
 
-from ...backend import AudioBackend, BackendError, Listener, Module, Sink, SinkInput
+from ...backend import AudioBackend, BackendError, Listener, Module, Sink, SinkInput, Source
 from ...constants import DEFAULT_LAN_NETWORKS, SINK_PREFIX
 from ...util import sanitize_sink_name
 from .audio import WindowsLoopbackRecorder, WindowsPlayer, list_audio_endpoints
@@ -135,8 +135,34 @@ class WindowsAudioBackend(AudioBackend):
     def sink_exists(self, name: str) -> bool:
         return self.sink(name) is not None
 
+    def sources(self) -> list[Source]:
+        return [Source(id=1, name="Default Input", driver="WASAPI", spec="s16le 2ch 48000Hz", state="running")]
+
+    def source(self, name: str) -> Source | None:
+        for s in self.sources():
+            if s.name == name:
+                return s
+        return None
+
+    def source_exists(self, name: str) -> bool:
+        return self.source(name) is not None
+
+    def module_for_source(self, source_name: str) -> Module | None:
+        for m in self.modules():
+            if m.name.startswith("module-tunnel-") and m.arg("source_name") == source_name:
+                return m
+        return None
+
     def sink_inputs(self) -> list[SinkInput]:
         return []
+
+    def detailed_sink_inputs(self) -> list[Any]:
+        return []
+
+    def move_app_streams(self, identifier: str | int, target: str) -> int:
+        raise BackendError(
+            "Per-application stream routing is only supported on Linux (PipeWire/PulseAudio)"
+        )
 
     def modules(self) -> list[Module]:
         with self._lock:
@@ -450,6 +476,94 @@ class WindowsAudioBackend(AudioBackend):
                 session.stop()
                 return True
             return False
+
+    def connect_tunnel_source(
+        self,
+        *,
+        host: str,
+        port: int,
+        source_name: str,
+        description: str,
+        remote_source: str = "",
+        reconnect_delay_ms: int = 3000,
+        latency_ms: int | None = None,
+        extra_args: Sequence[str] = (),
+    ) -> int:
+        raise BackendError(
+            "Microphone pass-through is only supported on Linux (PipeWire/PulseAudio)"
+        )
+
+    def disconnect_tunnel_source(self, source_name: str) -> bool:
+        source_name = sanitize_sink_name(source_name)
+        with self._lock:
+            module = self.module_for_source(source_name)
+            if module is not None:
+                return self.unload_module(module.id)
+            return False
+
+    def send_mic_to_remote(
+        self,
+        *,
+        host: str,
+        port: int,
+        description: str,
+        local_source: str = "@DEFAULT_SOURCE@",
+    ) -> tuple[int, int, int, int, str]:
+        raise BackendError(
+            "Microphone pass-through is only supported on Linux (PipeWire/PulseAudio)"
+        )
+
+    def stop_send_mic_to_remote(
+        self,
+        *,
+        host: str,
+        port: int,
+        remote_null_id: int = 0,
+        remote_remap_id: int = 0,
+        local_tunnel_id: int = 0,
+        local_loopback_id: int = 0,
+    ) -> None:
+        pass
+
+    def set_default_source(self, name: str) -> None:
+        pass
+
+    def source_outputs(self) -> list[Any]:
+        return []
+
+    def move_source_outputs(
+        self,
+        target: str,
+        *,
+        source: str | None = None,
+        exclude_modules: Sequence[int] = (),
+        skip_monitors: bool = True,
+    ) -> int:
+        return 0
+
+    def cleanup_orphaned_remote_mic_modules(self) -> list[int]:
+        return []
+
+    def get_sink_volume(self, sink_name: str) -> int:
+        return 100
+
+    def set_sink_volume(self, sink_name: str, volume_percent: int) -> None:
+        pass
+
+    def get_sink_mute(self, sink_name: str) -> bool:
+        return False
+
+    def set_sink_mute(self, sink_name: str, mute: bool) -> None:
+        pass
+
+    def remote_set_volume(
+        self,
+        host: str,
+        port: int,
+        volume_percent: int,
+        mute: bool | None = None,
+    ) -> None:
+        pass
 
     # -- diagnostics -----------------------------------------------------
 
