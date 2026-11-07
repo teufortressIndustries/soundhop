@@ -441,7 +441,7 @@ class MdnsService:
 
     def start_browsing(self) -> None:
         try:
-            from zeroconf import ServiceBrowser, Zeroconf
+            from zeroconf import ServiceBrowser, ServiceListener, Zeroconf
         except ModuleNotFoundError as exc:  # pragma: no cover - depends on extra
             raise MdnsUnavailable(
                 "mDNS needs the optional 'zeroconf' package (pip install 'soundhop[mdns]')"
@@ -456,7 +456,7 @@ class MdnsService:
         device_id = self.device_id
         peer_by_name = self._peer_by_name
 
-        class Listener:
+        class Listener(ServiceListener):
             def add_service(self, zc_: Any, type_: str, name_: str) -> None:
                 self._resolve(zc_, type_, name_)
 
