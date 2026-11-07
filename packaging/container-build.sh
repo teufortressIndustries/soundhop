@@ -165,7 +165,6 @@ echo "5. Populating AppDir metadata..."
 cp "$REPO_DIR/packaging/AppRun" "$APP_DIR/AppRun"
 chmod +x "$APP_DIR/AppRun"
 cp "$REPO_DIR/packaging/io.github.soundhop.desktop" "$APP_DIR/io.github.soundhop.desktop"
-ln -sf io.github.soundhop.desktop "$APP_DIR/soundhop.desktop"
 cp "$REPO_DIR/src/soundhop/assets/soundhop.svg" "$APP_DIR/soundhop.svg"
 if [ -f "$REPO_DIR/src/soundhop/assets/soundhop.png" ]; then
     cp "$REPO_DIR/src/soundhop/assets/soundhop.png" "$APP_DIR/soundhop.png"
@@ -176,10 +175,8 @@ fi
 
 mkdir -p "$APP_DIR/usr/share/applications" "$APP_DIR/usr/share/icons/hicolor/scalable/apps" "$APP_DIR/usr/share/icons/hicolor/256x256/apps" "$APP_DIR/usr/share/metainfo"
 cp "$REPO_DIR/packaging/io.github.soundhop.desktop" "$APP_DIR/usr/share/applications/io.github.soundhop.desktop"
-ln -sf io.github.soundhop.desktop "$APP_DIR/usr/share/applications/soundhop.desktop"
 if [ -f "$REPO_DIR/packaging/io.github.soundhop.metainfo.xml" ]; then
-    cp "$REPO_DIR/packaging/io.github.soundhop.metainfo.xml" "$APP_DIR/usr/share/metainfo/io.github.soundhop.metainfo.xml"
-    ln -sf io.github.soundhop.metainfo.xml "$APP_DIR/usr/share/metainfo/soundhop.appdata.xml"
+    cp "$REPO_DIR/packaging/io.github.soundhop.metainfo.xml" "$APP_DIR/usr/share/metainfo/io.github.soundhop.appdata.xml"
 fi
 cp "$REPO_DIR/src/soundhop/assets/soundhop.svg" "$APP_DIR/usr/share/icons/hicolor/scalable/apps/soundhop.svg"
 if [ -f "$REPO_DIR/src/soundhop/assets/soundhop.png" ]; then
@@ -215,6 +212,7 @@ echo "7. Generating universal AppImage (version: $VERSION)..."
 rm -f "$OUTPUT_FILE" "$OUTPUT_FILE.zsync"
 trap 'rm -f "$OUTPUT_FILE" "$OUTPUT_FILE.zsync"' ERR INT TERM
 
+cd "$OUTPUT_DIR"
 ARCH=x86_64 "$BUILD_DIR/squashfs-root/AppRun" -u "$UPDATE_INFO" --runtime-file "$BUILD_DIR/runtime-x86_64" "$APP_DIR" "$OUTPUT_FILE"
 if [ -f "$OUTPUT_FILE" ]; then
     chmod +x "$OUTPUT_FILE"

@@ -88,7 +88,6 @@ cp "$REPO_DIR/packaging/AppRun" "$APP_DIR/AppRun"
 chmod +x "$APP_DIR/AppRun"
 
 cp "$REPO_DIR/packaging/io.github.soundhop.desktop" "$APP_DIR/io.github.soundhop.desktop"
-ln -sf io.github.soundhop.desktop "$APP_DIR/soundhop.desktop"
 cp "$REPO_DIR/src/soundhop/assets/soundhop.svg" "$APP_DIR/soundhop.svg"
 
 # Generate PNG icon for .DirIcon if missing
@@ -118,11 +117,14 @@ mkdir -p "$APP_DIR/usr/bin"
 mkdir -p "$APP_DIR/usr/lib/$PY_VER/site-packages"
 mkdir -p "$APP_DIR/usr/lib64/$PY_VER/site-packages"
 mkdir -p "$APP_DIR/usr/share/applications"
+mkdir -p "$APP_DIR/usr/share/metainfo"
 mkdir -p "$APP_DIR/usr/share/icons/hicolor/scalable/apps"
 mkdir -p "$APP_DIR/usr/share/icons/hicolor/256x256/apps"
 
 cp "$REPO_DIR/packaging/io.github.soundhop.desktop" "$APP_DIR/usr/share/applications/io.github.soundhop.desktop"
-ln -sf io.github.soundhop.desktop "$APP_DIR/usr/share/applications/soundhop.desktop"
+if [[ -f "$REPO_DIR/packaging/io.github.soundhop.metainfo.xml" ]]; then
+    cp "$REPO_DIR/packaging/io.github.soundhop.metainfo.xml" "$APP_DIR/usr/share/metainfo/io.github.soundhop.appdata.xml"
+fi
 cp "$REPO_DIR/src/soundhop/assets/soundhop.svg" "$APP_DIR/usr/share/icons/hicolor/scalable/apps/soundhop.svg"
 if [[ -f "$PNG_ICON" ]]; then
     cp "$PNG_ICON" "$APP_DIR/usr/share/icons/hicolor/256x256/apps/soundhop.png"
@@ -204,7 +206,10 @@ rm -f "$OUTPUT_FILE" "$OUTPUT_FILE.zsync"
 trap 'rm -f "$OUTPUT_FILE" "$OUTPUT_FILE.zsync"' ERR INT TERM
 
 echo -e "\n${BOLD}Packaging AppImage...${NC}"
-ARCH=x86_64 "$APPIMAGETOOL_EXEC" -u "$UPDATE_INFO" --runtime-file "$RUNTIME_FILE" "$APP_DIR" "$OUTPUT_FILE"
+(
+    cd "$OUTPUT_DIR"
+    ARCH=x86_64 "$APPIMAGETOOL_EXEC" -u "$UPDATE_INFO" --runtime-file "$RUNTIME_FILE" "$APP_DIR" "$OUTPUT_FILE"
+)
 
 if [[ -f "$OUTPUT_FILE" ]]; then
     chmod +x "$OUTPUT_FILE"
