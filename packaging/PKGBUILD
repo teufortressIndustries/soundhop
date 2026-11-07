@@ -1,6 +1,6 @@
 # Maintainer: SoundHop Contributors <soundhop@example.com>
 pkgname=soundhop
-pkgver=1.1.6
+pkgver=1.2.0
 pkgrel=1
 pkgdesc="Seamless cross-distro local network audio sharing for Linux (PipeWire / PulseAudio)"
 arch=('any')

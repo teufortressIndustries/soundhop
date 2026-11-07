@@ -19,6 +19,6 @@
     <binary>shop</binary>
   </provides>
   <releases>
-    <release version="1.1.6" date="2026-11-06"/>
+    <release version="1.2.0" date="2026-11-06"/>
   </releases>
 </component>

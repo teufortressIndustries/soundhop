@@ -5,7 +5,7 @@ from __future__ import annotations
 APP_NAME = "SoundHop"
 APP_SLUG = "soundhop"
 APP_ID = "io.github.soundhop"
-VERSION = "1.1.6"
+VERSION = "1.2.0"
 REPO_URL = "https://github.com/teufortressIndustries/soundhop"
 ISSUES_URL = "https://github.com/teufortressIndustries/soundhop/issues"
 
@@ -26,14 +26,16 @@ MDNS_SERVICE_TYPE = "_soundhop._tcp.local."
 #: Prefix for PulseAudio/PipeWire modules and sinks created by SoundHop.
 MODULE_PREFIX = "soundhop_"
 SINK_PREFIX = "soundhop_"
+SOURCE_PREFIX = "soundhop_source_"
 
 #: How often a daemon announces itself, and how long a peer is considered
 #: online after its last announcement.
 BEACON_INTERVAL = 3.0
 PEER_TIMEOUT = 20.0
 
-#: How long to wait for a new tunnel sink to appear in the graph.
+#: How long to wait for a new tunnel sink or source to appear in the graph.
 SINK_TIMEOUT = 3.0
+SOURCE_TIMEOUT = 3.0
 
 #: How often the daemon checks whether it should auto-connect/reconnect.
 SUPERVISOR_INTERVAL = 2.0
