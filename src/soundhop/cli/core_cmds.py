@@ -400,10 +400,10 @@ def cmd_auto(args: argparse.Namespace) -> int:
         if _json_enabled(args):
             emit_json(payload)
             return 0
-        enabled = "on" if payload.get("auto_connect", payload.get("enabled")) else "off"
+        status_label = "on" if payload.get("auto_connect", payload.get("enabled")) else "off"
         if payload.get("paused"):
-            enabled = "paused"
-        print(f"Auto-connect: {enabled}")
+            status_label = "paused"
+        print(f"Auto-connect: {status_label}")
         if payload.get("last_peer"):
             print(f"  Last device: {payload['last_peer']}")
         return 0
@@ -518,40 +518,40 @@ def cmd_service(args: argparse.Namespace) -> int:
             print(f"Since:     {data['since']}")
         return 0
     if action == "start":
-        result = service.start_service()
+        ok_flag = service.start_service()
         if _json_enabled(args):
-            emit_json({"started": result})
-            return 0 if result else 1
-        ok("Started." if result else "Could not start the service.")
-        return 0 if result else 1
+            emit_json({"started": ok_flag})
+            return 0 if ok_flag else 1
+        ok("Started." if ok_flag else "Could not start the service.")
+        return 0 if ok_flag else 1
     if action == "stop":
-        result = service.stop_service()
+        ok_flag = service.stop_service()
         if _json_enabled(args):
-            emit_json({"stopped": result})
-            return 0 if result else 1
-        ok("Stopped." if result else "Could not stop the service.")
-        return 0 if result else 1
+            emit_json({"stopped": ok_flag})
+            return 0 if ok_flag else 1
+        ok("Stopped." if ok_flag else "Could not stop the service.")
+        return 0 if ok_flag else 1
     if action == "restart":
-        result = service.restart_service()
+        ok_flag = service.restart_service()
         if _json_enabled(args):
-            emit_json({"restarted": result})
-            return 0 if result else 1
-        ok("Restarted." if result else "Could not restart the service.")
-        return 0 if result else 1
+            emit_json({"restarted": ok_flag})
+            return 0 if ok_flag else 1
+        ok("Restarted." if ok_flag else "Could not restart the service.")
+        return 0 if ok_flag else 1
     if action == "enable":
-        result = service.enable_service()
+        ok_flag = service.enable_service()
         if _json_enabled(args):
-            emit_json({"enabled": result})
-            return 0 if result else 1
-        ok("Enabled." if result else "Could not enable the service.")
-        return 0 if result else 1
+            emit_json({"enabled": ok_flag})
+            return 0 if ok_flag else 1
+        ok("Enabled." if ok_flag else "Could not enable the service.")
+        return 0 if ok_flag else 1
     if action == "disable":
-        result = service.disable_service()
+        ok_flag = service.disable_service()
         if _json_enabled(args):
-            emit_json({"disabled": result})
-            return 0 if result else 1
-        ok("Disabled." if result else "Could not disable the service.")
-        return 0 if result else 1
+            emit_json({"disabled": ok_flag})
+            return 0 if ok_flag else 1
+        ok("Disabled." if ok_flag else "Could not disable the service.")
+        return 0 if ok_flag else 1
     error(f"Unknown service action: {action}")
     return 1
 
@@ -897,13 +897,13 @@ def cmd_setup(args: argparse.Namespace) -> int:
         if install_service:
             from .. import service
 
-            result = service.install(
+            svc_result = service.install(
                 enable=True,
                 start=True,
                 tray=False,
             )
-            if result.get("unit"):
-                ok(f"Installed {result['unit']}.")
+            if svc_result.get("unit"):
+                ok(f"Installed {svc_result['unit']}.")
             else:
                 warning("Could not install the user service.")
             tray = tray_dependency_available()
@@ -1031,7 +1031,7 @@ def cmd_route(args: argparse.Namespace) -> int:
 
 
 def cmd_unroute(args: argparse.Namespace) -> int:
-    setattr(args, "local", True)
+    args.local = True
     return cmd_route(args)
 
 

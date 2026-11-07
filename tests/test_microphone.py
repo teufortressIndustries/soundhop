@@ -1,9 +1,8 @@
 import unittest
-from unittest.mock import MagicMock, patch
+from unittest.mock import patch
 
 from soundhop.backend import AudioBackend, Module, Source
-from soundhop.controller import Controller, ControllerError
-from soundhop.discovery import Peer
+from soundhop.controller import Controller
 from soundhop.util import Result
 
 

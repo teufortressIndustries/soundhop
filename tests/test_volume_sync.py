@@ -1,5 +1,5 @@
 import unittest
-from unittest.mock import MagicMock, patch
+from unittest.mock import patch
 
 from soundhop.backend import AudioBackend
 from soundhop.controller import Controller
@@ -50,6 +50,7 @@ class VolumeSyncTest(unittest.TestCase):
 
         self.assertEqual(cmd, PA_COMMAND_SET_SINK_MUTE)
         self.assertEqual(tag, 43)
+        self.assertEqual(sink_idx, 0xFFFFFFFF)
         self.assertEqual(sink_name, "test-sink")
         self.assertTrue(mute)
 

@@ -56,7 +56,8 @@ def is_admin() -> bool:
     try:
         import ctypes
 
-        return bool(ctypes.windll.shell32.IsUserAnAdmin())
+        windll = getattr(ctypes, "windll", None)
+        return bool(windll and windll.shell32.IsUserAnAdmin())
     except Exception:
         return False
 
@@ -104,8 +105,8 @@ def detect() -> FirewallState:
             pass
     if shutil.which("firewall-cmd"):
         try:
-            result = subprocess.run(["systemctl", "is-active", "--quiet", "firewalld"], timeout=5)
-            if result.returncode == 0:
+            proc_fw = subprocess.run(["systemctl", "is-active", "--quiet", "firewalld"], timeout=5)
+            if proc_fw.returncode == 0:
                 return FirewallState("firewalld", True, "firewalld is active")
             return FirewallState("firewalld", False, "firewalld is installed but inactive")
         except (OSError, subprocess.TimeoutExpired):
@@ -369,7 +370,7 @@ def close_ports(
         return result
     for command in result.commands:
         try:
-            cmd_kwargs = {"capture_output": True, "text": True, "timeout": 30}
+            cmd_kwargs: dict[str, Any] = {"capture_output": True, "text": True, "timeout": 30}
             if hasattr(subprocess, "CREATE_NO_WINDOW"):
                 cmd_kwargs["creationflags"] = subprocess.CREATE_NO_WINDOW
             proc = subprocess.run(command, **cmd_kwargs)

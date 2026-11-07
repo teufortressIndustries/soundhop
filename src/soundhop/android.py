@@ -282,9 +282,11 @@ class AndroidManager:
         hasher = hashlib.sha256()
         header_sha256 = ""
         try:
+            if not url.startswith("https://"):
+                raise AndroidError(f"Refusing non-HTTPS download URL: {url}")
             req = urllib.request.Request(url, headers={"User-Agent": "SoundHop-AndroidManager"})
             with (
-                urllib.request.urlopen(req, timeout=30.0) as resp,
+                urllib.request.urlopen(req, timeout=30.0) as resp,  # nosec B310
                 open(archive_path, "wb") as out_file,
             ):
                 total = int(resp.headers.get("Content-Length", 0))
@@ -436,7 +438,7 @@ class AndroidManager:
                                     or (m.mode & 0o111)
                                 ):
                                     try:
-                                        os.chmod(target_path, 0o755)
+                                        os.chmod(target_path, 0o755)  # nosec B103
                                     except OSError:
                                         pass
         except Exception as exc:

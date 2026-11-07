@@ -1,6 +1,6 @@
 import json
 import unittest
-from unittest.mock import MagicMock, patch
+from unittest.mock import patch
 
 from soundhop.backend import AudioBackend, Module, Sink, SinkInputInfo
 from soundhop.controller import Controller, ControllerError

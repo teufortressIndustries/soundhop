@@ -65,8 +65,8 @@ def cmd_android(args: argparse.Namespace) -> int:
             return 1
 
     if sub == "mic":
-        setattr(args, "mic", True)
-        setattr(args, "as_mic", True)
+        args.mic = True
+        args.as_mic = True
         return cmd_android_start(args)
     if sub in ("stop", "disconnect"):
         return cmd_android_stop(args)
@@ -470,7 +470,7 @@ def cmd_android_start(args: argparse.Namespace) -> int:
     if use_as_mic:
         source = "mic"
     else:
-        source = getattr(args, "source", None)
+        source = getattr(args, "source", None) or ""
         if not source:
             major_v = target_device.major_version
             if target_device.sdk_version >= 31 or major_v >= 12:
@@ -533,7 +533,7 @@ def cmd_android_start(args: argparse.Namespace) -> int:
     print(f"  Source:      {source}")
     print(f"  Buffer:      {buffer_ms} ms")
     if use_as_mic:
-        print(f"  Mode:        Wireless PC Microphone (virtual source: soundhop_android_mic)")
+        print("  Mode:        Wireless PC Microphone (virtual source: soundhop_android_mic)")
     print()
     if use_as_mic:
         print(style("Streaming phone microphone as PC input. Press Ctrl+C to stop.", "green"))

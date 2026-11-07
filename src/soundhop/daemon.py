@@ -787,8 +787,8 @@ def configure_logging(verbose: bool = False, *, to_file: bool = False) -> None:
     )
     root = logging.getLogger()
     root.setLevel(level)
-    for handler in list(root.handlers):
-        root.removeHandler(handler)
+    for old_handler in list(root.handlers):
+        root.removeHandler(old_handler)
     if to_file:
         ensure_dir(log_path().parent)
         handler: logging.Handler = RotatingFileHandler(
@@ -810,7 +810,7 @@ def configure_logging(verbose: bool = False, *, to_file: bool = False) -> None:
 def _acquire_lock() -> Any | None:
     ensure_dir(runtime_dir())
     handle = open(lock_path(), "a+")
-    if fcntl is not None:
+    if sys.platform != "win32" and fcntl is not None:
         try:
             fcntl.flock(handle.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
         except OSError:

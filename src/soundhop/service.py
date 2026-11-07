@@ -33,6 +33,8 @@ def windows_autostart_command() -> str:
 
 
 def winreg_query_run(name: str = WINREG_APP_NAME) -> str | None:
+    if sys.platform != "win32":
+        return None
     try:
         import winreg
 
@@ -46,6 +48,8 @@ def winreg_query_run(name: str = WINREG_APP_NAME) -> str | None:
 
 
 def winreg_write_run(name: str = WINREG_APP_NAME, command: str | None = None) -> bool:
+    if sys.platform != "win32":
+        return False
     cmd = command or windows_autostart_command()
     try:
         import winreg
@@ -60,6 +64,8 @@ def winreg_write_run(name: str = WINREG_APP_NAME, command: str | None = None) ->
 
 
 def winreg_delete_run(name: str = WINREG_APP_NAME) -> bool:
+    if sys.platform != "win32":
+        return False
     try:
         import winreg
 

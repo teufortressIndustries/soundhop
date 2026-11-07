@@ -287,7 +287,7 @@ class WindowsAudioBackend(AudioBackend):
             self._stop_listener_locked()
             sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
             sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
-            sock.bind(("0.0.0.0", port))
+            sock.bind(("0.0.0.0", port))  # nosec B104
             sock.listen(5)
             sock.settimeout(0.5)
 

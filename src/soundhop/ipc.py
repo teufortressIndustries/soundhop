@@ -60,10 +60,10 @@ class IpcServer:
             pass
 
         sock: socket.socket | None = None
-        use_unix = hasattr(socket, "AF_UNIX")
-        if use_unix:
+        af_unix = getattr(socket, "AF_UNIX", None)
+        if af_unix is not None:
             try:
-                sock = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+                sock = socket.socket(af_unix, socket.SOCK_STREAM)
                 sock.bind(str(self.path))
                 if hasattr(os, "chmod"):
                     try:

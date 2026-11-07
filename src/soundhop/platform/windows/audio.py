@@ -31,13 +31,14 @@ class WindowsPlayer:
             try:
                 import sounddevice as sd
 
-                self._stream = sd.RawOutputStream(
+                stream = sd.RawOutputStream(
                     samplerate=self.sample_rate,
                     channels=self.channels,
                     dtype="int16",
                     latency="low",
                 )
-                self._stream.start()
+                stream.start()
+                self._stream = stream
                 log.debug(
                     "Opened sounddevice RawOutputStream (%s Hz, %s ch)",
                     self.sample_rate,

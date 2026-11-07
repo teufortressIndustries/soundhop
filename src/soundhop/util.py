@@ -406,7 +406,7 @@ def local_addresses(*, include_loopback: bool = False) -> list[str]:
     if not addresses:
         try:
             for info in socket.getaddrinfo(socket.gethostname(), None):
-                addr = info[4][0]
+                addr = str(info[4][0])
                 try:
                     ip = ipaddress.ip_address(addr)
                 except ValueError:

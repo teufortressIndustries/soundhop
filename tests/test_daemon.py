@@ -113,8 +113,9 @@ class DaemonTest(unittest.TestCase):
     def test_audio_event_monitor_handling(self) -> None:
         import threading
         from unittest.mock import MagicMock
-        from soundhop.daemon import AudioEventMonitor
+
         from soundhop.controller import Controller
+        from soundhop.daemon import AudioEventMonitor
 
         ctrl = Controller()
         ctrl.state.connected_peer = "test-peer"
@@ -135,7 +136,7 @@ class DaemonTest(unittest.TestCase):
 
         with (
             patch.object(ctrl, "sync_remote_volume") as mock_vol,
-            patch.object(ctrl, "enforce_routed_apps") as mock_route,
+            patch.object(ctrl, "enforce_routed_apps"),
             patch("soundhop.daemon.command_exists", return_value=True),
             patch("subprocess.Popen", return_value=fake_proc),
             patch("select.select", return_value=([fake_proc.stdout], [], [])),

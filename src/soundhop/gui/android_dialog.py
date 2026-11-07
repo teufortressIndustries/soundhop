@@ -548,7 +548,7 @@ def build_android_wizard_class(QtCore: Any, QtGui: Any, QtWidgets: Any) -> type:
                 def work() -> dict[str, Any]:
                     return self.stop_capture()
 
-                def done(_: Any) -> None:
+                def done(res: Any) -> None:
                     self._poll_status()
 
                 future = self._executor.submit(work)

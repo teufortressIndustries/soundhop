@@ -3,7 +3,7 @@ import unittest
 from pathlib import Path
 from unittest.mock import MagicMock, patch
 
-from soundhop.android import AdbDevice, AndroidManager
+from soundhop.android import AndroidManager
 from soundhop.state import KnownAndroidDevice, State
 from soundhop.util import Result
 
