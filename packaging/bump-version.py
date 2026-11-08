@@ -1,19 +1,14 @@
 #!/usr/bin/env python3
-"""Automated single-command version bumper for SoundHop.
+"""Automated single-command version bumper for SoundHop v2.0 (Rust workspace).
 
 Updates:
-- pyproject.toml (version = "X.Y.Z")
-- src/soundhop/constants.py (VERSION = "X.Y.Z")
+- Cargo.toml (version = "X.Y.Z" in [workspace.package])
+- crates/soundhop-core/src/constants.rs (pub const VERSION: &str = "X.Y.Z";)
 - packaging/PKGBUILD (pkgver=X.Y.Z)
 - packaging/soundhop.spec (Version: X.Y.Z)
 - README.md (AppImage artifact mentions)
 - packaging/io.github.soundhop.desktop (X-AppImage-Version)
-
-Usage:
-  ./packaging/bump-version.py 1.2.0
-  ./packaging/bump-version.py --patch
-  ./packaging/bump-version.py --minor
-  ./packaging/bump-version.py --major
+- packaging/io.github.soundhop.metainfo.xml (<release version="X.Y.Z">)
 """
 
 import argparse
@@ -22,10 +17,11 @@ import subprocess
 import sys
 from pathlib import Path
 
+
 def _find_repo_root() -> Path:
     current = Path(__file__).resolve().parent
     for candidate in [current, current.parent]:
-        if (candidate / "src" / "soundhop" / "constants.py").is_file():
+        if (candidate / "Cargo.toml").is_file():
             return candidate
     return current.parent
 
@@ -34,11 +30,17 @@ ROOT_DIR = _find_repo_root()
 
 
 def get_current_version() -> str:
-    const_file = ROOT_DIR / "src" / "soundhop" / "constants.py"
+    cargo_file = ROOT_DIR / "Cargo.toml"
+    if cargo_file.is_file():
+        text = cargo_file.read_text(encoding="utf-8")
+        m = re.search(r'^version\s*=\s*"([^"]+)"', text, flags=re.MULTILINE)
+        if m:
+            return m.group(1)
+    const_file = ROOT_DIR / "crates" / "soundhop-core" / "src" / "constants.rs"
     text = const_file.read_text(encoding="utf-8")
-    m = re.search(r'VERSION\s*=\s*["\']([^"\']+)["\']', text)
+    m = re.search(r'pub const VERSION:\s*&str\s*=\s*"([^"]+)"', text)
     if not m:
-        raise RuntimeError(f"Could not find VERSION in {const_file}")
+        raise RuntimeError(f"Could not find VERSION in {cargo_file} or {const_file}")
     return m.group(1)
 
 
@@ -57,7 +59,7 @@ def bump(current: str, mode: str) -> str:
         return f"{major}.{minor + 1}.0"
     if mode == "patch":
         return f"{major}.{minor}.{patch + 1}"
-    return mode  # explicit version
+    return mode
 
 
 def update_file(path: Path, pattern: str, replacement: str, flags: int = 0) -> bool:
@@ -74,14 +76,13 @@ def update_file(path: Path, pattern: str, replacement: str, flags: int = 0) -> b
 def main() -> int:
     parser = argparse.ArgumentParser(description="Bump SoundHop project version.")
     group = parser.add_mutually_exclusive_group(required=True)
-    group.add_argument("version", nargs="?", help="New version (e.g. 1.2.0)")
-    group.add_argument("--patch", action="store_true", help="Bump patch version (X.Y.Z+1)")
-    group.add_argument("--minor", action="store_true", help="Bump minor version (X.Y+1.0)")
-    group.add_argument("--major", action="store_true", help="Bump major version (X+1.0.0)")
-    parser.add_argument("--no-test", action="store_true", help="Skip running unit tests")
+    group.add_argument("version", nargs="?", help="New version (e.g. 2.1.0)")
+    group.add_argument("--patch", action="store_true", help="Bump patch version")
+    group.add_argument("--minor", action="store_true", help="Bump minor version")
+    group.add_argument("--major", action="store_true", help="Bump major version")
+    parser.add_argument("--no-test", action="store_true", help="Skip running cargo test")
 
     args = parser.parse_args()
-
     curr_ver = get_current_version()
 
     if args.patch:
@@ -94,89 +95,67 @@ def main() -> int:
         new_ver = args.version.lstrip("v")
         parse_semver(new_ver)
 
-    print(f"Bumping SoundHop version: {curr_ver} → {new_ver}\n")
-
+    print(f"Bumping SoundHop version: {curr_ver} -> {new_ver}\n")
     changes: list[str] = []
 
-    # 1. pyproject.toml
-    pyproject_path = ROOT_DIR / "pyproject.toml"
+    cargo_path = ROOT_DIR / "Cargo.toml"
     if update_file(
-        pyproject_path,
-        r'^version\s*=\s*["\'][0-9.]+["\']',
+        cargo_path,
+        r'^version\s*=\s*"[0-9.]+"',
         f'version = "{new_ver}"',
         flags=re.MULTILINE,
     ):
-        changes.append(f"✓ {pyproject_path.relative_to(ROOT_DIR)} (Python project metadata)")
+        changes.append("✓ Cargo.toml")
 
-    # 2. src/soundhop/constants.py
-    const_path = ROOT_DIR / "src" / "soundhop" / "constants.py"
-    if update_file(const_path, r'VERSION\s*=\s*["\'][^"\']+["\']', f'VERSION = "{new_ver}"'):
-        changes.append(f"✓ {const_path.relative_to(ROOT_DIR)} (Python source of truth)")
+    const_path = ROOT_DIR / "crates" / "soundhop-core" / "src" / "constants.rs"
+    if update_file(
+        const_path,
+        r'pub const VERSION:\s*&str\s*=\s*"[^"]+"',
+        f'pub const VERSION: &str = "{new_ver}"',
+    ):
+        changes.append("✓ crates/soundhop-core/src/constants.rs")
 
-    # 3. packaging/PKGBUILD
     pkg_path = ROOT_DIR / "packaging" / "PKGBUILD"
     if update_file(pkg_path, r'pkgver=[0-9.]+', f'pkgver={new_ver}'):
-        changes.append(f"✓ {pkg_path.relative_to(ROOT_DIR)} (Arch Linux package)")
+        changes.append("✓ packaging/PKGBUILD")
 
-    # 4. packaging/soundhop.spec
     spec_path = ROOT_DIR / "packaging" / "soundhop.spec"
     if update_file(spec_path, r'Version:\s+[0-9.]+', f'Version:        {new_ver}'):
-        changes.append(f"✓ {spec_path.relative_to(ROOT_DIR)} (RPM spec file)")
+        changes.append("✓ packaging/soundhop.spec")
 
-    # 5. README.md
     readme_path = ROOT_DIR / "README.md"
     if update_file(
         readme_path,
         r'SoundHop-[0-9.]+-universal-x86_64\.AppImage',
         f'SoundHop-{new_ver}-universal-x86_64.AppImage',
     ):
-        changes.append(f"✓ {readme_path.relative_to(ROOT_DIR)} (documentation)")
+        changes.append("✓ README.md")
 
-    # 6. packaging/io.github.soundhop.desktop
     desktop_path = ROOT_DIR / "packaging" / "io.github.soundhop.desktop"
-    if desktop_path.exists():
-        content = desktop_path.read_text(encoding="utf-8")
-        if re.search(r'X-AppImage-Version=[^\r\n]*', content):
-            if update_file(desktop_path, r'X-AppImage-Version=[^\r\n]*', f'X-AppImage-Version={new_ver}'):
-                changes.append(f"✓ {desktop_path.relative_to(ROOT_DIR)} (AppImage desktop entry version)")
-        else:
-            desktop_path.write_text(content.rstrip() + f"\nX-AppImage-Version={new_ver}\n", encoding="utf-8")
-            changes.append(f"✓ {desktop_path.relative_to(ROOT_DIR)} (AppImage desktop entry version added)")
+    if update_file(
+        desktop_path,
+        r'X-AppImage-Version=[^\r\n]*',
+        f'X-AppImage-Version={new_ver}',
+    ):
+        changes.append("✓ packaging/io.github.soundhop.desktop")
 
-    # 7. packaging/io.github.soundhop.metainfo.xml
     metainfo_path = ROOT_DIR / "packaging" / "io.github.soundhop.metainfo.xml"
-    if metainfo_path.exists():
-        if update_file(
-            metainfo_path,
-            r'<release version="[^"]+"',
-            f'<release version="{new_ver}"',
-        ):
-            changes.append(f"✓ {metainfo_path.relative_to(ROOT_DIR)} (AppStream metainfo version)")
-
-    if not changes:
-        print(f"All files already synchronized to version {new_ver}.")
-        return 0
+    if update_file(
+        metainfo_path,
+        r'<release version="[^"]+"',
+        f'<release version="{new_ver}"',
+    ):
+        changes.append("✓ packaging/io.github.soundhop.metainfo.xml")
 
     for c in changes:
         print(c)
 
-    print("\nNote: build-appimage.sh and container-build.sh read VERSION dynamically from constants.py!")
-
-    # Verify with unit tests
     if not args.no_test:
-        print("\nRunning unit tests to verify version bump...")
-        res = subprocess.run(
-            [sys.executable, "-m", "unittest", "discover", "tests"],
-            cwd=ROOT_DIR,
-            env={"PYTHONPATH": "src"},
-        )
+        print("\nRunning cargo test --workspace to verify version bump...")
+        res = subprocess.run(["cargo", "test", "--workspace"], cwd=ROOT_DIR)
         if res.returncode != 0:
-            print("\n❌ Tests failed after version bump!")
             return res.returncode
-        print("✓ All tests passed!")
 
-    print(f"\nSuccessfully updated version to {new_ver}.")
-    print(f"Git commit: git commit -am 'chore: bump version to v{new_ver}'")
     return 0
 
 

@@ -1,0 +1,34 @@
+[package]
+name = "soundhop-cli"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+authors.workspace = true
+repository.workspace = true
+description = "CLI, daemon entrypoint, and interactive TUI for SoundHop"
+default-run = "soundhop"
+
+[[bin]]
+name = "soundhop"
+path = "src/main.rs"
+
+[[bin]]
+name = "shop"
+path = "src/bin/shop.rs"
+
+[dependencies]
+soundhop-core.workspace = true
+soundhop-gui.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+toml.workspace = true
+thiserror.workspace = true
+tracing.workspace = true
+tracing-subscriber.workspace = true
+clap.workspace = true
+clap_complete.workspace = true
+ratatui.workspace = true
+crossterm.workspace = true
+
+[dev-dependencies]
+tempfile.workspace = true

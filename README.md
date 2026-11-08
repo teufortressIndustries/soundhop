@@ -91,16 +91,25 @@ Audio falls straight back to your local speakers or headphones without missing a
 
 ---
 
+## What's New in v2.0 (Pure Rust Rewrite)
+
+SoundHop v2.0 is a ground-up rewrite in pure Rust (`soundhop-core`, `soundhop-gui`, `soundhop-cli`), eliminating the Python & Qt runtime overhead while introducing five flagship capabilities:
+
+1. **Interactive Terminal UI (`soundhop tui` / default when run with no args in a TTY)**: Live `ratatui` dashboard with Multi-Room peer toggles, Per-App Audio Mixer, Mic & Android Bridge controls, and a real-time stereo VU meter + network RTT/jitter bar.
+2. **Multi-Room / Simultaneous Broadcast Audio (`soundhop connect PeerA PeerB --combine --keep-local`)**: Stream audio to multiple LAN speakers at once (plus optionally keep your local speakers playing in sync) via `module-combine-sink` on Linux and multi-peer TCP fan-out on Windows.
+3. **Persistent Per-App Routing Rules (`soundhop route Spotify --save`)**: Save `always_remote` and `always_local` application rules in `config.toml` (`[routing]`) so your music player automatically hops to remote speakers while system alerts or browsers stay local.
+4. **PIN / Pre-Shared Key (PSK) Pairing & HMAC-SHA256 Authentication (`soundhop pair <peer> --pin 123456`)**: Cryptographically sign UDP discovery beacons with HMAC-SHA256 and deterministically synchronize a 256-byte PulseAudio auth cookie across paired machines.
+5. **Real-Time Audio Level Meter & Network Latency / Jitter Telemetry**: Live Peak/RMS/dBFS audio metering and rolling TCP/UDP RTT & jitter (`ms`) tracking in both the TUI and the `egui` Settings dialog.
+
+---
+
 ## Requirements
 
 | Component | Minimum Version | Notes |
 | :--- | :--- | :--- |
-| **Linux Kernel** | 5.x+ | Any modern distro (Fedora, Arch, CachyOS, Ubuntu, Debian, openSUSE) |
-| **Audio Server** | PipeWire 0.3+ / PulseAudio 14+ | Must provide `pipewire-pulse` compatibility or PulseAudio |
-| **CLI Tools** | `pactl` | Standard tool from `pipewire-pulse` or `pulseaudio-utils` |
-| **Python** | 3.10+ | Required only when building from source (bundled inside AppImage) |
-| **Desktop GUI** | `PySide6` (Qt 6) | Bundled inside AppImage; only needed when running directly from source |
-| **Optional mDNS**| `python-zeroconf` | Fallback discovery if raw UDP broadcasts are blocked on your router |
+| **Linux / Windows** | Linux 5.x+ / Windows 10+ | Native static/dynamic Rust binaries (`soundhop` & `shop`) |
+| **Audio Server** | PipeWire 0.3+ / PulseAudio 14+ / WASAPI | `pactl` on Linux; native WASAPI loopback & playback on Windows |
+| **Rust Toolchain** | `rustc` / `cargo` 1.80+ | Only required when building from source |
 
 ---
 
@@ -204,7 +213,7 @@ soundhop completions zsh > ~/.zsh/completion/_soundhop
 
 ## Building from Source
 
-If you want to hack on SoundHop or run straight from git:
+If you want to hack on SoundHop or build from git:
 
 ### 1. Clone repository
 ```bash
@@ -212,28 +221,24 @@ git clone https://github.com/teufortressIndustries/soundhop.git
 cd soundhop
 ```
 
-### 2. Set up virtual environment
+### 2. Build release binaries with Cargo
 ```bash
-python3 -m venv .venv
-source .venv/bin/activate
-pip install --upgrade pip
-
-# Install in editable mode with GUI (PySide6) and mDNS (zeroconf):
-pip install -e ".[all]"
+cargo build --release --workspace
+# Binaries are emitted to target/release/soundhop and target/release/shop
 ```
 
-### 3. Run unit tests
-SoundHop comes with comprehensive unit tests for discovery, packet codecs, CLI parsing, state, and firewall helpers:
+### 3. Run unit & integration tests
 ```bash
-PYTHONPATH=src python3 -m unittest discover -s tests -v
+cargo fmt --all -- --check
+cargo clippy --workspace --all-targets -- -D warnings
+cargo test --workspace
 ```
 
 ### 4. Build Universal AppImage locally
-We build a universal, standalone AppImage using a clean Ubuntu 22.04 container (with Podman or Docker) so it runs on glibc 2.35+ across Fedora, Arch, CachyOS, Debian, and Ubuntu:
 ```bash
-./build-appimage-container.sh
+./packaging/build-appimage.sh
 ```
-The finished binary will be placed at `dist/SoundHop-1.2.0-universal-x86_64.AppImage`.
+The finished binary will be placed at `dist/SoundHop-2.0.0-universal-x86_64.AppImage`.
 
 ---
 

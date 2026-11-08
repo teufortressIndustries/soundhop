@@ -1,0 +1,22 @@
+[package]
+name = "soundhop-gui"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+authors.workspace = true
+repository.workspace = true
+description = "Native system tray and eframe/egui dialogs for SoundHop"
+
+[dependencies]
+soundhop-core.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+tracing.workspace = true
+eframe.workspace = true
+egui.workspace = true
+tray-icon.workspace = true
+muda.workspace = true
+image.workspace = true
+
+[target.'cfg(target_os = "linux")'.dependencies]
+gtk = "0.18"

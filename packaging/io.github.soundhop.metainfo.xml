@@ -5,11 +5,12 @@
   <project_license>MIT</project_license>
   <name>SoundHop</name>
   <developer_name>SoundHop Contributors</developer_name>
-  <summary>Stream and share audio between local Linux machines seamlessly</summary>
+  <summary>Stream and share audio between local Linux and Windows machines seamlessly</summary>
   <description>
     <p>
-      SoundHop wraps PipeWire and PulseAudio in an automatic, self-healing workflow
-      with zero-configuration LAN discovery and an intuitive desktop system tray.
+      SoundHop wraps PipeWire, PulseAudio, and Windows WASAPI in an automatic, self-healing workflow
+      with zero-configuration LAN discovery, multi-room broadcast, persistent per-app routing,
+      PIN/PSK pairing, an interactive TUI, and a native desktop system tray.
     </p>
   </description>
   <launchable type="desktop-id">io.github.soundhop.desktop</launchable>
@@ -21,6 +22,6 @@
   </provides>
   <content_rating type="oars-1.1"/>
   <releases>
-    <release version="1.2.0" date="2026-11-06"/>
+    <release version="2.0.0" date="2026-11-08"/>
   </releases>
 </component>

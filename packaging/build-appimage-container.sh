@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 # ==============================================================================
-# SoundHop Portable AppImage Builder (Ubuntu Container)
-# Builds a truly universal AppImage on Ubuntu 22.04 LTS (glibc 2.35 / standard Python)
+# SoundHop v2.0 Portable AppImage Builder (Ubuntu 22.04 Container)
+# Builds a universal AppImage on Ubuntu 22.04 LTS (glibc 2.35 + Rust toolchain)
 # Runs cleanly across all Linux distributions (Ubuntu, Debian, Fedora, Arch, CachyOS).
 # ==============================================================================
 set -euo pipefail
@@ -19,21 +19,26 @@ else
     exit 1
 fi
 
-echo "=== Building Universal SoundHop AppImage using Ubuntu 22.04 ($CONTAINER_CMD) ==="
+echo "=== Building Universal SoundHop v2.0 AppImage using Ubuntu 22.04 ($CONTAINER_CMD) ==="
 
-IMAGE_NAME="soundhop-builder:latest"
+IMAGE_NAME="soundhop-rust-builder:v2"
 
-# Check if pre-warmed builder image exists; build it once to eliminate apt-get delays
+# Check if pre-warmed Rust v2 builder image exists; build it once to eliminate apt-get/rustup delays
 if ! $CONTAINER_CMD image exists "$IMAGE_NAME" 2>/dev/null; then
-    echo "Building cached builder image '$IMAGE_NAME' (one-time setup)..."
+    echo "Building cached Rust builder image '$IMAGE_NAME' (one-time setup)..."
     if $CONTAINER_CMD build -t "$IMAGE_NAME" -f - "$REPO_DIR" << 'DOCKERFILE'; then
 FROM ubuntu:22.04
 ENV DEBIAN_FRONTEND=noninteractive
+ENV PATH="/root/.cargo/bin:${PATH}"
 RUN apt-get update -qq && apt-get install -y -qq --no-install-recommends \
-    python3 python3-pip python3-venv wget curl ca-certificates file libgl1 libegl1 libxkbcommon0 libpulse0 zstd binutils \
+    build-essential pkg-config wget curl ca-certificates file \
+    libgtk-3-dev libayatana-appindicator3-dev libxdo-dev \
+    libxcb1-dev libxkbcommon-dev libxkbcommon-x11-dev libwayland-dev \
+    libgl1-mesa-dev libssl-dev zstd zsync binutils squashfs-tools appstream \
+    && curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh -s -- -y --default-toolchain stable --profile minimal \
     && rm -rf /var/lib/apt/lists/*
 DOCKERFILE
-        echo "✓ Builder image cached."
+        echo "✓ Rust builder image '$IMAGE_NAME' cached."
     else
         echo "Notice: Could not cache builder image, falling back to base ubuntu:22.04."
         IMAGE_NAME="ubuntu:22.04"
@@ -42,7 +47,12 @@ fi
 
 chmod +x "$REPO_DIR/packaging/container-build.sh"
 
-$CONTAINER_CMD run --rm -it \
+TTY_FLAGS="-i"
+if [ -t 0 ] && [ -t 1 ]; then
+    TTY_FLAGS="-it"
+fi
+
+$CONTAINER_CMD run --rm $TTY_FLAGS \
     ${UPDATE_REPO:+-e UPDATE_REPO="$UPDATE_REPO"} \
     -v "$REPO_DIR:/work:Z" \
     -w /work \

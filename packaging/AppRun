@@ -1,53 +1,21 @@
 #!/usr/bin/env bash
 # ==============================================================================
-# AppRun entrypoint for SoundHop AppImage
+# AppRun entrypoint for SoundHop v2.0 AppImage (Pure Rust Binary)
 # ==============================================================================
 set -e
 
-# Resolve directory of this AppImage
 HERE="$(dirname "$(readlink -f "${0}")")"
 export APPDIR="${HERE}"
 export PATH="${HERE}/usr/bin:${PATH}"
-
-# Add bundled desktop entries and icons to XDG_DATA_DIRS
 export XDG_DATA_DIRS="${HERE}/usr/share:${XDG_DATA_DIRS:-/usr/local/share:/usr/share}"
+export LD_LIBRARY_PATH="${HERE}/usr/lib:${HERE}/usr/lib64:${LD_LIBRARY_PATH:-}"
 
-# Add all bundled python site-packages to PYTHONPATH
-for site_dir in "${HERE}"/usr/lib*/python3*/site-packages; do
-    if [ -d "$site_dir" ]; then
-        export PYTHONPATH="${site_dir}:${PYTHONPATH:-}"
-    fi
-done
-
-# Locate PySide6 directories inside AppDir to wire up Qt libraries and plugins
-for pyside_dir in "${HERE}"/usr/lib*/python3*/site-packages/PySide6; do
-    if [ -d "$pyside_dir" ]; then
-        # 1. Prepend bundled Qt libraries so system /lib64/libQt6Core is never mistakenly loaded
-        if [ -d "$pyside_dir/Qt/lib" ]; then
-            export LD_LIBRARY_PATH="${pyside_dir}/Qt/lib:${pyside_dir}:${pyside_dir}/../shiboken6:${HERE}/usr/lib:${HERE}/usr/lib64:${LD_LIBRARY_PATH:-}"
-        fi
-        # 2. Explicitly point Qt to its bundled QPA platform plugins (wayland, xcb)
-        if [ -d "$pyside_dir/Qt/plugins" ]; then
-            export QT_PLUGIN_PATH="${pyside_dir}/Qt/plugins:${HERE}/usr/plugins:${QT_PLUGIN_PATH:-}"
-        fi
-        break
-    fi
-done
-
-# Fallback LD_LIBRARY_PATH if PySide6 not dynamically found above
-if [ -z "${LD_LIBRARY_PATH:-}" ]; then
-    export LD_LIBRARY_PATH="${HERE}/usr/lib:${HERE}/usr/lib64"
-fi
-
-# If invoked without arguments:
-# - Launch the system tray if in a graphical session (KDE Plasma, GNOME, etc.)
-# - Otherwise show status
 if [ $# -eq 0 ]; then
     if [ -n "${WAYLAND_DISPLAY:-}" ] || [ -n "${DISPLAY:-}" ]; then
-        exec "${HERE}/usr/bin/python3" -m soundhop tray
+        exec "${HERE}/usr/bin/soundhop" tray
     else
-        exec "${HERE}/usr/bin/python3" -m soundhop status
+        exec "${HERE}/usr/bin/soundhop" status
     fi
 else
-    exec "${HERE}/usr/bin/python3" -m soundhop "$@"
+    exec "${HERE}/usr/bin/soundhop" "$@"
 fi

@@ -1,52 +1,58 @@
 Name:           soundhop
-Version:        1.2.0
+Version:        2.0.0
 Release:        1%{?dist}
-Summary:        Seamless cross-distro local network audio sharing for Linux
+Summary:        Seamless cross-distro local network audio sharing and multi-room broadcast
 
 License:        MIT
 URL:            https://github.com/teufortressIndustries/soundhop
 Source0:        %{name}-%{version}.tar.gz
 
-BuildArch:      noarch
-BuildRequires:  python3-devel
-BuildRequires:  pyproject-rpm-macros
-BuildRequires:  python3-build
-BuildRequires:  python3-installer
-BuildRequires:  python3-wheel
-BuildRequires:  python3-setuptools
+BuildRequires:  cargo
+BuildRequires:  rust
+BuildRequires:  gtk3-devel
+BuildRequires:  libappindicator-gtk3-devel
+BuildRequires:  libxdo-devel
+BuildRequires:  libxcb-devel
+BuildRequires:  libxkbcommon-devel
+BuildRequires:  wayland-devel
+BuildRequires:  mesa-libGL-devel
+BuildRequires:  openssl-devel
 
-Requires:       python3 >= 3.10
 Requires:       pipewire-pulseaudio
-Recommends:     python3-zeroconf
-Recommends:     python3-pyside6
+Requires:       gtk3
+Requires:       libappindicator-gtk3
+Requires:       libxdo
 
 %description
-SoundHop lets you seamlessly stream and share audio between Linux devices
-(such as Fedora, CachyOS/Arch, Ubuntu, openSUSE) over your local network using
-native PipeWire/PulseAudio protocol tunnels and zero-config UDP/mDNS discovery.
-Includes both a powerful CLI and an optional lightweight system tray for KDE/GNOME.
+SoundHop v2.0 lets you seamlessly stream and share audio between Linux and Windows
+devices over your local network using native PipeWire/PulseAudio protocol tunnels,
+multi-room combine sinks, persistent per-app routing rules, PIN/PSK HMAC pairing,
+an interactive terminal UI (TUI), and a native system tray.
 
 %prep
 %autosetup -n %{name}-%{version}
 
 %build
-%pyproject_wheel
+cargo build --release --workspace
 
 %install
-%pyproject_install
-%pyproject_save_files soundhop
-
+install -Dpm 0755 target/release/soundhop %{buildroot}%{_bindir}/soundhop
+install -Dpm 0755 target/release/shop %{buildroot}%{_bindir}/shop
 install -Dpm 0644 packaging/io.github.soundhop.desktop %{buildroot}%{_datadir}/applications/io.github.soundhop.desktop
-install -Dpm 0644 src/soundhop/assets/soundhop.svg %{buildroot}%{_datadir}/icons/hicolor/scalable/apps/soundhop.svg
+install -Dpm 0644 packaging/io.github.soundhop.metainfo.xml %{buildroot}%{_datadir}/metainfo/io.github.soundhop.appdata.xml
+install -Dpm 0644 assets/soundhop.svg %{buildroot}%{_datadir}/icons/hicolor/scalable/apps/soundhop.svg
+install -Dpm 0644 assets/soundhop.png %{buildroot}%{_datadir}/icons/hicolor/256x256/apps/soundhop.png
 
-%files -f %{pyproject_files}
+%files
 %license LICENSE
 %doc README.md
 %{_bindir}/soundhop
 %{_bindir}/shop
 %{_datadir}/applications/io.github.soundhop.desktop
+%{_datadir}/metainfo/io.github.soundhop.appdata.xml
 %{_datadir}/icons/hicolor/scalable/apps/soundhop.svg
+%{_datadir}/icons/hicolor/256x256/apps/soundhop.png
 
 %changelog
-* Mon Nov 02 2026 SoundHop Contributors <soundhop@example.com> - 1.0.0-1
-- Initial release of SoundHop cross-distro audio sharing.
+* Sun Nov 08 2026 SoundHop Contributors <soundhop@example.com> - 2.0.0-1
+- Complete Rust rewrite with TUI, Multi-Room Broadcast, Persistent App Routing, PIN/PSK Pairing, and Live Telemetry.
