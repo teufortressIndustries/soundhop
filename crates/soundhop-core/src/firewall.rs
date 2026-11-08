@@ -414,6 +414,7 @@ mod tests {
     use crate::util::{CommandResult, MockRunner};
 
     #[test]
+    #[cfg(not(windows))]
     fn test_detect_ufw() {
         let runner = MockRunner::new(|args, _| {
             let stdout = if args.first().map(|s| s.as_str()) == Some("ufw") {
@@ -435,6 +436,32 @@ mod tests {
             .insert("ufw".to_string());
         let st = detect_with_runner(&runner);
         assert_eq!(st.kind, "ufw");
+        assert!(st.active);
+    }
+
+    #[test]
+    #[cfg(windows)]
+    fn test_detect_windows_defender() {
+        let runner = MockRunner::new(|args, _| {
+            let stdout = if args.first().map(|s| s.as_str()) == Some("netsh") {
+                "State ON\n"
+            } else {
+                ""
+            };
+            Ok(CommandResult {
+                args: args.to_vec(),
+                returncode: 0,
+                stdout: stdout.to_string(),
+                stderr: String::new(),
+            })
+        });
+        runner
+            .available_commands
+            .lock()
+            .unwrap()
+            .insert("netsh".to_string());
+        let st = detect_with_runner(&runner);
+        assert_eq!(st.kind, "windows-defender");
         assert!(st.active);
     }
 }
