@@ -290,11 +290,18 @@ mdns = true                     # Enable mDNS fallback browsing
 - [x] **v1.1**:
   - **Android Support (scrcpy)**: Capture and listen to the audio from your Android devices over USB or Wi-Fi.
   - **Windows Support (EXPERIMENTAL)**: Experimental support for Windows OS.
-- [x] **v1.2 (Current)**:
+- [x] **v1.2**:
   - **Per-Application Stream Routing**: Direct specific apps (e.g. Spotify or Firefox) to remote speakers without moving your whole desktop audio.
   - **Microphone Pass-Through**: Stream microphone input back to the sender for remote calls and Discord.
   - **Remote Volume Sync**: Control receiver volume directly from the sender's media keys.
   - **Android Auto-Discovery & History**: ZeroConf mDNS discovery for Android Wireless Debugging and persistent device history for 1-click reconnects.
+- [x] **v2.0 (Current)**:
+  - **Full Rewrite on Rust**: Rewrite everything to rust.
+  - **Interactive Terminal UI**: (soundhop tui) using ratatui + crossterm.
+  - **Multi-Room / Broadcast Audio**: soundhop connect PeerA PeerB --combine --keep-local.
+  - **Persistent Per-App Routing Rules**: [routing] in config.toml & soundhop route --save.
+  - **PIN / PSK**: Pre-Shared Key Pairing & HMAC-SHA256 Authentication (soundhop pair).
+  - **Real-Time Audio Telemetry**: Audio Peak, RMS Level Meter & Network RTT, Jitter Telemetry.
 
 ---
 
