@@ -37,7 +37,6 @@ cargo build --release --workspace
 
 %install
 install -Dpm 0755 target/release/soundhop %{buildroot}%{_bindir}/soundhop
-install -Dpm 0755 target/release/shop %{buildroot}%{_bindir}/shop
 install -Dpm 0644 packaging/io.github.soundhop.desktop %{buildroot}%{_datadir}/applications/io.github.soundhop.desktop
 install -Dpm 0644 packaging/io.github.soundhop.metainfo.xml %{buildroot}%{_datadir}/metainfo/io.github.soundhop.appdata.xml
 install -Dpm 0644 assets/soundhop.svg %{buildroot}%{_datadir}/icons/hicolor/scalable/apps/soundhop.svg
@@ -47,7 +46,6 @@ install -Dpm 0644 assets/soundhop.png %{buildroot}%{_datadir}/icons/hicolor/256x
 %license LICENSE
 %doc README.md
 %{_bindir}/soundhop
-%{_bindir}/shop
 %{_datadir}/applications/io.github.soundhop.desktop
 %{_datadir}/metainfo/io.github.soundhop.appdata.xml
 %{_datadir}/icons/hicolor/scalable/apps/soundhop.svg

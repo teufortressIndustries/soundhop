@@ -37,7 +37,7 @@ rm -f "$HOME/.local/share/icons/hicolor/scalable/apps/soundhop.svg"
 
 # 4. Remove binaries / symlinks
 rm -f "$HOME/.local/bin/soundhop"
-rm -f "$HOME/.local/bin/shop"
+rm -f "$HOME/.local/bin/shop" # legacy alias cleanup
 
 # 5. Remove venv
 INSTALL_DIR="$HOME/.local/share/soundhop"

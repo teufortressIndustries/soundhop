@@ -24,7 +24,6 @@ build() {
 package() {
     cd "$srcdir/$pkgname-$pkgver"
     install -Dm755 target/release/soundhop "$pkgdir/usr/bin/soundhop"
-    install -Dm755 target/release/shop "$pkgdir/usr/bin/shop"
 
     install -Dm644 packaging/io.github.soundhop.desktop "$pkgdir/usr/share/applications/io.github.soundhop.desktop"
     install -Dm644 packaging/io.github.soundhop.metainfo.xml "$pkgdir/usr/share/metainfo/io.github.soundhop.appdata.xml"

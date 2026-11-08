@@ -94,8 +94,7 @@ cp "$REPO_DIR/packaging/AppRun" "$APP_DIR/AppRun"
 chmod +x "$APP_DIR/AppRun"
 
 cp "$REPO_DIR/target/release/soundhop" "$APP_DIR/usr/bin/soundhop"
-cp "$REPO_DIR/target/release/shop" "$APP_DIR/usr/bin/shop"
-chmod +x "$APP_DIR/usr/bin/soundhop" "$APP_DIR/usr/bin/shop"
+chmod +x "$APP_DIR/usr/bin/soundhop"
 
 # Bundle optional/non-default shared libraries (libxdo, libayatana-appindicator3, libappindicator3, libdbusmenu)
 for libpattern in \

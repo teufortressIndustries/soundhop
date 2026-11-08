@@ -12,10 +12,6 @@ default-run = "soundhop"
 name = "soundhop"
 path = "src/main.rs"
 
-[[bin]]
-name = "shop"
-path = "src/bin/shop.rs"
-
 [dependencies]
 soundhop-core.workspace = true
 soundhop-gui.workspace = true

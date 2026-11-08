@@ -113,7 +113,6 @@ jobs:
           cargo build --release --workspace
           New-Item -ItemType Directory -Force -Path dist | Out-Null
           Copy-Item target/release/soundhop.exe dist/SoundHop.exe
-          Copy-Item target/release/shop.exe dist/shop.exe
 
       - name: Verify Executable Created
         shell: pwsh
@@ -129,7 +128,6 @@ jobs:
           name: SoundHop-Windows-x86_64.exe
           path: |
             dist/SoundHop.exe
-            dist/shop.exe
           if-no-files-found: error
 
   release:
@@ -169,6 +167,5 @@ jobs:
             dist/*.AppImage
             dist/*.zsync
             dist/SoundHop.exe
-            dist/shop.exe
             dist/SHA256SUMS.txt
           generate_release_notes: true

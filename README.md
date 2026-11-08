@@ -17,7 +17,7 @@ PulseAudio and PipeWire already implement native TCP network streaming modules (
 - Live audio streams not automatically moving over when a tunnel connects.
 - Ghost tunnels and frozen audio when a remote laptop suspends or Wi-Fi drops.
 
-**SoundHop** fixes this. It wraps PipeWire and PulseAudio in an automatic, self-healing workflow with zero-configuration LAN discovery, an intuitive desktop system tray for KDE Plasma and GNOME (**the preferred and easiest way to use SoundHop**), and a full-featured CLI (`soundhop` or the short alias `shop`) for headless environments and scripts.
+**SoundHop** fixes this. It wraps PipeWire and PulseAudio in an automatic, self-healing workflow with zero-configuration LAN discovery, an intuitive desktop system tray for KDE Plasma and GNOME (**the preferred and easiest way to use SoundHop**), and a full-featured CLI (`soundhop`) for headless environments and scripts.
 
 ---
 
@@ -62,7 +62,7 @@ SoundHop also provides dedicated GUI dialogs accessible directly from the tray m
 
 ## Headless & CLI Usage
 
-Prefer working from the terminal, running on a headless server, or scripting integrations for Waybar or Polybar? SoundHop provides a first-class CLI (`soundhop` or `shop`):
+Prefer working from the terminal, running on a headless server, or scripting integrations for Waybar or Polybar? SoundHop provides a first-class CLI (`soundhop`):
 
 ### 1. Receiver (PC / Sound System)
 Turn on audio sharing:
@@ -107,7 +107,7 @@ SoundHop v2.0 is a ground-up rewrite in pure Rust (`soundhop-core`, `soundhop-gu
 
 | Component | Minimum Version | Notes |
 | :--- | :--- | :--- |
-| **Linux / Windows** | Linux 5.x+ / Windows 10+ | Native static/dynamic Rust binaries (`soundhop` & `shop`) |
+| **Linux / Windows** | Linux 5.x+ / Windows 10+ | Native static/dynamic Rust binary (`soundhop`) |
 | **Audio Server** | PipeWire 0.3+ / PulseAudio 14+ / WASAPI | `pactl` on Linux; native WASAPI loopback & playback on Windows |
 | **Rust Toolchain** | `rustc` / `cargo` 1.80+ | Only required when building from source |
 
@@ -135,8 +135,6 @@ SoundHop v2.0 is a ground-up rewrite in pure Rust (`soundhop-core`, `soundhop-gu
 ---
 
 ## CLI Command Reference
-
-Both `soundhop` and its single-syllable alias `shop` are available.
 
 ### Everyday Commands
 ```bash
@@ -224,7 +222,7 @@ cd soundhop
 ### 2. Build release binaries with Cargo
 ```bash
 cargo build --release --workspace
-# Binaries are emitted to target/release/soundhop and target/release/shop
+# Binary is emitted to target/release/soundhop
 ```
 
 ### 3. Run unit & integration tests
@@ -286,7 +284,7 @@ mdns = true                     # Enable mDNS fallback browsing
   - PipeWire & PulseAudio TCP audio transport
   - Fast UDP + mDNS LAN discovery
   - Native Wayland + X11 Qt system tray GUI
-  - Full CLI (`soundhop` / `shop`) and shell autocompletions
+  - Full CLI (`soundhop`) and shell autocompletions
   - Disconnect-on-quit toggle, buffer latency presets, and DSP detection (EasyEffects)
   - Portable AppImage & containerized multi-distro build pipeline
 - [x] **v1.1**:

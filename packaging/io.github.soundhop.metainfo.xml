@@ -18,7 +18,6 @@
   <url type="bugtracker">https://github.com/teufortressIndustries/soundhop/issues</url>
   <provides>
     <binary>soundhop</binary>
-    <binary>shop</binary>
   </provides>
   <content_rating type="oars-1.1"/>
   <releases>

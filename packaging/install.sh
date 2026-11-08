@@ -40,7 +40,6 @@ echo -e "${BOLD}Compiling SoundHop v2.0 (--release)...${NC}"
 )
 
 install -Dm755 "$REPO_DIR/target/release/soundhop" "$BIN_DIR/soundhop"
-install -Dm755 "$REPO_DIR/target/release/shop" "$BIN_DIR/shop"
 export PATH="$BIN_DIR:$PATH"
 
 if [[ -f "$REPO_DIR/assets/soundhop.svg" ]]; then

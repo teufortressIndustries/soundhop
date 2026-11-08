@@ -67,8 +67,7 @@ cp "$REPO_DIR/packaging/AppRun" "$APP_DIR/AppRun"
 chmod +x "$APP_DIR/AppRun"
 
 cp "$CARGO_TARGET_DIR/release/soundhop" "$APP_DIR/usr/bin/soundhop"
-cp "$CARGO_TARGET_DIR/release/shop" "$APP_DIR/usr/bin/shop"
-chmod +x "$APP_DIR/usr/bin/soundhop" "$APP_DIR/usr/bin/shop"
+chmod +x "$APP_DIR/usr/bin/soundhop"
 
 # Bundle optional/non-default shared libraries (libxdo, libayatana-appindicator3, libappindicator3, libdbusmenu)
 # so target machines do not need xdotool or appindicator packages installed.
@@ -86,7 +85,7 @@ for libpattern in \
     done
 done
 
-strip --strip-unneeded "$APP_DIR/usr/bin/soundhop" "$APP_DIR/usr/bin/shop" "$APP_DIR/usr/lib/"*.so* 2>/dev/null || true
+strip --strip-unneeded "$APP_DIR/usr/bin/soundhop" "$APP_DIR/usr/lib/"*.so* 2>/dev/null || true
 
 # Invariant 1: No duplicate .desktop symlinks
 cp "$REPO_DIR/packaging/io.github.soundhop.desktop" "$APP_DIR/io.github.soundhop.desktop"
