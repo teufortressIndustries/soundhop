@@ -26,7 +26,7 @@ pub enum ConfigError {
     #[error("Cannot parse TOML in {path}: {source}")]
     TomlParse {
         path: PathBuf,
-        source: toml::de::Error,
+        source: Box<toml::de::Error>,
     },
 }
 
@@ -249,7 +249,7 @@ impl Config {
         })?;
         let mut cfg: Self = toml::from_str(&raw_text).map_err(|source| ConfigError::TomlParse {
             path: target.clone(),
-            source,
+            source: Box::new(source),
         })?;
         cfg.path = target;
         cfg.normalize()?;
