@@ -5,7 +5,7 @@
 [![CI](https://github.com/teufortressIndustries/soundhop/actions/workflows/ci.yml/badge.svg)](https://github.com/teufortressIndustries/soundhop/actions/workflows/ci.yml)
 [![License: MIT](https://img.shields.io/badge/License-MIT-blue.svg)](LICENSE)
 
-[**Download Latest AppImage (Releases)**](https://github.com/teufortressIndustries/soundhop/releases) • [**Quickstart**](#quickstart) • [**CLI Commands**](#cli-command-reference) • [**Requirements**](#requirements) • [**Building from Source**](#building-from-source) • [**How It Works**](#how-it-works-under-the-hood)
+[**Download Latest AppImage (Releases)**](https://github.com/teufortressIndustries/soundhop/releases) • [**Quickstart**](#quickstart) • [**Interactive TUI**](#interactive-terminal-ui-tui) • [**CLI Commands**](#cli-command-reference) • [**Requirements**](#requirements) • [**Building from Source**](#building-from-source) • [**How It Works**](#how-it-works-under-the-hood)
 
 ---
 
@@ -57,6 +57,25 @@ SoundHop also provides dedicated GUI dialogs accessible directly from the tray m
 
 - **Capture Android audio...**: Effortlessly stream Android audio directly to your Linux speakers using official `scrcpy` over USB or Wi-Fi. Select your preferred codec (AAC, Opus, FLAC, Raw PCM), audio source (system output, app playback, or mic), and buffer latency.
 - **Settings...**: Customize your broadcast device name, audio port, RFC1918 subnet security, PipeWire buffer latency presets, automatic stream handoff, and scrcpy defaults.
+
+---
+
+## Interactive Terminal UI (TUI)
+
+Prefer managing audio from your terminal, running on a headless workstation over SSH, or keeping a live dashboard in a tmux pane? SoundHop v2.0 features a rich terminal interface powered by `ratatui` and `crossterm`:
+
+```bash
+soundhop tui
+```
+*(Launching `soundhop` with no arguments in any interactive terminal opens the TUI automatically)*.
+
+![SoundHop Interactive Terminal UI (TUI)](docs/screenshots/soundhop-tui.png)
+*SoundHop v2.0 Terminal UI (`soundhop tui`) with live LAN peer discovery, multi-room broadcast selection, active tunnel status, and real-time audio VU meter + network RTT/jitter telemetry.*
+
+- **Tab 1: Discovered Speakers & Multi-Room**: Navigate with arrow keys or `j`/`k`, press `Space` to select multiple speakers for simultaneous multi-room broadcast, `l` to toggle local speakers in sync, and `Enter` to connect or `d` to disconnect.
+- **Tab 2: Per-App Audio Mixer & Persistent Routing**: Route individual applications (`Spotify`, `Firefox`, `mpv`) between remote and local sinks on the fly, or press `p` to save permanent routing rules to `config.toml`.
+- **Tab 3: Network Microphone & Android Bridge**: Toggle bi-directional microphone pass-through (`s` to stream mic, `r` to receive peer mic, `o` to stop) or start/stop Android audio capture (`a`).
+- **Live VU Gauge & Network Telemetry**: Bottom gauge features a high-frequency stereo Peak/RMS VU meter with dBFS readout, and continuous network round-trip time (RTT) and jitter tracking in milliseconds.
 
 ---
 
@@ -146,7 +165,8 @@ soundhop connect --with-mic     # Connect and enable microphone pass-through
 soundhop connect --host 192.168.1.50 --port 4713
 soundhop disconnect             # Drop remote tunnel and restore local sound output
 soundhop share <on|off|status>  # Enable or disable receiving audio from other devices
-soundhop tray                   # Launch Qt system tray icon (KDE Plasma / GNOME)
+soundhop tray                   # Launch desktop system tray icon (KDE Plasma / GNOME)
+soundhop tui                    # Open interactive terminal UI dashboard
 ```
 
 ### Stream Routing, Mic Pass-Through & Volume Sync
