@@ -47,3 +47,12 @@ image = { version = "0.25", default-features = false, features = ["png"] }
 libc = "0.2"
 tempfile = "3.13"
 cpal = "0.15"
+
+[profile.dev]
+debug = 1
+
+[profile.release]
+opt-level = 3
+lto = "thin"
+codegen-units = 16
+strip = true
