@@ -471,7 +471,10 @@ pub fn build_tray_menu(controller: &Controller, peers: &[Peer]) -> Menu {
 
 fn spawn_self_dialog(flag: &str) {
     if let Ok(exe) = std::env::current_exe() {
-        let _ = Command::new(exe).arg(flag).spawn();
+        let mut cmd = Command::new(exe);
+        cmd.arg(flag);
+        soundhop_core::util::close_fds_pre_exec(&mut cmd);
+        let _ = cmd.spawn();
     }
 }
 
@@ -671,6 +674,16 @@ fn menu_state_signature(controller: &Controller, peers: &[Peer]) -> String {
 
 /// Runs the native system tray and embedded background daemon loop.
 pub fn run_tray(verbose: bool) -> Result<i32, String> {
+    let _lock = match soundhop_core::util::try_acquire_instance_lock("tray") {
+        Some(l) => l,
+        None => {
+            if verbose {
+                eprintln!("SoundHop system tray is already running in this session.");
+            }
+            return Ok(0);
+        }
+    };
+
     #[cfg(target_os = "linux")]
     {
         gtk::init().map_err(|e| format!("Failed to initialize GTK for system tray: {e}"))?;

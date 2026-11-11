@@ -100,6 +100,7 @@ impl ProcessRunner for SystemRunner {
             const CREATE_NO_WINDOW: u32 = 0x08000000;
             cmd.creation_flags(CREATE_NO_WINDOW);
         }
+        close_fds_pre_exec(&mut cmd);
         match cmd.output() {
             Ok(output) => {
                 let code = output.status.code().unwrap_or(1);
@@ -334,6 +335,74 @@ pub fn lock_path() -> PathBuf {
 
 pub fn pid_path() -> PathBuf {
     runtime_dir().join("daemon.pid")
+}
+
+/// Closes non-standard file descriptors (>= 3) on Unix before executing child processes.
+/// This prevents leaking parent file descriptors (such as AppImage FUSE mount directory
+/// file descriptors like FD 1023) into child processes (pactl, parec, scrcpy, notify-send).
+#[cfg(unix)]
+pub fn close_fds_pre_exec(cmd: &mut Command) {
+    use std::os::unix::process::CommandExt;
+    unsafe {
+        cmd.pre_exec(|| {
+            if libc::close_range(3, !0, 0) != 0 {
+                for fd in 3..1024 {
+                    libc::close(fd);
+                }
+            }
+            Ok(())
+        });
+    }
+}
+
+#[cfg(not(unix))]
+pub fn close_fds_pre_exec(_cmd: &mut Command) {}
+
+/// Single-instance process lock backed by kernel flock on Unix.
+pub struct InstanceLock {
+    _file: fs::File,
+    path: PathBuf,
+}
+
+impl Drop for InstanceLock {
+    fn drop(&mut self) {
+        #[cfg(unix)]
+        {
+            use std::os::unix::io::AsRawFd;
+            unsafe {
+                libc::flock(self._file.as_raw_fd(), libc::LOCK_UN);
+            }
+        }
+        let _ = fs::remove_file(&self.path);
+    }
+}
+
+pub fn try_acquire_instance_lock(name: &str) -> Option<InstanceLock> {
+    let dir = runtime_dir();
+    let _ = ensure_dir(&dir);
+    let lock_path = dir.join(format!("{name}.lock"));
+    let mut opts = OpenOptions::new();
+    opts.read(true).write(true).create(true).truncate(false);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+        opts.mode(0o600);
+    }
+    let file = opts.open(&lock_path).ok()?;
+
+    #[cfg(unix)]
+    {
+        use std::os::unix::io::AsRawFd;
+        let res = unsafe { libc::flock(file.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) };
+        if res != 0 {
+            return None;
+        }
+    }
+
+    Some(InstanceLock {
+        _file: file,
+        path: lock_path,
+    })
 }
 
 static ATOMIC_WRITE_LOCK: OnceLock<Mutex<()>> = OnceLock::new();
@@ -829,19 +898,20 @@ pub fn notify(title: &str, body: &str, urgency: &str) {
     #[cfg(target_os = "linux")]
     {
         if command_exists("notify-send") {
-            let _ = Command::new("notify-send")
-                .args([
-                    "--app-name=SoundHop",
-                    "--icon=soundhop",
-                    &format!("--urgency={urgency}"),
-                    "--expire-time=4000",
-                    title,
-                    body,
-                ])
-                .stdin(Stdio::null())
-                .stdout(Stdio::null())
-                .stderr(Stdio::null())
-                .spawn();
+            let mut cmd = Command::new("notify-send");
+            cmd.args([
+                "--app-name=SoundHop",
+                "--icon=soundhop",
+                &format!("--urgency={urgency}"),
+                "--expire-time=4000",
+                title,
+                body,
+            ])
+            .stdin(Stdio::null())
+            .stdout(Stdio::null())
+            .stderr(Stdio::null());
+            close_fds_pre_exec(&mut cmd);
+            let _ = cmd.spawn();
         }
     }
     #[cfg(windows)]
@@ -950,5 +1020,18 @@ mod tests {
             select_best_peer_ip(&candidates).as_deref(),
             Some("192.168.1.250")
         );
+    }
+
+    #[test]
+    fn test_try_acquire_instance_lock() {
+        let lock1 = try_acquire_instance_lock("test_single_instance");
+        assert!(lock1.is_some());
+        // Second acquisition while lock1 is held should fail
+        let lock2 = try_acquire_instance_lock("test_single_instance");
+        assert!(lock2.is_none());
+        // Dropping lock1 frees the lock
+        drop(lock1);
+        let lock3 = try_acquire_instance_lock("test_single_instance");
+        assert!(lock3.is_some());
     }
 }

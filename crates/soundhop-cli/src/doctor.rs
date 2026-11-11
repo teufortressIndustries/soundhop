@@ -51,6 +51,41 @@ pub fn run_doctor(controller: &Arc<Controller>, fix: bool, json_out: bool) -> i3
         fixed_actions.push("Installed and started user service".to_string());
     }
 
+    #[cfg(target_os = "linux")]
+    let appimage_mounts: Vec<String> = {
+        let mut mounts = Vec::new();
+        if let Ok(content) = std::fs::read_to_string("/proc/self/mountinfo") {
+            for line in content.lines() {
+                if let Some(pos) = line.find(" /tmp/.mount_SoundH") {
+                    let part = &line[pos + 1..];
+                    if let Some(end) = part.find(' ') {
+                        let path = part[..end].to_string();
+                        if !mounts.contains(&path) {
+                            mounts.push(path);
+                        }
+                    }
+                }
+            }
+        }
+        mounts
+    };
+    #[cfg(not(target_os = "linux"))]
+    let appimage_mounts: Vec<String> = Vec::new();
+
+    #[cfg(target_os = "linux")]
+    if fix && appimage_mounts.len() > 1 {
+        for m in &appimage_mounts {
+            let mut cmd = std::process::Command::new("fusermount");
+            cmd.args(["-u", m]);
+            soundhop_core::util::close_fds_pre_exec(&mut cmd);
+            if let Ok(out) = cmd.output() {
+                if out.status.success() {
+                    fixed_actions.push(format!("Unmounted stale AppImage mount {m}"));
+                }
+            }
+        }
+    }
+
     let addrs = local_addresses(false);
     let tools = controller.android_tool_status();
 
@@ -70,6 +105,7 @@ pub fn run_doctor(controller: &Arc<Controller>, fix: bool, json_out: bool) -> i3
         },
         "firewall": fw,
         "service": svc,
+        "appimage_mounts": appimage_mounts,
         "daemon_ipc_running": daemon_ipc,
         "android_tools": tools,
         "fixed_actions": fixed_actions,
@@ -126,6 +162,13 @@ pub fn run_doctor(controller: &Arc<Controller>, fix: bool, json_out: bool) -> i3
         ));
     } else {
         info("Android Bridge: Optional scrcpy/adb not installed (`soundhop android install`)");
+    }
+
+    if appimage_mounts.len() > 1 {
+        warning(&format!(
+            "AppImage Mounts: {} active mounts detected (run `soundhop doctor --fix` to clean up stale mounts)",
+            appimage_mounts.len()
+        ));
     }
 
     for act in &fixed_actions {

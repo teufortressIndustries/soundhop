@@ -68,13 +68,17 @@ Description={APP_NAME} local audio sharing
 After=pipewire-pulse.service pipewire.service wireplumber.service
 Wants=pipewire-pulse.service
 PartOf=graphical-session.target
+StartLimitIntervalSec=60
+StartLimitBurst=5
 
 [Service]
 Type=simple
 ExecStart={exe} daemon
 Restart=on-failure
 RestartSec=5
+RestartPreventExitStatus=2
 TimeoutStopSec=10
+KillMode=mixed
 
 [Install]
 WantedBy=default.target
@@ -223,6 +227,8 @@ mod tests {
         let unit = unit_text();
         assert!(unit.contains("Description=SoundHop local audio sharing"));
         assert!(unit.contains("daemon"));
+        assert!(unit.contains("RestartPreventExitStatus=2"));
+        assert!(unit.contains("KillMode=mixed"));
 
         let desktop = autostart_text();
         assert!(desktop.contains("[Desktop Entry]"));

@@ -256,7 +256,7 @@ cargo test --workspace
 ```bash
 ./packaging/build-appimage.sh
 ```
-The finished binary will be placed at `dist/SoundHop-2.0.0-universal-x86_64.AppImage`.
+The finished binary will be placed at `dist/SoundHop-2.0.1-universal-x86_64.AppImage`.
 
 ---
 

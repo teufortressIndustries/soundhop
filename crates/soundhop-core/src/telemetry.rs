@@ -329,6 +329,7 @@ fn run_audio_capture_loop(
         .stdin(Stdio::null())
         .stdout(Stdio::piped())
         .stderr(Stdio::null());
+        crate::util::close_fds_pre_exec(&mut cmd);
 
         let started = Instant::now();
         let Ok(mut child) = cmd.spawn() else {

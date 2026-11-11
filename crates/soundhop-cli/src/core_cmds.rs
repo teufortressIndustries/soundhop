@@ -899,7 +899,11 @@ pub fn handle_daemon(verbose: bool) -> i32 {
         Ok(()) => 0,
         Err(e) => {
             error(&e);
-            1
+            if e.contains("already running") {
+                2
+            } else {
+                1
+            }
         }
     }
 }

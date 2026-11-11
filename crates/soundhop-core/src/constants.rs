@@ -3,7 +3,7 @@
 pub const APP_NAME: &str = "SoundHop";
 pub const APP_SLUG: &str = "soundhop";
 pub const APP_ID: &str = "io.github.soundhop";
-pub const VERSION: &str = "2.0.0";
+pub const VERSION: &str = "2.0.1";
 pub const REPO_URL: &str = "https://github.com/teufortressIndustries/soundhop";
 pub const ISSUES_URL: &str = "https://github.com/teufortressIndustries/soundhop/issues";
 

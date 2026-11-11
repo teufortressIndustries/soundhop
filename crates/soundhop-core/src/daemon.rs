@@ -33,6 +33,7 @@ pub struct Daemon {
     warnings: Arc<Mutex<Vec<String>>>,
     supervisor_thread: Mutex<Option<JoinHandle<()>>>,
     audio_monitor_thread: Mutex<Option<JoinHandle<()>>>,
+    audio_monitor_child: Arc<Mutex<Option<std::process::Child>>>,
 }
 
 impl Daemon {
@@ -61,6 +62,7 @@ impl Daemon {
             warnings: Arc::new(Mutex::new(Vec::new())),
             supervisor_thread: Mutex::new(None),
             audio_monitor_thread: Mutex::new(None),
+            audio_monitor_child: Arc::new(Mutex::new(None)),
         })
     }
 
@@ -174,10 +176,18 @@ impl Daemon {
 
     pub fn request_stop(&self) {
         self.stop_flag.store(true, Ordering::SeqCst);
+        if let Some(mut child) = self.audio_monitor_child.lock().unwrap().take() {
+            let _ = child.kill();
+            let _ = child.wait();
+        }
     }
 
     pub fn shutdown(&self) {
         self.stop_flag.store(true, Ordering::SeqCst);
+        if let Some(mut child) = self.audio_monitor_child.lock().unwrap().take() {
+            let _ = child.kill();
+            let _ = child.wait();
+        }
         if let Some(ipc) = self.ipc.lock().unwrap().take() {
             ipc.stop();
         }
@@ -330,17 +340,20 @@ impl Daemon {
         }
 
         while !self.stop_flag.load(Ordering::SeqCst) {
-            let Ok(mut child) = Command::new("pactl")
-                .arg("subscribe")
+            let mut cmd = Command::new("pactl");
+            cmd.arg("subscribe")
                 .stdin(Stdio::null())
                 .stdout(Stdio::piped())
-                .stderr(Stdio::null())
-                .spawn()
-            else {
+                .stderr(Stdio::null());
+            crate::util::close_fds_pre_exec(&mut cmd);
+            let Ok(mut child) = cmd.spawn() else {
                 thread::sleep(Duration::from_secs(3));
                 continue;
             };
-            if let Some(stdout) = child.stdout.take() {
+            let stdout_opt = child.stdout.take();
+            *self.audio_monitor_child.lock().unwrap() = Some(child);
+
+            if let Some(stdout) = stdout_opt {
                 let reader = BufReader::new(stdout);
                 for line in reader.lines().map_while(Result::ok) {
                     if self.stop_flag.load(Ordering::SeqCst) {
@@ -354,8 +367,11 @@ impl Daemon {
                     }
                 }
             }
-            let _ = child.kill();
-            let _ = child.wait();
+
+            if let Some(mut child) = self.audio_monitor_child.lock().unwrap().take() {
+                let _ = child.kill();
+                let _ = child.wait();
+            }
             if !self.stop_flag.load(Ordering::SeqCst) {
                 thread::sleep(Duration::from_secs(1));
             }

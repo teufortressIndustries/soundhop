@@ -852,6 +852,8 @@ impl AndroidCaptureSession {
                 .env("PIPEWIRE_NODE", sink_name);
         }
 
+        crate::util::close_fds_pre_exec(&mut cmd);
+
         let mut child = cmd
             .spawn()
             .map_err(|e| AndroidError::Message(format!("Failed to start scrcpy: {e}")))?;
