@@ -358,10 +358,10 @@ pub fn close_fds_pre_exec(cmd: &mut Command) {
 #[cfg(not(unix))]
 pub fn close_fds_pre_exec(_cmd: &mut Command) {}
 
-/// Single-instance process lock backed by kernel flock on Unix.
+/// Single-instance process lock backed by kernel flock on Unix and exclusive sharing on Windows.
 pub struct InstanceLock {
     _file: fs::File,
-    path: PathBuf,
+    _path: PathBuf,
 }
 
 impl Drop for InstanceLock {
@@ -373,7 +373,6 @@ impl Drop for InstanceLock {
                 libc::flock(self._file.as_raw_fd(), libc::LOCK_UN);
             }
         }
-        let _ = fs::remove_file(&self.path);
     }
 }
 
@@ -388,6 +387,11 @@ pub fn try_acquire_instance_lock(name: &str) -> Option<InstanceLock> {
         use std::os::unix::fs::OpenOptionsExt;
         opts.mode(0o600);
     }
+    #[cfg(windows)]
+    {
+        use std::os::windows::fs::OpenOptionsExt;
+        opts.share_mode(0);
+    }
     let file = opts.open(&lock_path).ok()?;
 
     #[cfg(unix)]
@@ -401,7 +405,7 @@ pub fn try_acquire_instance_lock(name: &str) -> Option<InstanceLock> {
 
     Some(InstanceLock {
         _file: file,
-        path: lock_path,
+        _path: lock_path,
     })
 }
 
