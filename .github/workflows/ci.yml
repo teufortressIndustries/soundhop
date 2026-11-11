@@ -25,17 +25,22 @@ jobs:
       - name: Install Linux system libraries
         if: runner.os == 'Linux'
         run: |
-          echo "nameserver 8.8.8.8" | sudo tee -a /etc/resolv.conf > /dev/null || true
+          printf "nameserver 1.1.1.1\nnameserver 8.8.8.8\n" | sudo tee /etc/resolv.conf > /dev/null || true
           sudo sed -i 's|mirror+file:/etc/apt/apt-mirrors.txt|http://archive.ubuntu.com/ubuntu/|g' /etc/apt/sources.list /etc/apt/sources.list.d/* 2>/dev/null || true
           sudo sed -i 's|azure\.archive\.ubuntu\.com|archive.ubuntu.com|g' /etc/apt/sources.list /etc/apt/apt-mirrors.txt /etc/apt/sources.list.d/* 2>/dev/null || true
           sudo mkdir -p /etc/needrestart/conf.d
           echo '$nrconf{restart} = "l";' | sudo tee /etc/needrestart/conf.d/autorestart.conf > /dev/null
           echo 'debconf debconf/frontend select Noninteractive' | sudo debconf-set-selections
-          sudo DEBIAN_FRONTEND=noninteractive NEEDRESTART_MODE=l apt-get update -qq
-          sudo DEBIAN_FRONTEND=noninteractive NEEDRESTART_MODE=l apt-get install -y --no-install-recommends \
-            pkg-config libgtk-3-dev libayatana-appindicator3-dev libxdo-dev \
-            libxcb1-dev libxkbcommon-dev libxkbcommon-x11-dev libwayland-dev \
-            libgl1-mesa-dev libssl-dev
+          sudo rm -f /etc/apt/apt.conf.d/50appstream
+          for i in 1 2 3 4 5; do
+            sudo DEBIAN_FRONTEND=noninteractive NEEDRESTART_MODE=l apt-get update -qq && break || sleep 3
+          done
+          for i in 1 2 3; do
+            sudo DEBIAN_FRONTEND=noninteractive NEEDRESTART_MODE=l apt-get install -y --no-install-recommends \
+              pkg-config libgtk-3-dev libayatana-appindicator3-dev libxdo-dev \
+              libxcb1-dev libxkbcommon-dev libxkbcommon-x11-dev libwayland-dev \
+              libgl1-mesa-dev libssl-dev && break || sleep 3
+          done
 
       - name: Install Rust toolchain
         uses: dtolnay/rust-toolchain@stable
@@ -63,18 +68,23 @@ jobs:
 
       - name: Install system build dependencies
         run: |
-          echo "nameserver 8.8.8.8" | sudo tee -a /etc/resolv.conf > /dev/null || true
+          printf "nameserver 1.1.1.1\nnameserver 8.8.8.8\n" | sudo tee /etc/resolv.conf > /dev/null || true
           sudo sed -i 's|mirror+file:/etc/apt/apt-mirrors.txt|http://archive.ubuntu.com/ubuntu/|g' /etc/apt/sources.list /etc/apt/sources.list.d/* 2>/dev/null || true
           sudo sed -i 's|azure\.archive\.ubuntu\.com|archive.ubuntu.com|g' /etc/apt/sources.list /etc/apt/apt-mirrors.txt /etc/apt/sources.list.d/* 2>/dev/null || true
           sudo mkdir -p /etc/needrestart/conf.d
           echo '$nrconf{restart} = "l";' | sudo tee /etc/needrestart/conf.d/autorestart.conf > /dev/null
           echo 'debconf debconf/frontend select Noninteractive' | sudo debconf-set-selections
-          sudo DEBIAN_FRONTEND=noninteractive NEEDRESTART_MODE=l apt-get update -qq
-          sudo DEBIAN_FRONTEND=noninteractive NEEDRESTART_MODE=l apt-get install -y --no-install-recommends \
-            pkg-config libgtk-3-dev libayatana-appindicator3-dev libxdo-dev \
-            libxcb1-dev libxkbcommon-dev libxkbcommon-x11-dev libwayland-dev \
-            libgl1-mesa-dev libssl-dev wget curl ca-certificates file \
-            zstd zsync binutils squashfs-tools appstream
+          sudo rm -f /etc/apt/apt.conf.d/50appstream
+          for i in 1 2 3 4 5; do
+            sudo DEBIAN_FRONTEND=noninteractive NEEDRESTART_MODE=l apt-get update -qq && break || sleep 3
+          done
+          for i in 1 2 3; do
+            sudo DEBIAN_FRONTEND=noninteractive NEEDRESTART_MODE=l apt-get install -y --no-install-recommends \
+              pkg-config libgtk-3-dev libayatana-appindicator3-dev libxdo-dev \
+              libxcb1-dev libxkbcommon-dev libxkbcommon-x11-dev libwayland-dev \
+              libgl1-mesa-dev libssl-dev wget curl ca-certificates file \
+              zstd zsync binutils squashfs-tools appstream && break || sleep 3
+          done
 
       - name: Install Rust toolchain
         uses: dtolnay/rust-toolchain@stable
