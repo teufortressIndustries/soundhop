@@ -27,13 +27,9 @@ pub fn use_color() -> bool {
 pub fn supports_unicode() -> bool {
     #[cfg(target_os = "windows")]
     {
-        if std::env::var_os("WT_SESSION").is_some()
+        std::env::var_os("WT_SESSION").is_some()
             || std::env::var("TERM_PROGRAM").is_ok()
             || std::env::var("PYTHONUTF8").is_ok()
-        {
-            return true;
-        }
-        false
     }
     #[cfg(not(target_os = "windows"))]
     {
