@@ -1,9 +1,8 @@
-# 🔊 SoundHop
-
-> Hop audio between Linux boxes on your local network without manual `pactl` plumbing or broken streams.
-
 [![CI](https://github.com/teufortressIndustries/soundhop/actions/workflows/ci.yml/badge.svg)](https://github.com/teufortressIndustries/soundhop/actions/workflows/ci.yml)
 [![License: MIT](https://img.shields.io/badge/License-MIT-blue.svg)](LICENSE)
+[![AnyLinux](https://img.shields.io/badge/AnyLinux-compatible-green?logo=linux&logoColor=white)](https://pkgforge-dev.github.io/Anylinux-AppImages/)
+
+# <img width="48" height="48" alt="com github SoundHop" src="https://github.com/teufortressIndustries/soundhop/blob/main/assets/soundhop.png?raw=true" /> SoundHop
 
 [**Download Latest AppImage (Releases)**](https://github.com/teufortressIndustries/soundhop/releases) • [**Quickstart**](#quickstart) • [**Interactive TUI**](#interactive-terminal-ui-tui) • [**CLI Commands**](#cli-command-reference) • [**Requirements**](#requirements) • [**Building from Source**](#building-from-source) • [**How It Works**](#how-it-works-under-the-hood)
 
@@ -26,7 +25,7 @@ PulseAudio and PipeWire already implement native TCP network streaming modules (
 The primary and recommended way to use SoundHop is through the native desktop system tray widget. It runs seamlessly on KDE Plasma, GNOME, and other Linux desktop environments.
 
 ### 1. Launch SoundHop
-Download and run the standalone **[SoundHop AppImage](https://github.com/teufortressIndustries/soundhop/releases)** (no installation needed) or run:
+Download and run the standalone **[SoundHop AnyLinux AppImage](https://github.com/teufortressIndustries/soundhop/releases)** (no installation, host libraries, or FUSE required — works on glibc, musl, and non-FHS distros) or run:
 ```bash
 soundhop tray
 ```
@@ -288,7 +287,7 @@ mdns = true                     # Enable mDNS fallback browsing
 
 ## Limitations & Honest Notes
 
-- **Supported Platforms**: Linux (PipeWire / PulseAudio) and Windows 10/11 (WASAPI / sounddevice). macOS is currently not supported.
+- **Supported Platforms**: Linux (PipeWire / PulseAudio) and Windows 10/11 (WASAPI / `cpal`). macOS is currently not supported.
 - **Platform Feature Matrix**:
   - **LAN Speaker Streaming & Discovery**: Supported on both Linux and Windows 10/11.
   - **Android Audio Capture (`scrcpy`)**: Supported on both Linux and Windows 10/11 (virtual microphone mode requires Linux).
@@ -316,11 +315,12 @@ mdns = true                     # Enable mDNS fallback browsing
   - **Remote Volume Sync**: Control receiver volume directly from the sender's media keys.
   - **Android Auto-Discovery & History**: ZeroConf mDNS discovery for Android Wireless Debugging and persistent device history for 1-click reconnects.
 - [x] **v2.0 (Current)**:
-  - **Full Rewrite on Rust**: Rewrite everything to rust.
-  - **Interactive Terminal UI**: (soundhop tui) using ratatui + crossterm.
-  - **Multi-Room / Broadcast Audio**: soundhop connect PeerA PeerB --combine --keep-local.
-  - **Persistent Per-App Routing Rules**: [routing] in config.toml & soundhop route --save.
-  - **PIN / PSK**: Pre-Shared Key Pairing & HMAC-SHA256 Authentication (soundhop pair).
+  - **Full Rewrite in Rust**: Ground-up rewrite in pure Rust (`soundhop-core`, `soundhop-gui`, `soundhop-cli`).
+  - **AnyLinux AppImage**: Universal `quick-sharun` + `uruntime`/DwarFS AppImage supporting glibc, musl, non-FHS distros, and non-FUSE environments.
+  - **Interactive Terminal UI**: (`soundhop tui`) using `ratatui` + `crossterm`.
+  - **Multi-Room / Broadcast Audio**: `soundhop connect PeerA PeerB --combine --keep-local`.
+  - **Persistent Per-App Routing Rules**: `[routing]` in `config.toml` & `soundhop route --save`.
+  - **PIN / PSK**: Pre-Shared Key Pairing & HMAC-SHA256 Authentication (`soundhop pair`).
   - **Real-Time Audio Telemetry**: Audio Peak, RMS Level Meter & Network RTT, Jitter Telemetry.
 
 ---
