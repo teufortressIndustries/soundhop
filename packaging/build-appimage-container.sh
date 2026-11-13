@@ -1,8 +1,8 @@
 #!/usr/bin/env bash
 # ==============================================================================
-# SoundHop v2.0 Portable AppImage Builder (Ubuntu 22.04 Container)
-# Builds a universal AppImage on Ubuntu 22.04 LTS (glibc 2.35 + Rust toolchain)
-# Runs cleanly across all Linux distributions (Ubuntu, Debian, Fedora, Arch, CachyOS).
+# SoundHop v2.0 AnyLinux AppImage Builder (Arch Linux Container)
+# Uses pkgforge-dev/Anylinux-AppImages (quick-sharun + uruntime/DwarFS)
+# Produces a distro-agnostic AppImage that runs on glibc, musl, and non-FUSE hosts.
 # ==============================================================================
 set -euo pipefail
 
@@ -19,29 +19,35 @@ else
     exit 1
 fi
 
-echo "=== Building Universal SoundHop v2.0 AppImage using Ubuntu 22.04 ($CONTAINER_CMD) ==="
+echo "=== Building SoundHop v2.0 AnyLinux AppImage using Arch Linux ($CONTAINER_CMD) ==="
 
-IMAGE_NAME="soundhop-rust-builder:v2"
+IMAGE_NAME="soundhop-anylinux-builder:v2"
 
-# Check if pre-warmed Rust v2 builder image exists; build it once to eliminate apt-get/rustup delays
+# Pre-warm Arch Linux builder image once to eliminate pacman/rustup delays
 if ! $CONTAINER_CMD image exists "$IMAGE_NAME" 2>/dev/null; then
-    echo "Building cached Rust builder image '$IMAGE_NAME' (one-time setup)..."
+    echo "Building cached Arch Linux builder image '$IMAGE_NAME' (one-time setup)..."
     if $CONTAINER_CMD build -t "$IMAGE_NAME" -f - "$REPO_DIR" << 'DOCKERFILE'; then
-FROM ubuntu:22.04
-ENV DEBIAN_FRONTEND=noninteractive
+FROM docker.io/library/archlinux:base-devel
 ENV PATH="/root/.cargo/bin:${PATH}"
-RUN apt-get update -qq && apt-get install -y -qq --no-install-recommends \
-    build-essential pkg-config wget curl ca-certificates file \
-    libgtk-3-dev libayatana-appindicator3-dev libxdo-dev \
-    libxcb1-dev libxkbcommon-dev libxkbcommon-x11-dev libwayland-dev \
-    libgl1-mesa-dev libssl-dev zstd zsync binutils squashfs-tools appstream \
-    && curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh -s -- -y --default-toolchain stable --profile minimal \
-    && rm -rf /var/lib/apt/lists/*
+RUN printf 'Server = https://mirrors.kernel.org/archlinux/$repo/os/$arch\nServer = https://mirror.rackspace.com/archlinux/$repo/os/$arch\nServer = https://geo.mirror.pkgbuild.com/$repo/os/$arch\n' > /etc/pacman.d/mirrorlist \
+    && for i in 1 2 3; do \
+      pacman -Syu --noconfirm --needed \
+        rustup pkgconf wget curl file strace binutils patchelf zsync \
+        squashfs-tools desktop-file-utils appstream xorg-server-xvfb \
+        gtk3 libayatana-appindicator xdotool libxcb libxkbcommon libxkbcommon-x11 \
+        wayland mesa openssl && break || sleep 3; \
+    done \
+    && curl -fsSL https://raw.githubusercontent.com/pkgforge-dev/Anylinux-AppImages/refs/heads/main/useful-tools/get-debloated-pkgs.sh -o /tmp/get-debloated-pkgs.sh \
+    && chmod +x /tmp/get-debloated-pkgs.sh \
+    && /tmp/get-debloated-pkgs.sh --add-common --prefer-nano \
+    && rm -f /tmp/get-debloated-pkgs.sh \
+    && rustup default stable \
+    && pacman -Scc --noconfirm
 DOCKERFILE
-        echo "✓ Rust builder image '$IMAGE_NAME' cached."
+        echo "✓ Arch Linux builder image '$IMAGE_NAME' cached."
     else
-        echo "Notice: Could not cache builder image, falling back to base ubuntu:22.04."
-        IMAGE_NAME="ubuntu:22.04"
+        echo "Notice: Could not cache builder image, falling back to base archlinux:base-devel."
+        IMAGE_NAME="docker.io/library/archlinux:base-devel"
     fi
 fi
 
@@ -54,6 +60,7 @@ fi
 
 $CONTAINER_CMD run --rm $TTY_FLAGS \
     ${UPDATE_REPO:+-e UPDATE_REPO="$UPDATE_REPO"} \
+    ${VERSION:+-e VERSION="$VERSION"} \
     -v "$REPO_DIR:/work:Z" \
     -w /work \
     "$IMAGE_NAME" /work/packaging/container-build.sh

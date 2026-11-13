@@ -252,11 +252,11 @@ cargo clippy --workspace --all-targets -- -D warnings
 cargo test --workspace
 ```
 
-### 4. Build Universal AppImage locally
+### 4. Build AnyLinux AppImage locally
 ```bash
 ./packaging/build-appimage.sh
 ```
-The finished binary will be placed at `dist/SoundHop-2.0.1-universal-x86_64.AppImage`.
+On non-Arch hosts this automatically builds inside an Arch Linux container using [pkgforge's AnyLinux AppImages](https://pkgforge-dev.github.io/Anylinux-AppImages/) (`quick-sharun` + `uruntime`/DwarFS, no FUSE required at runtime). The finished binary will be placed at `dist/SoundHop-2.0.2-universal-x86_64.AppImage`.
 
 ---
 

@@ -1,21 +1,25 @@
-#!/usr/bin/env bash
+#!/bin/sh
 # ==============================================================================
-# AppRun entrypoint for SoundHop v2.0 AppImage (Pure Rust Binary)
+# AppRun entrypoint for SoundHop v2.0 AnyLinux AppImage (sharun + dash)
 # ==============================================================================
 set -e
 
-HERE="$(dirname "$(readlink -f "${0}")")"
-export APPDIR="${HERE}"
-export PATH="${HERE}/usr/bin:${PATH}"
-export XDG_DATA_DIRS="${HERE}/usr/share:${XDG_DATA_DIRS:-/usr/local/share:/usr/share}"
-export LD_LIBRARY_PATH="${HERE}/usr/lib:${HERE}/usr/lib64:${LD_LIBRARY_PATH:-}"
+HERE="$(dirname "$(readlink -f "$0")")"
+
+if [ -x "${HERE}/bin/soundhop" ]; then
+    BIN="${HERE}/bin/soundhop"
+elif [ -x "${HERE}/usr/bin/soundhop" ]; then
+    BIN="${HERE}/usr/bin/soundhop"
+else
+    BIN="soundhop"
+fi
 
 if [ $# -eq 0 ]; then
     if [ -n "${WAYLAND_DISPLAY:-}" ] || [ -n "${DISPLAY:-}" ]; then
-        exec "${HERE}/usr/bin/soundhop" tray
+        exec "$BIN" tray
     else
-        exec "${HERE}/usr/bin/soundhop" status
+        exec "$BIN" status
     fi
 else
-    exec "${HERE}/usr/bin/soundhop" "$@"
+    exec "$BIN" "$@"
 fi

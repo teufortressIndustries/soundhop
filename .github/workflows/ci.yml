@@ -60,34 +60,27 @@ jobs:
         run: cargo test --workspace
 
   build-appimage:
-    name: Build Universal Linux AppImage
-    runs-on: ubuntu-22.04
+    name: Build AnyLinux AppImage
+    runs-on: ubuntu-latest
+    container:
+      image: archlinux:base-devel
+      options: --privileged
 
     steps:
       - uses: actions/checkout@v4
 
-      - name: Install system build dependencies
+      - name: Install Arch Linux build dependencies
         run: |
-          printf "nameserver 1.1.1.1\nnameserver 8.8.8.8\n" | sudo tee /etc/resolv.conf > /dev/null || true
-          sudo sed -i 's|mirror+file:/etc/apt/apt-mirrors.txt|http://archive.ubuntu.com/ubuntu/|g' /etc/apt/sources.list /etc/apt/sources.list.d/* 2>/dev/null || true
-          sudo sed -i 's|azure\.archive\.ubuntu\.com|archive.ubuntu.com|g' /etc/apt/sources.list /etc/apt/apt-mirrors.txt /etc/apt/sources.list.d/* 2>/dev/null || true
-          sudo mkdir -p /etc/needrestart/conf.d
-          echo '$nrconf{restart} = "l";' | sudo tee /etc/needrestart/conf.d/autorestart.conf > /dev/null
-          echo 'debconf debconf/frontend select Noninteractive' | sudo debconf-set-selections
-          sudo rm -f /etc/apt/apt.conf.d/50appstream
-          for i in 1 2 3 4 5; do
-            sudo DEBIAN_FRONTEND=noninteractive NEEDRESTART_MODE=l apt-get update -qq && break || sleep 3
-          done
-          for i in 1 2 3; do
-            sudo DEBIAN_FRONTEND=noninteractive NEEDRESTART_MODE=l apt-get install -y --no-install-recommends \
-              pkg-config libgtk-3-dev libayatana-appindicator3-dev libxdo-dev \
-              libxcb1-dev libxkbcommon-dev libxkbcommon-x11-dev libwayland-dev \
-              libgl1-mesa-dev libssl-dev wget curl ca-certificates file \
-              zstd zsync binutils squashfs-tools appstream && break || sleep 3
-          done
+          pacman -Syu --noconfirm --needed \
+            base-devel rustup pkgconf wget curl file strace binutils patchelf zsync \
+            squashfs-tools desktop-file-utils appstream xorg-server-xvfb \
+            gtk3 libayatana-appindicator xdotool libxcb libxkbcommon libxkbcommon-x11 \
+            wayland mesa openssl git
 
-      - name: Install Rust toolchain
-        uses: dtolnay/rust-toolchain@stable
+      - name: Initialize Rust toolchain
+        run: |
+          rustup default stable
+          echo "$HOME/.cargo/bin" >> "$GITHUB_PATH"
 
       - name: Cache Cargo registry and target
         uses: Swatinem/rust-cache@v2
@@ -95,9 +88,8 @@ jobs:
           workspaces: |
             . -> build/appimage-container/cargo-target
 
-      - name: Build AppImage
+      - name: Build AnyLinux AppImage
         run: |
-          export DEBIAN_FRONTEND=noninteractive
           mkdir -p build/appimage-container dist
           chmod +x packaging/container-build.sh
           ./packaging/container-build.sh
@@ -105,8 +97,9 @@ jobs:
       - name: Verify AppImage Execution
         run: |
           chmod +x dist/*.AppImage
+          ./dist/*.AppImage version
+          ./dist/*.AppImage doctor || true
           ./dist/*.AppImage --appimage-extract-and-run version
-          ./dist/*.AppImage --appimage-extract-and-run doctor || true
 
       - name: Upload AppImage Artifact
         uses: actions/upload-artifact@v4

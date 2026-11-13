@@ -10,6 +10,6 @@ Terminal=false
 Categories=AudioVideo;Audio;
 StartupNotify=false
 Keywords=audio;sound;streaming;pipewire;pulseaudio;sharing;network;lan;multiroom;
-X-AppImage-Version=2.0.1
+X-AppImage-Version=2.0.2
 X-AppImage-UpdateURL=https://github.com/teufortressIndustries/soundhop
 X-AppImage-Homepage=https://github.com/teufortressIndustries/soundhop
