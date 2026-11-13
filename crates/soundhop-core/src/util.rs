@@ -222,11 +222,11 @@ pub fn command_exists(name: &str) -> bool {
 }
 
 pub fn is_executable(path: &Path) -> bool {
-    if !path.is_file() {
-        return false;
-    }
     #[cfg(unix)]
     {
+        if !path.is_file() {
+            return false;
+        }
         use std::os::unix::fs::PermissionsExt;
         if let Ok(meta) = path.metadata() {
             return (meta.permissions().mode() & 0o111) != 0;
@@ -235,7 +235,7 @@ pub fn is_executable(path: &Path) -> bool {
     }
     #[cfg(not(unix))]
     {
-        true
+        path.is_file()
     }
 }
 
