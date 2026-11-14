@@ -116,6 +116,14 @@ impl SettingsApp {
         match self.draft.save(None) {
             Ok(_) => {
                 let _ = self.controller.enforce_routed_apps();
+                if soundhop_core::ipc::is_running(None) {
+                    let _ = soundhop_core::ipc::request(
+                        "reload",
+                        serde_json::json!({}),
+                        None,
+                        std::time::Duration::from_secs(2),
+                    );
+                }
                 self.status_banner = Some(("Settings saved and applied.".to_string(), true));
             }
             Err(e) => {
@@ -127,7 +135,13 @@ impl SettingsApp {
 
 impl eframe::App for SettingsApp {
     fn update(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
-        ctx.request_repaint_after(std::time::Duration::from_millis(66));
+        let audio_active = self
+            .telemetry
+            .as_ref()
+            .map(|t| t.snapshot().audio.active)
+            .unwrap_or(false);
+        let repaint_ms = if audio_active { 66 } else { 500 };
+        ctx.request_repaint_after(std::time::Duration::from_millis(repaint_ms));
 
         egui::TopBottomPanel::top("settings_top_bar").show(ctx, |ui| {
             ui.add_space(6.0);

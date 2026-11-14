@@ -1,6 +1,6 @@
 //! Android audio capture integration using `scrcpy` and `adb`.
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, VecDeque};
 use std::fs::{self, File};
 use std::io::{BufRead, BufReader, Read, Write};
 use std::path::{Path, PathBuf};
@@ -283,19 +283,34 @@ impl AndroidManager {
             )));
         }
 
-        let resp = ureq::get(&url)
+        let agent = ureq::AgentBuilder::new()
+            .timeout_connect(Duration::from_secs(10))
+            .timeout_read(Duration::from_secs(60))
+            .build();
+        let resp = agent
+            .get(&url)
             .set("User-Agent", "SoundHop-AndroidManager")
             .call()
             .map_err(|e| AndroidError::Message(format!("Failed to download {url}: {e}")))?;
 
-        let mut reader = resp.into_reader();
+        const MAX_ARCHIVE_BYTES: u64 = 100 * 1024 * 1024;
+        let mut reader = resp.into_reader().take(MAX_ARCHIVE_BYTES + 1);
         let mut out_file = File::create(&archive_path)?;
         let mut hasher = Sha256::new();
+        let mut total_read: u64 = 0;
         let mut buf = [0u8; 65536];
         loop {
             let n = reader.read(&mut buf)?;
             if n == 0 {
                 break;
+            }
+            total_read += n as u64;
+            if total_read > MAX_ARCHIVE_BYTES {
+                drop(out_file);
+                let _ = fs::remove_file(&archive_path);
+                return Err(AndroidError::Message(
+                    "Downloaded archive exceeded 100 MiB safety limit".to_string(),
+                ));
             }
             out_file.write_all(&buf[..n])?;
             hasher.update(&buf[..n]);
@@ -695,7 +710,7 @@ struct CaptureInner {
     virtual_source_module: u32,
     previous_default_source: String,
     started_at: f64,
-    log_lines: Vec<String>,
+    log_lines: VecDeque<String>,
     last_error: String,
 }
 
@@ -721,7 +736,7 @@ impl AndroidCaptureSession {
                 virtual_source_module: 0,
                 previous_default_source: String::new(),
                 started_at: 0.0,
-                log_lines: Vec::new(),
+                log_lines: VecDeque::new(),
                 last_error: String::new(),
             })),
         }
@@ -864,10 +879,26 @@ impl AndroidCaptureSession {
                 let reader = BufReader::new(stdout);
                 for line in reader.lines().map_while(Result::ok) {
                     let mut g = inner_clone.lock().unwrap();
-                    g.log_lines.push(line);
-                    if g.log_lines.len() > 200 {
-                        g.log_lines.remove(0);
+                    if g.log_lines.len() >= 200 {
+                        g.log_lines.pop_front();
                     }
+                    g.log_lines.push_back(line);
+                }
+            });
+        }
+        if let Some(stderr) = child.stderr.take() {
+            let inner_clone = Arc::clone(&self.inner);
+            thread::spawn(move || {
+                let reader = BufReader::new(stderr);
+                for line in reader.lines().map_while(Result::ok) {
+                    let mut g = inner_clone.lock().unwrap();
+                    if !line.trim().is_empty() {
+                        g.last_error = line.clone();
+                    }
+                    if g.log_lines.len() >= 200 {
+                        g.log_lines.pop_front();
+                    }
+                    g.log_lines.push_back(line);
                 }
             });
         }

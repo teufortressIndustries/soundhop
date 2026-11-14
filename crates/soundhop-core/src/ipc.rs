@@ -96,13 +96,8 @@ impl IpcServer {
             .port();
         let token_bytes: [u8; 32] = rand::thread_rng().gen();
         let token = hex::encode(token_bytes);
-        let _ = fs::write(&port_file, format!("{port}\n"));
-        let _ = fs::write(&auth_file, format!("{token}\n"));
-        #[cfg(unix)]
-        {
-            use std::os::unix::fs::PermissionsExt;
-            let _ = fs::set_permissions(&auth_file, fs::Permissions::from_mode(0o600));
-        }
+        let _ = crate::util::atomic_write(&port_file, &format!("{port}\n"));
+        let _ = crate::util::atomic_write(&auth_file, &format!("{token}\n"));
         let _ = tcp.set_nonblocking(true);
         let stop = Arc::clone(&self.stop_flag);
         let handler = Arc::clone(&self.handler);
@@ -259,6 +254,34 @@ fn exchange_json<S: std::io::Read + Write>(mut stream: S, req: Value) -> Result<
     Ok(resp)
 }
 
+pub fn is_soundhop_process(pid: u64) -> bool {
+    if pid <= 1 || pid == u64::from(std::process::id()) {
+        return false;
+    }
+    #[cfg(target_os = "linux")]
+    {
+        if let Ok(comm) = fs::read_to_string(format!("/proc/{pid}/comm")) {
+            if comm.to_lowercase().contains("soundhop") {
+                return true;
+            }
+        }
+        if let Ok(cmdline) = fs::read(format!("/proc/{pid}/cmdline")) {
+            let s = String::from_utf8_lossy(&cmdline).to_lowercase();
+            return s.contains("soundhop");
+        }
+        false
+    }
+    #[cfg(all(unix, not(target_os = "linux")))]
+    {
+        true
+    }
+    #[cfg(not(unix))]
+    {
+        let _ = pid;
+        false
+    }
+}
+
 pub fn is_running(path: Option<&Path>) -> bool {
     let Ok(resp) = request(
         "ping",
@@ -274,24 +297,6 @@ pub fn is_running(path: Option<&Path>) -> bool {
         .and_then(|v| v.as_str());
     if let Some(ver) = ver_opt {
         if ver != crate::constants::VERSION {
-            #[cfg(unix)]
-            {
-                let pid_opt = resp
-                    .get("pid")
-                    .or_else(|| resp.get("daemon").and_then(|d| d.get("pid")))
-                    .and_then(|v| v.as_u64());
-                if let Some(pid) = pid_opt {
-                    let my_pid = u64::from(std::process::id());
-                    if pid > 1 && pid != my_pid {
-                        unsafe {
-                            libc::kill(pid as libc::pid_t, libc::SIGTERM);
-                        }
-                        thread::sleep(Duration::from_millis(250));
-                    }
-                }
-            }
-            let target = path.map(Path::to_path_buf).unwrap_or_else(socket_path);
-            let _ = fs::remove_file(target);
             return false;
         }
     }

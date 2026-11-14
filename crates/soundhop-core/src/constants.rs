@@ -3,7 +3,7 @@
 pub const APP_NAME: &str = "SoundHop";
 pub const APP_SLUG: &str = "soundhop";
 pub const APP_ID: &str = "io.github.soundhop";
-pub const VERSION: &str = "2.0.2";
+pub const VERSION: &str = "2.0.3";
 pub const REPO_URL: &str = "https://github.com/teufortressIndustries/soundhop";
 pub const ISSUES_URL: &str = "https://github.com/teufortressIndustries/soundhop/issues";
 
@@ -60,4 +60,4 @@ pub const SUPPORTED_AUDIO_CODECS: &[&str] = &["opus", "aac", "flac", "raw"];
 pub const DEFAULT_AUDIO_CODEC: &str = "aac";
 pub const DEFAULT_AUDIO_BIT_RATE: u32 = 128_000;
 pub const DEFAULT_AUDIO_BUFFER_MS: u32 = 50;
-pub const DEFAULT_SCRCPY_VERSION: &str = "5.0.1";
+pub const DEFAULT_SCRCPY_VERSION: &str = "3.1";

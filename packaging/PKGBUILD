@@ -1,6 +1,6 @@
 # Maintainer: SoundHop Contributors <soundhop@example.com>
 pkgname=soundhop
-pkgver=2.0.2
+pkgver=2.0.3
 pkgrel=1
 pkgdesc="Seamless cross-distro local network audio sharing, multi-room broadcast, and Android bridge"
 arch=('x86_64' 'aarch64')

@@ -39,6 +39,8 @@ struct AndroidWizardApp {
     duplicate: bool,
     status_msg: Arc<Mutex<Option<(String, bool)>>>,
     installing: Arc<Mutex<bool>>,
+    daemon_session_active: bool,
+    last_daemon_poll: std::time::Instant,
 }
 
 impl AndroidWizardApp {
@@ -49,7 +51,7 @@ impl AndroidWizardApp {
             .first()
             .map(|d| d.serial.clone())
             .unwrap_or_default();
-        Self {
+        let mut app = Self {
             controller,
             tool_status,
             devices,
@@ -63,7 +65,31 @@ impl AndroidWizardApp {
             duplicate: false,
             status_msg: Arc::new(Mutex::new(None)),
             installing: Arc::new(Mutex::new(false)),
+            daemon_session_active: false,
+            last_daemon_poll: std::time::Instant::now() - std::time::Duration::from_secs(5),
+        };
+        app.poll_daemon_session();
+        app
+    }
+
+    fn poll_daemon_session(&mut self) {
+        self.last_daemon_poll = std::time::Instant::now();
+        if soundhop_core::ipc::is_running(None) {
+            if let Ok(resp) = soundhop_core::ipc::request(
+                "android_status",
+                serde_json::json!({}),
+                None,
+                std::time::Duration::from_millis(400),
+            ) {
+                self.daemon_session_active = resp
+                    .get("session")
+                    .and_then(|s| s.get("active"))
+                    .and_then(|v| v.as_bool())
+                    .unwrap_or(false);
+                return;
+            }
         }
+        self.daemon_session_active = false;
     }
 
     fn refresh_devices(&mut self) {
@@ -84,6 +110,9 @@ impl AndroidWizardApp {
 impl eframe::App for AndroidWizardApp {
     fn update(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
         ctx.request_repaint_after(std::time::Duration::from_millis(250));
+        if self.last_daemon_poll.elapsed() >= std::time::Duration::from_secs(1) {
+            self.poll_daemon_session();
+        }
 
         egui::TopBottomPanel::top("android_top").show(ctx, |ui| {
             ui.add_space(6.0);
@@ -111,7 +140,8 @@ impl eframe::App for AndroidWizardApp {
                 ui.add_space(4.0);
             }
             ui.horizontal(|ui| {
-                let is_running = self.controller.android_session.is_active();
+                let is_running =
+                    self.controller.android_session.is_active() || self.daemon_session_active;
                 if !is_running {
                     if ui
                         .add_enabled(
@@ -126,28 +156,66 @@ impl eframe::App for AndroidWizardApp {
                             .find(|d| d.serial == self.selected_serial)
                             .map(|d| d.display_name())
                             .unwrap_or_else(|| self.selected_serial.clone());
-                        match self.controller.android_session.start(
-                            &self.selected_serial,
-                            &dev_name,
-                            Some(&self.codec),
-                            Some(&self.source),
-                            self.as_mic,
-                            Some(self.buffer_ms),
-                            Some(self.bit_rate),
-                            self.duplicate,
-                        ) {
-                            Ok(_) => {
-                                self.set_status(
-                                    format!("Android audio capture started for {dev_name}."),
-                                    true,
-                                );
+                        if soundhop_core::ipc::is_running(None) {
+                            match soundhop_core::ipc::request(
+                                "android_start",
+                                serde_json::json!({
+                                    "serial": self.selected_serial,
+                                    "device_name": dev_name,
+                                    "codec": self.codec,
+                                    "source": self.source,
+                                    "as_mic": self.as_mic,
+                                    "buffer_ms": self.buffer_ms,
+                                    "bit_rate": self.bit_rate,
+                                    "duplicate": self.duplicate,
+                                }),
+                                None,
+                                std::time::Duration::from_secs(10),
+                            ) {
+                                Ok(_) => {
+                                    self.daemon_session_active = true;
+                                    self.set_status(
+                                        format!("Android audio capture started for {dev_name}."),
+                                        true,
+                                    );
+                                }
+                                Err(e) => {
+                                    self.set_status(format!("Failed to start session: {e}"), false);
+                                }
                             }
-                            Err(e) => {
-                                self.set_status(format!("Failed to start session: {e}"), false);
+                        } else {
+                            match self.controller.android_session.start(
+                                &self.selected_serial,
+                                &dev_name,
+                                Some(&self.codec),
+                                Some(&self.source),
+                                self.as_mic,
+                                Some(self.buffer_ms),
+                                Some(self.bit_rate),
+                                self.duplicate,
+                            ) {
+                                Ok(_) => {
+                                    self.set_status(
+                                        format!("Android audio capture started for {dev_name}."),
+                                        true,
+                                    );
+                                }
+                                Err(e) => {
+                                    self.set_status(format!("Failed to start session: {e}"), false);
+                                }
                             }
                         }
                     }
                 } else if ui.button("Stop Android Audio Capture").clicked() {
+                    if soundhop_core::ipc::is_running(None) {
+                        let _ = soundhop_core::ipc::request(
+                            "android_stop",
+                            serde_json::json!({}),
+                            None,
+                            std::time::Duration::from_secs(5),
+                        );
+                        self.daemon_session_active = false;
+                    }
                     let _ = self.controller.android_session.stop();
                     self.set_status("Android audio capture stopped.", true);
                 }

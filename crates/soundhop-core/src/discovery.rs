@@ -297,14 +297,15 @@ pub fn parse_beacon(
         return (None, None);
     }
     if let Some(key) = psk_key.filter(|k| !k.trim().is_empty()) {
-        if !pkt.hmac.is_empty() {
-            let sig_input = format!(
-                "{}:{}:{}:{}:{}:{}:{}",
-                pkt.magic, pkt.proto, pkt.msg_type, pkt.id, pkt.port, pkt.security, pkt.ts_us
-            );
-            if !verify_hmac_hex(key, sig_input.as_bytes(), &pkt.hmac) {
-                return (None, None);
-            }
+        if pkt.hmac.is_empty() {
+            return (None, None);
+        }
+        let sig_input = format!(
+            "{}:{}:{}:{}:{}:{}:{}",
+            pkt.magic, pkt.proto, pkt.msg_type, pkt.id, pkt.port, pkt.security, pkt.ts_us
+        );
+        if !verify_hmac_hex(key, sig_input.as_bytes(), &pkt.hmac) {
+            return (None, None);
         }
     }
     if pkt.msg_type != "offer" {
@@ -760,5 +761,13 @@ mod tests {
         // Wrong key should reject
         let (_, bad_peer) = parse_beacon(&raw, "192.168.1.42", "udp", Some("wrong_key"));
         assert!(bad_peer.is_none());
+    }
+
+    #[test]
+    fn test_parse_beacon_rejects_empty_hmac_when_psk_set() {
+        let unsigned = make_beacon("dev_unsigned", "Spoof", 4713, "psk", "offer", None, None);
+        let (pkt, peer) = parse_beacon(&unsigned, "192.168.1.50", "udp", Some("secret-key"));
+        assert!(pkt.is_none());
+        assert!(peer.is_none());
     }
 }

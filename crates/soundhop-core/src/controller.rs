@@ -297,26 +297,30 @@ impl Controller {
             };
             let lvl = self.backend.get_sink_volume(&active_sink);
             let mute = self.backend.get_sink_mute(&active_sink);
-            // Update synthetic audio level meter if active
-            let any_stream = !self.backend.sink_inputs().unwrap_or_default().is_empty();
-            let norm = if mute || !any_stream {
-                0.0
-            } else {
-                (lvl as f32 / 100.0).clamp(0.0, 1.0) * 0.75
-            };
-            self.telemetry.set_audio_levels(AudioLevelSnapshot {
-                peak_left: norm,
-                peak_right: norm * 0.96,
-                rms_left: norm * 0.7,
-                rms_right: norm * 0.68,
-                dbfs: if norm > 0.001 {
-                    20.0 * norm.log10()
+            // Update synthetic audio level meter only if parec telemetry has not written live PCM levels recently
+            let now = now_secs();
+            let existing_audio = self.telemetry.snapshot().audio;
+            if now - existing_audio.updated_at > 1.5 {
+                let any_stream = !self.backend.sink_inputs().unwrap_or_default().is_empty();
+                let norm = if mute || !any_stream {
+                    0.0
                 } else {
-                    -60.0
-                },
-                active: any_stream && !mute,
-                updated_at: now_secs(),
-            });
+                    (lvl as f32 / 100.0).clamp(0.0, 1.0) * 0.75
+                };
+                self.telemetry.set_audio_levels(AudioLevelSnapshot {
+                    peak_left: norm,
+                    peak_right: norm * 0.96,
+                    rms_left: norm * 0.7,
+                    rms_right: norm * 0.68,
+                    dbfs: if norm > 0.001 {
+                        20.0 * norm.log10()
+                    } else {
+                        -60.0
+                    },
+                    active: any_stream && !mute,
+                    updated_at: now,
+                });
+            }
             serde_json::json!({
                 "level": lvl,
                 "mute": mute,
@@ -697,7 +701,7 @@ impl Controller {
 
         for p in peers {
             let sname = Self::sink_name_for(p);
-            let mid = self.backend.connect_tunnel(&TunnelParams {
+            match self.backend.connect_tunnel(&TunnelParams {
                 host: &p.host,
                 port: p.port,
                 sink_name: &sname,
@@ -705,24 +709,43 @@ impl Controller {
                 reconnect_delay_ms: cfg.connection.reconnect_delay_ms,
                 latency_ms: cfg.connection.latency_ms,
                 extra_args: &cfg.connection.extra_tunnel_args,
-            })?;
-            slave_sinks.push(sname.clone());
-            sessions.push(ActivePeerSession {
-                peer_id: p.id.clone(),
-                name: p.display_name(),
-                host: p.host.clone(),
-                port: p.port,
-                sink_name: sname,
-                module_id: mid,
-            });
-            self.remember_peer(p);
+            }) {
+                Ok(mid) => {
+                    slave_sinks.push(sname.clone());
+                    sessions.push(ActivePeerSession {
+                        peer_id: p.id.clone(),
+                        name: p.display_name(),
+                        host: p.host.clone(),
+                        port: p.port,
+                        sink_name: sname,
+                        module_id: mid,
+                    });
+                    self.remember_peer(p);
+                }
+                Err(e) => {
+                    for s in &sessions {
+                        let _ = self.backend.unload_module(s.module_id, true);
+                    }
+                    return Err(e.into());
+                }
+            }
         }
 
         let names_joined: Vec<String> = sessions.iter().map(|s| s.name.clone()).collect();
         let label = names_joined.join("+");
         let combine_mod =
-            self.backend
-                .create_combined_sink(MULTIROOM_SINK_NAME, &label, &slave_sinks)?;
+            match self
+                .backend
+                .create_combined_sink(MULTIROOM_SINK_NAME, &label, &slave_sinks)
+            {
+                Ok(id) => id,
+                Err(e) => {
+                    for s in &sessions {
+                        let _ = self.backend.unload_module(s.module_id, true);
+                    }
+                    return Err(e.into());
+                }
+            };
 
         let first = sessions[0].clone();
         {
@@ -1204,8 +1227,15 @@ impl Controller {
         if vol as i32 == st.last_synced_volume && mute == st.last_synced_mute {
             return false;
         }
-        self.backend
-            .remote_set_volume(&st.connected_host, st.connected_port, vol, Some(mute));
+        if !st.multiroom_peers.is_empty() {
+            for sess in &st.multiroom_peers {
+                self.backend
+                    .remote_set_volume(&sess.host, sess.port, vol, Some(mute));
+            }
+        } else {
+            self.backend
+                .remote_set_volume(&st.connected_host, st.connected_port, vol, Some(mute));
+        }
         let mut guard = self.state.lock().unwrap();
         guard.last_synced_volume = vol as i32;
         guard.last_synced_mute = mute;
@@ -1705,5 +1735,110 @@ mod tests {
             .routing
             .always_remote
             .contains(&"spotify".to_string()));
+    }
+
+    #[test]
+    fn test_connect_multi_rolls_back_on_combined_sink_failure() {
+        let listener1 = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let port1 = listener1.local_addr().unwrap().port();
+        let listener2 = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let port2 = listener2.local_addr().unwrap().port();
+
+        let peer1 = Peer {
+            id: "p1".to_string(),
+            name: "p1".to_string(),
+            host: "127.0.0.1".to_string(),
+            port: port1,
+            version: VERSION.to_string(),
+            protocol: PROTOCOL_VERSION,
+            security: "open".to_string(),
+            platform: "linux".to_string(),
+            last_seen: now_secs(),
+            source: "manual".to_string(),
+            rtt_ms: None,
+        };
+        let peer2 = Peer {
+            id: "p2".to_string(),
+            name: "p2".to_string(),
+            host: "127.0.0.1".to_string(),
+            port: port2,
+            ..peer1.clone()
+        };
+
+        let sname1 = Controller::sink_name_for(&peer1);
+        let sname2 = Controller::sink_name_for(&peer2);
+        let sname1_c = sname1.clone();
+        let sname2_c = sname2.clone();
+
+        let unloaded = Arc::new(Mutex::new(Vec::<String>::new()));
+        let unloaded_c = Arc::clone(&unloaded);
+        let active_sinks = Arc::new(Mutex::new(Vec::<(u32, String)>::new()));
+        let active_sinks_c = Arc::clone(&active_sinks);
+
+        let runner = Arc::new(MockRunner::new(move |args, _| {
+            let joined = args.join(" ");
+            if joined.contains("unload-module") {
+                unloaded_c.lock().unwrap().push(joined.clone());
+            }
+            if joined.contains("module-combine-sink") {
+                return Ok(CommandResult {
+                    args: args.to_vec(),
+                    returncode: 1,
+                    stdout: String::new(),
+                    stderr: "combine failed".to_string(),
+                });
+            }
+            let stdout = if joined.contains("info") {
+                "Server Name: PulseAudio (on PipeWire 1.2.0)\nDefault Sink: alsa_output.pci\n"
+                    .to_string()
+            } else if joined.contains("list short sinks") {
+                let mut out =
+                    "1\talsa_output.pci\tPipeWire\ts16le 2ch 48000Hz\tRUNNING\n".to_string();
+                for (id, s) in active_sinks_c.lock().unwrap().iter() {
+                    out.push_str(&format!(
+                        "{id}\t{s}\tmodule-tunnel-sink\ts16le 2ch 48000Hz\tRUNNING\n"
+                    ));
+                }
+                out
+            } else if joined.contains("module-tunnel-sink")
+                && joined.contains(&format!("sink_name={sname1_c}"))
+            {
+                active_sinks_c.lock().unwrap().push((201, sname1_c.clone()));
+                "201\n".to_string()
+            } else if joined.contains("module-tunnel-sink")
+                && joined.contains(&format!("sink_name={sname2_c}"))
+            {
+                active_sinks_c.lock().unwrap().push((202, sname2_c.clone()));
+                "202\n".to_string()
+            } else {
+                String::new()
+            };
+            Ok(CommandResult {
+                args: args.to_vec(),
+                returncode: 0,
+                stdout,
+                stderr: String::new(),
+            })
+        }));
+
+        let backend = Arc::new(LinuxAudioBackend::with_runner(runner));
+        let ctrl = Controller::new(
+            Some(Config::default()),
+            Some(State::default()),
+            Some(backend),
+            None,
+            None,
+            false,
+        );
+        ctrl.set_save_enabled(false);
+
+        let res = ctrl.connect_multi(&[peer1, peer2], ConnectOptions::default());
+        assert!(res.is_err());
+
+        let unloaded_cmds = unloaded.lock().unwrap();
+        assert!(unloaded_cmds.iter().any(|c| c.contains("201")));
+        assert!(unloaded_cmds.iter().any(|c| c.contains("202")));
+        drop(listener1);
+        drop(listener2);
     }
 }

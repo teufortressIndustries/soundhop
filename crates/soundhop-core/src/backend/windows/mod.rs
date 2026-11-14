@@ -35,6 +35,8 @@ struct ActiveTunnelSession {
     pub module_id: u32,
     stop_flag: Arc<AtomicBool>,
     recorder: Option<WindowsLoopbackRecorder>,
+    writer_stream: Option<Arc<Mutex<TcpStream>>>,
+    data_channel: u32,
 }
 
 impl ActiveTunnelSession {
@@ -346,11 +348,17 @@ impl AudioBackend for WindowsAudioBackend {
                         if stop_clone.load(Ordering::SeqCst) {
                             break;
                         }
-                        if sec_owned == "trusted-lan" && !ip_allowed(&peer_addr.ip(), &nets_owned) {
+                        if sec_owned != "open"
+                            && !nets_owned.is_empty()
+                            && !ip_allowed(&peer_addr.ip(), &nets_owned)
+                        {
                             continue;
                         }
                         let client_stop = Arc::clone(&stop_clone);
-                        thread::spawn(move || handle_incoming_pa_client(stream, client_stop));
+                        let client_sec = sec_owned.clone();
+                        thread::spawn(move || {
+                            handle_incoming_pa_client(stream, client_stop, client_sec);
+                        });
                     }
                     Err(ref e) if e.kind() == std::io::ErrorKind::WouldBlock => {
                         thread::sleep(Duration::from_millis(40));
@@ -393,7 +401,7 @@ impl AudioBackend for WindowsAudioBackend {
         stream.set_write_timeout(Some(Duration::from_secs(3))).ok();
 
         // PulseAudio Native Protocol Handshake
-        let cookie = [0u8; 256];
+        let cookie = load_cookie_bytes();
         stream
             .write_all(&make_command_auth(0, 35, &cookie))
             .map_err(|e| BackendError::Message(format!("PA auth send failed: {e}")))?;
@@ -431,9 +439,10 @@ impl AudioBackend for WindowsAudioBackend {
         let mod_id = self.next_module_id.fetch_add(1, Ordering::SeqCst);
         let stop_flag = Arc::new(AtomicBool::new(false));
         let writer_stream = Arc::new(Mutex::new(stream));
+        let writer_for_rec = Arc::clone(&writer_stream);
         let recorder = WindowsLoopbackRecorder::new(move |pcm_chunk| {
             let pkt = write_packet(data_channel, pcm_chunk);
-            if let Ok(mut guard) = writer_stream.lock() {
+            if let Ok(mut guard) = writer_for_rec.lock() {
                 let _ = guard.write_all(&pkt);
             }
         });
@@ -444,6 +453,8 @@ impl AudioBackend for WindowsAudioBackend {
                 module_id: mod_id,
                 stop_flag,
                 recorder: Some(recorder),
+                writer_stream: Some(writer_stream),
+                data_channel,
             },
         );
         self.modules.lock().unwrap().push(Module {
@@ -478,12 +489,39 @@ impl AudioBackend for WindowsAudioBackend {
     ) -> Result<u32, BackendError> {
         let mod_id = self.next_module_id.fetch_add(1, Ordering::SeqCst);
         let stop_flag = Arc::new(AtomicBool::new(false));
+        let targets: Vec<(Arc<Mutex<TcpStream>>, u32)> = {
+            let senders = self.active_senders.lock().unwrap();
+            slave_sinks
+                .iter()
+                .filter_map(|name| {
+                    senders.get(name).and_then(|sess| {
+                        sess.writer_stream
+                            .as_ref()
+                            .map(|ws| (Arc::clone(ws), sess.data_channel))
+                    })
+                })
+                .collect()
+        };
+        let recorder = if targets.is_empty() {
+            None
+        } else {
+            Some(WindowsLoopbackRecorder::new(move |pcm_chunk| {
+                for (ws, ch) in &targets {
+                    let pkt = write_packet(*ch, pcm_chunk);
+                    if let Ok(mut guard) = ws.lock() {
+                        let _ = guard.write_all(&pkt);
+                    }
+                }
+            }))
+        };
         self.active_senders.lock().unwrap().insert(
             sink_name.to_string(),
             ActiveTunnelSession {
                 module_id: mod_id,
                 stop_flag,
-                recorder: None,
+                recorder,
+                writer_stream: None,
+                data_channel: 0,
             },
         );
         self.modules.lock().unwrap().push(Module {
@@ -574,11 +612,37 @@ fn ip_allowed(ip: &IpAddr, allowed_networks: &[String]) -> bool {
     false
 }
 
-fn handle_incoming_pa_client(mut stream: TcpStream, stop_flag: Arc<AtomicBool>) {
+fn load_cookie_bytes() -> [u8; 256] {
+    let mut cookie = [0u8; 256];
+    let cookie_path = crate::security::soundhop_cookie_path();
+    if let Ok(bytes) = std::fs::read(&cookie_path) {
+        let copy_len = bytes.len().min(cookie.len());
+        cookie[..copy_len].copy_from_slice(&bytes[..copy_len]);
+    }
+    cookie
+}
+
+fn constant_time_eq(a: &[u8], b: &[u8]) -> bool {
+    if a.len() != b.len() {
+        return false;
+    }
+    let mut diff = 0u8;
+    for (&x, &y) in a.iter().zip(b.iter()) {
+        diff |= x ^ y;
+    }
+    diff == 0
+}
+
+fn handle_incoming_pa_client(mut stream: TcpStream, stop_flag: Arc<AtomicBool>, security: String) {
     let _ = stream.set_nonblocking(false);
     let _ = stream.set_read_timeout(Some(Duration::from_secs(5)));
     let player = WindowsPlayer::new(48_000, 2);
     player.start();
+
+    let cookie_required = matches!(security.as_str(), "psk" | "pin" | "cookie")
+        && crate::security::soundhop_cookie_path().exists();
+    let expected_cookie = load_cookie_bytes();
+    let mut authenticated = !cookie_required;
 
     while !stop_flag.load(Ordering::SeqCst) {
         let Some(pkt) = read_packet(&mut stream) else {
@@ -593,7 +657,18 @@ fn handle_incoming_pa_client(mut stream: TcpStream, stop_flag: Arc<AtomicBool>) 
                 continue;
             };
             let reply = match cmd {
-                PA_COMMAND_AUTH => Some(make_reply_auth(tag, 35)),
+                PA_COMMAND_AUTH => {
+                    let _proto_ver = r.read_u32();
+                    let client_cookie = r.read_arbitrary().unwrap_or_default();
+                    if cookie_required && !constant_time_eq(&client_cookie, &expected_cookie) {
+                        break;
+                    }
+                    authenticated = true;
+                    Some(make_reply_auth(tag, 35))
+                }
+                _ if !authenticated => {
+                    break;
+                }
                 PA_COMMAND_SET_CLIENT_NAME => Some(make_reply_ok(tag)),
                 PA_COMMAND_GET_SERVER_INFO => Some(make_reply_server_info(tag)),
                 PA_COMMAND_CREATE_PLAYBACK_STREAM => {
@@ -607,8 +682,10 @@ fn handle_incoming_pa_client(mut stream: TcpStream, stop_flag: Arc<AtomicBool>) 
                     break;
                 }
             }
-        } else {
+        } else if authenticated {
             player.write(&pkt.data);
+        } else {
+            break;
         }
     }
     player.close();

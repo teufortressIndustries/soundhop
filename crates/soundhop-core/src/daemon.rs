@@ -145,8 +145,7 @@ impl Daemon {
                 .or_else(|| resp.get("daemon").and_then(|d| d.get("pid")))
                 .and_then(|v| v.as_u64());
             if let Some(pid) = pid_opt {
-                let my_pid = u64::from(std::process::id());
-                if pid > 1 && pid != my_pid {
+                if crate::ipc::is_soundhop_process(pid) {
                     unsafe {
                         libc::kill(pid as libc::pid_t, libc::SIGTERM);
                     }
@@ -166,8 +165,9 @@ impl Daemon {
     }
 
     pub fn run_until_stopped(self: &Arc<Self>) -> Result<(), String> {
+        crate::util::install_signal_handlers();
         self.start()?;
-        while !self.stop_flag.load(Ordering::SeqCst) {
+        while !self.stop_flag.load(Ordering::SeqCst) && !crate::util::signal_stop_requested() {
             thread::sleep(Duration::from_millis(150));
         }
         self.shutdown();
@@ -199,6 +199,23 @@ impl Daemon {
         }
         if let Some(h) = self.audio_monitor_thread.lock().unwrap().take() {
             let _ = h.join();
+        }
+        let disconnect_on_quit = self
+            .controller
+            .config
+            .lock()
+            .unwrap()
+            .connection
+            .disconnect_on_quit;
+        if disconnect_on_quit {
+            if self.controller.state.lock().unwrap().is_connected() {
+                let _ = self
+                    .controller
+                    .disconnect(false, None, false, Some(false), true, false);
+            }
+            if self.controller.android_session.is_active() {
+                let _ = self.controller.android_session.stop();
+            }
         }
         let _ = fs::remove_file(pid_path());
     }
@@ -355,15 +372,23 @@ impl Daemon {
 
             if let Some(stdout) = stdout_opt {
                 let reader = BufReader::new(stdout);
+                let mut last_app_sync: Option<Instant> = None;
+                let mut last_vol_sync: Option<Instant> = None;
                 for line in reader.lines().map_while(Result::ok) {
                     if self.stop_flag.load(Ordering::SeqCst) {
                         break;
                     }
                     let lower = line.to_lowercase();
                     if lower.contains("on sink-input") {
-                        let _ = self.controller.enforce_routed_apps();
-                    } else if lower.contains("on sink") {
+                        if last_app_sync.is_none_or(|t| t.elapsed() >= Duration::from_millis(150)) {
+                            let _ = self.controller.enforce_routed_apps();
+                            last_app_sync = Some(Instant::now());
+                        }
+                    } else if lower.contains("on sink")
+                        && last_vol_sync.is_none_or(|t| t.elapsed() >= Duration::from_millis(150))
+                    {
                         let _ = self.controller.sync_remote_volume();
+                        last_vol_sync = Some(Instant::now());
                     }
                 }
             }

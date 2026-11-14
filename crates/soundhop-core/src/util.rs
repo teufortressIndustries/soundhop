@@ -77,7 +77,7 @@ impl ProcessRunner for SystemRunner {
         &self,
         args: &[String],
         env_vars: Option<&HashMap<String, String>>,
-        _timeout: Duration,
+        timeout: Duration,
     ) -> Result<CommandResult, UtilError> {
         let Some(program) = args.first() else {
             return Err(UtilError::ToolMissing(String::new()));
@@ -101,23 +101,78 @@ impl ProcessRunner for SystemRunner {
             cmd.creation_flags(CREATE_NO_WINDOW);
         }
         close_fds_pre_exec(&mut cmd);
-        match cmd.output() {
-            Ok(output) => {
-                let code = output.status.code().unwrap_or(1);
-                let stdout = String::from_utf8_lossy(&output.stdout).into_owned();
-                let stderr = String::from_utf8_lossy(&output.stderr).into_owned();
-                Ok(CommandResult {
-                    args: args.to_vec(),
-                    returncode: code,
-                    stdout,
-                    stderr,
-                })
-            }
+        let mut child = match cmd.spawn() {
+            Ok(c) => c,
             Err(err) if err.kind() == std::io::ErrorKind::NotFound => {
-                Err(UtilError::ToolMissing(program.clone()))
+                return Err(UtilError::ToolMissing(program.clone()));
             }
-            Err(err) => Err(UtilError::Io(err)),
+            Err(err) => return Err(UtilError::Io(err)),
+        };
+
+        let stdout_handle = child.stdout.take().map(|mut out| {
+            std::thread::spawn(move || {
+                let mut buf = Vec::new();
+                let _ = std::io::Read::read_to_end(&mut out, &mut buf);
+                String::from_utf8_lossy(&buf).into_owned()
+            })
+        });
+        let stderr_handle = child.stderr.take().map(|mut err| {
+            std::thread::spawn(move || {
+                let mut buf = Vec::new();
+                let _ = std::io::Read::read_to_end(&mut err, &mut buf);
+                String::from_utf8_lossy(&buf).into_owned()
+            })
+        });
+
+        let effective_timeout = if timeout.is_zero() {
+            Duration::from_secs(10)
+        } else {
+            timeout
+        };
+        let start = Instant::now();
+        let mut timed_out = false;
+        let status_code = loop {
+            match child.try_wait() {
+                Ok(Some(status)) => break status.code().unwrap_or(1),
+                Ok(None) => {
+                    if start.elapsed() >= effective_timeout {
+                        timed_out = true;
+                        let _ = child.kill();
+                        let _ = child.wait();
+                        break 124;
+                    }
+                    std::thread::sleep(Duration::from_millis(10));
+                }
+                Err(err) => {
+                    let _ = child.kill();
+                    let _ = child.wait();
+                    return Err(UtilError::Io(err));
+                }
+            }
+        };
+
+        let stdout = stdout_handle
+            .and_then(|h| h.join().ok())
+            .unwrap_or_default();
+        let mut stderr = stderr_handle
+            .and_then(|h| h.join().ok())
+            .unwrap_or_default();
+        if timed_out {
+            if !stderr.is_empty() && !stderr.ends_with('\n') {
+                stderr.push('\n');
+            }
+            stderr.push_str(&format!(
+                "Command timed out after {:.1}s",
+                effective_timeout.as_secs_f64()
+            ));
         }
+
+        Ok(CommandResult {
+            args: args.to_vec(),
+            returncode: status_code,
+            stdout,
+            stderr,
+        })
     }
 
     fn command_exists(&self, name: &str) -> bool {
@@ -915,13 +970,43 @@ pub fn notify(title: &str, body: &str, urgency: &str) {
             .stdout(Stdio::null())
             .stderr(Stdio::null());
             close_fds_pre_exec(&mut cmd);
-            let _ = cmd.spawn();
+            if let Ok(mut child) = cmd.spawn() {
+                std::thread::spawn(move || {
+                    let _ = child.wait();
+                });
+            }
         }
     }
     #[cfg(windows)]
     {
         let _ = (title, body, urgency);
     }
+}
+
+static SIGNAL_STOP_FLAG: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
+#[cfg(unix)]
+extern "C" fn handle_posix_signal(_sig: libc::c_int) {
+    SIGNAL_STOP_FLAG.store(true, std::sync::atomic::Ordering::SeqCst);
+}
+
+pub fn install_signal_handlers() {
+    SIGNAL_STOP_FLAG.store(false, std::sync::atomic::Ordering::SeqCst);
+    #[cfg(unix)]
+    unsafe {
+        libc::signal(
+            libc::SIGINT,
+            handle_posix_signal as *const () as libc::sighandler_t,
+        );
+        libc::signal(
+            libc::SIGTERM,
+            handle_posix_signal as *const () as libc::sighandler_t,
+        );
+    }
+}
+
+pub fn signal_stop_requested() -> bool {
+    SIGNAL_STOP_FLAG.load(std::sync::atomic::Ordering::SeqCst)
 }
 
 pub fn dedupe(values: impl IntoIterator<Item = String>) -> Vec<String> {
@@ -1037,5 +1122,19 @@ mod tests {
         drop(lock1);
         let lock3 = try_acquire_instance_lock("test_single_instance");
         assert!(lock3.is_some());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn test_system_runner_timeout_kills_hung_child() {
+        let runner = SystemRunner;
+        let args = vec!["sh".to_string(), "-c".to_string(), "sleep 5".to_string()];
+        let start = Instant::now();
+        let res = runner
+            .run(&args, None, Duration::from_millis(80))
+            .expect("spawn sh");
+        assert_eq!(res.returncode, 124);
+        assert!(res.stderr.contains("timed out"));
+        assert!(start.elapsed() < Duration::from_secs(2));
     }
 }

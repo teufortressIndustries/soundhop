@@ -21,7 +21,7 @@ fi
 
 echo "=== Building SoundHop v2.0 AnyLinux AppImage using Arch Linux ($CONTAINER_CMD) ==="
 
-IMAGE_NAME="soundhop-anylinux-builder:v2"
+IMAGE_NAME="soundhop-anylinux-builder:v3"
 
 # Pre-warm Arch Linux builder image once to eliminate pacman/rustup delays
 if ! $CONTAINER_CMD image exists "$IMAGE_NAME" 2>/dev/null; then
@@ -29,17 +29,22 @@ if ! $CONTAINER_CMD image exists "$IMAGE_NAME" 2>/dev/null; then
     if $CONTAINER_CMD build -t "$IMAGE_NAME" -f - "$REPO_DIR" << 'DOCKERFILE'; then
 FROM docker.io/library/archlinux:base-devel
 ENV PATH="/root/.cargo/bin:${PATH}"
+ARG ANYLINUX_COMMIT=f7e9cb26818bdeb3d64a0fe055fdd51cbc887a81
+ARG GET_DEBLOATED_SHA256=d215f7676785f1a1bb8784e69085d66c1df81488ef31f1ba7198325a5be05130
 RUN printf 'Server = https://mirrors.kernel.org/archlinux/$repo/os/$arch\nServer = https://mirror.rackspace.com/archlinux/$repo/os/$arch\nServer = https://geo.mirror.pkgbuild.com/$repo/os/$arch\n' > /etc/pacman.d/mirrorlist \
     && for i in 1 2 3; do \
+      pacman -Sy --noconfirm --needed archlinux-keyring && \
       pacman -Syu --noconfirm --needed \
         rustup pkgconf wget curl file strace binutils patchelf zsync \
         squashfs-tools desktop-file-utils appstream xorg-server-xvfb \
-        gtk3 libayatana-appindicator xdotool libxcb libxkbcommon libxkbcommon-x11 \
-        wayland mesa openssl && break || sleep 3; \
+        gtk3 libayatana-appindicator xdotool libxcb libxcursor libxi libxrandr \
+        libxkbcommon libxkbcommon-x11 wayland mesa openssl && break || sleep 3; \
     done \
-    && curl -fsSL https://raw.githubusercontent.com/pkgforge-dev/Anylinux-AppImages/refs/heads/main/useful-tools/get-debloated-pkgs.sh -o /tmp/get-debloated-pkgs.sh \
+    && curl --proto '=https' --tlsv1.2 --retry 3 --retry-delay 2 -fsSL "https://raw.githubusercontent.com/pkgforge-dev/Anylinux-AppImages/${ANYLINUX_COMMIT}/useful-tools/get-debloated-pkgs.sh" -o /tmp/get-debloated-pkgs.sh \
+    && printf '%s  %s\n' "$GET_DEBLOATED_SHA256" /tmp/get-debloated-pkgs.sh | sha256sum -c - \
     && chmod +x /tmp/get-debloated-pkgs.sh \
-    && /tmp/get-debloated-pkgs.sh --add-common --prefer-nano \
+    && /tmp/get-debloated-pkgs.sh --add-opengl --prefer-nano \
+        gtk3-mini libxml2-mini icu-mini glycin-mini \
     && rm -f /tmp/get-debloated-pkgs.sh \
     && rustup default stable \
     && pacman -Scc --noconfirm

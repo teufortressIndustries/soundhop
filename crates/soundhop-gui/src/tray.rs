@@ -5,7 +5,7 @@
 use std::collections::HashSet;
 use std::process::Command;
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::Arc;
+use std::sync::{Arc, OnceLock};
 use std::time::{Duration, Instant};
 
 use muda::{CheckMenuItem, Menu, MenuEvent, MenuId, MenuItem, PredefinedMenuItem, Submenu};
@@ -28,28 +28,36 @@ pub enum TrayBadgeState {
     Error,
 }
 
-/// Generates a 64x64 RGBA tray icon with a colored status badge in the bottom-right corner.
-pub fn build_tray_icon(state: TrayBadgeState) -> Icon {
-    let mut rgba = vec![0u8; 64 * 64 * 4];
-    if let Ok(img) = image::load_from_memory(EMBEDDED_PNG) {
-        let resized = img.resize_exact(64, 64, image::imageops::FilterType::Lanczos3);
-        let raw = resized.to_rgba8();
-        rgba.copy_from_slice(raw.as_raw());
-    } else {
-        for y in 0..64 {
-            for x in 0..64 {
-                let dx = x as i32 - 32;
-                let dy = y as i32 - 32;
-                if dx * dx + dy * dy <= 28 * 28 {
-                    let idx = (y * 64 + x) * 4;
-                    rgba[idx] = 45;
-                    rgba[idx + 1] = 135;
-                    rgba[idx + 2] = 245;
-                    rgba[idx + 3] = 255;
+fn base_tray_rgba() -> &'static [u8] {
+    static BASE_ICON_RGBA: OnceLock<Vec<u8>> = OnceLock::new();
+    BASE_ICON_RGBA.get_or_init(|| {
+        let mut rgba = vec![0u8; 64 * 64 * 4];
+        if let Ok(img) = image::load_from_memory(EMBEDDED_PNG) {
+            let resized = img.resize_exact(64, 64, image::imageops::FilterType::Lanczos3);
+            let raw = resized.to_rgba8();
+            rgba.copy_from_slice(raw.as_raw());
+        } else {
+            for y in 0..64 {
+                for x in 0..64 {
+                    let dx = x as i32 - 32;
+                    let dy = y as i32 - 32;
+                    if dx * dx + dy * dy <= 28 * 28 {
+                        let idx = (y * 64 + x) * 4;
+                        rgba[idx] = 45;
+                        rgba[idx + 1] = 135;
+                        rgba[idx + 2] = 245;
+                        rgba[idx + 3] = 255;
+                    }
                 }
             }
         }
-    }
+        rgba
+    })
+}
+
+/// Generates a 64x64 RGBA tray icon with a colored status badge in the bottom-right corner.
+pub fn build_tray_icon(state: TrayBadgeState) -> Icon {
+    let mut rgba = base_tray_rgba().to_vec();
 
     let badge_color: Option<[u8; 4]> = match state {
         TrayBadgeState::Idle => None,
@@ -474,7 +482,11 @@ fn spawn_self_dialog(flag: &str) {
         let mut cmd = Command::new(exe);
         cmd.arg(flag);
         soundhop_core::util::close_fds_pre_exec(&mut cmd);
-        let _ = cmd.spawn();
+        if let Ok(mut child) = cmd.spawn() {
+            std::thread::spawn(move || {
+                let _ = child.wait();
+            });
+        }
     }
 }
 
@@ -708,12 +720,13 @@ pub fn run_tray(verbose: bool) -> Result<i32, String> {
         .build()
         .map_err(|e| format!("Failed to create system tray icon: {e}"))?;
 
+    soundhop_core::util::install_signal_handlers();
     let running = Arc::new(AtomicBool::new(true));
     let mut last_badge = initial_badge;
     let mut last_refresh = Instant::now();
     let mut last_sig = menu_state_signature(&ctrl, &initial_peers);
 
-    while running.load(Ordering::Relaxed) {
+    while running.load(Ordering::Relaxed) && !soundhop_core::util::signal_stop_requested() {
         #[cfg(target_os = "linux")]
         {
             while gtk::events_pending() {
@@ -725,9 +738,11 @@ pub fn run_tray(verbose: bool) -> Result<i32, String> {
             handle_menu_action(event.id.0.as_str(), &daemon, &running);
             let peers = daemon_peers(&daemon);
             let new_badge = compute_badge_state(&ctrl);
-            let _ = tray_icon.set_icon(Some(build_tray_icon(new_badge)));
+            if new_badge != last_badge {
+                let _ = tray_icon.set_icon(Some(build_tray_icon(new_badge)));
+                last_badge = new_badge;
+            }
             tray_icon.set_menu(Some(Box::new(build_tray_menu(&ctrl, &peers))));
-            last_badge = new_badge;
             last_sig = menu_state_signature(&ctrl, &peers);
             last_refresh = Instant::now();
         }

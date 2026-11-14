@@ -51,7 +51,22 @@ impl LinuxAudioBackend {
         for a in args {
             full.push((*a).to_string());
         }
-        let res = self.runner.run(&full, None, Duration::from_secs(15))?;
+        let mut env_map = HashMap::new();
+        if args.contains(&"-s") {
+            let cookie_file = soundhop_cookie_path();
+            if cookie_file.exists() {
+                env_map.insert(
+                    "PULSE_COOKIE".to_string(),
+                    cookie_file.to_string_lossy().into_owned(),
+                );
+            }
+        }
+        let env_ref = if env_map.is_empty() {
+            None
+        } else {
+            Some(&env_map)
+        };
+        let res = self.runner.run(&full, env_ref, Duration::from_secs(15))?;
         if check && !res.ok() {
             let msg = res.combined_output();
             return Err(BackendError::Message(if msg.is_empty() {
@@ -709,6 +724,12 @@ impl AudioBackend for LinuxAudioBackend {
         if !params.extra_args.iter().any(|x| x.starts_with("format=")) {
             args.push("format=s16le".to_string());
         }
+        if !params.extra_args.iter().any(|x| x.starts_with("cookie=")) {
+            let cookie_file = soundhop_cookie_path();
+            if cookie_file.exists() {
+                args.push(format!("cookie={}", cookie_file.display()));
+            }
+        }
         args.extend(params.extra_args.iter().cloned());
         args.push(format!(
             "sink_properties=device.description=SoundHop-{safe_desc}"
@@ -793,6 +814,12 @@ impl AudioBackend for LinuxAudioBackend {
         args.push("rate=48000".to_string());
         args.push("channels=2".to_string());
         args.push("format=s16le".to_string());
+        if !params.extra_args.iter().any(|x| x.starts_with("cookie=")) {
+            let cookie_file = soundhop_cookie_path();
+            if cookie_file.exists() {
+                args.push(format!("cookie={}", cookie_file.display()));
+            }
+        }
         args.extend(params.extra_args.iter().cloned());
         args.push(format!(
             "source_properties=device.description=SoundHop-Microphone-{safe_desc}"
@@ -874,26 +901,48 @@ impl AudioBackend for LinuxAudioBackend {
             false,
         );
 
-        let local_tunnel_id = self.load_module(
-            "module-tunnel-sink",
-            &[
-                format!("server={remote_target}"),
-                format!("sink={remote_sink_name}"),
-                format!("sink_name={local_tunnel_name}"),
-                "rate=48000".to_string(),
-                "channels=2".to_string(),
-                "format=s16le".to_string(),
-            ],
-        )?;
+        let mut tunnel_args = vec![
+            format!("server={remote_target}"),
+            format!("sink={remote_sink_name}"),
+            format!("sink_name={local_tunnel_name}"),
+            "rate=48000".to_string(),
+            "channels=2".to_string(),
+            "format=s16le".to_string(),
+        ];
+        let cookie_file = soundhop_cookie_path();
+        if cookie_file.exists() {
+            tunnel_args.push(format!("cookie={}", cookie_file.display()));
+        }
 
-        let local_loopback_id = self.load_module(
+        let local_tunnel_id = match self.load_module("module-tunnel-sink", &tunnel_args) {
+            Ok(id) => id,
+            Err(e) => {
+                self.stop_send_mic_to_remote(host, port, remote_null_id, remote_remap_id, 0, 0);
+                return Err(e);
+            }
+        };
+
+        let local_loopback_id = match self.load_module(
             "module-loopback",
             &[
                 format!("source={local_source}"),
                 format!("sink={local_tunnel_name}"),
                 "latency_msec=30".to_string(),
             ],
-        )?;
+        ) {
+            Ok(id) => id,
+            Err(e) => {
+                self.stop_send_mic_to_remote(
+                    host,
+                    port,
+                    remote_null_id,
+                    remote_remap_id,
+                    local_tunnel_id,
+                    0,
+                );
+                return Err(e);
+            }
+        };
 
         Ok((
             remote_null_id,
