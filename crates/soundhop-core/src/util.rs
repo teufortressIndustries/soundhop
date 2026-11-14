@@ -72,6 +72,20 @@ pub trait ProcessRunner: Send + Sync {
 #[derive(Debug, Default, Clone)]
 pub struct SystemRunner;
 
+/// Terminates `child` and, on Unix, its entire process group so forked
+/// grandchildren do not keep inherited stdout/stderr pipes open after timeout.
+fn terminate_child(child: &mut std::process::Child) {
+    #[cfg(unix)]
+    unsafe {
+        let pgid = child.id() as libc::pid_t;
+        if pgid > 0 {
+            libc::kill(-pgid, libc::SIGKILL);
+        }
+    }
+    let _ = child.kill();
+    let _ = child.wait();
+}
+
 impl ProcessRunner for SystemRunner {
     fn run(
         &self,
@@ -99,6 +113,11 @@ impl ProcessRunner for SystemRunner {
             use std::os::windows::process::CommandExt;
             const CREATE_NO_WINDOW: u32 = 0x08000000;
             cmd.creation_flags(CREATE_NO_WINDOW);
+        }
+        #[cfg(unix)]
+        {
+            use std::os::unix::process::CommandExt;
+            cmd.process_group(0);
         }
         close_fds_pre_exec(&mut cmd);
         let mut child = match cmd.spawn() {
@@ -137,15 +156,13 @@ impl ProcessRunner for SystemRunner {
                 Ok(None) => {
                     if start.elapsed() >= effective_timeout {
                         timed_out = true;
-                        let _ = child.kill();
-                        let _ = child.wait();
+                        terminate_child(&mut child);
                         break 124;
                     }
                     std::thread::sleep(Duration::from_millis(10));
                 }
                 Err(err) => {
-                    let _ = child.kill();
-                    let _ = child.wait();
+                    terminate_child(&mut child);
                     return Err(UtilError::Io(err));
                 }
             }
@@ -1128,7 +1145,11 @@ mod tests {
     #[test]
     fn test_system_runner_timeout_kills_hung_child() {
         let runner = SystemRunner;
-        let args = vec!["sh".to_string(), "-c".to_string(), "sleep 5".to_string()];
+        let args = vec![
+            "sh".to_string(),
+            "-c".to_string(),
+            "sleep 5; true".to_string(),
+        ];
         let start = Instant::now();
         let res = runner
             .run(&args, None, Duration::from_millis(80))

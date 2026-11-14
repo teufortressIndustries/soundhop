@@ -3666,7 +3666,6 @@ dependencies = [
  "tempfile",
  "thiserror 2.0.21",
  "toml",
- "tracing",
  "ureq",
  "winreg",
  "zip",

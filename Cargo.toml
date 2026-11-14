@@ -12,7 +12,6 @@ edition = "2021"
 license = "MIT"
 authors = ["SoundHop contributors"]
 repository = "https://github.com/teufortressIndustries/soundhop"
-homepage = "https://github.com/teufortressIndustries/soundhop"
 
 [workspace.dependencies]
 soundhop-core = { path = "crates/soundhop-core" }
