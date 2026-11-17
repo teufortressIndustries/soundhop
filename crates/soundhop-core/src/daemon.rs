@@ -861,6 +861,7 @@ mod tests {
         let state_path = dir.path().join("state.json");
         let stop_called = Arc::new(AtomicBool::new(false));
         let stop_flag = Arc::clone(&stop_called);
+        let (stop_tx, stop_rx) = std::sync::mpsc::channel::<()>();
 
         let old_server = Arc::new(IpcServer::new(
             Arc::new(move |req| {
@@ -873,6 +874,7 @@ mod tests {
                     }),
                     "stop" => {
                         stop_flag.store(true, Ordering::SeqCst);
+                        let _ = stop_tx.send(());
                         serde_json::json!({ "ok": true, "stopping": true })
                     }
                     _ => serde_json::json!({ "ok": true }),
@@ -883,15 +885,9 @@ mod tests {
         old_server.start().unwrap();
 
         let stopper = Arc::clone(&old_server);
-        let waiter_flag = Arc::clone(&stop_called);
         let stopper_thread = thread::spawn(move || {
-            for _ in 0..50 {
-                if waiter_flag.load(Ordering::SeqCst) {
-                    stopper.stop();
-                    break;
-                }
-                thread::sleep(Duration::from_millis(20));
-            }
+            let _ = stop_rx.recv_timeout(Duration::from_secs(10));
+            stopper.stop();
         });
 
         let daemon = Daemon::new(Some(cfg_path), Some(state_path), false, Some(sock.clone()));
