@@ -3,7 +3,7 @@
 pub const APP_NAME: &str = "SoundHop";
 pub const APP_SLUG: &str = "soundhop";
 pub const APP_ID: &str = "io.github.soundhop";
-pub const VERSION: &str = "2.0.3";
+pub const VERSION: &str = "2.0.4";
 pub const REPO_URL: &str = "https://github.com/teufortressIndustries/soundhop";
 pub const ISSUES_URL: &str = "https://github.com/teufortressIndustries/soundhop/issues";
 
@@ -55,9 +55,22 @@ pub const DEFAULT_LAN_NETWORKS: &[&str] = &[
 /// Supported listener security modes.
 pub const SECURITY_MODES: &[&str] = &["trusted-lan", "psk", "pin", "cookie", "open"];
 
-/// Supported Android scrcpy audio codecs.
+/// Supported Android scrcpy audio codecs and sources.
 pub const SUPPORTED_AUDIO_CODECS: &[&str] = &["opus", "aac", "flac", "raw"];
+pub const SUPPORTED_AUDIO_SOURCES: &[&str] = &[
+    "output",
+    "mic",
+    "playback",
+    "mic-unprocessed",
+    "mic-camcorder",
+    "mic-voice-recognition",
+    "mic-voice-communication",
+];
 pub const DEFAULT_AUDIO_CODEC: &str = "aac";
 pub const DEFAULT_AUDIO_BIT_RATE: u32 = 128_000;
 pub const DEFAULT_AUDIO_BUFFER_MS: u32 = 50;
 pub const DEFAULT_SCRCPY_VERSION: &str = "3.1";
+pub const SCRCPY_V3_1_SHA256_LINUX_X86_64: &str =
+    "37dba54092ed9ec6b2f8f95432f61b8ea124aec9f1e9f2b3d22d4b10bb04c59a";
+pub const SCRCPY_V3_1_SHA256_WIN64: &str =
+    "0c05ea395d95cfe36bee974eeb435a3db87ea5594ff738370d5dc3068a9538ca";

@@ -15,7 +15,7 @@ use serde_json::Value;
 
 use crate::constants::{OFFLINE_PROBE_LIMIT, SUPERVISOR_INTERVAL_SECS, VERSION};
 use crate::controller::{ConnectOptions, Controller};
-use crate::discovery::{discover_once, DiscoveryManager, Peer};
+use crate::discovery::{discover_once_with_psk, DiscoveryManager, Peer};
 use crate::ipc::{is_running, request as ipc_request, IpcServer};
 use crate::util::{
     command_exists, ensure_dir, is_private_address, now_secs, pid_path, runtime_dir, socket_path,
@@ -485,7 +485,8 @@ impl Daemon {
                     .ok_or_else(|| format!("Unknown device: {q}"));
             }
         }
-        for found in discover_once(0.8, cfg.discovery.port, &cfg.device.id) {
+        let psk = (!cfg.sharing.psk_hash.is_empty()).then_some(cfg.sharing.psk_hash.as_str());
+        for found in discover_once_with_psk(0.8, cfg.discovery.port, &cfg.device.id, psk) {
             self.controller.remember_peer(&found);
             if found.id.eq_ignore_ascii_case(q)
                 || found.name.eq_ignore_ascii_case(q)

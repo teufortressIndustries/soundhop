@@ -16,7 +16,7 @@ use crate::config::Config;
 use crate::constants::{
     MULTIROOM_SINK_NAME, PROTOCOL_VERSION, SINK_PREFIX, SOURCE_PREFIX, VERSION,
 };
-use crate::discovery::{discover_once, Peer};
+use crate::discovery::{discover_once_with_psk, Peer};
 use crate::security::{derive_key_hex, derive_pa_cookie, generate_pairing_pin, write_pa_cookie};
 use crate::state::{ActivePeerSession, KnownPeer, PairedPeer, State};
 use crate::telemetry::{
@@ -535,7 +535,8 @@ impl Controller {
         {
             return peer.clone();
         }
-        for found in discover_once(0.7, cfg.discovery.port, &cfg.device.id) {
+        let psk = (!cfg.sharing.psk_hash.is_empty()).then_some(cfg.sharing.psk_hash.as_str());
+        for found in discover_once_with_psk(0.7, cfg.discovery.port, &cfg.device.id, psk) {
             if found.id == peer.id || found.name.eq_ignore_ascii_case(&peer.name) {
                 self.remember_peer(&found);
                 return found;

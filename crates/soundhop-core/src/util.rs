@@ -376,10 +376,35 @@ pub fn runtime_dir() -> PathBuf {
 }
 
 pub fn ensure_dir(path: &Path) -> std::io::Result<PathBuf> {
+    #[cfg(unix)]
+    {
+        if let Ok(pre_meta) = fs::symlink_metadata(path) {
+            if pre_meta.file_type().is_symlink() {
+                return Err(std::io::Error::new(
+                    std::io::ErrorKind::PermissionDenied,
+                    "Refusing symlinked directory",
+                ));
+            }
+        }
+    }
     fs::create_dir_all(path)?;
     #[cfg(unix)]
     {
-        use std::os::unix::fs::PermissionsExt;
+        use std::os::unix::fs::{MetadataExt, PermissionsExt};
+        let meta = fs::symlink_metadata(path)?;
+        if meta.file_type().is_symlink() {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::PermissionDenied,
+                "Refusing symlinked directory",
+            ));
+        }
+        let uid = unsafe { libc::getuid() };
+        if meta.uid() != uid {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::PermissionDenied,
+                "Directory is not owned by the current user",
+            ));
+        }
         let _ = fs::set_permissions(path, fs::Permissions::from_mode(0o700));
     }
     Ok(path.to_path_buf())
@@ -913,6 +938,31 @@ pub fn local_addresses(include_loopback: bool) -> Vec<String> {
     addrs
 }
 
+/// Return deduplicated private IPv4 CIDR subnets (e.g. `"192.168.1.0/24"`) for active
+/// non-virtual network interfaces on this host.
+pub fn active_lan_subnets() -> Vec<String> {
+    let mut subnets = Vec::new();
+    if let Ok(interfaces) = if_addrs::get_if_addrs() {
+        for iface in interfaces {
+            if is_virtual_bridge_interface(&iface.name) {
+                continue;
+            }
+            if let if_addrs::IfAddr::V4(v4) = iface.addr {
+                if v4.ip.is_loopback() || v4.ip.is_link_local() || !v4.ip.is_private() {
+                    continue;
+                }
+                if let Ok(net) = Ipv4Net::with_netmask(v4.ip, v4.netmask) {
+                    let cidr = net.trunc().to_string();
+                    if !subnets.contains(&cidr) {
+                        subnets.push(cidr);
+                    }
+                }
+            }
+        }
+    }
+    subnets
+}
+
 pub fn broadcast_addresses(include_loopback: bool) -> Vec<String> {
     let mut targets = vec!["255.255.255.255".to_string()];
     if let Ok(interfaces) = if_addrs::get_if_addrs() {
@@ -1157,5 +1207,17 @@ mod tests {
         assert_eq!(res.returncode, 124);
         assert!(res.stderr.contains("timed out"));
         assert!(start.elapsed() < Duration::from_secs(2));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn test_ensure_dir_rejects_symlink() {
+        let dir = tempfile::tempdir().unwrap();
+        let target = dir.path().join("real");
+        fs::create_dir_all(&target).unwrap();
+        let link = dir.path().join("symlink_dir");
+        std::os::unix::fs::symlink(&target, &link).unwrap();
+        let res = ensure_dir(&link);
+        assert!(res.is_err());
     }
 }

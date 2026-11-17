@@ -6,7 +6,7 @@ use std::path::{Path, PathBuf};
 
 use hmac::{Hmac, Mac};
 use rand::Rng;
-use sha2::{Digest, Sha256};
+use sha2::Sha256;
 
 use crate::util::{config_dir, ensure_dir};
 
@@ -15,20 +15,56 @@ type HmacSha256 = Hmac<Sha256>;
 /// Standard PulseAudio native protocol cookie size (256 bytes).
 pub const PA_COOKIE_SIZE: usize = 256;
 
-/// Generate a random 6-digit numeric pairing PIN (`"000000"`..`"999999"`).
+/// Default length of generated alphanumeric pairing codes (`A-Z`, `0-9`, ~62 bits of entropy).
+pub const PAIRING_PIN_LEN: usize = 12;
+
+/// Number of PBKDF2-HMAC-SHA256 iterations used to stretch pairing secrets.
+pub const PBKDF2_ITERATIONS: u32 = 60_000;
+
+const PAIRING_ALPHABET: &[u8] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789";
+
+/// Generate a random 12-character alphanumeric pairing code (`A-Z`, `0-9`).
 pub fn generate_pairing_pin() -> String {
-    let n: u32 = rand::thread_rng().gen_range(100_000..1_000_000);
-    format!("{n:06}")
+    let mut rng = rand::thread_rng();
+    (0..PAIRING_PIN_LEN)
+        .map(|_| {
+            let idx = rng.gen_range(0..PAIRING_ALPHABET.len());
+            PAIRING_ALPHABET[idx] as char
+        })
+        .collect()
 }
 
-/// Derive a 32-byte hex key from a passphrase or PIN and salt.
+/// Derive a 32-byte hex key from a passphrase or PIN and context using PBKDF2-HMAC-SHA256.
 pub fn derive_key_hex(secret: &str, context: &str) -> String {
-    let mut hasher = Sha256::new();
-    hasher.update(b"soundhop-v2-kdf:");
-    hasher.update(context.as_bytes());
-    hasher.update(b":");
-    hasher.update(secret.trim().as_bytes());
-    hex::encode(hasher.finalize())
+    let salt = format!("soundhop-v2-kdf:{context}");
+    let password = secret.trim().as_bytes();
+    let mut mac = HmacSha256::new_from_slice(password).expect("HMAC accepts keys of any size");
+    mac.update(salt.as_bytes());
+    mac.update(&1u32.to_be_bytes());
+    let mut u = mac.finalize().into_bytes();
+    let mut out = u;
+    for _ in 1..PBKDF2_ITERATIONS {
+        let mut round_mac =
+            HmacSha256::new_from_slice(password).expect("HMAC accepts keys of any size");
+        round_mac.update(&u);
+        u = round_mac.finalize().into_bytes();
+        for (o, b) in out.iter_mut().zip(u.iter()) {
+            *o ^= *b;
+        }
+    }
+    hex::encode(out)
+}
+
+/// Constant-time byte-slice equality comparison.
+pub fn constant_time_eq(a: &[u8], b: &[u8]) -> bool {
+    if a.len() != b.len() {
+        return false;
+    }
+    let mut diff = 0u8;
+    for (&x, &y) in a.iter().zip(b.iter()) {
+        diff |= x ^ y;
+    }
+    diff == 0
 }
 
 /// Compute an HMAC-SHA256 signature hex for a message given a key (hex or raw string).
@@ -98,6 +134,41 @@ pub fn write_pa_cookie(
     Ok(target)
 }
 
+/// Ensure a 256-byte PulseAudio cookie exists on disk with `0o600` permissions.
+/// Derives from `shared_key` when provided; otherwise preserves a valid existing
+/// cookie or generates a fresh random 256-byte cookie.
+pub fn ensure_pa_cookie(shared_key: Option<&str>) -> std::io::Result<PathBuf> {
+    ensure_pa_cookie_at(None, shared_key)
+}
+
+/// Same as `ensure_pa_cookie`, targeting an optional custom path.
+pub fn ensure_pa_cookie_at(
+    path: Option<&Path>,
+    shared_key: Option<&str>,
+) -> std::io::Result<PathBuf> {
+    let target = path
+        .map(Path::to_path_buf)
+        .unwrap_or_else(soundhop_cookie_path);
+    if let Some(key) = shared_key.map(str::trim).filter(|k| !k.is_empty()) {
+        let cookie = derive_pa_cookie(key);
+        return write_pa_cookie(Some(&target), &cookie);
+    }
+    if target.exists()
+        && fs::metadata(&target)
+            .map(|m| m.len() == PA_COOKIE_SIZE as u64)
+            .unwrap_or(false)
+    {
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let _ = fs::set_permissions(&target, fs::Permissions::from_mode(0o600));
+        }
+        return Ok(target);
+    }
+    let cookie = random_pa_cookie();
+    write_pa_cookie(Some(&target), &cookie)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -105,15 +176,46 @@ mod tests {
     #[test]
     fn test_pin_and_hmac_verification() {
         let pin = generate_pairing_pin();
-        assert_eq!(pin.len(), 6);
-        assert!(pin.chars().all(|c| c.is_ascii_digit()));
+        assert_eq!(pin.len(), PAIRING_PIN_LEN);
+        assert!(pin
+            .chars()
+            .all(|c| c.is_ascii_uppercase() || c.is_ascii_digit()));
 
         let key = derive_key_hex("my-secret-passphrase", "lan");
+        assert_eq!(key.len(), 64);
+        assert_eq!(key, derive_key_hex("my-secret-passphrase", "lan"));
+        assert_ne!(key, derive_key_hex("different-passphrase", "lan"));
+
         let payload = b"soundhop:v2:offer:peer123";
         let sig = compute_hmac_hex(&key, payload);
         assert!(verify_hmac_hex(&key, payload, &sig));
         assert!(!verify_hmac_hex(&key, b"tampered", &sig));
         assert!(!verify_hmac_hex("wrong-key", payload, &sig));
+    }
+
+    #[test]
+    fn test_constant_time_eq_and_ensure_pa_cookie() {
+        assert!(constant_time_eq(b"abcdef", b"abcdef"));
+        assert!(!constant_time_eq(b"abcdef", b"abcdeg"));
+        assert!(!constant_time_eq(b"abc", b"abcd"));
+
+        let dir = tempfile::tempdir().unwrap();
+        let cookie_file = dir.path().join("pulse-cookie");
+        let p = ensure_pa_cookie_at(Some(&cookie_file), None).unwrap();
+        assert_eq!(p, cookie_file);
+        let first = fs::read(&cookie_file).unwrap();
+        assert_eq!(first.len(), PA_COOKIE_SIZE);
+
+        // Calling again without shared_key preserves the valid existing cookie
+        ensure_pa_cookie_at(Some(&cookie_file), None).unwrap();
+        assert_eq!(fs::read(&cookie_file).unwrap(), first);
+
+        // Calling with shared_key derives and overwrites deterministically
+        ensure_pa_cookie_at(Some(&cookie_file), Some("shared-key-xyz")).unwrap();
+        assert_eq!(
+            fs::read(&cookie_file).unwrap(),
+            derive_pa_cookie("shared-key-xyz").to_vec()
+        );
     }
 
     #[test]

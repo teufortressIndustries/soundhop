@@ -12,7 +12,7 @@ use soundhop_core::config::Config;
 use soundhop_core::constants::{PROTOCOL_VERSION, VERSION};
 use soundhop_core::controller::{ConnectOptions, Controller};
 use soundhop_core::daemon::Daemon;
-use soundhop_core::discovery::{discover_once, Peer};
+use soundhop_core::discovery::{discover_once_with_psk, Peer};
 use soundhop_core::firewall::{detect as detect_firewall, open_ports};
 use soundhop_core::ipc::{is_running as ipc_is_running, request as ipc_request};
 use soundhop_core::security::generate_pairing_pin;
@@ -234,7 +234,13 @@ pub fn handle_discover(controller: &Arc<Controller>, args: &DiscoverArgs, json_o
         }
     } else {
         let cfg = controller.config.lock().unwrap().clone();
-        let found = discover_once(args.timeout.max(0.3), cfg.discovery.port, &cfg.device.id);
+        let psk = (!cfg.sharing.psk_hash.is_empty()).then_some(cfg.sharing.psk_hash.as_str());
+        let found = discover_once_with_psk(
+            args.timeout.max(0.3),
+            cfg.discovery.port,
+            &cfg.device.id,
+            psk,
+        );
         for p in &found {
             controller.remember_peer(p);
         }
@@ -299,7 +305,8 @@ fn resolve_cli_peer(controller: &Arc<Controller>, target: &str) -> Result<Peer, 
         });
     }
     // Quick scan fallback
-    let scanned = discover_once(0.9, cfg.discovery.port, &cfg.device.id);
+    let psk = (!cfg.sharing.psk_hash.is_empty()).then_some(cfg.sharing.psk_hash.as_str());
+    let scanned = discover_once_with_psk(0.9, cfg.discovery.port, &cfg.device.id, psk);
     for p in scanned {
         controller.remember_peer(&p);
         if p.id.eq_ignore_ascii_case(q)

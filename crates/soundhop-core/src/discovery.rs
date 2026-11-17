@@ -21,6 +21,9 @@ use crate::util::{
 
 pub const MAGIC: &str = "soundhop";
 
+/// Maximum allowed clock skew / replay window (30 seconds) for PSK-signed UDP beacons.
+pub const MAX_BEACON_SKEW_US: u64 = 30_000_000;
+
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 pub struct Peer {
     pub id: String,
@@ -124,6 +127,9 @@ impl PeerStore {
             let mut map = self.peers.write().unwrap();
             let prev = map.get(&peer.id);
             if let Some(p) = prev {
+                if (p.security == "psk" || p.security == "pin") && peer.source == "mdns" {
+                    return false;
+                }
                 if is_same_lan_subnet(&p.host) && !is_same_lan_subnet(&peer.host) {
                     peer.host = p.host.clone();
                 }
@@ -244,6 +250,23 @@ pub fn make_beacon(
     )
 }
 
+fn beacon_signing_input(pkt: &BeaconPacket) -> String {
+    format!(
+        "{}:{}:{}:{}:{}:{}:{}:{}:{}:{}:{}",
+        pkt.magic,
+        pkt.proto,
+        pkt.msg_type,
+        pkt.id,
+        pkt.name,
+        pkt.port,
+        pkt.ver,
+        pkt.security,
+        pkt.platform,
+        pkt.ts_us,
+        pkt.reply_port.unwrap_or(0)
+    )
+}
+
 #[allow(clippy::too_many_arguments)]
 pub fn make_beacon_with_reply_port(
     device_id: &str,
@@ -272,10 +295,7 @@ pub fn make_beacon_with_reply_port(
         reply_port,
     };
     if let Some(key) = psk_key.filter(|k| !k.trim().is_empty()) {
-        let sig_input = format!(
-            "{}:{}:{}:{}:{}:{}:{}",
-            pkt.magic, pkt.proto, pkt.msg_type, pkt.id, pkt.port, pkt.security, pkt.ts_us
-        );
+        let sig_input = beacon_signing_input(&pkt);
         pkt.hmac = compute_hmac_hex(key, sig_input.as_bytes());
     }
     serde_json::to_vec(&pkt).unwrap_or_default()
@@ -297,13 +317,14 @@ pub fn parse_beacon(
         return (None, None);
     }
     if let Some(key) = psk_key.filter(|k| !k.trim().is_empty()) {
-        if pkt.hmac.is_empty() {
+        if pkt.hmac.is_empty() || pkt.ts_us == 0 {
             return (None, None);
         }
-        let sig_input = format!(
-            "{}:{}:{}:{}:{}:{}:{}",
-            pkt.magic, pkt.proto, pkt.msg_type, pkt.id, pkt.port, pkt.security, pkt.ts_us
-        );
+        let now_us = (now_secs() * 1_000_000.0) as u64;
+        if now_us.abs_diff(pkt.ts_us) > MAX_BEACON_SKEW_US {
+            return (None, None);
+        }
+        let sig_input = beacon_signing_input(&pkt);
         if !verify_hmac_hex(key, sig_input.as_bytes(), &pkt.hmac) {
             return (None, None);
         }
@@ -525,15 +546,12 @@ impl DiscoveryManager {
                                             psk.as_deref(),
                                             Some(pkt.ts_us),
                                         );
-                                        let _ = sock.send_to(&reply, sender);
-                                        if let Some(rp) = pkt.reply_port.filter(|&p| p > 0) {
-                                            if rp != sender.port() {
-                                                let _ = sock.send_to(
-                                                    &reply,
-                                                    SocketAddr::new(sender.ip(), rp),
-                                                );
-                                            }
-                                        }
+                                        let reply_target = pkt
+                                            .reply_port
+                                            .filter(|&p| p > 0)
+                                            .map(|rp| SocketAddr::new(sender.ip(), rp))
+                                            .unwrap_or(sender);
+                                        let _ = sock.send_to(&reply, reply_target);
                                     }
                                 }
                                 if let Some(peer) = peer_opt {
@@ -585,57 +603,65 @@ impl DiscoveryManager {
                             let _ = mdns.register(info);
                         }
                     }
-                    if let Ok(receiver) = mdns.browse(MDNS_SERVICE_TYPE) {
-                        let stop = Arc::clone(&self.stop_flag);
-                        let store = Arc::clone(&self.store);
-                        let own_id = self.device_id.clone();
-                        let handle = thread::spawn(move || {
-                            while !stop.load(Ordering::SeqCst) {
-                                if let Ok(ServiceEvent::ServiceResolved(info)) =
-                                    receiver.recv_timeout(Duration::from_millis(250))
-                                {
-                                    let id =
-                                        info.get_property_val_str("id").unwrap_or("").to_string();
-                                    if id.is_empty() || id == own_id {
-                                        continue;
-                                    }
-                                    let name = info
-                                        .get_property_val_str("name")
-                                        .unwrap_or("SoundHop Peer")
-                                        .to_string();
-                                    let ver = info
-                                        .get_property_val_str("ver")
-                                        .unwrap_or(VERSION)
-                                        .to_string();
-                                    let sec = info
-                                        .get_property_val_str("security")
-                                        .unwrap_or("trusted-lan")
-                                        .to_string();
-                                    let proto = info
-                                        .get_property_val_str("proto")
-                                        .and_then(|p| p.parse::<u32>().ok())
-                                        .unwrap_or(PROTOCOL_VERSION);
-                                    if let Some(host) = select_best_peer_ip(info.get_addresses()) {
-                                        if is_private_address(&host) {
-                                            store.update(Peer {
-                                                id,
-                                                name,
-                                                host,
-                                                port: info.get_port(),
-                                                version: ver,
-                                                protocol: proto,
-                                                security: sec,
-                                                platform: "linux".to_string(),
-                                                last_seen: now_secs(),
-                                                source: "mdns".to_string(),
-                                                rtt_ms: None,
-                                            });
+                    let psk_mode = self.psk_key.as_ref().is_some_and(|k| !k.trim().is_empty())
+                        || matches!(self.security.as_str(), "psk" | "pin");
+                    if !psk_mode {
+                        if let Ok(receiver) = mdns.browse(MDNS_SERVICE_TYPE) {
+                            let stop = Arc::clone(&self.stop_flag);
+                            let store = Arc::clone(&self.store);
+                            let own_id = self.device_id.clone();
+                            let handle = thread::spawn(move || {
+                                while !stop.load(Ordering::SeqCst) {
+                                    if let Ok(ServiceEvent::ServiceResolved(info)) =
+                                        receiver.recv_timeout(Duration::from_millis(250))
+                                    {
+                                        let id = info
+                                            .get_property_val_str("id")
+                                            .unwrap_or("")
+                                            .to_string();
+                                        if id.is_empty() || id == own_id {
+                                            continue;
+                                        }
+                                        let name = info
+                                            .get_property_val_str("name")
+                                            .unwrap_or("SoundHop Peer")
+                                            .to_string();
+                                        let ver = info
+                                            .get_property_val_str("ver")
+                                            .unwrap_or(VERSION)
+                                            .to_string();
+                                        let sec = info
+                                            .get_property_val_str("security")
+                                            .unwrap_or("trusted-lan")
+                                            .to_string();
+                                        let proto = info
+                                            .get_property_val_str("proto")
+                                            .and_then(|p| p.parse::<u32>().ok())
+                                            .unwrap_or(PROTOCOL_VERSION);
+                                        if let Some(host) =
+                                            select_best_peer_ip(info.get_addresses())
+                                        {
+                                            if is_private_address(&host) {
+                                                store.update(Peer {
+                                                    id,
+                                                    name,
+                                                    host,
+                                                    port: info.get_port(),
+                                                    version: ver,
+                                                    protocol: proto,
+                                                    security: sec,
+                                                    platform: "linux".to_string(),
+                                                    last_seen: now_secs(),
+                                                    source: "mdns".to_string(),
+                                                    rtt_ms: None,
+                                                });
+                                            }
                                         }
                                     }
                                 }
-                            }
-                        });
-                        *self.mdns_thread.lock().unwrap() = Some(handle);
+                            });
+                            *self.mdns_thread.lock().unwrap() = Some(handle);
+                        }
                     }
                     *self.mdns_daemon.lock().unwrap() = Some(mdns);
                 }
@@ -697,18 +723,34 @@ impl DiscoveryManager {
 
 /// Perform a one-shot discovery scan when the daemon is not running.
 pub fn discover_once(timeout_secs: f64, discovery_port: u16, own_id: &str) -> Vec<Peer> {
+    discover_once_with_psk(timeout_secs, discovery_port, own_id, None)
+}
+
+/// Perform a one-shot discovery scan, enforcing HMAC verification when `psk_key` is set.
+pub fn discover_once_with_psk(
+    timeout_secs: f64,
+    discovery_port: u16,
+    own_id: &str,
+    psk_key: Option<&str>,
+) -> Vec<Peer> {
     let store = PeerStore::new(PEER_TIMEOUT_SECS);
     let Ok(sock) = bind_udp_reusable(0) else {
         return Vec::new();
     };
     let local_port = sock.local_addr().map(|a| a.port()).ok();
+    let psk_clean = psk_key.filter(|k| !k.trim().is_empty());
+    let security = if psk_clean.is_some() {
+        "psk"
+    } else {
+        "trusted-lan"
+    };
     let probe = make_beacon_with_reply_port(
         own_id,
         &hostname_name(),
         0,
-        "trusted-lan",
+        security,
         "probe",
-        None,
+        psk_clean,
         None,
         local_port,
     );
@@ -722,7 +764,7 @@ pub fn discover_once(timeout_secs: f64, discovery_port: u16, own_id: &str) -> Ve
     while Instant::now() < deadline {
         if let Ok((len, sender)) = sock.recv_from(&mut buf) {
             let host = sender.ip().to_string();
-            let (_, peer_opt) = parse_beacon(&buf[..len], &host, "udp", None);
+            let (_, peer_opt) = parse_beacon(&buf[..len], &host, "udp", psk_clean);
             if let Some(peer) = peer_opt {
                 if peer.id != own_id {
                     store.update(peer);
@@ -769,5 +811,86 @@ mod tests {
         let (pkt, peer) = parse_beacon(&unsigned, "192.168.1.50", "udp", Some("secret-key"));
         assert!(pkt.is_none());
         assert!(peer.is_none());
+    }
+
+    #[test]
+    fn test_parse_beacon_rejects_tampered_metadata_and_stale_replay() {
+        let key = "0123456789abcdef0123456789abcdef";
+        let raw = make_beacon_with_reply_port(
+            "dev_abc",
+            "Original Name",
+            4713,
+            "psk",
+            "offer",
+            Some(key),
+            None,
+            Some(47777),
+        );
+        let mut parsed: BeaconPacket = serde_json::from_slice(&raw).unwrap();
+        parsed.name = "Spoofed Name".to_string();
+        let tampered_name = serde_json::to_vec(&parsed).unwrap();
+        assert!(
+            parse_beacon(&tampered_name, "192.168.1.50", "udp", Some(key))
+                .1
+                .is_none()
+        );
+
+        let mut parsed_rp: BeaconPacket = serde_json::from_slice(&raw).unwrap();
+        parsed_rp.reply_port = Some(9999);
+        let tampered_rp = serde_json::to_vec(&parsed_rp).unwrap();
+        assert!(parse_beacon(&tampered_rp, "192.168.1.50", "udp", Some(key))
+            .0
+            .is_none());
+
+        let stale_ts = ((now_secs() - 60.0).max(1.0) * 1_000_000.0) as u64;
+        let stale = make_beacon(
+            "dev_abc",
+            "Original Name",
+            4713,
+            "psk",
+            "offer",
+            Some(key),
+            Some(stale_ts),
+        );
+        assert!(parse_beacon(&stale, "192.168.1.50", "udp", Some(key))
+            .1
+            .is_none());
+    }
+
+    #[test]
+    fn test_peer_store_blocks_mdns_overwrite_of_psk_peer() {
+        let store = PeerStore::new(20.0);
+        let psk_peer = Peer {
+            id: "peer-1".to_string(),
+            name: "Studio".to_string(),
+            host: "192.168.1.20".to_string(),
+            port: 4713,
+            version: VERSION.to_string(),
+            protocol: PROTOCOL_VERSION,
+            security: "psk".to_string(),
+            platform: "linux".to_string(),
+            last_seen: now_secs(),
+            source: "udp".to_string(),
+            rtt_ms: None,
+        };
+        assert!(store.update(psk_peer));
+
+        let spoof_mdns = Peer {
+            id: "peer-1".to_string(),
+            name: "Studio".to_string(),
+            host: "192.168.1.99".to_string(),
+            port: 9999,
+            version: VERSION.to_string(),
+            protocol: PROTOCOL_VERSION,
+            security: "trusted-lan".to_string(),
+            platform: "linux".to_string(),
+            last_seen: now_secs(),
+            source: "mdns".to_string(),
+            rtt_ms: None,
+        };
+        assert!(!store.update(spoof_mdns));
+        let stored = store.get("peer-1").unwrap();
+        assert_eq!(stored.host, "192.168.1.20");
+        assert_eq!(stored.port, 4713);
     }
 }

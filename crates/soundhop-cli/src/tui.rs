@@ -22,7 +22,7 @@ use ratatui::text::{Line, Span};
 use ratatui::widgets::{Block, Borders, Gauge, List, ListItem, Paragraph, Tabs};
 use ratatui::{Frame, Terminal};
 use soundhop_core::controller::{ConnectOptions, Controller};
-use soundhop_core::discovery::{discover_once, DiscoveryManager, Peer};
+use soundhop_core::discovery::{discover_once_with_psk, DiscoveryManager, Peer};
 use soundhop_core::util::{is_own_non_loopback_ip, is_private_address};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -262,7 +262,9 @@ impl TuiState {
             }
             KeyCode::Char('r') => {
                 let cfg = self.controller.config.lock().unwrap().clone();
-                self.peers = discover_once(0.8, cfg.discovery.port, &cfg.device.id);
+                let psk =
+                    (!cfg.sharing.psk_hash.is_empty()).then_some(cfg.sharing.psk_hash.as_str());
+                self.peers = discover_once_with_psk(0.8, cfg.discovery.port, &cfg.device.id, psk);
                 for p in &self.peers {
                     self.controller.remember_peer(p);
                 }

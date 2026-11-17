@@ -7,7 +7,7 @@ pub mod protocol;
 use std::collections::HashMap;
 use std::io::Write;
 use std::net::{IpAddr, SocketAddr, TcpListener, TcpStream, ToSocketAddrs};
-use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU32, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 use std::thread::{self, JoinHandle};
 use std::time::Duration;
@@ -329,6 +329,9 @@ impl AudioBackend for WindowsAudioBackend {
             }
         }
         self.stop_listener_internal();
+        if matches!(security, "psk" | "pin" | "cookie") {
+            let _ = crate::security::ensure_pa_cookie(None);
+        }
         let tcp = TcpListener::bind(("0.0.0.0", port))
             .map_err(|e| BackendError::Message(format!("Could not bind TCP port {port}: {e}")))?;
         let bound_port = tcp.local_addr().map(|a| a.port()).unwrap_or(port);
@@ -338,9 +341,11 @@ impl AudioBackend for WindowsAudioBackend {
         *self.listener_port.lock().unwrap() = Some(bound_port);
         *self.listener_security.lock().unwrap() = security.to_string();
 
+        const MAX_CONCURRENT_PA_CLIENTS: usize = 16;
         let stop_clone = Arc::clone(&self.listener_stop);
         let sec_owned = security.to_string();
         let nets_owned: Vec<String> = allowed_networks.to_vec();
+        let active_clients = Arc::new(AtomicUsize::new(0));
         let handle = thread::spawn(move || {
             while !stop_clone.load(Ordering::SeqCst) {
                 match tcp.accept() {
@@ -354,9 +359,19 @@ impl AudioBackend for WindowsAudioBackend {
                         {
                             continue;
                         }
+                        let prev =
+                            active_clients.try_update(Ordering::SeqCst, Ordering::SeqCst, |cur| {
+                                (cur < MAX_CONCURRENT_PA_CLIENTS).then_some(cur + 1)
+                            });
+                        if prev.is_err() {
+                            drop(stream);
+                            continue;
+                        }
                         let client_stop = Arc::clone(&stop_clone);
                         let client_sec = sec_owned.clone();
+                        let clients_ref = Arc::clone(&active_clients);
                         thread::spawn(move || {
+                            let _slot_guard = ClientSlotGuard(clients_ref);
                             handle_incoming_pa_client(stream, client_stop, client_sec);
                         });
                     }
@@ -401,7 +416,7 @@ impl AudioBackend for WindowsAudioBackend {
         stream.set_write_timeout(Some(Duration::from_secs(3))).ok();
 
         // PulseAudio Native Protocol Handshake
-        let cookie = load_cookie_bytes();
+        let cookie = load_cookie_bytes().unwrap_or([0u8; 256]);
         stream
             .write_all(&make_command_auth(0, 35, &cookie))
             .map_err(|e| BackendError::Message(format!("PA auth send failed: {e}")))?;
@@ -612,37 +627,52 @@ fn ip_allowed(ip: &IpAddr, allowed_networks: &[String]) -> bool {
     false
 }
 
-fn load_cookie_bytes() -> [u8; 256] {
-    let mut cookie = [0u8; 256];
+struct ClientSlotGuard(Arc<AtomicUsize>);
+
+impl Drop for ClientSlotGuard {
+    fn drop(&mut self) {
+        self.0.fetch_sub(1, Ordering::SeqCst);
+    }
+}
+
+fn load_cookie_bytes() -> Option<[u8; 256]> {
     let cookie_path = crate::security::soundhop_cookie_path();
-    if let Ok(bytes) = std::fs::read(&cookie_path) {
-        let copy_len = bytes.len().min(cookie.len());
-        cookie[..copy_len].copy_from_slice(&bytes[..copy_len]);
+    let bytes = std::fs::read(&cookie_path).ok()?;
+    if bytes.len() < 256 {
+        return None;
     }
-    cookie
+    let mut cookie = [0u8; 256];
+    cookie.copy_from_slice(&bytes[..256]);
+    Some(cookie)
 }
 
-fn constant_time_eq(a: &[u8], b: &[u8]) -> bool {
-    if a.len() != b.len() {
-        return false;
-    }
-    let mut diff = 0u8;
-    for (&x, &y) in a.iter().zip(b.iter()) {
-        diff |= x ^ y;
-    }
-    diff == 0
+fn handle_incoming_pa_client(stream: TcpStream, stop_flag: Arc<AtomicBool>, security: String) {
+    let cookie_required = matches!(security.as_str(), "psk" | "pin" | "cookie");
+    let expected_cookie = if cookie_required {
+        match load_cookie_bytes() {
+            Some(c) => Some(c),
+            None => return,
+        }
+    } else {
+        None
+    };
+    handle_incoming_pa_client_with_cookie(stream, stop_flag, cookie_required, expected_cookie);
 }
 
-fn handle_incoming_pa_client(mut stream: TcpStream, stop_flag: Arc<AtomicBool>, security: String) {
+fn handle_incoming_pa_client_with_cookie(
+    mut stream: TcpStream,
+    stop_flag: Arc<AtomicBool>,
+    cookie_required: bool,
+    expected_cookie: Option<[u8; 256]>,
+) {
+    if cookie_required && expected_cookie.is_none() {
+        return;
+    }
     let _ = stream.set_nonblocking(false);
     let _ = stream.set_read_timeout(Some(Duration::from_secs(5)));
-    let player = WindowsPlayer::new(48_000, 2);
-    player.start();
 
-    let cookie_required = matches!(security.as_str(), "psk" | "pin" | "cookie")
-        && crate::security::soundhop_cookie_path().exists();
-    let expected_cookie = load_cookie_bytes();
     let mut authenticated = !cookie_required;
+    let mut player: Option<WindowsPlayer> = None;
 
     while !stop_flag.load(Ordering::SeqCst) {
         let Some(pkt) = read_packet(&mut stream) else {
@@ -660,8 +690,10 @@ fn handle_incoming_pa_client(mut stream: TcpStream, stop_flag: Arc<AtomicBool>, 
                 PA_COMMAND_AUTH => {
                     let _proto_ver = r.read_u32();
                     let client_cookie = r.read_arbitrary().unwrap_or_default();
-                    if cookie_required && !constant_time_eq(&client_cookie, &expected_cookie) {
-                        break;
+                    if let Some(ref exp) = expected_cookie {
+                        if !crate::security::constant_time_eq(&client_cookie, exp) {
+                            break;
+                        }
                     }
                     authenticated = true;
                     Some(make_reply_auth(tag, 35))
@@ -673,6 +705,11 @@ fn handle_incoming_pa_client(mut stream: TcpStream, stop_flag: Arc<AtomicBool>, 
                 PA_COMMAND_GET_SERVER_INFO => Some(make_reply_server_info(tag)),
                 PA_COMMAND_CREATE_PLAYBACK_STREAM => {
                     let spec = r.read_sample_spec().unwrap_or_default();
+                    if player.is_none() {
+                        let wp = WindowsPlayer::new(48_000, 2);
+                        wp.start();
+                        player = Some(wp);
+                    }
                     Some(make_reply_create_playback_stream(tag, 0, 0, spec))
                 }
                 _ => Some(make_reply_ok(tag)),
@@ -683,12 +720,19 @@ fn handle_incoming_pa_client(mut stream: TcpStream, stop_flag: Arc<AtomicBool>, 
                 }
             }
         } else if authenticated {
-            player.write(&pkt.data);
+            let p = player.get_or_insert_with(|| {
+                let wp = WindowsPlayer::new(48_000, 2);
+                wp.start();
+                wp
+            });
+            p.write(&pkt.data);
         } else {
             break;
         }
     }
-    player.close();
+    if let Some(p) = player {
+        p.close();
+    }
 }
 
 #[cfg(test)]
@@ -720,5 +764,53 @@ mod tests {
 
         sender.disconnect_tunnel("soundhop_test_win").unwrap();
         receiver.remove_listener(listener.module_id).unwrap();
+    }
+
+    #[test]
+    fn test_windows_pa_client_cookie_fail_closed() {
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let addr = listener.local_addr().unwrap();
+        let stop = Arc::new(AtomicBool::new(false));
+        let stop_c = Arc::clone(&stop);
+
+        // Missing cookie fails closed immediately
+        let h1 = thread::spawn(move || {
+            let (s, _) = listener.accept().unwrap();
+            handle_incoming_pa_client_with_cookie(s, stop_c, true, None);
+        });
+        let mut c1 = TcpStream::connect(addr).unwrap();
+        let _ = c1.write_all(&make_command_auth(0, 35, &[0u8; 256]));
+        assert!(read_packet(&mut c1).is_none());
+        h1.join().unwrap();
+
+        // Wrong cookie is rejected; right cookie succeeds
+        let listener2 = TcpListener::bind("127.0.0.1:0").unwrap();
+        let addr2 = listener2.local_addr().unwrap();
+        let expected = [0x42u8; 256];
+        let stop_c2 = Arc::clone(&stop);
+        let h2 = thread::spawn(move || {
+            for _ in 0..2 {
+                let (s, _) = listener2.accept().unwrap();
+                let sc = Arc::clone(&stop_c2);
+                handle_incoming_pa_client_with_cookie(s, sc, true, Some(expected));
+            }
+        });
+
+        let mut bad_client = TcpStream::connect(addr2).unwrap();
+        bad_client
+            .write_all(&make_command_auth(0, 35, &[0x99u8; 256]))
+            .unwrap();
+        assert!(read_packet(&mut bad_client).is_none());
+
+        let mut good_client = TcpStream::connect(addr2).unwrap();
+        good_client
+            .write_all(&make_command_auth(0, 35, &expected))
+            .unwrap();
+        let reply = read_packet(&mut good_client).unwrap();
+        let mut r = TagStructReader::new(&reply.data);
+        assert_eq!(r.read_u32().unwrap(), PA_COMMAND_REPLY);
+        drop(good_client);
+        stop.store(true, Ordering::SeqCst);
+        h2.join().unwrap();
     }
 }

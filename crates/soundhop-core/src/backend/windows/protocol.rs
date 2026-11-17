@@ -50,6 +50,8 @@ pub const PA_SAMPLE_S16LE: u8 = 3;
 pub const PA_SAMPLE_FLOAT32LE: u8 = 5;
 
 pub const PA_CONTROL_CHANNEL: u32 = 0xFFFF_FFFF;
+pub const MAX_CONTROL_PACKET_BYTES: usize = 64 * 1024;
+pub const MAX_AUDIO_PACKET_BYTES: usize = 4 * 1024 * 1024;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct SampleSpec {
@@ -361,7 +363,12 @@ pub fn read_packet<R: Read>(stream: &mut R) -> Option<Packet> {
     stream.read_exact(&mut header).ok()?;
     let channel = u32::from_be_bytes([header[0], header[1], header[2], header[3]]);
     let length = u32::from_be_bytes([header[4], header[5], header[6], header[7]]) as usize;
-    if length > 16 * 1024 * 1024 {
+    let max_len = if channel == PA_CONTROL_CHANNEL {
+        MAX_CONTROL_PACKET_BYTES
+    } else {
+        MAX_AUDIO_PACKET_BYTES
+    };
+    if length > max_len {
         return None;
     }
     let mut data = vec![0u8; length];
@@ -501,5 +508,12 @@ mod tests {
         assert_eq!(r.read_sample_spec().unwrap(), SampleSpec::default());
         assert_eq!(r.read_arbitrary().unwrap(), vec![1, 2, 3, 4]);
         assert_eq!(r.remaining(), 0);
+
+        // Oversized control packet is rejected without allocating
+        let mut oversized_hdr = Vec::new();
+        oversized_hdr.extend_from_slice(&PA_CONTROL_CHANNEL.to_be_bytes());
+        oversized_hdr.extend_from_slice(&((MAX_CONTROL_PACKET_BYTES + 1) as u32).to_be_bytes());
+        let mut bad_cur = Cursor::new(oversized_hdr);
+        assert!(read_packet(&mut bad_cur).is_none());
     }
 }

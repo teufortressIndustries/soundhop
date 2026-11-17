@@ -9,8 +9,10 @@ use crate::backend::{
     listener_security_from_args, AudioBackend, BackendError, Listener, Module, Sink, SinkInput,
     SinkInputInfo, Source, SourceOutput, SourceTunnelParams, TunnelParams,
 };
-use crate::constants::{SINK_PREFIX, SINK_TIMEOUT_SECS, SOURCE_PREFIX, SOURCE_TIMEOUT_SECS};
-use crate::security::soundhop_cookie_path;
+use crate::constants::{
+    DEFAULT_LAN_NETWORKS, SINK_PREFIX, SINK_TIMEOUT_SECS, SOURCE_PREFIX, SOURCE_TIMEOUT_SECS,
+};
+use crate::security::{ensure_pa_cookie, soundhop_cookie_path};
 use crate::util::{sanitize_sink_name, tcp_server_arg, CommandResult, ProcessRunner, SystemRunner};
 
 pub struct LinuxAudioBackend {
@@ -649,31 +651,13 @@ impl AudioBackend for LinuxAudioBackend {
         }
 
         let args: Vec<String> = match security {
-            "cookie" => vec![format!("port={port}")],
-            "psk" | "pin" => {
-                let cookie_file = soundhop_cookie_path();
-                if cookie_file.exists() {
-                    vec![
-                        format!("port={port}"),
-                        format!("auth-cookie={}", cookie_file.display()),
-                        "auth-cookie-enabled=1".to_string(),
-                    ]
-                } else {
-                    vec![format!("port={port}")]
-                }
+            "psk" | "pin" | "cookie" => {
+                let cookie_file = ensure_pa_cookie(None).map_err(|e| {
+                    BackendError::Message(format!("Failed to prepare PulseAudio cookie: {e}"))
+                })?;
+                build_listener_args(port, security, allowed_networks, Some(&cookie_file))
             }
-            "open" => vec![format!("port={port}"), "auth-anonymous=1".to_string()],
-            _ => {
-                let mut nets: Vec<String> = allowed_networks.to_vec();
-                if !nets.iter().any(|n| n == "127.0.0.1") {
-                    nets.insert(0, "127.0.0.1".to_string());
-                }
-                vec![
-                    format!("port={port}"),
-                    "auth-anonymous=1".to_string(),
-                    format!("auth-ip-acl={}", nets.join(";")),
-                ]
-            }
+            _ => build_listener_args(port, security, allowed_networks, None),
         };
         let module_id = self.load_module("module-native-protocol-tcp", &args)?;
         Ok(Listener {
@@ -699,6 +683,11 @@ impl AudioBackend for LinuxAudioBackend {
             }
         }
 
+        let safe_extra: Vec<String> = params
+            .extra_args
+            .iter()
+            .filter_map(|arg| crate::config::validate_extra_tunnel_arg(arg).ok())
+            .collect();
         let safe_desc = sanitize_sink_name(params.description, 64).replace('_', "-");
         let mut args = vec![
             format!("server={}", tcp_server_arg(params.host, params.port)),
@@ -715,22 +704,20 @@ impl AudioBackend for LinuxAudioBackend {
                 args.push(format!("latency_msec={lat}"));
             }
         }
-        if !params.extra_args.iter().any(|x| x.starts_with("rate=")) {
+        if !safe_extra.iter().any(|x| x.starts_with("rate=")) {
             args.push("rate=48000".to_string());
         }
-        if !params.extra_args.iter().any(|x| x.starts_with("channels=")) {
+        if !safe_extra.iter().any(|x| x.starts_with("channels=")) {
             args.push("channels=2".to_string());
         }
-        if !params.extra_args.iter().any(|x| x.starts_with("format=")) {
+        if !safe_extra.iter().any(|x| x.starts_with("format=")) {
             args.push("format=s16le".to_string());
         }
-        if !params.extra_args.iter().any(|x| x.starts_with("cookie=")) {
-            let cookie_file = soundhop_cookie_path();
-            if cookie_file.exists() {
-                args.push(format!("cookie={}", cookie_file.display()));
-            }
+        let cookie_file = soundhop_cookie_path();
+        if cookie_file.exists() {
+            args.push(format!("cookie={}", cookie_file.display()));
         }
-        args.extend(params.extra_args.iter().cloned());
+        args.extend(safe_extra);
         args.push(format!(
             "sink_properties=device.description=SoundHop-{safe_desc}"
         ));
@@ -811,16 +798,25 @@ impl AudioBackend for LinuxAudioBackend {
                 args.push(format!("latency_msec={lat}"));
             }
         }
-        args.push("rate=48000".to_string());
-        args.push("channels=2".to_string());
-        args.push("format=s16le".to_string());
-        if !params.extra_args.iter().any(|x| x.starts_with("cookie=")) {
-            let cookie_file = soundhop_cookie_path();
-            if cookie_file.exists() {
-                args.push(format!("cookie={}", cookie_file.display()));
-            }
+        let safe_extra: Vec<String> = params
+            .extra_args
+            .iter()
+            .filter_map(|arg| crate::config::validate_extra_tunnel_arg(arg).ok())
+            .collect();
+        if !safe_extra.iter().any(|x| x.starts_with("rate=")) {
+            args.push("rate=48000".to_string());
         }
-        args.extend(params.extra_args.iter().cloned());
+        if !safe_extra.iter().any(|x| x.starts_with("channels=")) {
+            args.push("channels=2".to_string());
+        }
+        if !safe_extra.iter().any(|x| x.starts_with("format=")) {
+            args.push("format=s16le".to_string());
+        }
+        let cookie_file = soundhop_cookie_path();
+        if cookie_file.exists() {
+            args.push(format!("cookie={}", cookie_file.display()));
+        }
+        args.extend(safe_extra);
         args.push(format!(
             "source_properties=device.description=SoundHop-Microphone-{safe_desc}"
         ));
@@ -1115,6 +1111,63 @@ impl AudioBackend for LinuxAudioBackend {
     }
 }
 
+fn effective_allowed_networks(allowed_networks: &[String]) -> Vec<String> {
+    let is_default_broad = allowed_networks.len() == DEFAULT_LAN_NETWORKS.len()
+        && allowed_networks
+            .iter()
+            .zip(DEFAULT_LAN_NETWORKS.iter())
+            .all(|(a, b)| a == b);
+    let mut nets: Vec<String> = if is_default_broad {
+        let active = crate::util::active_lan_subnets();
+        if !active.is_empty() {
+            let mut scoped = vec!["127.0.0.1".to_string(), "::1".to_string()];
+            for sub in active {
+                if !scoped.contains(&sub) {
+                    scoped.push(sub);
+                }
+            }
+            scoped
+        } else {
+            allowed_networks.to_vec()
+        }
+    } else {
+        allowed_networks.to_vec()
+    };
+    if !nets.iter().any(|n| n == "127.0.0.1") {
+        nets.insert(0, "127.0.0.1".to_string());
+    }
+    nets
+}
+
+fn build_listener_args(
+    port: u16,
+    security: &str,
+    allowed_networks: &[String],
+    cookie_path: Option<&std::path::Path>,
+) -> Vec<String> {
+    match security {
+        "psk" | "pin" | "cookie" => {
+            let nets = effective_allowed_networks(allowed_networks);
+            let mut args = vec![format!("port={port}")];
+            if let Some(cookie_file) = cookie_path {
+                args.push(format!("auth-cookie={}", cookie_file.display()));
+            }
+            args.push("auth-cookie-enabled=1".to_string());
+            args.push(format!("auth-ip-acl={}", nets.join(";")));
+            args
+        }
+        "open" => vec![format!("port={port}"), "auth-anonymous=1".to_string()],
+        _ => {
+            let nets = effective_allowed_networks(allowed_networks);
+            vec![
+                format!("port={port}"),
+                "auth-anonymous=1".to_string(),
+                format!("auth-ip-acl={}", nets.join(";")),
+            ]
+        }
+    }
+}
+
 fn extract_first_percentage(text: &str) -> Option<u32> {
     for part in text.split('%') {
         let digits: String = part
@@ -1254,5 +1307,68 @@ mod tests {
             )
             .unwrap();
         assert_eq!(mod_id, 42);
+    }
+
+    #[test]
+    fn test_linux_backend_filters_unsafe_extra_args_and_builds_cookie_acl() {
+        let cookie = std::path::Path::new("/tmp/test-soundhop-cookie");
+        let args = build_listener_args(4713, "psk", &["192.168.1.0/24".to_string()], Some(cookie));
+        assert!(args.contains(&"auth-cookie=/tmp/test-soundhop-cookie".to_string()));
+        assert!(args.contains(&"auth-cookie-enabled=1".to_string()));
+        assert!(args.contains(&"auth-ip-acl=127.0.0.1;192.168.1.0/24".to_string()));
+        assert!(!args.contains(&"auth-anonymous=1".to_string()));
+
+        let recorded = Arc::new(Mutex::new(Vec::<Vec<String>>::new()));
+        let rec_c = Arc::clone(&recorded);
+        let loaded = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let loaded_c = Arc::clone(&loaded);
+        let runner = Arc::new(MockRunner::new(move |call_args, _| {
+            rec_c.lock().unwrap().push(call_args.to_vec());
+            let joined = call_args.join(" ");
+            let stdout = if joined.contains("list short sinks") {
+                if loaded_c.load(std::sync::atomic::Ordering::SeqCst) {
+                    "1\talsa_output.pci\tPipeWire\ts16le 2ch 48000Hz\tRUNNING\n2\tsoundhop_peer_1\tmodule-tunnel-sink\ts16le 2ch 48000Hz\tRUNNING\n"
+                } else {
+                    "1\talsa_output.pci\tPipeWire\ts16le 2ch 48000Hz\tRUNNING\n"
+                }
+            } else if joined.contains("load-module") {
+                loaded_c.store(true, std::sync::atomic::Ordering::SeqCst);
+                "77\n"
+            } else {
+                ""
+            };
+            Ok(CommandResult {
+                args: call_args.to_vec(),
+                returncode: 0,
+                stdout: stdout.to_string(),
+                stderr: String::new(),
+            })
+        }));
+        let backend = LinuxAudioBackend::with_runner(runner);
+        let extra = vec![
+            "cookie=/etc/shadow".to_string(),
+            "server=tcp:evil:4713".to_string(),
+            "latency_msec=90".to_string(),
+        ];
+        let mid = backend
+            .connect_tunnel(&TunnelParams {
+                host: "192.168.1.50",
+                port: 4713,
+                sink_name: "soundhop_peer_1",
+                description: "Peer1",
+                reconnect_delay_ms: 3000,
+                latency_ms: None,
+                extra_args: &extra,
+            })
+            .unwrap();
+        assert_eq!(mid, 77);
+        let calls = recorded.lock().unwrap();
+        let load_call = calls
+            .iter()
+            .find(|c| c.iter().any(|a| a == "load-module"))
+            .unwrap();
+        assert!(!load_call.iter().any(|a| a == "cookie=/etc/shadow"));
+        assert!(!load_call.iter().any(|a| a == "server=tcp:evil:4713"));
+        assert!(load_call.iter().any(|a| a == "latency_msec=90"));
     }
 }

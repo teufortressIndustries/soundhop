@@ -311,6 +311,11 @@ impl Config {
             self.connection.latency_ms = None;
         }
         self.connection.disconnect_grace_s = self.connection.disconnect_grace_s.max(3.0);
+        let mut validated_extra = Vec::with_capacity(self.connection.extra_tunnel_args.len());
+        for arg in &self.connection.extra_tunnel_args {
+            validated_extra.push(validate_extra_tunnel_arg(arg)?);
+        }
+        self.connection.extra_tunnel_args = validated_extra;
 
         let mode = self.routing.default_mode.trim().to_lowercase();
         self.routing.default_mode = if mode == "selective" {
@@ -461,6 +466,48 @@ fn clean_app_list(list: &[String]) -> Vec<String> {
     out
 }
 
+/// Validate a `connection.extra_tunnel_args` entry against an explicit allowlist of safe
+/// PulseAudio tunnel parameters, preventing path (`cookie=`) or endpoint (`server=`) injection.
+pub fn validate_extra_tunnel_arg(raw: &str) -> Result<String, ConfigError> {
+    let trimmed = raw.trim();
+    if trimmed.is_empty()
+        || trimmed.chars().any(|c| c.is_whitespace() || c.is_control())
+        || trimmed.contains('/')
+        || trimmed.contains('\\')
+        || trimmed.contains(';')
+        || trimmed.contains('"')
+        || trimmed.contains('\'')
+        || trimmed.contains("..")
+    {
+        return Err(ConfigError::Invalid(format!(
+            "Unsafe character in connection.extra_tunnel_args: {raw:?}"
+        )));
+    }
+    let Some((key, val)) = trimmed.split_once('=') else {
+        return Err(ConfigError::Invalid(format!(
+            "Tunnel argument must be key=value: {trimmed}"
+        )));
+    };
+    if !matches!(
+        key,
+        "rate" | "channels" | "format" | "latency_msec" | "reconnect_delay_msec"
+    ) {
+        return Err(ConfigError::Invalid(format!(
+            "Disallowed tunnel argument key in connection.extra_tunnel_args: {key}"
+        )));
+    }
+    if val.is_empty()
+        || !val
+            .chars()
+            .all(|c| c.is_ascii_alphanumeric() || c == '_' || c == '-' || c == '.')
+    {
+        return Err(ConfigError::Invalid(format!(
+            "Invalid value in connection.extra_tunnel_args for {key}: {val}"
+        )));
+    }
+    Ok(trimmed.to_string())
+}
+
 fn resolve_config_alias(dotted: &str) -> &str {
     match dotted {
         "connection.auto_reconnect" => "connection.auto_connect",
@@ -557,5 +604,28 @@ mod tests {
         let mut cfg = Config::default();
         cfg.sharing.allowed_networks = vec!["not-an-ip".to_string()];
         assert!(cfg.normalize().is_err());
+    }
+
+    #[test]
+    fn test_extra_tunnel_args_rejects_cookie_and_server_injection() {
+        let mut cfg = Config::default();
+        cfg.connection.extra_tunnel_args =
+            vec!["rate=44100".to_string(), "latency_msec=80".to_string()];
+        assert!(cfg.normalize().is_ok());
+
+        for bad in [
+            "cookie=/etc/shadow",
+            "server=tcp:evil:4713",
+            "sink_name=custom",
+            "rate=48000;evil",
+            "latency_msec=../10",
+        ] {
+            let mut bad_cfg = Config::default();
+            bad_cfg.connection.extra_tunnel_args = vec![bad.to_string()];
+            assert!(
+                bad_cfg.normalize().is_err(),
+                "expected {bad:?} to be rejected"
+            );
+        }
     }
 }

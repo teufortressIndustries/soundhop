@@ -18,7 +18,8 @@ use thiserror::Error;
 use crate::backend::AudioBackend;
 use crate::constants::{
     DEFAULT_AUDIO_BIT_RATE, DEFAULT_AUDIO_BUFFER_MS, DEFAULT_AUDIO_CODEC, DEFAULT_SCRCPY_VERSION,
-    SUPPORTED_AUDIO_CODECS,
+    SCRCPY_V3_1_SHA256_LINUX_X86_64, SCRCPY_V3_1_SHA256_WIN64, SUPPORTED_AUDIO_CODECS,
+    SUPPORTED_AUDIO_SOURCES,
 };
 use crate::util::{
     data_dir, home_dir, is_executable, now_secs, which_binary, CommandResult, ProcessRunner,
@@ -317,9 +318,27 @@ impl AndroidManager {
         }
         drop(out_file);
 
-        if let Some(expected) = expected_sha256.map(str::trim).filter(|s| !s.is_empty()) {
+        let pinned_sha256: Option<&str> = expected_sha256
+            .map(str::trim)
+            .filter(|s| !s.is_empty())
+            .or_else(|| {
+                if ver == DEFAULT_SCRCPY_VERSION {
+                    if cfg!(windows) {
+                        Some(SCRCPY_V3_1_SHA256_WIN64)
+                    } else if std::env::consts::ARCH == "x86_64" {
+                        Some(SCRCPY_V3_1_SHA256_LINUX_X86_64)
+                    } else {
+                        None
+                    }
+                } else {
+                    None
+                }
+            });
+
+        if let Some(expected) = pinned_sha256 {
             let actual = hex::encode(hasher.finalize());
-            if !actual.eq_ignore_ascii_case(expected) {
+            let expected_lower = expected.to_ascii_lowercase();
+            if !crate::security::constant_time_eq(actual.as_bytes(), expected_lower.as_bytes()) {
                 let _ = fs::remove_file(&archive_path);
                 return Err(AndroidError::Message(format!(
                     "SHA-256 checksum mismatch: expected {expected}, got {actual}"
@@ -348,9 +367,10 @@ impl AndroidManager {
             )
         })?;
         let mut full = vec![adb_bin.to_string_lossy().to_string()];
-        if let Some(s) = serial.filter(|s| !s.is_empty()) {
+        if let Some(s) = serial.filter(|s| !s.trim().is_empty()) {
+            let clean = validate_adb_target(s)?;
             full.push("-s".to_string());
-            full.push(s.to_string());
+            full.push(clean.to_string());
         }
         for a in args {
             full.push((*a).to_string());
@@ -401,10 +421,14 @@ impl AndroidManager {
     }
 
     pub fn connect_wifi(&self, host: &str, port: u16) -> (bool, String) {
-        let target = if host.contains(':') {
-            host.to_string()
+        let clean_host = match validate_adb_target(host) {
+            Ok(h) => h,
+            Err(e) => return (false, e.to_string()),
+        };
+        let target = if clean_host.contains(':') {
+            clean_host.to_string()
         } else {
-            format!("{host}:{port}")
+            format!("{clean_host}:{port}")
         };
         match self.run_adb(&["connect", &target], None) {
             Ok(res) => {
@@ -420,9 +444,16 @@ impl AndroidManager {
     }
 
     pub fn disconnect_wifi(&self, target: Option<&str>) -> (bool, String) {
-        let args: Vec<&str> = match target {
-            Some(t) if !t.is_empty() => vec!["disconnect", t],
-            _ => vec!["disconnect"],
+        let clean_target = match target.filter(|t| !t.trim().is_empty()) {
+            Some(t) => match validate_adb_target(t) {
+                Ok(c) => Some(c),
+                Err(e) => return (false, e.to_string()),
+            },
+            None => None,
+        };
+        let args: Vec<&str> = match clean_target {
+            Some(t) => vec!["disconnect", t],
+            None => vec!["disconnect"],
         };
         match self.run_adb(&args, None) {
             Ok(res) => (true, res.stdout.trim().to_string()),
@@ -438,9 +469,10 @@ impl AndroidManager {
             scrcpy_bin.to_string_lossy().to_string(),
             "--list-encoders".to_string(),
         ];
-        if let Some(s) = serial.filter(|s| !s.is_empty()) {
+        if let Some(s) = serial.filter(|s| !s.trim().is_empty()) {
+            let clean = validate_adb_target(s)?;
             args.push("-s".to_string());
-            args.push(s.to_string());
+            args.push(clean.to_string());
         }
         let Ok(res) = self.runner.run(&args, None, Duration::from_secs(10)) else {
             return Ok(default_encoders());
@@ -458,13 +490,14 @@ impl AndroidManager {
         bit_rate: Option<u32>,
         duplicate: bool,
     ) -> Result<Vec<String>, AndroidError> {
+        let clean_serial = validate_adb_target(serial)?;
         let scrcpy_bin = self
             .find_scrcpy()
             .ok_or_else(|| AndroidError::Message("scrcpy binary not found.".to_string()))?;
         let mut cmd = vec![
             scrcpy_bin.to_string_lossy().to_string(),
             "-s".to_string(),
-            serial.to_string(),
+            clean_serial.to_string(),
             "--no-video".to_string(),
             "--no-window".to_string(),
             "--no-control".to_string(),
@@ -475,7 +508,13 @@ impl AndroidManager {
             cmd.push(format!("--audio-codec={codec_clean}"));
         }
         if let Some(src) = source.map(str::trim).filter(|s| !s.is_empty()) {
-            cmd.push(format!("--audio-source={}", src.to_lowercase()));
+            let src_clean = src.to_lowercase();
+            if !SUPPORTED_AUDIO_SOURCES.contains(&src_clean.as_str()) {
+                return Err(AndroidError::Message(format!(
+                    "Unsupported Android audio source: {src}"
+                )));
+            }
+            cmd.push(format!("--audio-source={src_clean}"));
         }
         if let Some(buf) = buffer_ms.filter(|&b| b > 0) {
             cmd.push(format!("--audio-buffer={buf}"));
@@ -488,6 +527,20 @@ impl AndroidManager {
         }
         Ok(cmd)
     }
+}
+
+/// Validate an ADB device serial or `host[:port]` target to prevent CLI option injection.
+pub fn validate_adb_target(value: &str) -> Result<&str, AndroidError> {
+    let trimmed = value.trim();
+    if trimmed.is_empty()
+        || trimmed.starts_with('-')
+        || trimmed.chars().any(|c| c.is_whitespace() || c.is_control())
+    {
+        return Err(AndroidError::Message(format!(
+            "Invalid ADB target or device serial: {value:?}"
+        )));
+    }
+    Ok(trimmed)
 }
 
 pub fn parse_adb_devices_output(stdout: &str) -> Vec<AdbDevice> {
@@ -975,5 +1028,39 @@ mod tests {
         let info = parse_scrcpy_encoders(enc_out);
         assert!(info.codecs.contains_key("opus"));
         assert!(info.codecs.contains_key("aac"));
+    }
+
+    #[test]
+    fn test_validate_adb_target_and_capture_args() {
+        assert_eq!(
+            validate_adb_target("192.168.1.10:5555").unwrap(),
+            "192.168.1.10:5555"
+        );
+        assert!(validate_adb_target("--help").is_err());
+        assert!(validate_adb_target("-s").is_err());
+        assert!(validate_adb_target("abc def").is_err());
+        assert!(validate_adb_target("   ").is_err());
+
+        let dir = tempfile::tempdir().unwrap();
+        let fake_scrcpy = dir.path().join("scrcpy");
+        fs::write(&fake_scrcpy, b"#!/bin/sh\n").unwrap();
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            fs::set_permissions(&fake_scrcpy, fs::Permissions::from_mode(0o755)).unwrap();
+        }
+        let mgr = AndroidManager::new(&fake_scrcpy.to_string_lossy(), "");
+
+        assert!(mgr
+            .build_capture_args("-evil", "opus", Some("output"), None, None, false)
+            .is_err());
+        assert!(mgr
+            .build_capture_args("R58M123", "opus", Some("invalid_source"), None, None, false)
+            .is_err());
+        let args = mgr
+            .build_capture_args("R58M123", "opus", Some("output"), Some(50), None, false)
+            .unwrap();
+        assert!(args.contains(&"--audio-source=output".to_string()));
+        assert!(args.contains(&"R58M123".to_string()));
     }
 }

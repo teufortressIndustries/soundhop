@@ -2,7 +2,7 @@
 //! or authenticated localhost TCP (Windows / fallback).
 
 use std::fs;
-use std::io::{BufRead, BufReader, Write};
+use std::io::{BufRead, BufReader, Read, Write};
 use std::net::{SocketAddr, TcpListener, TcpStream};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -134,6 +134,8 @@ impl IpcServer {
     }
 }
 
+const MAX_IPC_LINE_BYTES: u64 = 64 * 1024;
+
 fn serve_stream<S: std::io::Read + Write>(
     mut stream: S,
     expected_token: Option<String>,
@@ -141,16 +143,27 @@ fn serve_stream<S: std::io::Read + Write>(
 ) {
     let mut line = String::new();
     {
-        let mut reader = BufReader::new(&mut stream);
+        let limited = (&mut stream).take(MAX_IPC_LINE_BYTES);
+        let mut reader = BufReader::new(limited);
         if reader.read_line(&mut line).is_err() || line.trim().is_empty() {
             return;
         }
+    }
+    if line.len() as u64 >= MAX_IPC_LINE_BYTES && !line.ends_with('\n') {
+        let resp = serde_json::json!({
+            "ok": false,
+            "error": "IPC request exceeds maximum line length"
+        });
+        let mut encoded = serde_json::to_vec(&resp).unwrap_or_else(|_| b"{}".to_vec());
+        encoded.push(b'\n');
+        let _ = stream.write_all(&encoded);
+        return;
     }
     let response = match serde_json::from_str::<Value>(line.trim()) {
         Ok(Value::Object(map)) => {
             if let Some(ref exp) = expected_token {
                 let provided = map.get("auth").and_then(|v| v.as_str()).unwrap_or("");
-                if provided != exp {
+                if !crate::security::constant_time_eq(provided.as_bytes(), exp.as_bytes()) {
                     serde_json::json!({
                         "ok": false,
                         "error": "Unauthorized: invalid or missing IPC authentication token"

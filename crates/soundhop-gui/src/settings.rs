@@ -454,18 +454,18 @@ impl SettingsApp {
     fn render_security_tab(&mut self, ui: &mut egui::Ui) {
         ui.heading("PIN / Pre-Shared Key (PSK) Pairing & HMAC Beacons");
         ui.label(
-            "Pair devices with a shared 6-digit PIN to sign UDP discovery beacons with HMAC-SHA256 and synchronize a 256-byte PulseAudio cookie.",
+            "Pair devices with a shared pairing code or passphrase to sign UDP discovery beacons with HMAC-SHA256 and synchronize a 256-byte PulseAudio cookie.",
         );
         ui.add_space(8.0);
 
         ui.horizontal(|ui| {
-            if ui.button("Generate 6-Digit PIN").clicked() {
+            if ui.button("Generate 12-Char Pairing Code").clicked() {
                 self.generated_pin = generate_pairing_pin();
                 self.pairing_pin_input = self.generated_pin.clone();
             }
             if !self.generated_pin.is_empty() {
                 ui.label(
-                    egui::RichText::new(format!("Generated PIN: {}", self.generated_pin))
+                    egui::RichText::new(format!("Generated Code: {}", self.generated_pin))
                         .strong()
                         .size(16.0),
                 );
@@ -474,13 +474,15 @@ impl SettingsApp {
 
         ui.add_space(8.0);
         ui.horizontal(|ui| {
-            ui.label("Enter Shared PIN:");
+            ui.label("Enter Shared Code / PIN:");
             ui.text_edit_singleline(&mut self.pairing_pin_input);
             if ui.button("Apply PIN & Sync Cookie").clicked() {
                 let pin = self.pairing_pin_input.trim();
-                if pin.len() < 4 {
-                    self.status_banner =
-                        Some(("PIN must be at least 4 characters.".to_string(), false));
+                if pin.len() < 6 {
+                    self.status_banner = Some((
+                        "Pairing code / PIN must be at least 6 characters.".to_string(),
+                        false,
+                    ));
                 } else {
                     let shared_key = derive_key_hex(pin, "soundhop-pair");
                     let cookie = derive_pa_cookie(&shared_key);
