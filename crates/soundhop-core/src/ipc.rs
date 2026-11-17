@@ -295,25 +295,104 @@ pub fn is_soundhop_process(pid: u64) -> bool {
     }
 }
 
-pub fn is_running(path: Option<&Path>) -> bool {
-    let Ok(resp) = request(
+/// Finds a running user-owned `soundhop` process invoked with the given subcommand argument
+/// (e.g., `"tray"`), used as a fallback when upgrading from versions without lock metadata.
+pub fn find_soundhop_process_with_arg(arg: &str) -> Option<u64> {
+    #[cfg(target_os = "linux")]
+    {
+        use std::os::unix::fs::MetadataExt;
+        let uid = unsafe { libc::getuid() };
+        let self_pid = u64::from(std::process::id());
+        let Ok(entries) = fs::read_dir("/proc") else {
+            return None;
+        };
+        for entry in entries.flatten() {
+            let name = entry.file_name();
+            let Some(pid_str) = name.to_str() else {
+                continue;
+            };
+            let Ok(pid) = pid_str.parse::<u64>() else {
+                continue;
+            };
+            if pid <= 1 || pid == self_pid {
+                continue;
+            }
+            let Ok(meta) = entry.metadata() else {
+                continue;
+            };
+            if meta.uid() != uid {
+                continue;
+            }
+            let Ok(cmdline) = fs::read(entry.path().join("cmdline")) else {
+                continue;
+            };
+            let args: Vec<String> = cmdline
+                .split(|&b| b == 0)
+                .filter(|s| !s.is_empty())
+                .map(|s| String::from_utf8_lossy(s).into_owned())
+                .collect();
+            let is_soundhop = args
+                .first()
+                .is_some_and(|exe| exe.to_lowercase().contains("soundhop"))
+                || fs::read_to_string(entry.path().join("comm"))
+                    .is_ok_and(|c| c.to_lowercase().contains("soundhop"));
+            if is_soundhop && args.iter().skip(1).any(|a| a == arg) {
+                return Some(pid);
+            }
+        }
+        None
+    }
+    #[cfg(not(target_os = "linux"))]
+    {
+        let _ = arg;
+        None
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct IpcPingInfo {
+    pub pid: Option<u64>,
+    pub version: String,
+    pub pong: bool,
+}
+
+pub fn ping(path: Option<&Path>) -> Option<IpcPingInfo> {
+    let resp = request(
         "ping",
         serde_json::json!({}),
         path,
         Duration::from_millis(500),
-    ) else {
-        return false;
-    };
-    let ver_opt = resp
+    )
+    .ok()?;
+    let pong = resp.get("pong").and_then(|v| v.as_bool()).unwrap_or(false);
+    if !pong {
+        return None;
+    }
+    let version = resp
         .get("version")
         .or_else(|| resp.get("daemon").and_then(|d| d.get("version")))
-        .and_then(|v| v.as_str());
-    if let Some(ver) = ver_opt {
-        if ver != crate::constants::VERSION {
-            return false;
-        }
+        .and_then(|v| v.as_str())
+        .unwrap_or("")
+        .to_string();
+    let pid = resp
+        .get("pid")
+        .or_else(|| resp.get("daemon").and_then(|d| d.get("pid")))
+        .and_then(|v| v.as_u64());
+    Some(IpcPingInfo { pid, version, pong })
+}
+
+pub fn is_reachable(path: Option<&Path>) -> bool {
+    ping(path).is_some()
+}
+
+pub fn is_running(path: Option<&Path>) -> bool {
+    let Some(info) = ping(path) else {
+        return false;
+    };
+    if !info.version.is_empty() && info.version != crate::constants::VERSION {
+        return false;
     }
-    resp.get("pong").and_then(|v| v.as_bool()).unwrap_or(false)
+    info.pong
 }
 
 #[cfg(test)]
@@ -346,6 +425,38 @@ mod tests {
         )
         .unwrap();
         assert_eq!(res["echo"], "hello");
+        server.stop();
+    }
+
+    #[test]
+    fn test_ping_reachable_vs_version_mismatch() {
+        let dir = tempfile::tempdir().unwrap();
+        let sock = dir.path().join("ver.sock");
+        let server = IpcServer::new(
+            Arc::new(|req| {
+                let cmd = req.get("cmd").and_then(|v| v.as_str()).unwrap_or("");
+                if cmd == "ping" {
+                    serde_json::json!({
+                        "ok": true,
+                        "pong": true,
+                        "pid": 424242,
+                        "version": "0.0.1-old"
+                    })
+                } else {
+                    serde_json::json!({ "ok": true })
+                }
+            }),
+            Some(sock.clone()),
+        );
+        server.start().unwrap();
+
+        let info = ping(Some(&sock)).expect("old daemon should respond to ping");
+        assert_eq!(info.pid, Some(424242));
+        assert_eq!(info.version, "0.0.1-old");
+        assert!(info.pong);
+        assert!(is_reachable(Some(&sock)));
+        assert!(!is_running(Some(&sock)));
+
         server.stop();
     }
 }

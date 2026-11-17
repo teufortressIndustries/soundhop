@@ -418,15 +418,15 @@ pub fn draw_tui(frame: &mut Frame<'_>, state: &TuiState) {
 
 fn draw_top_bar(frame: &mut Frame<'_>, area: Rect, state: &TuiState) {
     let titles = vec![
-        Line::from(" [1] Peers & Multi-Room "),
-        Line::from(" [2] App Mixer & Rules "),
-        Line::from(" [3] Mic & Android Bridge "),
+        Line::from(" [1] Speakers "),
+        Line::from(" [2] Apps "),
+        Line::from(" [3] Phone & Mic "),
     ];
     let tabs = Tabs::new(titles)
         .block(
             Block::default()
                 .borders(Borders::ALL)
-                .title(" SoundHop v2.0 Interactive Dashboard "),
+                .title(" SoundHop Control Dashboard "),
         )
         .select(state.tab.index())
         .style(Style::default().fg(Color::Cyan))
@@ -449,7 +449,7 @@ fn draw_peers_tab(frame: &mut Frame<'_>, area: Rect, state: &TuiState) {
 
     let items: Vec<ListItem<'_>> = if state.peers.is_empty() {
         vec![ListItem::new(
-            "  No speakers discovered yet. Press 'r' to scan LAN.",
+            "  Looking for nearby speakers... Press 'r' to scan again.",
         )]
     } else {
         state
@@ -470,10 +470,10 @@ fn draw_peers_tab(frame: &mut Frame<'_>, area: Rect, state: &TuiState) {
                 let is_active = st.connected_peer == p.id
                     || st.multiroom_peers.iter().any(|s| s.peer_id == p.id);
                 let conn_tag = if is_active { " (CONNECTED)" } else { "" };
-                let rtt_tag = p.rtt_ms.map(|r| format!("  {r:.1} ms")).unwrap_or_default();
+                let rtt_tag = p.rtt_ms.map(|r| format!("  {r:.0} ms")).unwrap_or_default();
                 let text = format!(
-                    "{selected_cursor} {checked} {} ({}:{}){}{}",
-                    p.name, p.host, p.port, rtt_tag, conn_tag
+                    "{selected_cursor} {checked} {} ({}){}{}",
+                    p.name, p.host, rtt_tag, conn_tag
                 );
                 let style = if is_active {
                     Style::default()
@@ -489,11 +489,19 @@ fn draw_peers_tab(frame: &mut Frame<'_>, area: Rect, state: &TuiState) {
             .collect()
     };
 
-    let list =
-        List::new(items).block(Block::default().borders(Borders::ALL).title(
-            " Discovered Speakers (Space: Multi-Room Select | Enter: Connect | r: Rescan) ",
-        ));
+    let list = List::new(items).block(
+        Block::default()
+            .borders(Borders::ALL)
+            .title(" Play Audio On (Space: Multi-Room | Enter: Connect | r: Refresh) "),
+    );
     frame.render_widget(list, cols[0]);
+
+    let privacy_label = match cfg.sharing.security.as_str() {
+        "psk" => "PIN-Paired Only",
+        "cookie" => "System Cookie",
+        "open" => "Open",
+        _ => "Home Wi-Fi",
+    };
 
     let summary_lines = vec![
         Line::from(vec![
@@ -504,12 +512,12 @@ fn draw_peers_tab(frame: &mut Frame<'_>, area: Rect, state: &TuiState) {
             ),
         ]),
         Line::from(vec![
-            Span::styled("Sharing Speakers: ", Style::default().fg(Color::Gray)),
+            Span::styled("Share My Speakers: ", Style::default().fg(Color::Gray)),
             Span::styled(
                 if cfg.sharing.enabled {
-                    format!("ON (TCP :{})", cfg.sharing.port)
+                    "On (Visible on Wi-Fi)"
                 } else {
-                    "OFF".to_string()
+                    "Off"
                 },
                 Style::default().fg(if cfg.sharing.enabled {
                     Color::Green
@@ -519,31 +527,31 @@ fn draw_peers_tab(frame: &mut Frame<'_>, area: Rect, state: &TuiState) {
             ),
         ]),
         Line::from(vec![
-            Span::styled("Security Mode: ", Style::default().fg(Color::Gray)),
-            Span::raw(&cfg.sharing.security),
+            Span::styled("Privacy: ", Style::default().fg(Color::Gray)),
+            Span::raw(privacy_label),
         ]),
         Line::from(""),
         Line::from(vec![
-            Span::styled("Active Output: ", Style::default().fg(Color::Gray)),
+            Span::styled("Playing On: ", Style::default().fg(Color::Gray)),
             Span::styled(
                 if st.is_connected() {
                     &st.connected_name
                 } else {
-                    "Local Speakers"
+                    "This Device"
                 },
                 Style::default().fg(Color::Cyan),
             ),
         ]),
         Line::from(vec![
-            Span::styled("Multi-Room Mode: ", Style::default().fg(Color::Gray)),
+            Span::styled("Mode: ", Style::default().fg(Color::Gray)),
             Span::raw(if st.is_multiroom() {
-                "Active"
+                "Multiple Speakers"
             } else {
-                "Single"
+                "Single Speaker"
             }),
         ]),
         Line::from(vec![
-            Span::styled("Keep Local Output (l): ", Style::default().fg(Color::Gray)),
+            Span::styled("Keep Playing Here (l): ", Style::default().fg(Color::Gray)),
             Span::raw(if state.keep_local { "Yes" } else { "No" }),
         ]),
     ];
@@ -551,14 +559,14 @@ fn draw_peers_tab(frame: &mut Frame<'_>, area: Rect, state: &TuiState) {
     let right_panel = Paragraph::new(summary_lines).block(
         Block::default()
             .borders(Borders::ALL)
-            .title(" Session Status (s: Share | d: Disconnect) "),
+            .title(" This Device (s: Share | d: Disconnect) "),
     );
     frame.render_widget(right_panel, cols[1]);
 }
 
 fn draw_apps_tab(frame: &mut Frame<'_>, area: Rect, state: &TuiState) {
     let items: Vec<ListItem<'_>> = if state.apps.is_empty() {
-        vec![ListItem::new("  No active audio application streams.")]
+        vec![ListItem::new("  No apps are playing audio right now.")]
     } else {
         state
             .apps
@@ -573,7 +581,7 @@ fn draw_apps_tab(frame: &mut Frame<'_>, area: Rect, state: &TuiState) {
                 let name = app
                     .get("app_name")
                     .and_then(|v| v.as_str())
-                    .unwrap_or("Unknown");
+                    .unwrap_or("App");
                 let media = app.get("media_name").and_then(|v| v.as_str()).unwrap_or("");
                 let rule = app
                     .get("routed_rule")
@@ -586,10 +594,10 @@ fn draw_apps_tab(frame: &mut Frame<'_>, area: Rect, state: &TuiState) {
                 let badge = if rule == "remote" {
                     "[REMOTE]"
                 } else {
-                    "[LOCAL]"
+                    "[THIS PC]"
                 };
-                let saved_tag = if persistent { " (Saved Rule)" } else { "" };
-                let line_str = format!("{cursor} {badge:<9} {name} — {media}{saved_tag}");
+                let saved_tag = if persistent { " (Remembered)" } else { "" };
+                let line_str = format!("{cursor} {badge:<10} {name} — {media}{saved_tag}");
                 let style = if idx == state.selected_app_idx {
                     Style::default()
                         .fg(Color::Yellow)
@@ -606,7 +614,7 @@ fn draw_apps_tab(frame: &mut Frame<'_>, area: Rect, state: &TuiState) {
 
     let list =
         List::new(items).block(Block::default().borders(Borders::ALL).title(
-            " Per-App Audio Routing (Enter: Toggle Remote/Local | p: Save Persistent Rule) ",
+            " Choose Where Apps Play (Enter: Switch This PC / Remote | p: Always Remember) ",
         ));
     frame.render_widget(list, area);
 }
@@ -625,45 +633,46 @@ fn draw_mic_android_tab(frame: &mut Frame<'_>, area: Rect, state: &TuiState) {
 
     let text = vec![
         Line::from(Span::styled(
-            "Network Microphone Pass-Through",
+            "Microphone Sharing",
             Style::default()
                 .fg(Color::Cyan)
                 .add_modifier(Modifier::BOLD),
         )),
         Line::from(format!(
-            "  Active: {} | Direction: {} | Source: {}",
-            !st.connected_source.is_empty(),
-            if st.mic_direction.is_empty() {
-                "off"
+            "  Status: {} | Mode: {}",
+            if !st.connected_source.is_empty() {
+                "Active"
             } else {
-                &st.mic_direction
+                "Off"
             },
-            if st.connected_source.is_empty() {
+            if st.mic_direction.is_empty() {
                 "none"
+            } else if st.mic_direction == "send" {
+                "Sending my mic"
             } else {
-                &st.connected_source
+                "Hearing peer mic"
             }
         )),
-        Line::from("  Keys: [s] Send My Mic to Peer | [r] Receive Peer Mic | [o] Stop Mic"),
+        Line::from("  Keys: [s] Send My Mic | [r] Hear Peer Mic | [o] Turn Off"),
         Line::from(""),
         Line::from(Span::styled(
-            "Android Audio & Virtual Microphone Bridge (scrcpy)",
+            "Phone Audio (Android)",
             Style::default()
                 .fg(Color::Cyan)
                 .add_modifier(Modifier::BOLD),
         )),
         Line::from(format!(
-            "  Streaming Active: {} | Device: {}",
+            "  Listening: {} | Phone: {}",
             if and_active { "Yes" } else { "No" },
             and_dev
         )),
-        Line::from("  Keys: [a] Start / Stop Android Audio Capture"),
+        Line::from("  Keys: [a] Start / Stop Listening"),
     ];
 
     let block = Paragraph::new(text).block(
         Block::default()
             .borders(Borders::ALL)
-            .title(" Microphone Pass-Through & Android Audio "),
+            .title(" Phone Audio & Microphone Sharing "),
     );
     frame.render_widget(block, area);
 }
@@ -675,16 +684,12 @@ fn draw_telemetry_bar(frame: &mut Frame<'_>, area: Rect, state: &TuiState) {
     let peak_max = snap.audio.peak_left.max(snap.audio.peak_right);
     let net_label = if let Some(n) = first_net {
         format!(
-            "RTT: {:.1} ms | Jitter: {:.1} ms | Level: {:.1} dBFS | L: {:.0}% R: {:.0}%",
-            n.last_rtt_ms,
-            n.jitter_ms,
-            snap.audio.dbfs,
-            snap.audio.peak_left * 100.0,
-            snap.audio.peak_right * 100.0
+            "Signal: {:.1} ms RTT | Jitter: {:.1} ms | Level: {:.1} dBFS",
+            n.last_rtt_ms, n.jitter_ms, snap.audio.dbfs
         )
     } else {
         format!(
-            "RTT: -- ms | Jitter: -- ms | Level: {:.1} dBFS | L: {:.0}% R: {:.0}%",
+            "Audio Level: {:.1} dBFS (L: {:.0}% R: {:.0}%)",
             snap.audio.dbfs,
             snap.audio.peak_left * 100.0,
             snap.audio.peak_right * 100.0
@@ -703,7 +708,7 @@ fn draw_telemetry_bar(frame: &mut Frame<'_>, area: Rect, state: &TuiState) {
         .block(
             Block::default()
                 .borders(Borders::ALL)
-                .title(" Live Audio VU Meter & Network Latency / Jitter Telemetry "),
+                .title(" Audio Level & Connection Health "),
         )
         .gauge_style(Style::default().fg(gauge_color).bg(Color::Black))
         .ratio(ratio)

@@ -16,7 +16,7 @@ use serde_json::Value;
 use crate::constants::{OFFLINE_PROBE_LIMIT, SUPERVISOR_INTERVAL_SECS, VERSION};
 use crate::controller::{ConnectOptions, Controller};
 use crate::discovery::{discover_once_with_psk, DiscoveryManager, Peer};
-use crate::ipc::{is_running, request as ipc_request, IpcServer};
+use crate::ipc::{is_reachable, ping, request as ipc_request, IpcServer};
 use crate::util::{
     command_exists, ensure_dir, is_private_address, now_secs, pid_path, runtime_dir, socket_path,
     split_host_port, tcp_probe_rtt,
@@ -67,10 +67,10 @@ impl Daemon {
     }
 
     pub fn start(self: &Arc<Self>) -> Result<(), String> {
-        if is_running(self.ipc_path.as_deref()) {
+        if is_reachable(self.ipc_path.as_deref()) {
             self.try_replace_stale_daemon();
         }
-        if is_running(self.ipc_path.as_deref()) {
+        if is_reachable(self.ipc_path.as_deref()) {
             return Err("SoundHop daemon is already running".to_string());
         }
         self.stop_flag.store(false, Ordering::SeqCst);
@@ -116,20 +116,10 @@ impl Daemon {
     }
 
     fn try_replace_stale_daemon(&self) {
-        let Ok(resp) = ipc_request(
-            "ping",
-            serde_json::json!({}),
-            self.ipc_path.as_deref(),
-            Duration::from_secs(2),
-        ) else {
+        let Some(info) = ping(self.ipc_path.as_deref()) else {
             return;
         };
-        let running_ver = resp
-            .get("version")
-            .or_else(|| resp.get("daemon").and_then(|d| d.get("version")))
-            .and_then(|v| v.as_str())
-            .unwrap_or("");
-        if running_ver == VERSION {
+        if info.version == VERSION {
             return;
         }
         let _ = ipc_request(
@@ -139,28 +129,31 @@ impl Daemon {
             Duration::from_secs(1),
         );
         #[cfg(unix)]
-        {
-            let pid_opt = resp
-                .get("pid")
-                .or_else(|| resp.get("daemon").and_then(|d| d.get("pid")))
-                .and_then(|v| v.as_u64());
-            if let Some(pid) = pid_opt {
-                if crate::ipc::is_soundhop_process(pid) {
-                    unsafe {
-                        libc::kill(pid as libc::pid_t, libc::SIGTERM);
-                    }
-                }
+        let tracked_pid = info.pid.filter(|&pid| crate::ipc::is_soundhop_process(pid));
+        #[cfg(unix)]
+        if let Some(pid) = tracked_pid {
+            unsafe {
+                libc::kill(pid as libc::pid_t, libc::SIGTERM);
             }
         }
-        for _ in 0..25 {
-            if !is_running(self.ipc_path.as_deref()) {
+        for _ in 0..30 {
+            let ipc_down = !is_reachable(self.ipc_path.as_deref());
+            #[cfg(unix)]
+            let proc_exited = tracked_pid
+                .map(|pid| unsafe { libc::kill(pid as libc::pid_t, 0) != 0 })
+                .unwrap_or(true);
+            #[cfg(not(unix))]
+            let proc_exited = true;
+            if ipc_down && proc_exited {
                 break;
             }
             thread::sleep(Duration::from_millis(100));
         }
-        if !is_running(self.ipc_path.as_deref()) {
+        if !is_reachable(self.ipc_path.as_deref()) {
             let sock = self.ipc_path.clone().unwrap_or_else(socket_path);
-            let _ = fs::remove_file(sock);
+            let _ = fs::remove_file(&sock);
+            let _ = fs::remove_file(sock.with_extension("port"));
+            let _ = fs::remove_file(sock.with_extension("auth"));
         }
     }
 
@@ -630,10 +623,20 @@ impl Daemon {
                 }
             }
             "pair" => {
+                if req.get("clear").and_then(|v| v.as_bool()).unwrap_or(false) {
+                    let res = self.controller.clear_pairing();
+                    self.setup_sharing();
+                    self.setup_discovery();
+                    return res;
+                }
                 let peer = req.get("peer").and_then(|v| v.as_str()).unwrap_or("");
                 let secret = req.get("secret").and_then(|v| v.as_str());
                 match self.controller.pair_peer(peer, secret) {
-                    Ok(res) => res,
+                    Ok(res) => {
+                        self.setup_sharing();
+                        self.setup_discovery();
+                        res
+                    }
                     Err(e) => serde_json::json!({ "ok": false, "error": e.to_string() }),
                 }
             }
@@ -661,6 +664,41 @@ impl Daemon {
                     Ok(res) => res,
                     Err(e) => serde_json::json!({ "ok": false, "error": e.to_string() }),
                 }
+            }
+            "unroute" => {
+                let all = req.get("all").and_then(|v| v.as_bool()).unwrap_or(false);
+                let app = if all {
+                    None
+                } else {
+                    req.get("app").and_then(|v| v.as_str())
+                };
+                let remove_rule = req
+                    .get("remove_rule")
+                    .and_then(|v| v.as_bool())
+                    .unwrap_or(false);
+                match self.controller.unroute_app(app, remove_rule) {
+                    Ok(res) => res,
+                    Err(e) => serde_json::json!({ "ok": false, "error": e.to_string() }),
+                }
+            }
+            "firewall_status" => {
+                let st = crate::firewall::detect();
+                serde_json::json!({
+                    "ok": true,
+                    "kind": st.kind,
+                    "active": st.active,
+                    "detail": st.detail,
+                })
+            }
+            "firewall_open" => {
+                let cfg = self.controller.config.lock().unwrap().clone();
+                let res = crate::firewall::open_ports(
+                    cfg.sharing.port,
+                    cfg.discovery.port,
+                    false,
+                    cfg.discovery.mdns,
+                );
+                res.to_json()
             }
             "mic" => {
                 let action = req
@@ -808,5 +846,59 @@ impl Daemon {
                 "error": format!("Unknown IPC command: {cmd}")
             }),
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_try_replace_stale_daemon_stops_old_version() {
+        let dir = tempfile::tempdir().unwrap();
+        let sock = dir.path().join("daemon.sock");
+        let cfg_path = dir.path().join("config.toml");
+        let state_path = dir.path().join("state.json");
+        let stop_called = Arc::new(AtomicBool::new(false));
+        let stop_flag = Arc::clone(&stop_called);
+
+        let old_server = Arc::new(IpcServer::new(
+            Arc::new(move |req| {
+                let cmd = req.get("cmd").and_then(|v| v.as_str()).unwrap_or("");
+                match cmd {
+                    "ping" => serde_json::json!({
+                        "ok": true,
+                        "pong": true,
+                        "version": "2.0.4",
+                    }),
+                    "stop" => {
+                        stop_flag.store(true, Ordering::SeqCst);
+                        serde_json::json!({ "ok": true, "stopping": true })
+                    }
+                    _ => serde_json::json!({ "ok": true }),
+                }
+            }),
+            Some(sock.clone()),
+        ));
+        old_server.start().unwrap();
+
+        let stopper = Arc::clone(&old_server);
+        let waiter_flag = Arc::clone(&stop_called);
+        let stopper_thread = thread::spawn(move || {
+            for _ in 0..50 {
+                if waiter_flag.load(Ordering::SeqCst) {
+                    stopper.stop();
+                    break;
+                }
+                thread::sleep(Duration::from_millis(20));
+            }
+        });
+
+        let daemon = Daemon::new(Some(cfg_path), Some(state_path), false, Some(sock.clone()));
+        daemon.try_replace_stale_daemon();
+        let _ = stopper_thread.join();
+
+        assert!(stop_called.load(Ordering::SeqCst));
+        assert!(!is_reachable(Some(&sock)));
     }
 }

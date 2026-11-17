@@ -47,7 +47,7 @@ if [[ -f "$REPO_DIR/assets/soundhop.svg" ]]; then
 fi
 
 if [[ -f "$REPO_DIR/packaging/io.github.soundhop.desktop" ]]; then
-    sed "s|Exec=soundhop tray|Exec=$BIN_DIR/soundhop tray|g" "$REPO_DIR/packaging/io.github.soundhop.desktop" > "$APP_DIR/io.github.soundhop.desktop"
+    sed "s|Exec=soundhop gui|Exec=$BIN_DIR/soundhop gui|g" "$REPO_DIR/packaging/io.github.soundhop.desktop" > "$APP_DIR/io.github.soundhop.desktop"
     chmod 644 "$APP_DIR/io.github.soundhop.desktop"
 fi
 
@@ -60,5 +60,6 @@ fi
 echo
 echo -e "${GREEN}${BOLD}✓ SoundHop v2.0 installation complete!${NC}"
 echo -e "  ${CYAN}soundhop${NC}          # Launch interactive TUI dashboard"
-echo -e "  ${CYAN}soundhop tray${NC}     # Launch native system tray"
+echo -e "  ${CYAN}soundhop gui${NC}      # Open SoundHop Control Center"
+echo -e "  ${CYAN}soundhop tray${NC}     # Run background system tray"
 echo -e "  ${CYAN}soundhop status${NC}   # View status"

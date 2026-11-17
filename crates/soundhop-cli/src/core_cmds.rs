@@ -14,11 +14,13 @@ use soundhop_core::controller::{ConnectOptions, Controller};
 use soundhop_core::daemon::Daemon;
 use soundhop_core::discovery::{discover_once_with_psk, Peer};
 use soundhop_core::firewall::{detect as detect_firewall, open_ports};
-use soundhop_core::ipc::{is_running as ipc_is_running, request as ipc_request};
+use soundhop_core::ipc::{
+    is_reachable as ipc_is_reachable, is_running as ipc_is_running, request as ipc_request,
+};
 use soundhop_core::security::generate_pairing_pin;
 use soundhop_core::service::{
     install as install_service, restart_service, start_service, status as service_status,
-    stop_service, uninstall as uninstall_service,
+    stop_service, sync_appimage_paths_if_installed, uninstall as uninstall_service,
 };
 use soundhop_core::util::{config_path, is_private_address, split_host_port};
 
@@ -669,13 +671,7 @@ pub fn handle_route(controller: &Arc<Controller>, args: &RouteArgs, json_out: bo
 
 pub fn handle_unroute(controller: &Arc<Controller>, args: &UnrouteArgs, json_out: bool) -> i32 {
     if args.all || args.app.is_none() {
-        controller.state.lock().unwrap().routed_apps.clear();
-        if args.remove_rule {
-            let mut cfg = controller.config.lock().unwrap();
-            cfg.routing.always_remote.clear();
-            cfg.routing.always_local.clear();
-        }
-        controller.save();
+        let _ = controller.unroute_app(None, args.remove_rule);
         if json_out {
             print_json(&serde_json::json!({ "unrouted_all": true }));
         } else {
@@ -686,10 +682,7 @@ pub fn handle_unroute(controller: &Arc<Controller>, args: &UnrouteArgs, json_out
 
     let app = args.app.as_deref().unwrap_or("");
     if args.remove_rule {
-        let key = app.trim().to_lowercase();
-        let mut cfg = controller.config.lock().unwrap();
-        cfg.routing.always_remote.retain(|x| x != &key);
-        cfg.routing.always_local.retain(|x| x != &key);
+        let _ = controller.unroute_app(Some(app), true);
     }
     match controller.route_app(app, Some("local"), false) {
         Ok(val) => {
@@ -917,7 +910,7 @@ pub fn handle_daemon(verbose: bool) -> i32 {
 
 pub fn handle_stop(controller: &Arc<Controller>, json_out: bool) -> i32 {
     let mut stopped_daemon = false;
-    if ipc_is_running(None)
+    if ipc_is_reachable(None)
         && ipc_request("stop", serde_json::json!({}), None, Duration::from_secs(3)).is_ok()
     {
         stopped_daemon = true;
@@ -941,7 +934,10 @@ pub fn handle_service(args: &ServiceArgs, json_out: bool) -> i32 {
         "uninstall" | "remove" => uninstall_service(),
         "start" => serde_json::json!({ "started": start_service() }),
         "stop" => serde_json::json!({ "stopped": stop_service() }),
-        "restart" => serde_json::json!({ "restarted": restart_service() }),
+        "restart" => {
+            let _ = sync_appimage_paths_if_installed(false);
+            serde_json::json!({ "restarted": restart_service() })
+        }
         _ => service_status(),
     };
     if json_out {

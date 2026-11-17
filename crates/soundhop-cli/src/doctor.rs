@@ -52,7 +52,10 @@ pub fn run_doctor(controller: &Arc<Controller>, fix: bool, json_out: bool) -> i3
     }
 
     #[cfg(target_os = "linux")]
-    let appimage_mounts: Vec<String> = {
+    let (appimage_mounts, stale_appimage_mounts): (Vec<String>, Vec<String>) = {
+        let own_mount = std::env::var_os("APPDIR")
+            .map(|v| v.to_string_lossy().into_owned())
+            .filter(|s| s.starts_with("/tmp/.mount_SoundH"));
         let mut mounts = Vec::new();
         if let Ok(content) = std::fs::read_to_string("/proc/self/mountinfo") {
             for line in content.lines() {
@@ -67,14 +70,20 @@ pub fn run_doctor(controller: &Arc<Controller>, fix: bool, json_out: bool) -> i3
                 }
             }
         }
-        mounts
+        let stale = mounts
+            .iter()
+            .filter(|m| own_mount.as_deref() != Some(m.as_str()))
+            .cloned()
+            .collect();
+        (mounts, stale)
     };
     #[cfg(not(target_os = "linux"))]
-    let appimage_mounts: Vec<String> = Vec::new();
+    let (appimage_mounts, stale_appimage_mounts): (Vec<String>, Vec<String>) =
+        (Vec::new(), Vec::new());
 
     #[cfg(target_os = "linux")]
     if fix && appimage_mounts.len() > 1 {
-        for m in &appimage_mounts {
+        for m in &stale_appimage_mounts {
             let mut cmd = std::process::Command::new("fusermount");
             cmd.args(["-u", m]);
             soundhop_core::util::close_fds_pre_exec(&mut cmd);

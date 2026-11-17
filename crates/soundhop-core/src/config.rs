@@ -157,6 +157,8 @@ impl Default for DiscoveryConfig {
 pub struct UiConfig {
     pub notifications: bool,
     pub start_tray: bool,
+    pub theme: String,
+    pub onboarding_completed: bool,
 }
 
 impl Default for UiConfig {
@@ -164,6 +166,8 @@ impl Default for UiConfig {
         Self {
             notifications: true,
             start_tray: false,
+            theme: "dark".to_string(),
+            onboarding_completed: false,
         }
     }
 }
@@ -343,6 +347,13 @@ impl Config {
         self.android.buffer_ms = self.android.buffer_ms.max(10);
         self.android.bit_rate = self.android.bit_rate.max(16_000);
         self.android.last_serial = self.android.last_serial.trim().to_string();
+
+        let theme = self.ui.theme.trim().to_lowercase();
+        self.ui.theme = match theme.as_str() {
+            "light" => "light".to_string(),
+            "system" | "auto" => "system".to_string(),
+            _ => "dark".to_string(),
+        };
         Ok(())
     }
 
@@ -586,7 +597,7 @@ mod tests {
             .unwrap();
         cfg.save(None).unwrap();
 
-        let reloaded = Config::load(Some(&cfg_file)).unwrap();
+        let mut reloaded = Config::load(Some(&cfg_file)).unwrap();
         assert_eq!(reloaded.sharing.security, "psk");
         assert_eq!(
             reloaded.routing.always_remote,
@@ -597,6 +608,31 @@ mod tests {
             reloaded.get_dotted("sharing.security").unwrap(),
             serde_json::Value::String("psk".to_string())
         );
+        assert_eq!(reloaded.ui.theme, "dark");
+        assert!(!reloaded.ui.onboarding_completed);
+
+        reloaded.set_dotted("ui.theme", "light").unwrap();
+        reloaded
+            .set_dotted("ui.onboarding_completed", "true")
+            .unwrap();
+        assert_eq!(reloaded.ui.theme, "light");
+        assert!(reloaded.ui.onboarding_completed);
+    }
+
+    #[test]
+    fn test_ui_config_backwards_compat_toml() {
+        let dir = tempfile::tempdir().unwrap();
+        let cfg_file = dir.path().join("legacy.toml");
+        fs::write(
+            &cfg_file,
+            "[ui]\nnotifications = false\nstart_tray = true\n",
+        )
+        .unwrap();
+        let cfg = Config::load(Some(&cfg_file)).unwrap();
+        assert!(!cfg.ui.notifications);
+        assert!(cfg.ui.start_tray);
+        assert_eq!(cfg.ui.theme, "dark");
+        assert!(!cfg.ui.onboarding_completed);
     }
 
     #[test]

@@ -21,6 +21,10 @@ pub struct Cli {
     #[arg(long, global = true)]
     pub no_color: bool,
 
+    /// Internal flag to open the Control Center on a specific tab (`home`, `apps`, `phone`, `settings`)
+    #[arg(long, hide = true)]
+    pub gui_tab: Option<String>,
+
     /// Internal flag to open the standalone Settings & Routing Rules window
     #[arg(long, hide = true)]
     pub settings_dialog: bool,
@@ -97,8 +101,10 @@ pub enum Commands {
     /// Run comprehensive system, audio backend, network, and firewall diagnostics
     Doctor(DoctorArgs),
 
-    /// Launch the native OS system tray icon & menu
-    #[command(visible_alias = "gui")]
+    /// Launch the SoundHop Control Center GUI (starts background tray if needed)
+    Gui,
+
+    /// Launch the native OS system tray icon & background daemon
     Tray,
 
     /// View recent daemon log lines

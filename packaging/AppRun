@@ -16,7 +16,7 @@ fi
 
 if [ $# -eq 0 ]; then
     if [ -n "${WAYLAND_DISPLAY:-}" ] || [ -n "${DISPLAY:-}" ]; then
-        exec "$BIN" tray
+        exec "$BIN" gui
     else
         exec "$BIN" status
     fi

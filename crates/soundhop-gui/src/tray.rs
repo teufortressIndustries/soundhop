@@ -9,13 +9,19 @@ use std::sync::{Arc, OnceLock};
 use std::time::{Duration, Instant};
 
 use muda::{CheckMenuItem, Menu, MenuEvent, MenuId, MenuItem, PredefinedMenuItem, Submenu};
-use soundhop_core::constants::PROTOCOL_VERSION;
+use soundhop_core::constants::{PROTOCOL_VERSION, VERSION};
 use soundhop_core::controller::{ConnectOptions, Controller};
 use soundhop_core::daemon::Daemon;
 use soundhop_core::discovery::Peer;
-use soundhop_core::ipc::{is_running as ipc_is_running, request as ipc_request};
-use soundhop_core::util::{is_own_non_loopback_ip, is_private_address, now_secs};
-use tray_icon::{Icon, TrayIconBuilder};
+use soundhop_core::ipc::{
+    find_soundhop_process_with_arg, is_running as ipc_is_running, ping as ipc_ping,
+    request as ipc_request,
+};
+use soundhop_core::service::sync_appimage_paths_if_installed;
+use soundhop_core::util::{
+    is_own_non_loopback_ip, is_private_address, now_secs, replace_stale_instance, InstanceLockInfo,
+};
+use tray_icon::{Icon, TrayIconBuilder, TrayIconEvent};
 
 const EMBEDDED_PNG: &[u8] = include_bytes!("../../../assets/soundhop.png");
 
@@ -231,14 +237,17 @@ pub fn build_tray_menu(controller: &Controller, peers: &[Peer]) -> Menu {
     let st = controller.state.lock().unwrap().clone();
     let cfg = controller.config.lock().unwrap().clone();
 
+    let open_item = MenuItem::with_id(MenuId::new("open_gui"), "Open SoundHop", true, None);
+    let _ = menu.append(&open_item);
+
     let status_text = if st.is_multiroom() {
-        format!("SoundHop — Multi-Room ({})", st.connected_name)
+        format!("Multi-room: {}", st.connected_name)
     } else if st.is_connected() {
-        format!("SoundHop — Connected to {}", st.connected_name)
+        format!("Playing on: {}", st.connected_name)
     } else if cfg.sharing.enabled {
-        "SoundHop — Sharing Speakers".to_string()
+        "Ready • Sharing my speakers".to_string()
     } else {
-        "SoundHop — Ready".to_string()
+        "Ready • Playing on this device".to_string()
     };
     let header_item = MenuItem::with_id(MenuId::new("noop_header"), status_text, false, None);
     let _ = menu.append(&header_item);
@@ -257,10 +266,22 @@ pub fn build_tray_menu(controller: &Controller, peers: &[Peer]) -> Menu {
         HashSet::new()
     };
 
+    let play_header = MenuItem::with_id(MenuId::new("noop_play_on"), "Play Audio On", false, None);
+    let _ = menu.append(&play_header);
+
+    let local_chk = CheckMenuItem::with_id(
+        MenuId::new("action_disconnect"),
+        "This Device (Local Speakers)",
+        st.is_connected(),
+        !st.is_connected(),
+        None,
+    );
+    let _ = menu.append(&local_chk);
+
     if peers.is_empty() {
         let no_peers = MenuItem::with_id(
             MenuId::new("noop_peers"),
-            "Searching for LAN speakers...",
+            "Looking for nearby speakers...",
             false,
             None,
         );
@@ -273,7 +294,7 @@ pub fn build_tray_menu(controller: &Controller, peers: &[Peer]) -> Menu {
                 .rtt_ms
                 .map(|r| format!(" ({r:.0} ms)"))
                 .unwrap_or_default();
-            let label = format!("{} [{}]{}", peer.name, peer.host, rtt_suffix);
+            let label = format!("{}{}", peer.name, rtt_suffix);
             let item = CheckMenuItem::with_id(
                 MenuId::new(format!("peer_toggle:{}", peer.id)),
                 label,
@@ -285,7 +306,7 @@ pub fn build_tray_menu(controller: &Controller, peers: &[Peer]) -> Menu {
         }
 
         if peers.len() > 1 {
-            let multi_sub = Submenu::new("Multi-Room Broadcast", true);
+            let multi_sub = Submenu::new("Multiple Speakers", true);
             for peer in peers {
                 let is_in_group = connected_ids.contains(&peer.id);
                 let chk = CheckMenuItem::with_id(
@@ -300,7 +321,7 @@ pub fn build_tray_menu(controller: &Controller, peers: &[Peer]) -> Menu {
             let _ = multi_sub.append(&PredefinedMenuItem::separator());
             let keep_local_chk = CheckMenuItem::with_id(
                 MenuId::new("multiroom_keep_local"),
-                "Keep Local Speakers Active (--keep-local)",
+                "Keep Playing on This Device Too",
                 true,
                 st.keep_local,
                 None,
@@ -308,7 +329,7 @@ pub fn build_tray_menu(controller: &Controller, peers: &[Peer]) -> Menu {
             let _ = multi_sub.append(&keep_local_chk);
             let broadcast_all = MenuItem::with_id(
                 MenuId::new("multiroom_broadcast_all"),
-                "Broadcast to All Discovered Peers",
+                "Play on All Speakers",
                 true,
                 None,
             );
@@ -317,21 +338,11 @@ pub fn build_tray_menu(controller: &Controller, peers: &[Peer]) -> Menu {
         }
     }
 
-    if st.is_connected() {
-        let disc_item = MenuItem::with_id(
-            MenuId::new("action_disconnect"),
-            "Disconnect Speaker(s)",
-            true,
-            None,
-        );
-        let _ = menu.append(&disc_item);
-    }
-
     let _ = menu.append(&PredefinedMenuItem::separator());
 
     let share_chk = CheckMenuItem::with_id(
         MenuId::new("toggle_share"),
-        format!("Share My Speakers (TCP :{})", cfg.sharing.port),
+        "Share My Speakers",
         true,
         cfg.sharing.enabled || st.listener_module > 0,
         None,
@@ -340,20 +351,20 @@ pub fn build_tray_menu(controller: &Controller, peers: &[Peer]) -> Menu {
 
     let auto_chk = CheckMenuItem::with_id(
         MenuId::new("toggle_autoconnect"),
-        "Auto-Connect to Preferred Speaker",
+        "Auto-Connect to Last Speaker",
         true,
         cfg.connection.auto_connect && !st.auto_paused,
         None,
     );
     let _ = menu.append(&auto_chk);
 
-    // Per-App Audio Routing submenu
-    let app_sub = Submenu::new("Per-App Audio Routing", true);
+    // Apps submenu (plain labels, no & mnemonics)
+    let app_sub = Submenu::new("Apps", true);
     let streams = controller.list_apps();
     if streams.is_empty() {
         let empty = MenuItem::with_id(
             MenuId::new("noop_apps"),
-            "No active audio streams",
+            "No apps playing right now",
             false,
             None,
         );
@@ -377,9 +388,14 @@ pub fn build_tray_menu(controller: &Controller, peers: &[Peer]) -> Menu {
                     .and_then(|v| v.as_str())
                     .map(|r| r == "remote")
                     .unwrap_or(false);
+            let label = if media_name.is_empty() {
+                app_name.to_string()
+            } else {
+                format!("{app_name} - {media_name}")
+            };
             let chk = CheckMenuItem::with_id(
                 MenuId::new(format!("app_route:{app_name}")),
-                format!("{app_name} ({media_name})"),
+                label,
                 st.is_connected(),
                 is_routed,
                 None,
@@ -389,42 +405,12 @@ pub fn build_tray_menu(controller: &Controller, peers: &[Peer]) -> Menu {
     }
     let _ = menu.append(&app_sub);
 
-    // Microphone Pass-Through submenu
-    let mic_active = !st.connected_source.is_empty();
-    let mic_sub = Submenu::new("Microphone Pass-Through", true);
-    let mic_send = CheckMenuItem::with_id(
-        MenuId::new("mic_send_toggle"),
-        "Send My Microphone to Connected Peer",
-        st.is_connected() || mic_active,
-        mic_active && st.mic_direction == "send",
-        None,
-    );
-    let mic_recv = CheckMenuItem::with_id(
-        MenuId::new("mic_recv_toggle"),
-        "Receive Peer Microphone",
-        st.is_connected() || mic_active,
-        mic_active && st.mic_direction == "receive",
-        None,
-    );
-    let _ = mic_sub.append(&mic_send);
-    let _ = mic_sub.append(&mic_recv);
-    if mic_active {
-        let mic_off = MenuItem::with_id(
-            MenuId::new("mic_stop"),
-            "Stop Microphone Pass-Through",
-            true,
-            None,
-        );
-        let _ = mic_sub.append(&mic_off);
-    }
-    let _ = menu.append(&mic_sub);
-
-    // Volume submenu
-    let vol_sub = Submenu::new("Volume & Mute", st.is_connected());
+    // Volume submenu (avoid '&' which GTK treats as mnemonic underline)
+    let vol_sub = Submenu::new("Volume and Mute", st.is_connected());
     for pct in [25u32, 50, 75, 100, 125] {
         let item = MenuItem::with_id(
             MenuId::new(format!("vol_set:{pct}")),
-            format!("Set Volume {pct}%"),
+            format!("Volume {pct}%"),
             st.is_connected(),
             None,
         );
@@ -440,35 +426,50 @@ pub fn build_tray_menu(controller: &Controller, peers: &[Peer]) -> Menu {
     let _ = vol_sub.append(&mute_item);
     let _ = menu.append(&vol_sub);
 
-    // Android Audio submenu
-    let android_sub = Submenu::new("Android Audio Bridge", true);
+    // Microphone submenu
+    let mic_active = !st.connected_source.is_empty();
+    let mic_sub = Submenu::new("Microphone", true);
+    let mic_send = CheckMenuItem::with_id(
+        MenuId::new("mic_send_toggle"),
+        "Send My Microphone",
+        st.is_connected() || mic_active,
+        mic_active && st.mic_direction == "send",
+        None,
+    );
+    let mic_recv = CheckMenuItem::with_id(
+        MenuId::new("mic_recv_toggle"),
+        "Hear Peer Microphone",
+        st.is_connected() || mic_active,
+        mic_active && st.mic_direction == "receive",
+        None,
+    );
+    let _ = mic_sub.append(&mic_send);
+    let _ = mic_sub.append(&mic_recv);
+    if mic_active {
+        let mic_off = MenuItem::with_id(MenuId::new("mic_stop"), "Turn Off Microphone", true, None);
+        let _ = mic_sub.append(&mic_off);
+    }
+    let _ = menu.append(&mic_sub);
+
+    // Phone Audio action
     let and_running = controller.android_session.is_active();
     let and_wiz = MenuItem::with_id(
         MenuId::new("open_android_wizard"),
-        "Open Android Audio & Wi-Fi ADB Wizard...",
+        "Phone Audio...",
         true,
         None,
     );
-    let _ = android_sub.append(&and_wiz);
+    let _ = menu.append(&and_wiz);
     if and_running {
-        let and_stop = MenuItem::with_id(
-            MenuId::new("android_stop"),
-            "Stop Active Android Stream",
-            true,
-            None,
-        );
-        let _ = android_sub.append(&and_stop);
+        let and_stop =
+            MenuItem::with_id(MenuId::new("android_stop"), "Stop Phone Audio", true, None);
+        let _ = menu.append(&and_stop);
     }
-    let _ = menu.append(&android_sub);
 
     let _ = menu.append(&PredefinedMenuItem::separator());
 
-    let settings_item = MenuItem::with_id(
-        MenuId::new("open_settings"),
-        "Settings & Routing Rules...",
-        true,
-        None,
-    );
+    let settings_item =
+        MenuItem::with_id(MenuId::new("open_settings"), "Preferences...", true, None);
     let _ = menu.append(&settings_item);
 
     let quit_item = MenuItem::with_id(MenuId::new("quit_tray"), "Quit SoundHop", true, None);
@@ -477,10 +478,10 @@ pub fn build_tray_menu(controller: &Controller, peers: &[Peer]) -> Menu {
     menu
 }
 
-fn spawn_self_dialog(flag: &str) {
+fn spawn_self_args(args: &[&str]) {
     if let Ok(exe) = std::env::current_exe() {
         let mut cmd = Command::new(exe);
-        cmd.arg(flag);
+        cmd.args(args);
         soundhop_core::util::close_fds_pre_exec(&mut cmd);
         if let Ok(mut child) = cmd.spawn() {
             std::thread::spawn(move || {
@@ -498,12 +499,16 @@ fn handle_menu_action(id_str: &str, daemon: &Daemon, running: &AtomicBool) {
         running.store(false, Ordering::SeqCst);
         return;
     }
+    if id_str == "open_gui" {
+        spawn_self_args(&["--gui-tab", "home"]);
+        return;
+    }
     if id_str == "open_settings" {
-        spawn_self_dialog("--settings-dialog");
+        spawn_self_args(&["--gui-tab", "settings"]);
         return;
     }
     if id_str == "open_android_wizard" {
-        spawn_self_dialog("--android-wizard");
+        spawn_self_args(&["--gui-tab", "phone"]);
         return;
     }
     if id_str == "android_stop" {
@@ -684,9 +689,33 @@ fn menu_state_signature(controller: &Controller, peers: &[Peer]) -> String {
     )
 }
 
+fn find_legacy_tray_holder() -> Option<InstanceLockInfo> {
+    if let Some(pid) = find_soundhop_process_with_arg("tray") {
+        let ver = ipc_ping(None)
+            .filter(|p| p.pid == Some(pid))
+            .map(|p| p.version)
+            .unwrap_or_default();
+        return Some(InstanceLockInfo {
+            pid: Some(pid),
+            version: ver,
+        });
+    }
+    if let Some(info) = ipc_ping(None) {
+        if info.version != VERSION && info.pid.is_some() {
+            return Some(InstanceLockInfo {
+                pid: info.pid,
+                version: info.version,
+            });
+        }
+    }
+    None
+}
+
 /// Runs the native system tray and embedded background daemon loop.
 pub fn run_tray(verbose: bool) -> Result<i32, String> {
-    let _lock = match soundhop_core::util::try_acquire_instance_lock("tray") {
+    let _ = sync_appimage_paths_if_installed(true);
+
+    let _lock = match replace_stale_instance("tray", Some(find_legacy_tray_holder)) {
         Some(l) => l,
         None => {
             if verbose {
@@ -731,6 +760,12 @@ pub fn run_tray(verbose: bool) -> Result<i32, String> {
         {
             while gtk::events_pending() {
                 gtk::main_iteration_do(false);
+            }
+        }
+
+        while let Ok(event) = TrayIconEvent::receiver().try_recv() {
+            if matches!(event, TrayIconEvent::DoubleClick { .. }) {
+                spawn_self_args(&["--gui-tab", "home"]);
             }
         }
 
@@ -789,6 +824,22 @@ mod tests {
             TrayBadgeState::Error,
         ] {
             let _icon = build_tray_icon(state);
+        }
+    }
+
+    #[test]
+    fn test_tray_menu_labels_avoid_gtk_mnemonics() {
+        let src = include_str!("tray.rs");
+        let prod_src = src.split("#[cfg(test)]").next().unwrap_or(src);
+        for forbidden in [
+            "Volume & Mute",
+            "Settings & Routing",
+            "Android Audio & Wi-Fi",
+        ] {
+            assert!(
+                !prod_src.contains(forbidden),
+                "Tray menu must not contain single '&' mnemonic string: {forbidden}"
+            );
         }
     }
 }

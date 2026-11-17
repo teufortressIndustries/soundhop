@@ -4,7 +4,7 @@
 use std::collections::{HashMap, HashSet};
 use std::env;
 use std::fs::{self, OpenOptions};
-use std::io::Write;
+use std::io::{Seek, SeekFrom, Write};
 use std::net::{IpAddr, Ipv4Addr, SocketAddr, TcpStream, ToSocketAddrs};
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
@@ -15,7 +15,7 @@ use ipnet::Ipv4Net;
 use rand::Rng;
 use thiserror::Error;
 
-use crate::constants::APP_SLUG;
+use crate::constants::{APP_SLUG, VERSION};
 
 // ---------------------------------------------------------------------------
 // Process execution & Mockable Runner
@@ -455,6 +455,13 @@ pub fn close_fds_pre_exec(cmd: &mut Command) {
 #[cfg(not(unix))]
 pub fn close_fds_pre_exec(_cmd: &mut Command) {}
 
+/// Metadata written by the active lock holder after acquiring `InstanceLock`.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct InstanceLockInfo {
+    pub pid: Option<u64>,
+    pub version: String,
+}
+
 /// Single-instance process lock backed by kernel flock on Unix and exclusive sharing on Windows.
 pub struct InstanceLock {
     _file: fs::File,
@@ -473,6 +480,26 @@ impl Drop for InstanceLock {
     }
 }
 
+pub fn instance_lock_path(name: &str) -> PathBuf {
+    runtime_dir().join(format!("{name}.lock"))
+}
+
+pub fn read_instance_lock_info(name: &str) -> Option<InstanceLockInfo> {
+    let content = fs::read_to_string(instance_lock_path(name)).ok()?;
+    let trimmed = content.trim();
+    if trimmed.is_empty() {
+        return None;
+    }
+    let val: serde_json::Value = serde_json::from_str(trimmed).ok()?;
+    let pid = val.get("pid").and_then(|v| v.as_u64());
+    let version = val
+        .get("version")
+        .and_then(|v| v.as_str())
+        .unwrap_or("")
+        .to_string();
+    Some(InstanceLockInfo { pid, version })
+}
+
 pub fn try_acquire_instance_lock(name: &str) -> Option<InstanceLock> {
     let dir = runtime_dir();
     let _ = ensure_dir(&dir);
@@ -489,7 +516,7 @@ pub fn try_acquire_instance_lock(name: &str) -> Option<InstanceLock> {
         use std::os::windows::fs::OpenOptionsExt;
         opts.share_mode(0);
     }
-    let file = opts.open(&lock_path).ok()?;
+    let mut file = opts.open(&lock_path).ok()?;
 
     #[cfg(unix)]
     {
@@ -500,10 +527,54 @@ pub fn try_acquire_instance_lock(name: &str) -> Option<InstanceLock> {
         }
     }
 
+    let meta = serde_json::json!({
+        "pid": std::process::id(),
+        "version": VERSION,
+    })
+    .to_string();
+    if file.set_len(0).is_ok() && file.seek(SeekFrom::Start(0)).is_ok() {
+        let _ = file.write_all(meta.as_bytes());
+        let _ = file.flush();
+    }
+
     Some(InstanceLock {
         _file: file,
         _path: lock_path,
     })
+}
+
+/// Acquires the single-instance lock `name`, terminating an older-version holder if one
+/// is detected via lock metadata (or `legacy_finder` for older builds without lock metadata).
+pub fn replace_stale_instance(
+    name: &str,
+    legacy_finder: Option<fn() -> Option<InstanceLockInfo>>,
+) -> Option<InstanceLock> {
+    if let Some(lock) = try_acquire_instance_lock(name) {
+        return Some(lock);
+    }
+
+    let holder = read_instance_lock_info(name).or_else(|| legacy_finder.and_then(|f| f()))?;
+    if holder.version == VERSION {
+        return None;
+    }
+
+    let pid = holder.pid?;
+    if !crate::ipc::is_soundhop_process(pid) {
+        return None;
+    }
+
+    #[cfg(unix)]
+    unsafe {
+        libc::kill(pid as libc::pid_t, libc::SIGTERM);
+    }
+
+    for _ in 0..60 {
+        if let Some(lock) = try_acquire_instance_lock(name) {
+            return Some(lock);
+        }
+        std::thread::sleep(Duration::from_millis(50));
+    }
+    None
 }
 
 static ATOMIC_WRITE_LOCK: OnceLock<Mutex<()>> = OnceLock::new();
@@ -1182,9 +1253,18 @@ mod tests {
     fn test_try_acquire_instance_lock() {
         let lock1 = try_acquire_instance_lock("test_single_instance");
         assert!(lock1.is_some());
-        // Second acquisition while lock1 is held should fail
+        let info = read_instance_lock_info("test_single_instance")
+            .expect("lock metadata should be written on acquisition");
+        assert_eq!(info.pid, Some(u64::from(std::process::id())));
+        assert_eq!(info.version, VERSION);
+
+        // Second acquisition while lock1 is held should fail without wiping metadata
         let lock2 = try_acquire_instance_lock("test_single_instance");
         assert!(lock2.is_none());
+        let info_after = read_instance_lock_info("test_single_instance")
+            .expect("failed acquisition must preserve lock holder metadata");
+        assert_eq!(info_after, info);
+
         // Dropping lock1 frees the lock
         drop(lock1);
         let lock3 = try_acquire_instance_lock("test_single_instance");

@@ -157,14 +157,14 @@ echo "4. Deploying SoundHop & libraries with quick-sharun..."
     /usr/lib/libwayland-cursor.so*
 
 # Preserve quick-sharun's generated AppRun.sh, AppRun.lib, and path-mapping hooks;
-# add SoundHop's tray/status default-dispatch logic as a hook in bin/.
+# add SoundHop's GUI/status default-dispatch logic as a hook in bin/.
 cat << 'EOF' > "$APP_DIR/bin/soundhop-dispatch.hook"
 #!/bin/sh
-# Default to launching tray on graphical sessions or status on headless sessions
-# when the AppImage is invoked with no CLI arguments.
+# Default to launching the Control Center (which also starts the tray) on graphical
+# sessions or status on headless sessions when invoked with no CLI arguments.
 if [ $# -eq 0 ]; then
     if [ -n "${WAYLAND_DISPLAY:-}" ] || [ -n "${DISPLAY:-}" ]; then
-        set -- tray
+        set -- gui
     else
         set -- status
     fi

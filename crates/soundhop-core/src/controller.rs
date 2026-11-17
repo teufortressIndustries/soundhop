@@ -995,6 +995,19 @@ impl Controller {
         }))
     }
 
+    pub fn clear_pairing(&self) -> serde_json::Value {
+        self.state.lock().unwrap().paired_peers.clear();
+        {
+            let mut cfg = self.config.lock().unwrap();
+            cfg.sharing.psk_hash.clear();
+            if cfg.sharing.security == "psk" {
+                cfg.sharing.security = "trusted-lan".to_string();
+            }
+        }
+        self.save();
+        serde_json::json!({ "ok": true, "cleared": true })
+    }
+
     // -- Auto-Connect Controls -------------------------------------------
 
     pub fn set_auto(&self, enabled: bool) -> serde_json::Value {
@@ -1406,6 +1419,63 @@ impl Controller {
         }))
     }
 
+    /// Clear temporary and/or persistent routing overrides for one app or all apps.
+    pub fn unroute_app(
+        &self,
+        app: Option<&str>,
+        remove_rule: bool,
+    ) -> Result<serde_json::Value, ControllerError> {
+        let trimmed = app.map(str::trim).filter(|s| !s.is_empty());
+        if let Some(target_app) = trimmed {
+            let key = target_app.to_lowercase();
+            {
+                let mut st = self.state.lock().unwrap();
+                st.routed_apps.remove(&key);
+            }
+            if remove_rule {
+                let mut cfg = self.config.lock().unwrap();
+                cfg.routing.always_remote.retain(|x| x != &key);
+                cfg.routing.always_local.retain(|x| x != &key);
+            }
+            self.save();
+            // Best-effort restore to default/local sink if backend is available
+            let st_snap = self.state.lock().unwrap().clone();
+            let target_sink = if !st_snap.connected_sink.is_empty()
+                && self.config.lock().unwrap().routing.default_mode == "all"
+            {
+                st_snap.connected_sink
+            } else {
+                let mut loc = self.local_default_candidate(&st_snap.previous_default_sink);
+                if loc.is_empty() {
+                    loc = self.backend.default_sink().unwrap_or_default();
+                }
+                loc
+            };
+            let moved = if !target_sink.is_empty() {
+                self.backend
+                    .move_app_streams(target_app, &target_sink)
+                    .unwrap_or(0)
+            } else {
+                0
+            };
+            Ok(serde_json::json!({
+                "ok": true,
+                "app": target_app,
+                "remove_rule": remove_rule,
+                "moved": moved,
+            }))
+        } else {
+            self.state.lock().unwrap().routed_apps.clear();
+            if remove_rule {
+                let mut cfg = self.config.lock().unwrap();
+                cfg.routing.always_remote.clear();
+                cfg.routing.always_local.clear();
+            }
+            self.save();
+            Ok(serde_json::json!({ "ok": true, "unrouted_all": true }))
+        }
+    }
+
     pub fn enforce_routed_apps(&self) -> usize {
         let st = self.state.lock().unwrap().clone();
         let cfg = self.config.lock().unwrap().clone();
@@ -1736,6 +1806,20 @@ mod tests {
             .routing
             .always_remote
             .contains(&"spotify".to_string()));
+
+        let unroute_res = ctrl.unroute_app(Some("spotify"), true).unwrap();
+        assert_eq!(unroute_res["remove_rule"], true);
+        assert!(!ctrl
+            .config
+            .lock()
+            .unwrap()
+            .routing
+            .always_remote
+            .contains(&"spotify".to_string()));
+
+        let clear_res = ctrl.clear_pairing();
+        assert_eq!(clear_res["cleared"], true);
+        assert!(ctrl.config.lock().unwrap().sharing.psk_hash.is_empty());
     }
 
     #[test]
