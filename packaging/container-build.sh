@@ -20,15 +20,19 @@ OUTPUT_DIR="$REPO_DIR/dist"
 ANYLINUX_COMMIT="${ANYLINUX_COMMIT:-f7e9cb26818bdeb3d64a0fe055fdd51cbc887a81}"
 QUICK_SHARUN_URL="${QUICK_SHARUN_URL:-https://raw.githubusercontent.com/pkgforge-dev/Anylinux-AppImages/${ANYLINUX_COMMIT}/useful-tools/quick-sharun.sh}"
 QUICK_SHARUN_SHA256="${QUICK_SHARUN_SHA256:-0aea2f589658e5db1659a6ccb8d29546c4e03028f1e29b37c6450cece917249a}"
-GET_DEBLOATED_URL="${GET_DEBLOATED_URL:-https://raw.githubusercontent.com/pkgforge-dev/Anylinux-AppImages/${ANYLINUX_COMMIT}/useful-tools/get-debloated-pkgs.sh}"
-GET_DEBLOATED_SHA256="${GET_DEBLOATED_SHA256:-d215f7676785f1a1bb8784e69085d66c1df81488ef31f1ba7198325a5be05130}"
+DEBLOATED_BASE_URL="${DEBLOATED_BASE_URL:-https://github.com/pkgforge-dev/archlinux-pkgs-debloated/releases/download/continuous}"
 QUICK_SHARUN="$BUILD_DIR/quick-sharun.sh"
+
+# Ensure wget (used internally by quick-sharun.sh) avoids hanging on unrouted container IPv6 or read stalls
+if [[ ! -f "$HOME/.wgetrc" ]] || ! grep -q "inet4_only" "$HOME/.wgetrc" 2>/dev/null; then
+    printf 'inet4_only = on\ntimeout = 20\ntries = 5\n' >> "$HOME/.wgetrc"
+fi
 
 fetch_verified_script() {
     local url="$1"
     local dest="$2"
     local expected_sha256="$3"
-    curl --proto '=https' --tlsv1.2 --retry 3 --retry-delay 2 -fsSL "$url" -o "$dest"
+    curl --ipv4 --connect-timeout 15 --max-time 180 --proto '=https' --tlsv1.2 --retry 3 --retry-delay 2 -fsSL "$url" -o "$dest"
     if [[ -n "$expected_sha256" && "$expected_sha256" != "skip" ]]; then
         printf '%s  %s\n' "$expected_sha256" "$dest" | sha256sum -c -
     fi
@@ -57,9 +61,20 @@ fi
 
 if ! pacman -Q mesa-mini >/dev/null 2>&1 && ! pacman -Q mesa-nano >/dev/null 2>&1; then
     echo "0b. Installing debloated Mesa/GTK3 packages (no LLVM, no Qt6/GTK4/Vulkan)..."
-    fetch_verified_script "$GET_DEBLOATED_URL" "$BUILD_DIR/get-debloated-pkgs.sh" "$GET_DEBLOATED_SHA256"
-    ${SUDO:-} "$BUILD_DIR/get-debloated-pkgs.sh" --add-opengl --prefer-nano \
-        gtk3-mini libxml2-mini icu-mini glycin-mini
+    host_arch="$(uname -m)"
+    debloat_dir="$BUILD_DIR/debloated-pkgs"
+    rm -rf "$debloat_dir"
+    mkdir -p "$debloat_dir"
+    for pkg in mesa-nano gtk3-mini libxml2-mini icu-mini glycin-mini; do
+        pkg_file="${pkg}-${host_arch}.pkg.tar.zst"
+        pkg_url="${DEBLOATED_BASE_URL}/${pkg_file}"
+        echo "  -> Downloading ${pkg_file}..."
+        curl --ipv4 --connect-timeout 15 --max-time 180 --proto '=https' --tlsv1.2 --retry 3 --retry-delay 2 -fsSL "$pkg_url" -o "$debloat_dir/$pkg_file"
+    done
+    for i in 1 2 3; do
+        $SUDO pacman -U --noconfirm --ask 4 "$debloat_dir"/*.pkg.tar.zst && break || sleep 5
+    done
+    rm -rf "$debloat_dir"
 fi
 
 if ! command -v cargo >/dev/null 2>&1; then
