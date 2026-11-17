@@ -4,7 +4,7 @@
 use std::collections::{HashMap, HashSet};
 use std::env;
 use std::fs::{self, OpenOptions};
-use std::io::{Seek, SeekFrom, Write};
+use std::io::Write;
 use std::net::{IpAddr, Ipv4Addr, SocketAddr, TcpStream, ToSocketAddrs};
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
@@ -466,10 +466,14 @@ pub struct InstanceLockInfo {
 pub struct InstanceLock {
     _file: fs::File,
     _path: PathBuf,
+    _info_path: PathBuf,
 }
 
 impl Drop for InstanceLock {
     fn drop(&mut self) {
+        // Remove companion metadata while the lock is still held so another acquirer
+        // cannot race to recreate it before we unlock.
+        let _ = fs::remove_file(&self._info_path);
         #[cfg(unix)]
         {
             use std::os::unix::io::AsRawFd;
@@ -484,8 +488,14 @@ pub fn instance_lock_path(name: &str) -> PathBuf {
     runtime_dir().join(format!("{name}.lock"))
 }
 
+pub fn instance_lock_info_path(name: &str) -> PathBuf {
+    runtime_dir().join(format!("{name}.lock.info"))
+}
+
 pub fn read_instance_lock_info(name: &str) -> Option<InstanceLockInfo> {
-    let content = fs::read_to_string(instance_lock_path(name)).ok()?;
+    let content = fs::read_to_string(instance_lock_info_path(name))
+        .or_else(|_| fs::read_to_string(instance_lock_path(name)))
+        .ok()?;
     let trimmed = content.trim();
     if trimmed.is_empty() {
         return None;
@@ -504,6 +514,7 @@ pub fn try_acquire_instance_lock(name: &str) -> Option<InstanceLock> {
     let dir = runtime_dir();
     let _ = ensure_dir(&dir);
     let lock_path = dir.join(format!("{name}.lock"));
+    let info_path = dir.join(format!("{name}.lock.info"));
     let mut opts = OpenOptions::new();
     opts.read(true).write(true).create(true).truncate(false);
     #[cfg(unix)]
@@ -516,7 +527,7 @@ pub fn try_acquire_instance_lock(name: &str) -> Option<InstanceLock> {
         use std::os::windows::fs::OpenOptionsExt;
         opts.share_mode(0);
     }
-    let mut file = opts.open(&lock_path).ok()?;
+    let file = opts.open(&lock_path).ok()?;
 
     #[cfg(unix)]
     {
@@ -532,14 +543,12 @@ pub fn try_acquire_instance_lock(name: &str) -> Option<InstanceLock> {
         "version": VERSION,
     })
     .to_string();
-    if file.set_len(0).is_ok() && file.seek(SeekFrom::Start(0)).is_ok() {
-        let _ = file.write_all(meta.as_bytes());
-        let _ = file.flush();
-    }
+    let _ = atomic_write(&info_path, &meta);
 
     Some(InstanceLock {
         _file: file,
         _path: lock_path,
+        _info_path: info_path,
     })
 }
 
