@@ -8,7 +8,7 @@ use crate::backend::{GuiBackend, GuiCommand, GuiSnapshot};
 use crate::theme::{Palette, ThemeMode};
 use crate::widgets::{
     card, collapsible_advanced, danger_button, pill_badge, primary_button, secondary_button,
-    section_header, segmented_control, toggle_switch,
+    section_header, segmented_control, selectable_card, toggle_switch,
 };
 
 pub struct SettingsViewState {
@@ -282,41 +282,17 @@ pub fn render(
             ),
         ] {
             let selected = snap.config.sharing.security == mode_key;
-            let row_resp = egui::Frame::new()
-                .fill(if selected {
-                    pal.accent_soft
-                } else {
-                    pal.card_elevated
-                })
-                .stroke(egui::Stroke::new(
-                    1.0_f32,
-                    if selected {
-                        pal.accent
-                    } else {
-                        pal.border_subtle
-                    },
-                ))
-                .corner_radius(egui::CornerRadius::same(9))
-                .inner_margin(egui::Margin::symmetric(12, 9))
-                .show(ui, |ui| {
-                    ui.horizontal(|ui| {
-                        let mut is_sel = selected;
-                        if ui.radio(is_sel, "").clicked() {
-                            is_sel = true;
-                        }
-                        ui.vertical(|ui| {
-                            ui.label(RichText::new(title).color(pal.text).size(13.5).strong());
-                            ui.label(RichText::new(desc).color(pal.text_muted).size(12.0));
-                        });
-                        if is_sel && !selected {
-                            backend.send(GuiCommand::SaveConfigPatch {
-                                patch: serde_json::json!({ "sharing": { "security": mode_key } }),
-                                toast: Some(format!("Switched privacy mode to {title}.")),
-                            });
-                        }
-                    });
-                });
-            if row_resp.response.interact(egui::Sense::click()).clicked() && !selected {
+            if selectable_card(
+                ui,
+                pal,
+                ("privacy_mode", mode_key),
+                selected,
+                title,
+                desc,
+            )
+            .clicked()
+                && !selected
+            {
                 backend.send(GuiCommand::SaveConfigPatch {
                     patch: serde_json::json!({ "sharing": { "security": mode_key } }),
                     toast: Some(format!("Switched privacy mode to {title}.")),

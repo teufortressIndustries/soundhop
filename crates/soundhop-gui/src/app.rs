@@ -2,15 +2,15 @@
 //! live non-blocking backend sync, embedded brand icon, and onboarding overlay.
 
 use std::sync::Arc;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
-use eframe::egui::{self, Color32, CornerRadius, Margin, RichText, Stroke};
+use eframe::egui::{self, CornerRadius, Margin, RichText, Stroke};
 use soundhop_core::controller::Controller;
 
 use crate::backend::{GuiBackend, GuiCommand};
 use crate::theme::{apply_theme, Palette, ThemeMode};
 use crate::views::{apps, home, onboarding, phone, settings};
-use crate::widgets::{callout_card, pill_badge};
+use crate::widgets::{callout_card, compact_button, nav_tab_button, pill_badge};
 
 const EMBEDDED_LOGO_PNG: &[u8] = include_bytes!("../../../assets/soundhop.png");
 
@@ -98,6 +98,7 @@ fn load_window_icon() -> Option<egui::IconData> {
 pub struct ControlCenterApp {
     backend: GuiBackend,
     active_tab: GuiTab,
+    tab_transition_start: Option<Instant>,
     home_state: home::HomeViewState,
     apps_state: apps::AppsViewState,
     phone_state: phone::PhoneViewState,
@@ -112,6 +113,7 @@ impl ControlCenterApp {
         Self {
             backend,
             active_tab: initial_tab,
+            tab_transition_start: None,
             home_state: home::HomeViewState::default(),
             apps_state: apps::AppsViewState::default(),
             phone_state: phone::PhoneViewState::default(),
@@ -199,37 +201,18 @@ impl eframe::App for ControlCenterApp {
 
                 ui.add_space(18.0);
 
+                let mut selected_tab_rect = None;
                 for tab in [GuiTab::Home, GuiTab::Apps, GuiTab::Phone, GuiTab::Settings] {
                     let selected = self.active_tab == tab;
-                    let fill = if selected {
-                        pal.accent_soft
-                    } else {
-                        Color32::TRANSPARENT
-                    };
-                    let stroke = if selected {
-                        Stroke::new(1.0_f32, pal.accent)
-                    } else {
-                        Stroke::NONE
-                    };
-                    let text_color = if selected {
-                        pal.accent
-                    } else {
-                        pal.text_secondary
-                    };
-
-                    let btn = egui::Button::new(
-                        RichText::new(tab.label())
-                            .color(text_color)
-                            .size(14.0)
-                            .strong(),
-                    )
-                    .fill(fill)
-                    .stroke(stroke)
-                    .corner_radius(CornerRadius::same(9))
-                    .min_size(egui::vec2(ui.available_width(), 38.0));
-
-                    if ui.add(btn).clicked() {
-                        self.active_tab = tab;
+                    let resp = nav_tab_button(ui, &pal, tab.label(), selected);
+                    if selected {
+                        selected_tab_rect = Some(resp.rect);
+                    }
+                    if resp.clicked() {
+                        if self.active_tab != tab {
+                            self.active_tab = tab;
+                            self.tab_transition_start = Some(Instant::now());
+                        }
                         match tab {
                             GuiTab::Phone => self.backend.send(GuiCommand::RefreshAndroid),
                             GuiTab::Settings => self.backend.send(GuiCommand::RefreshSystem),
@@ -240,18 +223,25 @@ impl eframe::App for ControlCenterApp {
                     ui.add_space(4.0);
                 }
 
+                if let Some(tab_rect) = selected_tab_rect {
+                    let indicator_y = ctx.animate_value_with_time(
+                        egui::Id::new("nav_rail_indicator_y"),
+                        tab_rect.center().y,
+                        0.13,
+                    );
+                    let pill = egui::Rect::from_center_size(
+                        egui::pos2(tab_rect.left() + 4.5, indicator_y),
+                        egui::vec2(3.0, 20.0),
+                    );
+                    ui.painter().rect_filled(pill, 1.5, pal.accent);
+                }
+
                 // Bottom Rail Status + Quick Theme Switch
                 ui.with_layout(egui::Layout::bottom_up(egui::Align::Min), |ui| {
                     ui.horizontal(|ui| {
                         let next_theme = if pal.dark { "light" } else { "dark" };
                         let theme_label = if pal.dark { "Light Mode" } else { "Dark Mode" };
-                        let tbtn = egui::Button::new(
-                            RichText::new(theme_label).color(pal.text_muted).size(11.5),
-                        )
-                        .fill(pal.card)
-                        .stroke(Stroke::new(1.0_f32, pal.border_subtle))
-                        .corner_radius(CornerRadius::same(7));
-                        if ui.add(tbtn).clicked() {
+                        if compact_button(ui, &pal, theme_label).clicked() {
                             self.backend.send(GuiCommand::SaveConfigPatch {
                                 patch: serde_json::json!({ "ui": { "theme": next_theme } }),
                                 toast: None,
@@ -293,40 +283,80 @@ impl eframe::App for ControlCenterApp {
             )
             .show(ctx, |ui| {
                 // Toast or busy indicator at top of workspace if present
+                let busy_alpha = ctx.animate_bool_with_time_and_easing(
+                    egui::Id::new("busy_banner_visible"),
+                    snap.busy_message.is_some(),
+                    0.12,
+                    egui::emath::easing::cubic_out,
+                );
                 if let Some(ref busy) = snap.busy_message {
-                    render_banner(ui, &pal, busy, false, true, &self.backend);
+                    render_banner(ui, &pal, busy, false, true, busy_alpha, &self.backend);
                     ui.add_space(10.0);
                 } else if let Some(toast) = self.backend.latest_toast() {
+                    let elapsed = toast.created_at.elapsed().as_secs_f32();
+                    let fade_in = (elapsed / 0.14).clamp(0.0, 1.0);
+                    let fade_out = ((4.0 - elapsed) / 0.30).clamp(0.0, 1.0);
+                    let alpha = fade_in.min(fade_out);
+                    if elapsed < 0.16 || elapsed > 3.65 {
+                        ctx.request_repaint();
+                    }
                     render_banner(
                         ui,
                         &pal,
                         &toast.message,
                         toast.is_error,
                         false,
+                        alpha,
                         &self.backend,
                     );
                     ui.add_space(10.0);
                 }
 
+                let (tab_alpha, tab_offset_y) = if let Some(started) = self.tab_transition_start {
+                    let elapsed = started.elapsed().as_secs_f32();
+                    let dur = 0.14_f32;
+                    if elapsed < dur {
+                        ctx.request_repaint();
+                        let eased =
+                            egui::emath::easing::cubic_out((elapsed / dur).clamp(0.0, 1.0));
+                        (0.25 + 0.75 * eased, (1.0 - eased) * 6.0)
+                    } else {
+                        self.tab_transition_start = None;
+                        (1.0, 0.0)
+                    }
+                } else {
+                    (1.0, 0.0)
+                };
+
                 egui::ScrollArea::vertical()
                     .auto_shrink([false, false])
-                    .show(ui, |ui| match self.active_tab {
-                        GuiTab::Home => {
-                            home::render(ui, &pal, &snap, &mut self.home_state, &self.backend)
+                    .show(ui, |ui| {
+                        if tab_offset_y > 0.05 {
+                            ui.add_space(tab_offset_y);
                         }
-                        GuiTab::Apps => {
-                            apps::render(ui, &pal, &snap, &mut self.apps_state, &self.backend)
+                        ui.set_opacity(tab_alpha);
+                        match self.active_tab {
+                            GuiTab::Home => {
+                                home::render(ui, &pal, &snap, &mut self.home_state, &self.backend)
+                            }
+                            GuiTab::Apps => {
+                                apps::render(ui, &pal, &snap, &mut self.apps_state, &self.backend)
+                            }
+                            GuiTab::Phone => phone::render(
+                                ui,
+                                &pal,
+                                &snap,
+                                &mut self.phone_state,
+                                &self.backend,
+                            ),
+                            GuiTab::Settings => settings::render(
+                                ui,
+                                &pal,
+                                &snap,
+                                &mut self.settings_state,
+                                &self.backend,
+                            ),
                         }
-                        GuiTab::Phone => {
-                            phone::render(ui, &pal, &snap, &mut self.phone_state, &self.backend)
-                        }
-                        GuiTab::Settings => settings::render(
-                            ui,
-                            &pal,
-                            &snap,
-                            &mut self.settings_state,
-                            &self.backend,
-                        ),
                     });
             });
     }
@@ -338,6 +368,7 @@ fn render_banner(
     message: &str,
     is_error: bool,
     is_busy: bool,
+    alpha: f32,
     backend: &GuiBackend,
 ) {
     let (bg, border, fg) = if is_error {
@@ -347,22 +378,22 @@ fn render_banner(
     } else {
         (pal.success_soft, pal.success, pal.success)
     };
-    callout_card(ui, bg, border, |ui| {
-        ui.horizontal(|ui| {
-            if is_busy {
-                ui.spinner();
-            }
-            ui.label(RichText::new(message).color(fg).size(12.5).strong());
-            if !is_busy {
-                ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                    if ui
-                        .small_button(RichText::new("Dismiss").color(pal.text_muted))
-                        .clicked()
-                    {
-                        backend.dismiss_toast();
-                    }
-                });
-            }
+    ui.scope(|ui| {
+        ui.set_opacity(alpha.clamp(0.0, 1.0));
+        callout_card(ui, bg, border, |ui| {
+            ui.horizontal(|ui| {
+                if is_busy {
+                    ui.spinner();
+                }
+                ui.label(RichText::new(message).color(fg).size(12.5).strong());
+                if !is_busy {
+                    ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                        if compact_button(ui, pal, "Dismiss").clicked() {
+                            backend.dismiss_toast();
+                        }
+                    });
+                }
+            });
         });
     });
 }

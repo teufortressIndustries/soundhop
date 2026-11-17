@@ -285,7 +285,7 @@ cargo test --workspace
 ```bash
 ./packaging/build-appimage.sh
 ```
-On non-Arch hosts this automatically builds inside an Arch Linux container using [pkgforge's AnyLinux AppImages](https://pkgforge-dev.github.io/Anylinux-AppImages/) (`quick-sharun` + `uruntime`/DwarFS, no FUSE required at runtime). The finished binary will be placed at `dist/SoundHop-2.1.0-universal-x86_64.AppImage`.
+On non-Arch hosts this automatically builds inside an Arch Linux container using [pkgforge's AnyLinux AppImages](https://pkgforge-dev.github.io/Anylinux-AppImages/) (`quick-sharun` + `uruntime`/DwarFS, no FUSE required at runtime). The finished binary will be placed at `dist/SoundHop-2.1.1-universal-x86_64.AppImage`.
 
 ---
 

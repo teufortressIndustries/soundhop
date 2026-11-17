@@ -1,8 +1,8 @@
 //! Non-blocking background worker and plain-language state snapshot for the Control Center GUI.
 
 use std::collections::HashSet;
-use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::{mpsc, Arc, Mutex, RwLock};
+use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
+use std::sync::{mpsc, Arc, Condvar, Mutex, RwLock};
 use std::thread::{self, JoinHandle};
 use std::time::{Duration, Instant};
 
@@ -111,6 +111,9 @@ pub struct GuiSnapshot {
     pub service_enabled: bool,
     pub autostart_installed: bool,
     pub busy_message: Option<String>,
+    pub refreshing_peers: bool,
+    pub refreshing_android: bool,
+    pub pending_peer_id: Option<String>,
     pub show_onboarding: bool,
     pub paired_count: usize,
 }
@@ -169,6 +172,9 @@ impl GuiSnapshot {
                 .and_then(|v| v.as_bool())
                 .unwrap_or(false),
             busy_message: None,
+            refreshing_peers: false,
+            refreshing_android: false,
+            pending_peer_id: None,
         }
     }
 
@@ -315,12 +321,27 @@ pub enum GuiCommand {
     ReopenOnboarding,
 }
 
+fn is_mutating_command(cmd: &GuiCommand) -> bool {
+    !matches!(
+        cmd,
+        GuiCommand::RefreshFast
+            | GuiCommand::RefreshPeers
+            | GuiCommand::RefreshAndroid
+            | GuiCommand::RefreshSystem
+    )
+}
+
 pub struct GuiBackend {
     pub snapshot: Arc<RwLock<GuiSnapshot>>,
-    tx: mpsc::Sender<GuiCommand>,
+    tx: Option<mpsc::Sender<GuiCommand>>,
     toasts: Arc<Mutex<Vec<GuiToast>>>,
+    ctx: Option<egui::Context>,
+    mutation_seq: Arc<AtomicU64>,
+    active_commands: Arc<AtomicUsize>,
     stop_flag: Arc<AtomicBool>,
-    handle: Option<JoinHandle<()>>,
+    poller_wake: Arc<(Mutex<bool>, Condvar)>,
+    cmd_handle: Option<JoinHandle<()>>,
+    poller_handle: Option<JoinHandle<()>>,
 }
 
 impl GuiBackend {
@@ -345,68 +366,266 @@ impl GuiBackend {
         }
         let (tx, rx) = mpsc::channel::<GuiCommand>();
         let stop_flag = Arc::new(AtomicBool::new(false));
+        let mutation_seq = Arc::new(AtomicU64::new(0));
+        let active_commands = Arc::new(AtomicUsize::new(0));
+        let cached_live_peers = Arc::new(Mutex::new(Vec::new()));
+        let controller_sync_lock = Arc::new(Mutex::new(()));
+        let poller_wake = Arc::new((Mutex::new(false), Condvar::new()));
 
-        let snap_w = Arc::clone(&snapshot);
-        let toasts_w = Arc::clone(&toasts);
-        let stop_w = Arc::clone(&stop_flag);
+        let cmd_worker = WorkerState {
+            controller: Arc::clone(&controller),
+            snapshot: Arc::clone(&snapshot),
+            toasts: Arc::clone(&toasts),
+            ctx: ctx.clone(),
+            cached_live_peers: Arc::clone(&cached_live_peers),
+            mutation_seq: Arc::clone(&mutation_seq),
+            active_commands: Arc::clone(&active_commands),
+            controller_sync_lock: Arc::clone(&controller_sync_lock),
+            use_ipc: true,
+        };
 
-        let handle = thread::spawn(move || {
+        let mut poller_worker = WorkerState {
+            controller: Arc::clone(&controller),
+            snapshot: Arc::clone(&snapshot),
+            toasts: Arc::clone(&toasts),
+            ctx: ctx.clone(),
+            cached_live_peers,
+            mutation_seq: Arc::clone(&mutation_seq),
+            active_commands: Arc::clone(&active_commands),
+            controller_sync_lock,
+            use_ipc: true,
+        };
+
+        let cmd_handle = thread::spawn(move || {
+            let mut worker = cmd_worker;
+            while let Ok(cmd) = rx.recv() {
+                let mutating = is_mutating_command(&cmd);
+                worker.handle_command(cmd);
+                if mutating {
+                    worker.active_commands.fetch_sub(1, Ordering::SeqCst);
+                }
+                worker.request_repaint();
+            }
+        });
+
+        let stop_poller = Arc::clone(&stop_flag);
+        let wake_poller = Arc::clone(&poller_wake);
+        let poller_handle = thread::spawn(move || {
             let _telemetry_monitor = if controller.is_save_enabled() {
                 Some(controller.start_telemetry_monitor())
             } else {
                 None
             };
 
-            let mut worker = WorkerState {
-                controller,
-                snapshot: snap_w,
-                toasts: toasts_w,
-                ctx,
-                cached_live_peers: Vec::new(),
-            };
-
-            worker.refresh_fast();
-            worker.refresh_peers();
-            worker.refresh_android();
-            worker.refresh_system();
-            worker.request_repaint();
+            poller_worker.refresh_fast(false);
+            poller_worker.refresh_peers();
+            poller_worker.refresh_android();
+            poller_worker.refresh_system();
+            poller_worker.request_repaint();
 
             let mut last_fast = Instant::now();
             let mut last_peers = Instant::now();
 
-            while !stop_w.load(Ordering::Relaxed) {
-                while let Ok(cmd) = rx.try_recv() {
-                    worker.handle_command(cmd);
-                    worker.request_repaint();
+            while !stop_poller.load(Ordering::Relaxed) {
+                let (lock, cvar) = &*wake_poller;
+                let guard = lock.lock().unwrap();
+                if !*guard {
+                    let _ = cvar.wait_timeout(guard, Duration::from_millis(650));
+                }
+                if stop_poller.load(Ordering::Relaxed) {
+                    break;
                 }
 
                 if last_fast.elapsed() >= Duration::from_millis(650) {
-                    worker.refresh_fast();
-                    worker.request_repaint();
+                    poller_worker.refresh_fast(false);
+                    poller_worker.request_repaint();
                     last_fast = Instant::now();
                 }
 
                 if last_peers.elapsed() >= Duration::from_secs(3) {
-                    worker.refresh_peers();
-                    worker.request_repaint();
+                    poller_worker.refresh_peers();
+                    poller_worker.refresh_fast(false);
+                    poller_worker.request_repaint();
                     last_peers = Instant::now();
                 }
-
-                thread::sleep(Duration::from_millis(45));
             }
         });
 
         Self {
             snapshot,
-            tx,
+            tx: Some(tx),
             toasts,
+            ctx,
+            mutation_seq,
+            active_commands,
             stop_flag,
-            handle: Some(handle),
+            poller_wake,
+            cmd_handle: Some(cmd_handle),
+            poller_handle: Some(poller_handle),
         }
     }
 
     pub fn send(&self, cmd: GuiCommand) {
-        let _ = self.tx.send(cmd);
+        let mutating = is_mutating_command(&cmd);
+        self.apply_optimistic_update(&cmd);
+        if mutating {
+            self.active_commands.fetch_add(1, Ordering::SeqCst);
+        }
+        if let Some(ref ctx) = self.ctx {
+            ctx.request_repaint();
+        }
+        if let Some(ref tx) = self.tx {
+            if tx.send(cmd).is_err() && mutating {
+                self.active_commands.fetch_sub(1, Ordering::SeqCst);
+            }
+        } else if mutating {
+            self.active_commands.fetch_sub(1, Ordering::SeqCst);
+        }
+    }
+
+    fn apply_optimistic_update(&self, cmd: &GuiCommand) {
+        self.mutation_seq.fetch_add(1, Ordering::SeqCst);
+        let mut snap = self.snapshot.write().unwrap();
+        match cmd {
+            GuiCommand::RefreshFast | GuiCommand::RefreshSystem => {}
+            GuiCommand::RefreshPeers => {
+                snap.refreshing_peers = true;
+            }
+            GuiCommand::RefreshAndroid => {
+                snap.refreshing_android = true;
+            }
+            GuiCommand::ConnectPeer { peer_id } => {
+                snap.pending_peer_id = Some(peer_id.clone());
+                snap.busy_message = Some("Connecting to speaker...".to_string());
+            }
+            GuiCommand::ConnectAddress { host_port } => {
+                let trimmed = host_port.trim();
+                if !trimmed.is_empty() {
+                    snap.busy_message = Some(format!("Connecting to {trimmed}..."));
+                }
+            }
+            GuiCommand::ConnectMulti { peer_ids, .. } => {
+                if !peer_ids.is_empty() {
+                    snap.busy_message = Some("Starting multi-room audio...".to_string());
+                }
+            }
+            GuiCommand::Disconnect => {
+                snap.busy_message = Some("Switching back to this device...".to_string());
+            }
+            GuiCommand::SetShare { enabled } => {
+                snap.sharing_enabled = *enabled;
+            }
+            GuiCommand::SetAutoConnect { enabled } => {
+                snap.auto_connect = *enabled;
+            }
+            GuiCommand::SetVolume { level } => {
+                snap.volume_level = *level;
+            }
+            GuiCommand::SetMute { muted } => {
+                snap.volume_muted = *muted;
+            }
+            GuiCommand::RouteApp { app, target, save } => {
+                let is_remote = target == "remote";
+                if let Some(existing) = snap
+                    .apps
+                    .iter_mut()
+                    .find(|a| a.app_name.eq_ignore_ascii_case(app))
+                {
+                    existing.is_remote = is_remote;
+                    existing.routed_rule = target.clone();
+                    if *save {
+                        existing.persistent = true;
+                    }
+                } else if *save {
+                    snap.apps.push(AppStreamView {
+                        app_name: app.clone(),
+                        media_name: String::new(),
+                        is_remote,
+                        routed_rule: target.clone(),
+                        persistent: true,
+                        active: false,
+                    });
+                }
+            }
+            GuiCommand::UnrouteApp { app, remove_rule } => {
+                if let Some(existing) = snap
+                    .apps
+                    .iter_mut()
+                    .find(|a| a.app_name.eq_ignore_ascii_case(app))
+                {
+                    existing.is_remote = false;
+                    if *remove_rule {
+                        existing.persistent = false;
+                        existing.routed_rule.clear();
+                    }
+                }
+                if *remove_rule {
+                    snap.apps.retain(|a| a.active || a.persistent);
+                }
+            }
+            GuiCommand::SetDefaultRoutingMode { mode } => {
+                snap.config.routing.default_mode = mode.clone();
+            }
+            GuiCommand::SetMic { direction } => {
+                snap.mic_enabled = direction.is_some();
+                if let Some(dir) = direction {
+                    snap.mic_direction = dir.clone();
+                }
+            }
+            GuiCommand::SaveConfigPatch { patch, .. } => {
+                let _ = snap.config.apply_patch(patch);
+            }
+            GuiCommand::ApplyPairingPin { pin } => {
+                if pin.trim().len() >= 6 {
+                    snap.config.sharing.security = "psk".to_string();
+                }
+            }
+            GuiCommand::ClearPairing => {
+                snap.config.sharing.psk_hash.clear();
+                snap.config.sharing.security = "trusted-lan".to_string();
+            }
+            GuiCommand::AndroidInstallTools => {
+                snap.android_installing = true;
+            }
+            GuiCommand::AndroidSwitchWifi { .. } => {
+                snap.busy_message = Some("Switching phone to Wi-Fi...".to_string());
+            }
+            GuiCommand::AndroidConnectWifi { ip_port } => {
+                if !ip_port.trim().is_empty() {
+                    snap.busy_message = Some(format!("Connecting to {}...", ip_port.trim()));
+                }
+            }
+            GuiCommand::AndroidDisconnectWifi { .. } => {}
+            GuiCommand::AndroidStart { device_name, .. } => {
+                snap.busy_message = Some(format!("Starting audio from {device_name}..."));
+            }
+            GuiCommand::AndroidStop => {
+                snap.android_session_active = false;
+            }
+            GuiCommand::OpenFirewall => {
+                snap.busy_message = Some("Opening firewall ports...".to_string());
+            }
+            GuiCommand::SetAutostart { enabled } => {
+                snap.autostart_installed = *enabled;
+                snap.service_enabled = *enabled;
+            }
+            GuiCommand::CompleteOnboarding {
+                device_name,
+                enable_sharing,
+                enable_autostart,
+                ..
+            } => {
+                snap.show_onboarding = false;
+                snap.sharing_enabled = *enable_sharing;
+                snap.autostart_installed = *enable_autostart;
+                if !device_name.trim().is_empty() {
+                    snap.config.device.name = device_name.trim().to_string();
+                }
+            }
+            GuiCommand::ReopenOnboarding => {
+                snap.show_onboarding = true;
+            }
+        }
     }
 
     pub fn read(&self) -> GuiSnapshot {
@@ -427,7 +646,17 @@ impl GuiBackend {
 impl Drop for GuiBackend {
     fn drop(&mut self) {
         self.stop_flag.store(true, Ordering::SeqCst);
-        if let Some(h) = self.handle.take() {
+        self.tx.take();
+        {
+            let (lock, cvar) = &*self.poller_wake;
+            let mut stopped = lock.lock().unwrap();
+            *stopped = true;
+            cvar.notify_all();
+        }
+        if let Some(h) = self.cmd_handle.take() {
+            let _ = h.join();
+        }
+        if let Some(h) = self.poller_handle.take() {
             let _ = h.join();
         }
     }
@@ -438,7 +667,11 @@ struct WorkerState {
     snapshot: Arc<RwLock<GuiSnapshot>>,
     toasts: Arc<Mutex<Vec<GuiToast>>>,
     ctx: Option<egui::Context>,
-    cached_live_peers: Vec<Peer>,
+    cached_live_peers: Arc<Mutex<Vec<Peer>>>,
+    mutation_seq: Arc<AtomicU64>,
+    active_commands: Arc<AtomicUsize>,
+    controller_sync_lock: Arc<Mutex<()>>,
+    use_ipc: bool,
 }
 
 impl WorkerState {
@@ -468,12 +701,16 @@ impl WorkerState {
 
     fn handle_command(&mut self, cmd: GuiCommand) {
         match cmd {
-            GuiCommand::RefreshFast => self.refresh_fast(),
+            GuiCommand::RefreshFast => self.refresh_fast(true),
             GuiCommand::RefreshPeers => {
                 self.refresh_peers();
-                self.refresh_fast();
+                self.refresh_fast(true);
+                self.snapshot.write().unwrap().refreshing_peers = false;
             }
-            GuiCommand::RefreshAndroid => self.refresh_android(),
+            GuiCommand::RefreshAndroid => {
+                self.refresh_android();
+                self.snapshot.write().unwrap().refreshing_android = false;
+            }
             GuiCommand::RefreshSystem => self.refresh_system(),
             GuiCommand::ConnectPeer { peer_id } => {
                 self.set_busy(Some("Connecting to speaker...".to_string()));
@@ -497,6 +734,7 @@ impl WorkerState {
                         }
                     })
                 } else if let Some(peer) = self.find_peer_for_id(&peer_id) {
+                    let _sync = self.controller_sync_lock.lock().unwrap();
                     self.controller
                         .connect(
                             &peer,
@@ -510,13 +748,17 @@ impl WorkerState {
                 } else {
                     Err("Speaker is not currently reachable.".to_string())
                 };
+                self.snapshot.write().unwrap().pending_peer_id = None;
                 self.set_busy(None);
                 match res {
                     Ok(_) => {
                         self.push_toast("Connected to remote speaker.", false);
-                        self.refresh_fast();
+                        self.refresh_fast(true);
                     }
-                    Err(e) => self.push_toast(e, true),
+                    Err(e) => {
+                        self.push_toast(e, true);
+                        self.refresh_fast(true);
+                    }
                 }
             }
             GuiCommand::ConnectAddress { host_port } => {
@@ -559,6 +801,7 @@ impl WorkerState {
                         source: "manual".to_string(),
                         rtt_ms: None,
                     };
+                    let _sync = self.controller_sync_lock.lock().unwrap();
                     self.controller
                         .connect(
                             &peer,
@@ -574,10 +817,13 @@ impl WorkerState {
                 match res {
                     Ok(_) => {
                         self.push_toast(format!("Connected to {host}."), false);
-                        self.refresh_fast();
+                        self.refresh_fast(true);
                         self.refresh_peers();
                     }
-                    Err(e) => self.push_toast(e, true),
+                    Err(e) => {
+                        self.push_toast(e, true);
+                        self.refresh_fast(true);
+                    }
                 }
             }
             GuiCommand::ConnectMulti {
@@ -616,6 +862,7 @@ impl WorkerState {
                         .iter()
                         .filter_map(|id| self.find_peer_for_id(id))
                         .collect();
+                    let _sync = self.controller_sync_lock.lock().unwrap();
                     self.controller
                         .connect_multi(
                             &targets,
@@ -632,9 +879,12 @@ impl WorkerState {
                 match res {
                     Ok(_) => {
                         self.push_toast("Multi-room speakers connected.", false);
-                        self.refresh_fast();
+                        self.refresh_fast(true);
                     }
-                    Err(e) => self.push_toast(e, true),
+                    Err(e) => {
+                        self.push_toast(e, true);
+                        self.refresh_fast(true);
+                    }
                 }
             }
             GuiCommand::Disconnect => {
@@ -649,6 +899,7 @@ impl WorkerState {
                     .map(|_| ())
                     .map_err(|e| e.to_string())
                 } else {
+                    let _sync = self.controller_sync_lock.lock().unwrap();
                     self.controller
                         .disconnect(false, None, true, Some(true), false, false)
                         .map(|_| ())
@@ -658,9 +909,12 @@ impl WorkerState {
                 match res {
                     Ok(_) => {
                         self.push_toast("Audio returned to this device.", false);
-                        self.refresh_fast();
+                        self.refresh_fast(true);
                     }
-                    Err(e) => self.push_toast(e, true),
+                    Err(e) => {
+                        self.push_toast(e, true);
+                        self.refresh_fast(true);
+                    }
                 }
             }
             GuiCommand::SetShare { enabled } => {
@@ -674,6 +928,7 @@ impl WorkerState {
                     .map(|_| ())
                     .map_err(|e| e.to_string())
                 } else {
+                    let _sync = self.controller_sync_lock.lock().unwrap();
                     self.controller
                         .share(enabled, Some(true))
                         .map(|_| ())
@@ -689,9 +944,12 @@ impl WorkerState {
                             },
                             false,
                         );
-                        self.refresh_fast();
+                        self.refresh_fast(true);
                     }
-                    Err(e) => self.push_toast(e, true),
+                    Err(e) => {
+                        self.push_toast(e, true);
+                        self.refresh_fast(true);
+                    }
                 }
             }
             GuiCommand::SetAutoConnect { enabled } => {
@@ -703,9 +961,10 @@ impl WorkerState {
                         Duration::from_secs(3),
                     );
                 } else {
+                    let _sync = self.controller_sync_lock.lock().unwrap();
                     let _ = self.controller.set_auto(enabled);
                 }
-                self.refresh_fast();
+                self.refresh_fast(true);
             }
             GuiCommand::SetVolume { level } => {
                 if ipc_is_running(None) {
@@ -716,6 +975,7 @@ impl WorkerState {
                         Duration::from_secs(2),
                     );
                 } else {
+                    let _sync = self.controller_sync_lock.lock().unwrap();
                     let _ = self.controller.set_volume(Some(level), None, true);
                 }
                 self.snapshot.write().unwrap().volume_level = level;
@@ -729,6 +989,7 @@ impl WorkerState {
                         Duration::from_secs(2),
                     );
                 } else {
+                    let _sync = self.controller_sync_lock.lock().unwrap();
                     let _ = self.controller.set_volume(None, Some(muted), true);
                 }
                 self.snapshot.write().unwrap().volume_muted = muted;
@@ -743,13 +1004,17 @@ impl WorkerState {
                     )
                     .map_err(|e| e.to_string())
                 } else {
+                    let _sync = self.controller_sync_lock.lock().unwrap();
                     self.controller
                         .route_app(&app, Some(&target), save)
                         .map_err(|e| e.to_string())
                 };
                 match res {
-                    Ok(_) => self.refresh_fast(),
-                    Err(e) => self.push_toast(e, true),
+                    Ok(_) => self.refresh_fast(true),
+                    Err(e) => {
+                        self.push_toast(e, true);
+                        self.refresh_fast(true);
+                    }
                 }
             }
             GuiCommand::UnrouteApp { app, remove_rule } => {
@@ -762,6 +1027,7 @@ impl WorkerState {
                     )
                     .map_err(|e| e.to_string())
                 } else {
+                    let _sync = self.controller_sync_lock.lock().unwrap();
                     self.controller
                         .unroute_app(Some(&app), remove_rule)
                         .map_err(|e| e.to_string())
@@ -771,9 +1037,12 @@ impl WorkerState {
                         if remove_rule {
                             self.push_toast("Removed saved app rule.", false);
                         }
-                        self.refresh_fast();
+                        self.refresh_fast(true);
                     }
-                    Err(e) => self.push_toast(e, true),
+                    Err(e) => {
+                        self.push_toast(e, true);
+                        self.refresh_fast(true);
+                    }
                 }
             }
             GuiCommand::SetDefaultRoutingMode { mode } => {
@@ -811,6 +1080,7 @@ impl WorkerState {
                         }
                     })
                 } else {
+                    let _sync = self.controller_sync_lock.lock().unwrap();
                     match direction.as_deref() {
                         Some(dir) => self.controller.enable_mic(dir).map_err(|e| e.to_string()),
                         None => self.controller.disable_mic().map_err(|e| e.to_string()),
@@ -824,9 +1094,12 @@ impl WorkerState {
                             _ => "Microphone sharing turned off.",
                         };
                         self.push_toast(msg, false);
-                        self.refresh_fast();
+                        self.refresh_fast(true);
                     }
-                    Err(e) => self.push_toast(e, true),
+                    Err(e) => {
+                        self.push_toast(e, true);
+                        self.refresh_fast(true);
+                    }
                 }
             }
             GuiCommand::SaveConfigPatch { patch, toast } => {
@@ -836,6 +1109,7 @@ impl WorkerState {
                 let trimmed = pin.trim().to_string();
                 if trimmed.len() < 6 {
                     self.push_toast("Enter a code with at least 6 characters.", true);
+                    self.refresh_fast(true);
                     return;
                 }
                 let res = if ipc_is_running(None) {
@@ -847,6 +1121,7 @@ impl WorkerState {
                     )
                     .map_err(|e| e.to_string())
                 } else {
+                    let _sync = self.controller_sync_lock.lock().unwrap();
                     self.controller
                         .pair_peer("lan-group", Some(&trimmed))
                         .map_err(|e| e.to_string())
@@ -857,9 +1132,12 @@ impl WorkerState {
                             "Devices paired! Enter the same code on your other device.",
                             false,
                         );
-                        self.refresh_fast();
+                        self.refresh_fast(true);
                     }
-                    Err(e) => self.push_toast(e, true),
+                    Err(e) => {
+                        self.push_toast(e, true);
+                        self.refresh_fast(true);
+                    }
                 }
             }
             GuiCommand::ClearPairing => {
@@ -873,6 +1151,7 @@ impl WorkerState {
                     .map(|_| ())
                     .map_err(|e| e.to_string())
                 } else {
+                    let _sync = self.controller_sync_lock.lock().unwrap();
                     self.controller.clear_pairing();
                     Ok(())
                 };
@@ -882,9 +1161,12 @@ impl WorkerState {
                             "Pairing cleared. Switched back to Home Wi-Fi mode.",
                             false,
                         );
-                        self.refresh_fast();
+                        self.refresh_fast(true);
                     }
-                    Err(e) => self.push_toast(e, true),
+                    Err(e) => {
+                        self.push_toast(e, true);
+                        self.refresh_fast(true);
+                    }
                 }
             }
             GuiCommand::AndroidInstallTools => {
@@ -1001,9 +1283,12 @@ impl WorkerState {
                 match res {
                     Ok(_) => {
                         self.push_toast(format!("Listening to {device_name}."), false);
-                        self.refresh_fast();
+                        self.refresh_fast(true);
                     }
-                    Err(e) => self.push_toast(e, true),
+                    Err(e) => {
+                        self.push_toast(e, true);
+                        self.refresh_fast(true);
+                    }
                 }
             }
             GuiCommand::AndroidStop => {
@@ -1017,7 +1302,7 @@ impl WorkerState {
                 }
                 let _ = self.controller.android_session.stop();
                 self.push_toast("Stopped phone audio.", false);
-                self.refresh_fast();
+                self.refresh_fast(true);
             }
             GuiCommand::OpenFirewall => {
                 self.set_busy(Some("Opening firewall ports...".to_string()));
@@ -1113,7 +1398,7 @@ impl WorkerState {
                 }
                 self.snapshot.write().unwrap().show_onboarding = false;
                 self.push_toast("You're all set! SoundHop is ready.", false);
-                self.refresh_fast();
+                self.refresh_fast(true);
                 self.refresh_peers();
                 self.refresh_system();
             }
@@ -1138,34 +1423,56 @@ impl WorkerState {
                             .and_then(|v| v.as_str())
                             .unwrap_or("Could not save setting");
                         self.push_toast(err, true);
+                        self.refresh_fast(true);
                         return;
                     }
-                    self.controller.reload_from_disk();
+                    {
+                        let _sync = self.controller_sync_lock.lock().unwrap();
+                        self.controller.reload_from_disk();
+                    }
                     if let Some(msg) = toast {
                         self.push_toast(msg, false);
                     }
-                    self.refresh_fast();
+                    self.refresh_fast(true);
                 }
-                Err(e) => self.push_toast(e.to_string(), true),
+                Err(e) => {
+                    self.push_toast(e.to_string(), true);
+                    self.refresh_fast(true);
+                }
             }
         } else {
-            let res = self.controller.config.lock().unwrap().apply_patch(&patch);
-            match res {
-                Ok(_) => {
+            let res = {
+                let _sync = self.controller_sync_lock.lock().unwrap();
+                let r = self.controller.config.lock().unwrap().apply_patch(&patch);
+                if r.is_ok() {
                     self.controller.save();
                     let _ = self.controller.enforce_routed_apps();
+                }
+                r
+            };
+            match res {
+                Ok(_) => {
                     if let Some(msg) = toast {
                         self.push_toast(msg, false);
                     }
-                    self.refresh_fast();
+                    self.refresh_fast(true);
                 }
-                Err(e) => self.push_toast(e.to_string(), true),
+                Err(e) => {
+                    self.push_toast(e.to_string(), true);
+                    self.refresh_fast(true);
+                }
             }
         }
     }
 
     fn find_peer_for_id(&self, peer_id: &str) -> Option<Peer> {
-        if let Some(p) = self.cached_live_peers.iter().find(|p| p.id == peer_id) {
+        if let Some(p) = self
+            .cached_live_peers
+            .lock()
+            .unwrap()
+            .iter()
+            .find(|p| p.id == peer_id)
+        {
             return Some(p.clone());
         }
         self.controller.known_peer(peer_id)
@@ -1184,7 +1491,7 @@ impl WorkerState {
                         .iter()
                         .filter_map(|item| serde_json::from_value::<Peer>(item.clone()).ok())
                         .collect();
-                    self.cached_live_peers = parsed;
+                    *self.cached_live_peers.lock().unwrap() = parsed;
                     return;
                 }
             }
@@ -1196,7 +1503,7 @@ impl WorkerState {
             self.controller.remember_peer(p);
         }
         if !found.is_empty() {
-            self.cached_live_peers = found;
+            *self.cached_live_peers.lock().unwrap() = found;
         }
     }
 
@@ -1254,8 +1561,13 @@ impl WorkerState {
             .unwrap_or(false);
     }
 
-    fn refresh_fast(&mut self) {
-        let daemon_up = ipc_is_running(None);
+    fn refresh_fast(&mut self, allow_during_command: bool) {
+        let seq_before = self.mutation_seq.load(Ordering::SeqCst);
+        if !allow_during_command && self.active_commands.load(Ordering::SeqCst) > 0 {
+            return;
+        }
+
+        let daemon_up = self.use_ipc && ipc_is_running(None);
         let status_val = if daemon_up {
             ipc_request(
                 "status",
@@ -1282,14 +1594,33 @@ impl WorkerState {
             None
         };
 
-        self.controller.reload_from_disk();
-        let cfg = self.controller.config.lock().unwrap().clone();
-        let st = self.controller.state.lock().unwrap().clone();
-        let local_telem = self.controller.telemetry_snapshot();
+        let live_peers = self.cached_live_peers.lock().unwrap().clone();
 
-        let status_json =
-            status_val.unwrap_or_else(|| self.controller.status(Some(&self.cached_live_peers)));
-        let apps_json = apps_val.unwrap_or_else(|| self.controller.list_apps());
+        let (cfg, st, local_telem, status_json, apps_json) = {
+            let _sync_guard = if allow_during_command {
+                Some(self.controller_sync_lock.lock().unwrap())
+            } else {
+                if self.active_commands.load(Ordering::SeqCst) > 0
+                    || self.mutation_seq.load(Ordering::SeqCst) != seq_before
+                {
+                    return;
+                }
+                match self.controller_sync_lock.try_lock() {
+                    Ok(g) => Some(g),
+                    Err(_) => return,
+                }
+            };
+
+            self.controller.reload_from_disk();
+            let cfg = self.controller.config.lock().unwrap().clone();
+            let st = self.controller.state.lock().unwrap().clone();
+            let local_telem = self.controller.telemetry_snapshot();
+
+            let status_json =
+                status_val.unwrap_or_else(|| self.controller.status(Some(&live_peers)));
+            let apps_json = apps_val.unwrap_or_else(|| self.controller.list_apps());
+            (cfg, st, local_telem, status_json, apps_json)
+        };
 
         // Parse connection block
         let conn = status_json.get("connection").filter(|c| !c.is_null());
@@ -1418,7 +1749,7 @@ impl WorkerState {
         let paired_ids: HashSet<String> = st.paired_peers.keys().cloned().collect();
         let mut peer_views = Vec::new();
         let mut seen_ids = HashSet::new();
-        for p in &self.cached_live_peers {
+        for p in &live_peers {
             if p.id == cfg.device.id || seen_ids.contains(&p.id) {
                 continue;
             }
@@ -1502,6 +1833,13 @@ impl WorkerState {
             })
             .collect();
 
+        if !allow_during_command
+            && (self.active_commands.load(Ordering::SeqCst) > 0
+                || self.mutation_seq.load(Ordering::SeqCst) != seq_before)
+        {
+            return;
+        }
+
         let mut guard = self.snapshot.write().unwrap();
         guard.daemon_connected = daemon_up;
         guard.config = cfg;
@@ -1582,5 +1920,111 @@ mod tests {
         };
         assert_eq!(peer.signal_label(), "Excellent signal");
         assert_eq!(security_friendly_label("psk"), "PIN-Paired Devices Only");
+    }
+
+    fn test_controller() -> Arc<Controller> {
+        let runner = Arc::new(MockRunner::new(|args, _| {
+            Ok(CommandResult {
+                args: args.to_vec(),
+                returncode: 0,
+                stdout: String::new(),
+                stderr: String::new(),
+            })
+        }));
+        let backend = Arc::new(LinuxAudioBackend::with_runner(runner));
+        let ctrl = Arc::new(Controller::new(
+            Some(Config::default()),
+            Some(State::default()),
+            Some(backend),
+            None,
+            None,
+            false,
+        ));
+        ctrl.set_save_enabled(false);
+        ctrl
+    }
+
+    #[test]
+    fn test_optimistic_updates_on_send() {
+        let ctrl = test_controller();
+        let initial = GuiSnapshot::from_controller(&ctrl);
+        let snapshot = Arc::new(RwLock::new(initial));
+        let (tx, _rx) = mpsc::channel();
+        let gui_backend = GuiBackend {
+            snapshot: Arc::clone(&snapshot),
+            tx: Some(tx),
+            toasts: Arc::new(Mutex::new(Vec::new())),
+            ctx: None,
+            mutation_seq: Arc::new(AtomicU64::new(0)),
+            active_commands: Arc::new(AtomicUsize::new(0)),
+            stop_flag: Arc::new(AtomicBool::new(false)),
+            poller_wake: Arc::new((Mutex::new(false), Condvar::new())),
+            cmd_handle: None,
+            poller_handle: None,
+        };
+
+        gui_backend.send(GuiCommand::SetShare { enabled: false });
+        assert!(!gui_backend.read().sharing_enabled);
+
+        gui_backend.send(GuiCommand::SetShare { enabled: true });
+        assert!(gui_backend.read().sharing_enabled);
+
+        gui_backend.send(GuiCommand::SetMute { muted: true });
+        assert!(gui_backend.read().volume_muted);
+
+        gui_backend.send(GuiCommand::SetDefaultRoutingMode {
+            mode: "selective".to_string(),
+        });
+        assert_eq!(gui_backend.read().config.routing.default_mode, "selective");
+
+        gui_backend.send(GuiCommand::SaveConfigPatch {
+            patch: serde_json::json!({ "ui": { "theme": "light" } }),
+            toast: None,
+        });
+        assert_eq!(gui_backend.read().config.ui.theme, "light");
+
+        gui_backend.send(GuiCommand::RefreshPeers);
+        assert!(gui_backend.read().refreshing_peers);
+
+        gui_backend.send(GuiCommand::ConnectPeer {
+            peer_id: "peer-1".to_string(),
+        });
+        let snap = gui_backend.read();
+        assert_eq!(snap.pending_peer_id.as_deref(), Some("peer-1"));
+        assert!(snap.busy_message.is_some());
+    }
+
+    #[test]
+    fn test_stale_refresh_does_not_clobber_active_mutation() {
+        let ctrl = test_controller();
+        let initial = GuiSnapshot::from_controller(&ctrl);
+        let snapshot = Arc::new(RwLock::new(initial));
+        let mutation_seq = Arc::new(AtomicU64::new(0));
+        let active_commands = Arc::new(AtomicUsize::new(1));
+
+        let mut worker = WorkerState {
+            controller: Arc::clone(&ctrl),
+            snapshot: Arc::clone(&snapshot),
+            toasts: Arc::new(Mutex::new(Vec::new())),
+            ctx: None,
+            cached_live_peers: Arc::new(Mutex::new(Vec::new())),
+            mutation_seq: Arc::clone(&mutation_seq),
+            active_commands: Arc::clone(&active_commands),
+            controller_sync_lock: Arc::new(Mutex::new(())),
+            use_ipc: false,
+        };
+
+        // Simulate optimistic UI state (false) opposing controller truth (true) while a command is in flight
+        snapshot.write().unwrap().sharing_enabled = false;
+        mutation_seq.fetch_add(1, Ordering::SeqCst);
+
+        // Background poller refresh (allow_during_command = false) must not revert it
+        worker.refresh_fast(false);
+        assert!(!snapshot.read().unwrap().sharing_enabled);
+
+        // Once command completes (active_commands == 0), forced refresh updates to truth (true)
+        active_commands.store(0, Ordering::SeqCst);
+        worker.refresh_fast(true);
+        assert!(snapshot.read().unwrap().sharing_enabled);
     }
 }

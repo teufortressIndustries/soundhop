@@ -143,9 +143,16 @@ pub fn render(
             );
         });
         ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-            if secondary_button(ui, pal, "Refresh").clicked() {
-                backend.send(GuiCommand::RefreshPeers);
-            }
+            ui.add_enabled_ui(!snap.refreshing_peers, |ui| {
+                let refresh_label = if snap.refreshing_peers {
+                    "Refreshing..."
+                } else {
+                    "Refresh"
+                };
+                if secondary_button(ui, pal, refresh_label).clicked() {
+                    backend.send(GuiCommand::RefreshPeers);
+                }
+            });
             if snap.peers.len() > 1 {
                 ui.add_space(8.0);
                 let mut mr = state.multiroom_mode;
@@ -183,9 +190,16 @@ pub fn render(
                 );
                 ui.add_space(10.0);
                 ui.horizontal(|ui| {
-                    if secondary_button(ui, pal, "Scan Again").clicked() {
-                        backend.send(GuiCommand::RefreshPeers);
-                    }
+                    ui.add_enabled_ui(!snap.refreshing_peers, |ui| {
+                        let scan_label = if snap.refreshing_peers {
+                            "Scanning..."
+                        } else {
+                            "Scan Again"
+                        };
+                        if secondary_button(ui, pal, scan_label).clicked() {
+                            backend.send(GuiCommand::RefreshPeers);
+                        }
+                    });
                     let addr_label = if state.show_manual_connect {
                         "Hide Manual Connect"
                     } else {
@@ -197,29 +211,39 @@ pub fn render(
                 });
             });
 
-            if state.show_manual_connect {
-                ui.add_space(10.0);
-                ui.separator();
-                ui.add_space(8.0);
-                ui.horizontal(|ui| {
-                    ui.label(
-                        RichText::new("Device IP or Hostname:")
-                            .color(pal.text_secondary)
-                            .size(12.5),
-                    );
-                    let resp = ui.add(
-                        egui::TextEdit::singleline(&mut state.manual_address)
-                            .hint_text("e.g. 192.168.1.50")
-                            .desired_width(210.0),
-                    );
-                    let enter = resp.lost_focus() && ui.input(|i| i.key_pressed(egui::Key::Enter));
-                    if (primary_button(ui, pal, "Connect").clicked() || enter)
-                        && !state.manual_address.trim().is_empty()
-                    {
-                        backend.send(GuiCommand::ConnectAddress {
-                            host_port: state.manual_address.clone(),
-                        });
-                    }
+            let manual_t = ui.ctx().animate_bool_with_time_and_easing(
+                egui::Id::new("home_manual_connect_reveal"),
+                state.show_manual_connect,
+                0.14,
+                egui::emath::easing::cubic_out,
+            );
+            if state.show_manual_connect || manual_t > 0.02 {
+                ui.scope(|ui| {
+                    ui.set_opacity(manual_t);
+                    ui.add_space(10.0 * manual_t);
+                    ui.separator();
+                    ui.add_space(8.0 * manual_t);
+                    ui.horizontal(|ui| {
+                        ui.label(
+                            RichText::new("Device IP or Hostname:")
+                                .color(pal.text_secondary)
+                                .size(12.5),
+                        );
+                        let resp = ui.add(
+                            egui::TextEdit::singleline(&mut state.manual_address)
+                                .hint_text("e.g. 192.168.1.50")
+                                .desired_width(210.0),
+                        );
+                        let enter =
+                            resp.lost_focus() && ui.input(|i| i.key_pressed(egui::Key::Enter));
+                        if (primary_button(ui, pal, "Connect").clicked() || enter)
+                            && !state.manual_address.trim().is_empty()
+                        {
+                            backend.send(GuiCommand::ConnectAddress {
+                                host_port: state.manual_address.clone(),
+                            });
+                        }
+                    });
                 });
             }
         });
@@ -277,13 +301,24 @@ pub fn render(
 
                     ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
                         if !state.multiroom_mode {
+                            let is_connecting_this =
+                                snap.pending_peer_id.as_deref() == Some(peer.id.as_str());
                             if is_conn {
                                 if danger_button(ui, pal, "Disconnect").clicked() {
                                     backend.send(GuiCommand::Disconnect);
                                 }
-                            } else if primary_button(ui, pal, "Play Here").clicked() {
-                                backend.send(GuiCommand::ConnectPeer {
-                                    peer_id: peer.id.clone(),
+                            } else {
+                                ui.add_enabled_ui(!is_connecting_this, |ui| {
+                                    let btn_label = if is_connecting_this {
+                                        "Connecting..."
+                                    } else {
+                                        "Play Here"
+                                    };
+                                    if primary_button(ui, pal, btn_label).clicked() {
+                                        backend.send(GuiCommand::ConnectPeer {
+                                            peer_id: peer.id.clone(),
+                                        });
+                                    }
                                 });
                             }
                         }

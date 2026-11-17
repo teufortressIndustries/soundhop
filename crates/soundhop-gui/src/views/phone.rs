@@ -78,9 +78,16 @@ pub fn render(
             );
         });
         ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-            if secondary_button(ui, pal, "Refresh").clicked() {
-                backend.send(GuiCommand::RefreshAndroid);
-            }
+            ui.add_enabled_ui(!snap.refreshing_android, |ui| {
+                let label = if snap.refreshing_android {
+                    "Refreshing..."
+                } else {
+                    "Refresh"
+                };
+                if secondary_button(ui, pal, label).clicked() {
+                    backend.send(GuiCommand::RefreshAndroid);
+                }
+            });
         });
     });
 
@@ -178,9 +185,16 @@ pub fn render(
             }
             ui.add_space(10.0);
             ui.horizontal(|ui| {
-                if secondary_button(ui, pal, "Refresh Devices").clicked() {
-                    backend.send(GuiCommand::RefreshAndroid);
-                }
+                ui.add_enabled_ui(!snap.refreshing_android, |ui| {
+                    let label = if snap.refreshing_android {
+                        "Refreshing..."
+                    } else {
+                        "Refresh Devices"
+                    };
+                    if secondary_button(ui, pal, label).clicked() {
+                        backend.send(GuiCommand::RefreshAndroid);
+                    }
+                });
                 let wifi_btn = if state.show_manual_wifi {
                     "Hide Wi-Fi IP"
                 } else {
@@ -191,28 +205,37 @@ pub fn render(
                 }
             });
 
-            if state.show_manual_wifi {
-                ui.add_space(10.0);
-                ui.separator();
-                ui.add_space(8.0);
-                ui.horizontal(|ui| {
-                    ui.label(
-                        RichText::new("Phone Wi-Fi IP:")
-                            .color(pal.text_secondary)
-                            .size(12.5),
-                    );
-                    ui.add(
-                        egui::TextEdit::singleline(&mut state.manual_ip)
-                            .hint_text("e.g. 192.168.1.99")
-                            .desired_width(190.0),
-                    );
-                    if primary_button(ui, pal, "Connect").clicked()
-                        && !state.manual_ip.trim().is_empty()
-                    {
-                        backend.send(GuiCommand::AndroidConnectWifi {
-                            ip_port: state.manual_ip.clone(),
-                        });
-                    }
+            let wifi_empty_t = ui.ctx().animate_bool_with_time_and_easing(
+                egui::Id::new("phone_manual_wifi_empty_reveal"),
+                state.show_manual_wifi,
+                0.14,
+                egui::emath::easing::cubic_out,
+            );
+            if state.show_manual_wifi || wifi_empty_t > 0.02 {
+                ui.scope(|ui| {
+                    ui.set_opacity(wifi_empty_t);
+                    ui.add_space(10.0 * wifi_empty_t);
+                    ui.separator();
+                    ui.add_space(8.0 * wifi_empty_t);
+                    ui.horizontal(|ui| {
+                        ui.label(
+                            RichText::new("Phone Wi-Fi IP:")
+                                .color(pal.text_secondary)
+                                .size(12.5),
+                        );
+                        ui.add(
+                            egui::TextEdit::singleline(&mut state.manual_ip)
+                                .hint_text("e.g. 192.168.1.99")
+                                .desired_width(190.0),
+                        );
+                        if primary_button(ui, pal, "Connect").clicked()
+                            && !state.manual_ip.trim().is_empty()
+                        {
+                            backend.send(GuiCommand::AndroidConnectWifi {
+                                ip_port: state.manual_ip.clone(),
+                            });
+                        }
+                    });
                 });
             }
         });
@@ -310,23 +333,32 @@ pub fn render(
                 state.show_manual_wifi = !state.show_manual_wifi;
             }
         });
-        if state.show_manual_wifi {
-            ui.add_space(4.0);
-            card(ui, pal, None, |ui| {
-                ui.horizontal(|ui| {
-                    ui.label(RichText::new("Phone Wi-Fi IP:").color(pal.text_secondary));
-                    ui.add(
-                        egui::TextEdit::singleline(&mut state.manual_ip)
-                            .hint_text("192.168.1.99")
-                            .desired_width(190.0),
-                    );
-                    if secondary_button(ui, pal, "Connect").clicked()
-                        && !state.manual_ip.trim().is_empty()
-                    {
-                        backend.send(GuiCommand::AndroidConnectWifi {
-                            ip_port: state.manual_ip.clone(),
-                        });
-                    }
+        let wifi_dev_t = ui.ctx().animate_bool_with_time_and_easing(
+            egui::Id::new("phone_manual_wifi_list_reveal"),
+            state.show_manual_wifi,
+            0.14,
+            egui::emath::easing::cubic_out,
+        );
+        if state.show_manual_wifi || wifi_dev_t > 0.02 {
+            ui.scope(|ui| {
+                ui.set_opacity(wifi_dev_t);
+                ui.add_space(4.0 * wifi_dev_t);
+                card(ui, pal, None, |ui| {
+                    ui.horizontal(|ui| {
+                        ui.label(RichText::new("Phone Wi-Fi IP:").color(pal.text_secondary));
+                        ui.add(
+                            egui::TextEdit::singleline(&mut state.manual_ip)
+                                .hint_text("192.168.1.99")
+                                .desired_width(190.0),
+                        );
+                        if secondary_button(ui, pal, "Connect").clicked()
+                            && !state.manual_ip.trim().is_empty()
+                        {
+                            backend.send(GuiCommand::AndroidConnectWifi {
+                                ip_port: state.manual_ip.clone(),
+                            });
+                        }
+                    });
                 });
             });
         }

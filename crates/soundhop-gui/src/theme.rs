@@ -140,11 +140,18 @@ impl Palette {
     }
 }
 
+/// Linearly interpolate between two `Color32` colors in `Rgba` space.
+pub fn lerp_color(a: Color32, b: Color32, t: f32) -> Color32 {
+    let t = t.clamp(0.0, 1.0);
+    Color32::from(egui::lerp(egui::Rgba::from(a)..=egui::Rgba::from(b), t))
+}
+
 /// Apply the SoundHop NUI theme to `egui::Context` and return the active `Palette`.
 pub fn apply_theme(ctx: &egui::Context, mode: ThemeMode, system_dark: bool) -> Palette {
     let pal = Palette::for_mode(mode, system_dark);
 
     let mut style = (*ctx.style()).clone();
+    style.animation_time = 0.14;
     style.spacing.item_spacing = egui::vec2(10.0, 10.0);
     style.spacing.button_padding = egui::vec2(14.0, 8.0);
     style.spacing.interact_size = egui::vec2(40.0, 30.0);
@@ -157,6 +164,7 @@ pub fn apply_theme(ctx: &egui::Context, mode: ThemeMode, system_dark: bool) -> P
         Visuals::light()
     };
 
+    visuals.interact_cursor = Some(egui::CursorIcon::PointingHand);
     visuals.window_fill = pal.canvas;
     visuals.panel_fill = pal.canvas;
     visuals.extreme_bg_color = if pal.dark {
@@ -192,6 +200,7 @@ pub fn apply_theme(ctx: &egui::Context, mode: ThemeMode, system_dark: bool) -> P
     visuals.widgets.inactive.bg_stroke = Stroke::new(1.0_f32, pal.border);
     visuals.widgets.inactive.fg_stroke = Stroke::new(1.0_f32, pal.text);
     visuals.widgets.inactive.corner_radius = CornerRadius::same(8);
+    visuals.widgets.inactive.expansion = 0.0;
 
     // Hovered widgets
     visuals.widgets.hovered.bg_fill = pal.card_hover;
@@ -199,6 +208,7 @@ pub fn apply_theme(ctx: &egui::Context, mode: ThemeMode, system_dark: bool) -> P
     visuals.widgets.hovered.bg_stroke = Stroke::new(1.2_f32, pal.accent);
     visuals.widgets.hovered.fg_stroke = Stroke::new(1.0_f32, pal.text);
     visuals.widgets.hovered.corner_radius = CornerRadius::same(8);
+    visuals.widgets.hovered.expansion = 0.0;
 
     // Active / pressed widgets
     visuals.widgets.active.bg_fill = pal.accent_soft;
@@ -206,6 +216,7 @@ pub fn apply_theme(ctx: &egui::Context, mode: ThemeMode, system_dark: bool) -> P
     visuals.widgets.active.bg_stroke = Stroke::new(1.5_f32, pal.accent);
     visuals.widgets.active.fg_stroke = Stroke::new(1.0_f32, pal.text);
     visuals.widgets.active.corner_radius = CornerRadius::same(8);
+    visuals.widgets.active.expansion = 0.0;
 
     // Open combos/menus
     visuals.widgets.open.bg_fill = pal.card_hover;
@@ -213,6 +224,7 @@ pub fn apply_theme(ctx: &egui::Context, mode: ThemeMode, system_dark: bool) -> P
     visuals.widgets.open.bg_stroke = Stroke::new(1.2_f32, pal.accent);
     visuals.widgets.open.fg_stroke = Stroke::new(1.0_f32, pal.text);
     visuals.widgets.open.corner_radius = CornerRadius::same(8);
+    visuals.widgets.open.expansion = 0.0;
 
     style.visuals = visuals;
     ctx.set_style(style);
@@ -236,5 +248,25 @@ mod tests {
         assert!(!light.dark);
         assert!(!sys_light.dark);
         assert_ne!(dark.canvas, light.canvas);
+    }
+
+    #[test]
+    fn test_apply_theme_sets_pointer_cursor_and_lerp_color() {
+        let ctx = egui::Context::default();
+        let _ = apply_theme(&ctx, ThemeMode::Dark, true);
+        let style = ctx.style();
+        assert_eq!(
+            style.visuals.interact_cursor,
+            Some(egui::CursorIcon::PointingHand)
+        );
+        assert!(style.animation_time > 0.0);
+        assert_eq!(style.visuals.widgets.hovered.expansion, 0.0);
+
+        let a = Color32::from_rgb(0, 0, 0);
+        let b = Color32::from_rgb(200, 100, 50);
+        assert_eq!(lerp_color(a, b, 0.0), a);
+        assert_eq!(lerp_color(a, b, 1.0), b);
+        let mid = lerp_color(a, b, 0.5);
+        assert!(mid.r() > 0 && mid.r() < 200);
     }
 }
