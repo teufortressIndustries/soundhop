@@ -317,8 +317,7 @@ impl eframe::App for ControlCenterApp {
                     let dur = 0.14_f32;
                     if elapsed < dur {
                         ctx.request_repaint();
-                        let eased =
-                            egui::emath::easing::cubic_out((elapsed / dur).clamp(0.0, 1.0));
+                        let eased = egui::emath::easing::cubic_out((elapsed / dur).clamp(0.0, 1.0));
                         (0.25 + 0.75 * eased, (1.0 - eased) * 6.0)
                     } else {
                         self.tab_transition_start = None;
@@ -342,13 +341,9 @@ impl eframe::App for ControlCenterApp {
                             GuiTab::Apps => {
                                 apps::render(ui, &pal, &snap, &mut self.apps_state, &self.backend)
                             }
-                            GuiTab::Phone => phone::render(
-                                ui,
-                                &pal,
-                                &snap,
-                                &mut self.phone_state,
-                                &self.backend,
-                            ),
+                            GuiTab::Phone => {
+                                phone::render(ui, &pal, &snap, &mut self.phone_state, &self.backend)
+                            }
                             GuiTab::Settings => settings::render(
                                 ui,
                                 &pal,

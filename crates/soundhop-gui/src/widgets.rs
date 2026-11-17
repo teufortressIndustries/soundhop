@@ -58,8 +58,7 @@ fn styled_button(
     }
 
     let wrap_width = (ui.available_width() - 2.0 * padding.x).max(40.0);
-    let galley =
-        WidgetText::from(rich).into_galley(ui, None, wrap_width, egui::TextStyle::Button);
+    let galley = WidgetText::from(rich).into_galley(ui, None, wrap_width, egui::TextStyle::Button);
 
     let mut desired_size = galley.size() + 2.0 * padding;
     desired_size = desired_size.max(min_size);
@@ -161,8 +160,7 @@ fn styled_button(
                     press_t * 0.75,
                 );
                 let idle_stroke = lerp_color(Color32::TRANSPARENT, pal.accent, sel_t);
-                let hover_stroke =
-                    lerp_color(pal.border_subtle, pal.accent, sel_t.max(0.35));
+                let hover_stroke = lerp_color(pal.border_subtle, pal.accent, sel_t.max(0.35));
                 let stroke_c = lerp_color(idle_stroke, hover_stroke, hover_t);
                 let fg = lerp_color(
                     lerp_color(pal.text_secondary, pal.text, hover_t),
@@ -470,7 +468,12 @@ pub fn selectable_card(
     let height = (text_h + pad.y * 2.0).max(48.0);
     let (rect, response) = ui.allocate_exact_size(egui::vec2(width, height), Sense::click());
     response.widget_info(|| {
-        egui::WidgetInfo::selected(egui::WidgetType::RadioButton, ui.is_enabled(), selected, title)
+        egui::WidgetInfo::selected(
+            egui::WidgetType::RadioButton,
+            ui.is_enabled(),
+            selected,
+            title,
+        )
     });
 
     let enabled = ui.is_enabled();
@@ -526,7 +529,12 @@ pub fn selectable_card(
                 CornerRadius::same(11),
                 Stroke::new(
                     1.5_f32,
-                    Color32::from_rgba_unmultiplied(pal.accent.r(), pal.accent.g(), pal.accent.b(), p_alpha),
+                    Color32::from_rgba_unmultiplied(
+                        pal.accent.r(),
+                        pal.accent.g(),
+                        pal.accent.b(),
+                        p_alpha,
+                    ),
                 ),
                 StrokeKind::Outside,
             );
@@ -536,17 +544,11 @@ pub fn selectable_card(
         let radio_center = egui::pos2(draw_rect.left() + pad.x + 8.0, draw_rect.center().y);
         let outer_r = 7.5;
         let ring_color = lerp_color(pal.border, pal.accent, sel_t.max(hover_t * 0.6));
-        ui.painter().circle_stroke(
-            radio_center,
-            outer_r,
-            Stroke::new(1.5_f32, ring_color),
-        );
+        ui.painter()
+            .circle_stroke(radio_center, outer_r, Stroke::new(1.5_f32, ring_color));
         if sel_t > 0.02 {
-            ui.painter().circle_filled(
-                radio_center,
-                4.2 * sel_t,
-                pal.accent,
-            );
+            ui.painter()
+                .circle_filled(radio_center, 4.2 * sel_t, pal.accent);
         }
 
         let text_x = draw_rect.left() + pad.x + radio_w;
@@ -594,8 +596,14 @@ pub fn segmented_control<T: Copy + PartialEq>(
                 for (label, value) in options {
                     let selected = *current == *value;
                     let galley = WidgetText::from(RichText::new(*label).size(12.5).strong())
-                        .into_galley(ui, Some(egui::TextWrapMode::Extend), f32::INFINITY, egui::TextStyle::Button);
-                    let desired = egui::vec2(galley.size().x + 22.0, (galley.size().y + 10.0).max(26.0));
+                        .into_galley(
+                            ui,
+                            Some(egui::TextWrapMode::Extend),
+                            f32::INFINITY,
+                            egui::TextStyle::Button,
+                        );
+                    let desired =
+                        egui::vec2(galley.size().x + 22.0, (galley.size().y + 10.0).max(26.0));
                     let (rect, response) = ui.allocate_exact_size(desired, Sense::click());
                     response.widget_info(|| {
                         egui::WidgetInfo::selected(
@@ -628,23 +636,16 @@ pub fn segmented_control<T: Copy + PartialEq>(
             if let Some(first) = layouts.first() {
                 let seg_id = first.response.id;
                 let origin_x = first.rect.left();
-                let selected_layout = layouts
-                    .iter()
-                    .find(|l| l.selected)
-                    .unwrap_or(first);
+                let selected_layout = layouts.iter().find(|l| l.selected).unwrap_or(first);
                 let target_rel_x = selected_layout.rect.left() - origin_x;
                 let target_w = selected_layout.rect.width();
 
-                let anim_rel_x = ui.ctx().animate_value_with_time(
-                    seg_id.with("pill_x"),
-                    target_rel_x,
-                    0.12,
-                );
-                let anim_w = ui.ctx().animate_value_with_time(
-                    seg_id.with("pill_w"),
-                    target_w,
-                    0.12,
-                );
+                let anim_rel_x =
+                    ui.ctx()
+                        .animate_value_with_time(seg_id.with("pill_x"), target_rel_x, 0.12);
+                let anim_w =
+                    ui.ctx()
+                        .animate_value_with_time(seg_id.with("pill_w"), target_w, 0.12);
 
                 // Hover tints on unselected options (drawn behind sliding pill)
                 for (idx, item) in layouts.iter().enumerate() {
@@ -661,11 +662,8 @@ pub fn segmented_control<T: Copy + PartialEq>(
                             pal.card_hover.b(),
                             (hover_t * 210.0) as u8,
                         );
-                        ui.painter().rect_filled(
-                            item.rect,
-                            CornerRadius::same(6),
-                            hover_fill,
-                        );
+                        ui.painter()
+                            .rect_filled(item.rect, CornerRadius::same(6), hover_fill);
                     }
                 }
 

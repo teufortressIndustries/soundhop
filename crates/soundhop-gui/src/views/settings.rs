@@ -282,15 +282,7 @@ pub fn render(
             ),
         ] {
             let selected = snap.config.sharing.security == mode_key;
-            if selectable_card(
-                ui,
-                pal,
-                ("privacy_mode", mode_key),
-                selected,
-                title,
-                desc,
-            )
-            .clicked()
+            if selectable_card(ui, pal, ("privacy_mode", mode_key), selected, title, desc).clicked()
                 && !selected
             {
                 backend.send(GuiCommand::SaveConfigPatch {
