@@ -216,6 +216,7 @@ pub trait AudioBackend: Send + Sync {
 
     fn connect_tunnel_source(&self, params: &SourceTunnelParams<'_>) -> Result<u32, BackendError>;
     fn disconnect_tunnel_source(&self, source_name: &str) -> Result<bool, BackendError>;
+    #[allow(clippy::type_complexity)]
     fn send_mic_to_remote(
         &self,
         host: &str,

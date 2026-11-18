@@ -461,7 +461,11 @@ impl Controller {
     }
 
     fn ensure_listener_internal(&self) -> Result<Listener, ControllerError> {
-        let cfg = self.config.lock().unwrap_or_else(|e| e.into_inner()).clone();
+        let cfg = self
+            .config
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .clone();
         let (mod_id, created) = {
             let st = self.state.lock().unwrap_or_else(|e| e.into_inner());
             (st.listener_module, st.listener_created)
@@ -569,7 +573,11 @@ impl Controller {
             }
             *guard = disk_state;
         }
-        let cfg = self.config.lock().unwrap_or_else(|e| e.into_inner()).clone();
+        let cfg = self
+            .config
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .clone();
         if opts.keep_local || cfg.connection.keep_local_output {
             let mut m_opts = opts;
             m_opts.keep_local = true;
@@ -795,8 +803,11 @@ impl Controller {
             st.connected_by = opts.by;
             st.auto_paused = false;
         }
-        self.config.lock().unwrap_or_else(|e| e.into_inner()).connection.last_peer =
-            first.peer_id.clone();
+        self.config
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .connection
+            .last_peer = first.peer_id.clone();
         if opts.with_mic {
             let _ = self.enable_mic_internal(&opts.mic_direction);
         }
@@ -1202,8 +1213,7 @@ impl Controller {
             } else {
                 None
             };
-            let remap_opt = if st_snap.remote_mic_remap_set || st_snap.remote_mic_remap_module > 0
-            {
+            let remap_opt = if st_snap.remote_mic_remap_set || st_snap.remote_mic_remap_module > 0 {
                 Some(st_snap.remote_mic_remap_module)
             } else {
                 None

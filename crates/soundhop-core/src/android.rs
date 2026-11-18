@@ -943,7 +943,9 @@ impl AndroidCaptureSession {
                 if !prev_source.is_empty() {
                     let _ = self.backend.set_default_source(&prev_source);
                 }
-                return Err(AndroidError::Message(format!("Failed to start scrcpy: {e}")));
+                return Err(AndroidError::Message(format!(
+                    "Failed to start scrcpy: {e}"
+                )));
             }
         };
 

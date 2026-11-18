@@ -738,8 +738,7 @@ fn handle_incoming_pa_client_with_cookie(
                 PA_COMMAND_CREATE_PLAYBACK_STREAM => {
                     let spec = r.read_sample_spec().unwrap_or_default();
                     if player.is_none() {
-                        let wp =
-                            WindowsPlayer::new(spec.rate.max(8_000), spec.channels.max(1));
+                        let wp = WindowsPlayer::new(spec.rate.max(8_000), spec.channels.max(1));
                         wp.start();
                         player = Some(wp);
                     }

@@ -1544,7 +1544,10 @@ impl WorkerState {
                     self.push_toast("You're all set! SoundHop is ready.", false);
                 } else {
                     self.push_toast(
-                        format!("Setup finished, but failed to configure: {}.", failures.join(", ")),
+                        format!(
+                            "Setup finished, but failed to configure: {}.",
+                            failures.join(", ")
+                        ),
                         true,
                     );
                 }

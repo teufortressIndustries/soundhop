@@ -150,14 +150,25 @@ pub fn handle_setup(controller: &Arc<Controller>, args: &SetupArgs, json_out: bo
         }
     }
     if let Some(ref svc) = svc_res {
-        let started = svc.get("started").and_then(|v| v.as_bool()).unwrap_or(false);
-        let enabled = svc.get("enabled").and_then(|v| v.as_bool()).unwrap_or(false);
+        let started = svc
+            .get("started")
+            .and_then(|v| v.as_bool())
+            .unwrap_or(false);
+        let enabled = svc
+            .get("enabled")
+            .and_then(|v| v.as_bool())
+            .unwrap_or(false);
         if started {
             ok("Background Daemon & Tray Autostart: Installed and started");
         } else if enabled {
-            warning("Background Daemon & Tray Autostart: Installed and enabled, but failed to start");
+            warning(
+                "Background Daemon & Tray Autostart: Installed and enabled, but failed to start",
+            );
         } else {
-            emit_error("Background Daemon & Tray Autostart: Installation failed", false);
+            emit_error(
+                "Background Daemon & Tray Autostart: Installation failed",
+                false,
+            );
         }
     }
     if all_ok {
@@ -257,11 +268,8 @@ pub fn handle_status(controller: &Arc<Controller>, json_out: bool) -> i32 {
 }
 
 pub fn handle_discover(controller: &Arc<Controller>, args: &DiscoverArgs, json_out: bool) -> i32 {
-    let peers: Vec<Peer> = match try_ipc(
-        "discover",
-        serde_json::json!({}),
-        Duration::from_secs(5),
-    ) {
+    let peers: Vec<Peer> = match try_ipc("discover", serde_json::json!({}), Duration::from_secs(5))
+    {
         Some(Ok(resp)) => resp
             .get("peers")
             .and_then(|v| v.as_array())
@@ -1023,10 +1031,7 @@ pub fn handle_mic(controller: &Arc<Controller>, args: &MicArgs, json_out: bool) 
                 .get("enabled")
                 .and_then(|v| v.as_bool())
                 .unwrap_or(false);
-            let dir = out
-                .get("direction")
-                .and_then(|v| v.as_str())
-                .unwrap_or("");
+            let dir = out.get("direction").and_then(|v| v.as_str()).unwrap_or("");
             info(&format!(
                 "Microphone Pass-Through: {} ({})",
                 if enabled { "active" } else { "off" },
@@ -1041,7 +1046,10 @@ pub fn parse_volume_input(raw: &str, cur_vol: i32) -> Result<u32, String> {
     let val_str = raw.trim().to_lowercase();
     let clean = val_str.strip_suffix('%').unwrap_or(&val_str);
     if clean.is_empty() {
-        return Err("Specify a volume level (`0-150`, `+10`, `-10`, `mute`, `unmute`, `toggle`).".to_string());
+        return Err(
+            "Specify a volume level (`0-150`, `+10`, `-10`, `mute`, `unmute`, `toggle`)."
+                .to_string(),
+        );
     }
     let target = if let Some(delta_str) = clean.strip_prefix('+') {
         if delta_str.is_empty() || !delta_str.chars().all(|c| c.is_ascii_digit()) {
@@ -1108,10 +1116,7 @@ pub fn handle_volume(controller: &Arc<Controller>, args: &VolumeArgs, json_out: 
         "unmute" => (None, Some(false)),
         "toggle" => {
             let cur = match get_cur() {
-                Ok(v) => v
-                    .get("mute")
-                    .and_then(|x| x.as_bool())
-                    .unwrap_or(false),
+                Ok(v) => v.get("mute").and_then(|x| x.as_bool()).unwrap_or(false),
                 Err(e) => {
                     emit_error(&e, json_out);
                     return 1;
@@ -1121,10 +1126,7 @@ pub fn handle_volume(controller: &Arc<Controller>, args: &VolumeArgs, json_out: 
         }
         _ => {
             let cur_vol = match get_cur() {
-                Ok(v) => v
-                    .get("volume")
-                    .and_then(|x| x.as_u64())
-                    .unwrap_or(100) as i32,
+                Ok(v) => v.get("volume").and_then(|x| x.as_u64()).unwrap_or(100) as i32,
                 Err(e) => {
                     emit_error(&e, json_out);
                     return 1;
@@ -1351,21 +1353,32 @@ pub fn handle_service(args: &ServiceArgs, json_out: bool) -> i32 {
         "uninstall" | "remove" => {
             let v = uninstall_service();
             let ok_flag = v.get("removed").and_then(|x| x.as_bool()).unwrap_or(false)
-                || v.get("tray_removed").and_then(|x| x.as_bool()).unwrap_or(false);
+                || v.get("tray_removed")
+                    .and_then(|x| x.as_bool())
+                    .unwrap_or(false);
             (v, ok_flag)
         }
         "start" => {
             let ok_flag = start_service();
-            (serde_json::json!({ "ok": ok_flag, "started": ok_flag }), ok_flag)
+            (
+                serde_json::json!({ "ok": ok_flag, "started": ok_flag }),
+                ok_flag,
+            )
         }
         "stop" => {
             let ok_flag = stop_service();
-            (serde_json::json!({ "ok": ok_flag, "stopped": ok_flag }), ok_flag)
+            (
+                serde_json::json!({ "ok": ok_flag, "stopped": ok_flag }),
+                ok_flag,
+            )
         }
         "restart" => {
             let _ = sync_appimage_paths_if_installed(false);
             let ok_flag = restart_service();
-            (serde_json::json!({ "ok": ok_flag, "restarted": ok_flag }), ok_flag)
+            (
+                serde_json::json!({ "ok": ok_flag, "restarted": ok_flag }),
+                ok_flag,
+            )
         }
         "status" => (service_status(), true),
         other => {
@@ -1407,7 +1420,11 @@ pub fn handle_firewall(controller: &Arc<Controller>, args: &FirewallArgs, json_o
                 ok(&format!("Firewall ({}): ports opened.", res.firewall.kind));
             } else {
                 emit_error(
-                    &format!("Firewall ({}): {}", res.firewall.kind, res.errors.join("; ")),
+                    &format!(
+                        "Firewall ({}): {}",
+                        res.firewall.kind,
+                        res.errors.join("; ")
+                    ),
                     false,
                 );
             }
@@ -1454,7 +1471,10 @@ pub fn handle_config(controller: &Arc<Controller>, args: &ConfigArgs, json_out: 
         "reset" => {
             let mut def = Config::default();
             if let Err(e) = def.save(None) {
-                emit_error(&format!("Failed to save reset configuration: {e}"), json_out);
+                emit_error(
+                    &format!("Failed to save reset configuration: {e}"),
+                    json_out,
+                );
                 return 1;
             }
             *lock_or_recover(&controller.config) = def.clone();

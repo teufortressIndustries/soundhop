@@ -131,9 +131,7 @@ pub fn run_doctor(controller: &Arc<Controller>, fix: bool, json_out: bool) -> i3
                 }
                 Err(e) => {
                     fix_failed = true;
-                    fix_errors.push(format!(
-                        "Failed to run fusermount -u {m}: {e}"
-                    ));
+                    fix_errors.push(format!("Failed to run fusermount -u {m}: {e}"));
                 }
             }
         }

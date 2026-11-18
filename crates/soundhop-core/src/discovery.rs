@@ -578,11 +578,7 @@ impl DiscoveryManager {
                 Ok(mdns) => {
                     if advertising {
                         let id_prefix: String = self.device_id.chars().take(6).collect();
-                        let instance_name = format!(
-                            "{}-{}",
-                            slugify(&self.name, 20),
-                            id_prefix
-                        );
+                        let instance_name = format!("{}-{}", slugify(&self.name, 20), id_prefix);
                         let host_fqdn = format!("{instance_name}.local.");
                         let addrs = local_addresses(false);
                         let ip_str = addrs.first().map(|s| s.as_str()).unwrap_or("");

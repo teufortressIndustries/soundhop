@@ -200,18 +200,17 @@ impl Daemon {
             .unwrap()
             .connection
             .disconnect_on_quit;
-        if disconnect_on_quit {
-            if self
+        if disconnect_on_quit
+            && self
                 .controller
                 .state
                 .lock()
                 .unwrap_or_else(|e| e.into_inner())
                 .is_connected()
-            {
-                let _ = self
-                    .controller
-                    .disconnect(false, None, false, Some(false), true, false);
-            }
+        {
+            let _ = self
+                .controller
+                .disconnect(false, None, false, Some(false), true, false);
         }
         if self.controller.android_session.is_active() {
             let _ = self.controller.android_session.stop();

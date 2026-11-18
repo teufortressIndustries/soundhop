@@ -654,7 +654,9 @@ fn collect_tray_snapshot(daemon: &Daemon) -> TrayMenuSnapshot {
             let routed_apps_lower: HashSet<String> = apps
                 .iter()
                 .filter(|a| {
-                    a.get("is_remote").and_then(|v| v.as_bool()).unwrap_or(false)
+                    a.get("is_remote")
+                        .and_then(|v| v.as_bool())
+                        .unwrap_or(false)
                         || a.get("routed_rule")
                             .and_then(|v| v.as_str())
                             .map(|r| r == "remote")
@@ -738,7 +740,12 @@ fn handle_menu_action(id_str: &str, daemon: &Daemon, running: &AtomicBool) {
     }
     if id_str == "android_stop" {
         if external {
-            let _ = ipc_request("android_stop", serde_json::json!({}), None, Duration::from_secs(5));
+            let _ = ipc_request(
+                "android_stop",
+                serde_json::json!({}),
+                None,
+                Duration::from_secs(5),
+            );
         } else {
             let _ = ctrl.android_session.stop();
         }
@@ -746,7 +753,12 @@ fn handle_menu_action(id_str: &str, daemon: &Daemon, running: &AtomicBool) {
     }
     if id_str == "action_disconnect" {
         if external {
-            let _ = ipc_request("disconnect", serde_json::json!({}), None, Duration::from_secs(6));
+            let _ = ipc_request(
+                "disconnect",
+                serde_json::json!({}),
+                None,
+                Duration::from_secs(6),
+            );
         } else {
             let _ = ctrl.disconnect(false, None, true, Some(true), false, false);
         }
@@ -754,10 +766,19 @@ fn handle_menu_action(id_str: &str, daemon: &Daemon, running: &AtomicBool) {
     }
     if id_str == "toggle_share" {
         if external {
-            let currently_enabled = ipc_request("status", serde_json::json!({}), None, Duration::from_millis(600))
-                .ok()
-                .and_then(|v| v.get("sharing").and_then(|s| s.get("enabled")).and_then(|b| b.as_bool()))
-                .unwrap_or_else(|| lock_or_recover(&ctrl.config).sharing.enabled);
+            let currently_enabled = ipc_request(
+                "status",
+                serde_json::json!({}),
+                None,
+                Duration::from_millis(600),
+            )
+            .ok()
+            .and_then(|v| {
+                v.get("sharing")
+                    .and_then(|s| s.get("enabled"))
+                    .and_then(|b| b.as_bool())
+            })
+            .unwrap_or_else(|| lock_or_recover(&ctrl.config).sharing.enabled);
             let _ = ipc_request(
                 "share",
                 serde_json::json!({ "enabled": !currently_enabled }),
@@ -776,10 +797,19 @@ fn handle_menu_action(id_str: &str, daemon: &Daemon, running: &AtomicBool) {
     }
     if id_str == "toggle_autoconnect" {
         if external {
-            let cur = ipc_request("status", serde_json::json!({}), None, Duration::from_millis(600))
-                .ok()
-                .and_then(|v| v.get("auto").and_then(|a| a.get("enabled")).and_then(|b| b.as_bool()))
-                .unwrap_or_else(|| lock_or_recover(&ctrl.config).connection.auto_connect);
+            let cur = ipc_request(
+                "status",
+                serde_json::json!({}),
+                None,
+                Duration::from_millis(600),
+            )
+            .ok()
+            .and_then(|v| {
+                v.get("auto")
+                    .and_then(|a| a.get("enabled"))
+                    .and_then(|b| b.as_bool())
+            })
+            .unwrap_or_else(|| lock_or_recover(&ctrl.config).connection.auto_connect);
             let _ = ipc_request(
                 "auto",
                 serde_json::json!({ "action": if cur { "off" } else { "on" } }),
@@ -799,7 +829,12 @@ fn handle_menu_action(id_str: &str, daemon: &Daemon, running: &AtomicBool) {
         if external {
             let snap = collect_tray_snapshot(daemon);
             if snap.connected_peer == peer_id {
-                let _ = ipc_request("disconnect", serde_json::json!({}), None, Duration::from_secs(6));
+                let _ = ipc_request(
+                    "disconnect",
+                    serde_json::json!({}),
+                    None,
+                    Duration::from_secs(6),
+                );
             } else {
                 let _ = ipc_request(
                     "connect",
@@ -841,7 +876,12 @@ fn handle_menu_action(id_str: &str, daemon: &Daemon, running: &AtomicBool) {
                 active_ids.push(peer_id.to_string());
             }
             if active_ids.is_empty() {
-                let _ = ipc_request("disconnect", serde_json::json!({}), None, Duration::from_secs(6));
+                let _ = ipc_request(
+                    "disconnect",
+                    serde_json::json!({}),
+                    None,
+                    Duration::from_secs(6),
+                );
             } else {
                 let _ = ipc_request(
                     "connect",
@@ -1043,10 +1083,19 @@ fn handle_menu_action(id_str: &str, daemon: &Daemon, running: &AtomicBool) {
     }
     if id_str == "vol_mute_toggle" {
         if external {
-            let cur_mute = ipc_request("status", serde_json::json!({}), None, Duration::from_millis(600))
-                .ok()
-                .and_then(|v| v.get("volume").and_then(|vol| vol.get("mute")).and_then(|b| b.as_bool()))
-                .unwrap_or(false);
+            let cur_mute = ipc_request(
+                "status",
+                serde_json::json!({}),
+                None,
+                Duration::from_millis(600),
+            )
+            .ok()
+            .and_then(|v| {
+                v.get("volume")
+                    .and_then(|vol| vol.get("mute"))
+                    .and_then(|b| b.as_bool())
+            })
+            .unwrap_or(false);
             let _ = ipc_request(
                 "volume",
                 serde_json::json!({ "mute": !cur_mute }),
@@ -1082,7 +1131,10 @@ fn compute_menu_signature(
         .map(|a| {
             let name = a.get("app_name").and_then(|v| v.as_str()).unwrap_or("");
             let media = a.get("media_name").and_then(|v| v.as_str()).unwrap_or("");
-            let remote = a.get("is_remote").and_then(|v| v.as_bool()).unwrap_or(false);
+            let remote = a
+                .get("is_remote")
+                .and_then(|v| v.as_bool())
+                .unwrap_or(false);
             let rule = a.get("routed_rule").and_then(|v| v.as_str()).unwrap_or("");
             format!("{name}:{media}:{remote}:{rule}")
         })
@@ -1296,17 +1348,7 @@ mod tests {
 
     #[test]
     fn test_compute_menu_signature_tracks_apps_and_android() {
-        let s1 = compute_menu_signature(
-            &[],
-            &[],
-            "",
-            0,
-            false,
-            false,
-            false,
-            "",
-            false,
-        );
+        let s1 = compute_menu_signature(&[], &[], "", 0, false, false, false, "", false);
         let s2 = compute_menu_signature(
             &[],
             &[serde_json::json!({
@@ -1323,17 +1365,7 @@ mod tests {
             "",
             false,
         );
-        let s3 = compute_menu_signature(
-            &[],
-            &[],
-            "",
-            0,
-            false,
-            false,
-            false,
-            "",
-            true,
-        );
+        let s3 = compute_menu_signature(&[], &[], "", 0, false, false, false, "", true);
         assert_ne!(s1, s2);
         assert_ne!(s1, s3);
     }

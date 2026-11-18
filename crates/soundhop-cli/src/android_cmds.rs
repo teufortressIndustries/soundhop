@@ -19,7 +19,9 @@ fn parse_bitrate(s: &str) -> Option<u32> {
     let val = if let Some(num) = trimmed.strip_suffix('K') {
         num.parse::<u32>().ok().and_then(|v| v.checked_mul(1000))
     } else if let Some(num) = trimmed.strip_suffix('M') {
-        num.parse::<u32>().ok().and_then(|v| v.checked_mul(1_000_000))
+        num.parse::<u32>()
+            .ok()
+            .and_then(|v| v.checked_mul(1_000_000))
     } else {
         trimmed.parse::<u32>().ok()
     }?;
@@ -158,7 +160,10 @@ pub fn handle_android(controller: &Arc<Controller>, args: &AndroidArgs, json_out
         }
         "connect" => {
             let Some(ref target) = args.target else {
-                emit_error("Specify an Android IP[:port] to connect over Wi-Fi.", json_out);
+                emit_error(
+                    "Specify an Android IP[:port] to connect over Wi-Fi.",
+                    json_out,
+                );
                 return 1;
             };
             let (ok_conn, msg) = controller.android_manager.connect_wifi(target, 5555);

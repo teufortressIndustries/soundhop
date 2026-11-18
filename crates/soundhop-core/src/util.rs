@@ -1133,7 +1133,11 @@ pub fn tcp_probe_rtt(host: &str, port: u16, timeout: Duration) -> Option<f64> {
         SocketAddr::new(ip, port)
     } else if let Ok(sa) = format!("[{clean}]:{port}").parse::<SocketAddr>() {
         sa
-    } else if let Some(sa) = (clean, port).to_socket_addrs().ok().and_then(|mut it| it.next()) {
+    } else if let Some(sa) = (clean, port)
+        .to_socket_addrs()
+        .ok()
+        .and_then(|mut it| it.next())
+    {
         sa
     } else {
         let no_zone = clean.split('%').next().unwrap_or(clean);

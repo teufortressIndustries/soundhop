@@ -1022,23 +1022,13 @@ impl AudioBackend for LinuxAudioBackend {
             let remote_target = tcp_server_arg(host, port);
             if let Some(remap_id) = remote_remap_id {
                 let _ = self.pactl_call(
-                    &[
-                        "-s",
-                        &remote_target,
-                        "unload-module",
-                        &remap_id.to_string(),
-                    ],
+                    &["-s", &remote_target, "unload-module", &remap_id.to_string()],
                     false,
                 );
             }
             if let Some(null_id) = remote_null_id {
                 let _ = self.pactl_call(
-                    &[
-                        "-s",
-                        &remote_target,
-                        "unload-module",
-                        &null_id.to_string(),
-                    ],
+                    &["-s", &remote_target, "unload-module", &null_id.to_string()],
                     false,
                 );
             }
@@ -1472,7 +1462,10 @@ mod tests {
         backend.stop_send_mic_to_remote("192.168.1.50", 4713, r_null, r_remap, l_tun, l_loop);
         let calls = unloaded.lock().unwrap();
         assert_eq!(
-            calls.iter().filter(|c| c.contains("unload-module 0")).count(),
+            calls
+                .iter()
+                .filter(|c| c.contains("unload-module 0"))
+                .count(),
             2
         );
     }

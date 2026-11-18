@@ -404,7 +404,11 @@ fn run_audio_capture_loop(
 
 fn run_network_probe_loop(controller: Arc<Controller>, stop_flag: Arc<AtomicBool>) {
     while !stop_flag.load(Ordering::SeqCst) {
-        let st = controller.state.lock().unwrap_or_else(|e| e.into_inner()).clone();
+        let st = controller
+            .state
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .clone();
         let mut targets: Vec<(String, String, u16)> = Vec::new();
         let mut seen = HashSet::new();
 
