@@ -25,7 +25,7 @@ pub struct HomeViewState {
 
 impl HomeViewState {
     fn sync_initial(&mut self, snap: &GuiSnapshot) {
-        if !self.initialized_from_snap {
+        if !self.initialized_from_snap && snap.hydrated {
             self.multiroom_mode = snap.multiroom;
             self.keep_local = snap.keep_local;
             for p in &snap.multiroom_peers {

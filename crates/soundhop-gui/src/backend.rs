@@ -20,6 +20,8 @@ use soundhop_core::service::{
 use soundhop_core::state::ActivePeerSession;
 use soundhop_core::util::{is_own_non_loopback_ip, is_private_address, now_secs, split_host_port};
 
+use crate::{lock_or_recover, read_or_recover, write_or_recover};
+
 #[derive(Debug, Clone)]
 pub struct PeerView {
     pub id: String,
@@ -116,18 +118,16 @@ pub struct GuiSnapshot {
     pub pending_peer_id: Option<String>,
     pub show_onboarding: bool,
     pub paired_count: usize,
+    pub hydrated: bool,
 }
 
 impl GuiSnapshot {
     pub fn from_controller(controller: &Controller) -> Self {
-        let cfg = controller.config.lock().unwrap().clone();
-        let st = controller.state.lock().unwrap().clone();
-        let fw = detect_firewall();
-        let svc = service_status();
-        let android_tools = controller.android_manager.get_tool_status();
+        let cfg = lock_or_recover(&controller.config).clone();
+        let st = lock_or_recover(&controller.state).clone();
 
         Self {
-            daemon_connected: ipc_is_running(None),
+            daemon_connected: false,
             show_onboarding: !cfg.ui.onboarding_completed && st.known_peers.is_empty(),
             paired_count: st.paired_peers.len(),
             config: cfg.clone(),
@@ -154,27 +154,28 @@ impl GuiSnapshot {
             audio_peak: 0.0,
             rtt_ms: None,
             jitter_ms: None,
-            android_tools,
+            android_tools: ToolStatus {
+                scrcpy_path: None,
+                scrcpy_version: String::new(),
+                adb_path: None,
+                adb_version: String::new(),
+                is_managed: false,
+            },
             android_devices: Vec::new(),
             android_session_active: st.android_active,
             android_session_device: st.android_model,
             android_installing: false,
-            firewall_kind: fw.kind,
-            firewall_active: fw.active,
-            firewall_detail: fw.detail,
-            service_running: svc.get("active").and_then(|v| v.as_bool()).unwrap_or(false),
-            service_enabled: svc
-                .get("enabled")
-                .and_then(|v| v.as_bool())
-                .unwrap_or(false),
-            autostart_installed: svc
-                .get("tray_autostart")
-                .and_then(|v| v.as_bool())
-                .unwrap_or(false),
+            firewall_kind: "none".to_string(),
+            firewall_active: false,
+            firewall_detail: String::new(),
+            service_running: false,
+            service_enabled: false,
+            autostart_installed: false,
             busy_message: None,
             refreshing_peers: false,
             refreshing_android: false,
             pending_peer_id: None,
+            hydrated: false,
         }
     }
 
@@ -358,7 +359,7 @@ impl GuiBackend {
         let snapshot = Arc::new(RwLock::new(initial));
         let toasts = Arc::new(Mutex::new(Vec::new()));
         if let Some(msg) = initial_toast {
-            toasts.lock().unwrap().push(GuiToast {
+            lock_or_recover(&toasts).push(GuiToast {
                 message: msg,
                 is_error: false,
                 created_at: Instant::now(),
@@ -366,6 +367,7 @@ impl GuiBackend {
         }
         let (tx, rx) = mpsc::channel::<GuiCommand>();
         let stop_flag = Arc::new(AtomicBool::new(false));
+        let onboarding_reopened = Arc::new(AtomicBool::new(false));
         let mutation_seq = Arc::new(AtomicU64::new(0));
         let active_commands = Arc::new(AtomicUsize::new(0));
         let cached_live_peers = Arc::new(Mutex::new(Vec::new()));
@@ -380,6 +382,7 @@ impl GuiBackend {
             cached_live_peers: Arc::clone(&cached_live_peers),
             mutation_seq: Arc::clone(&mutation_seq),
             active_commands: Arc::clone(&active_commands),
+            onboarding_reopened: Arc::clone(&onboarding_reopened),
             controller_sync_lock: Arc::clone(&controller_sync_lock),
             use_ipc: true,
         };
@@ -392,6 +395,7 @@ impl GuiBackend {
             cached_live_peers,
             mutation_seq: Arc::clone(&mutation_seq),
             active_commands: Arc::clone(&active_commands),
+            onboarding_reopened: Arc::clone(&onboarding_reopened),
             controller_sync_lock,
             use_ipc: true,
         };
@@ -428,7 +432,7 @@ impl GuiBackend {
 
             while !stop_poller.load(Ordering::Relaxed) {
                 let (lock, cvar) = &*wake_poller;
-                let guard = lock.lock().unwrap();
+                let guard = lock_or_recover(lock);
                 if !*guard {
                     let _ = cvar.wait_timeout(guard, Duration::from_millis(650));
                 }
@@ -485,7 +489,7 @@ impl GuiBackend {
 
     fn apply_optimistic_update(&self, cmd: &GuiCommand) {
         self.mutation_seq.fetch_add(1, Ordering::SeqCst);
-        let mut snap = self.snapshot.write().unwrap();
+        let mut snap = write_or_recover(&self.snapshot);
         match cmd {
             GuiCommand::RefreshFast | GuiCommand::RefreshSystem => {}
             GuiCommand::RefreshPeers => {
@@ -629,17 +633,17 @@ impl GuiBackend {
     }
 
     pub fn read(&self) -> GuiSnapshot {
-        self.snapshot.read().unwrap().clone()
+        read_or_recover(&self.snapshot).clone()
     }
 
     pub fn latest_toast(&self) -> Option<GuiToast> {
-        let mut guard = self.toasts.lock().unwrap();
+        let mut guard = lock_or_recover(&self.toasts);
         guard.retain(|t| t.created_at.elapsed() < Duration::from_secs(4));
         guard.last().cloned()
     }
 
     pub fn dismiss_toast(&self) {
-        self.toasts.lock().unwrap().clear();
+        lock_or_recover(&self.toasts).clear();
     }
 }
 
@@ -649,16 +653,14 @@ impl Drop for GuiBackend {
         self.tx.take();
         {
             let (lock, cvar) = &*self.poller_wake;
-            let mut stopped = lock.lock().unwrap();
+            let mut stopped = lock_or_recover(lock);
             *stopped = true;
             cvar.notify_all();
         }
-        if let Some(h) = self.cmd_handle.take() {
-            let _ = h.join();
-        }
-        if let Some(h) = self.poller_handle.take() {
-            let _ = h.join();
-        }
+        // Detach worker threads on drop instead of blocking the UI thread on
+        // in-flight IPC/network/install operations (e.g. 15s firewall or scrcpy download).
+        self.cmd_handle.take();
+        self.poller_handle.take();
     }
 }
 
@@ -670,6 +672,7 @@ struct WorkerState {
     cached_live_peers: Arc<Mutex<Vec<Peer>>>,
     mutation_seq: Arc<AtomicU64>,
     active_commands: Arc<AtomicUsize>,
+    onboarding_reopened: Arc<AtomicBool>,
     controller_sync_lock: Arc<Mutex<()>>,
     use_ipc: bool,
 }
@@ -682,7 +685,7 @@ impl WorkerState {
     }
 
     fn push_toast(&self, message: impl Into<String>, is_error: bool) {
-        let mut guard = self.toasts.lock().unwrap();
+        let mut guard = lock_or_recover(&self.toasts);
         guard.push(GuiToast {
             message: message.into(),
             is_error,
@@ -695,7 +698,7 @@ impl WorkerState {
     }
 
     fn set_busy(&self, msg: Option<String>) {
-        self.snapshot.write().unwrap().busy_message = msg;
+        write_or_recover(&self.snapshot).busy_message = msg;
         self.request_repaint();
     }
 
@@ -705,11 +708,11 @@ impl WorkerState {
             GuiCommand::RefreshPeers => {
                 self.refresh_peers();
                 self.refresh_fast(true);
-                self.snapshot.write().unwrap().refreshing_peers = false;
+                write_or_recover(&self.snapshot).refreshing_peers = false;
             }
             GuiCommand::RefreshAndroid => {
                 self.refresh_android();
-                self.snapshot.write().unwrap().refreshing_android = false;
+                write_or_recover(&self.snapshot).refreshing_android = false;
             }
             GuiCommand::RefreshSystem => self.refresh_system(),
             GuiCommand::ConnectPeer { peer_id } => {
@@ -734,7 +737,7 @@ impl WorkerState {
                         }
                     })
                 } else if let Some(peer) = self.find_peer_for_id(&peer_id) {
-                    let _sync = self.controller_sync_lock.lock().unwrap();
+                    let _sync = lock_or_recover(&self.controller_sync_lock);
                     self.controller
                         .connect(
                             &peer,
@@ -748,7 +751,7 @@ impl WorkerState {
                 } else {
                     Err("Speaker is not currently reachable.".to_string())
                 };
-                self.snapshot.write().unwrap().pending_peer_id = None;
+                write_or_recover(&self.snapshot).pending_peer_id = None;
                 self.set_busy(None);
                 match res {
                     Ok(_) => {
@@ -801,7 +804,7 @@ impl WorkerState {
                         source: "manual".to_string(),
                         rtt_ms: None,
                     };
-                    let _sync = self.controller_sync_lock.lock().unwrap();
+                    let _sync = lock_or_recover(&self.controller_sync_lock);
                     self.controller
                         .connect(
                             &peer,
@@ -862,7 +865,7 @@ impl WorkerState {
                         .iter()
                         .filter_map(|id| self.find_peer_for_id(id))
                         .collect();
-                    let _sync = self.controller_sync_lock.lock().unwrap();
+                    let _sync = lock_or_recover(&self.controller_sync_lock);
                     self.controller
                         .connect_multi(
                             &targets,
@@ -899,7 +902,7 @@ impl WorkerState {
                     .map(|_| ())
                     .map_err(|e| e.to_string())
                 } else {
-                    let _sync = self.controller_sync_lock.lock().unwrap();
+                    let _sync = lock_or_recover(&self.controller_sync_lock);
                     self.controller
                         .disconnect(false, None, true, Some(true), false, false)
                         .map(|_| ())
@@ -928,7 +931,7 @@ impl WorkerState {
                     .map(|_| ())
                     .map_err(|e| e.to_string())
                 } else {
-                    let _sync = self.controller_sync_lock.lock().unwrap();
+                    let _sync = lock_or_recover(&self.controller_sync_lock);
                     self.controller
                         .share(enabled, Some(true))
                         .map(|_| ())
@@ -953,46 +956,128 @@ impl WorkerState {
                 }
             }
             GuiCommand::SetAutoConnect { enabled } => {
-                if ipc_is_running(None) {
-                    let _ = ipc_request(
+                let res = if ipc_is_running(None) {
+                    ipc_request(
                         "auto",
                         serde_json::json!({ "action": if enabled { "on" } else { "off" } }),
                         None,
                         Duration::from_secs(3),
-                    );
+                    )
+                    .map_err(|e| e.to_string())
+                    .and_then(|v| {
+                        if v.get("ok").and_then(|x| x.as_bool()).unwrap_or(true) {
+                            Ok(())
+                        } else {
+                            Err(v
+                                .get("error")
+                                .and_then(|x| x.as_str())
+                                .unwrap_or("Failed to update auto-connect")
+                                .to_string())
+                        }
+                    })
                 } else {
-                    let _sync = self.controller_sync_lock.lock().unwrap();
-                    let _ = self.controller.set_auto(enabled);
+                    let _sync = lock_or_recover(&self.controller_sync_lock);
+                    let v = self.controller.set_auto(enabled);
+                    if v.get("ok").and_then(|x| x.as_bool()).unwrap_or(true) {
+                        Ok(())
+                    } else {
+                        Err(v
+                            .get("error")
+                            .and_then(|x| x.as_str())
+                            .unwrap_or("Failed to update auto-connect")
+                            .to_string())
+                    }
+                };
+                if let Err(e) = res {
+                    self.push_toast(format!("Failed to update auto-connect: {e}"), true);
                 }
                 self.refresh_fast(true);
             }
             GuiCommand::SetVolume { level } => {
-                if ipc_is_running(None) {
-                    let _ = ipc_request(
+                let res = if ipc_is_running(None) {
+                    ipc_request(
                         "volume",
                         serde_json::json!({ "volume": level }),
                         None,
                         Duration::from_secs(2),
-                    );
+                    )
+                    .map_err(|e| e.to_string())
+                    .and_then(|v| {
+                        if v.get("ok").and_then(|x| x.as_bool()).unwrap_or(true) {
+                            Ok(())
+                        } else {
+                            Err(v
+                                .get("error")
+                                .and_then(|x| x.as_str())
+                                .unwrap_or("Failed to set volume")
+                                .to_string())
+                        }
+                    })
                 } else {
-                    let _sync = self.controller_sync_lock.lock().unwrap();
-                    let _ = self.controller.set_volume(Some(level), None, true);
+                    let _sync = lock_or_recover(&self.controller_sync_lock);
+                    let v = self.controller.set_volume(Some(level), None, true);
+                    if v.get("ok").and_then(|x| x.as_bool()).unwrap_or(true) {
+                        Ok(())
+                    } else {
+                        Err(v
+                            .get("error")
+                            .and_then(|x| x.as_str())
+                            .unwrap_or("Failed to set volume")
+                            .to_string())
+                    }
+                };
+                match res {
+                    Ok(_) => {
+                        write_or_recover(&self.snapshot).volume_level = level;
+                    }
+                    Err(e) => {
+                        self.push_toast(format!("Failed to set volume: {e}"), true);
+                        self.refresh_fast(true);
+                    }
                 }
-                self.snapshot.write().unwrap().volume_level = level;
             }
             GuiCommand::SetMute { muted } => {
-                if ipc_is_running(None) {
-                    let _ = ipc_request(
+                let res = if ipc_is_running(None) {
+                    ipc_request(
                         "volume",
                         serde_json::json!({ "mute": muted }),
                         None,
                         Duration::from_secs(2),
-                    );
+                    )
+                    .map_err(|e| e.to_string())
+                    .and_then(|v| {
+                        if v.get("ok").and_then(|x| x.as_bool()).unwrap_or(true) {
+                            Ok(())
+                        } else {
+                            Err(v
+                                .get("error")
+                                .and_then(|x| x.as_str())
+                                .unwrap_or("Failed to update mute")
+                                .to_string())
+                        }
+                    })
                 } else {
-                    let _sync = self.controller_sync_lock.lock().unwrap();
-                    let _ = self.controller.set_volume(None, Some(muted), true);
+                    let _sync = lock_or_recover(&self.controller_sync_lock);
+                    let v = self.controller.set_volume(None, Some(muted), true);
+                    if v.get("ok").and_then(|x| x.as_bool()).unwrap_or(true) {
+                        Ok(())
+                    } else {
+                        Err(v
+                            .get("error")
+                            .and_then(|x| x.as_str())
+                            .unwrap_or("Failed to update mute")
+                            .to_string())
+                    }
+                };
+                match res {
+                    Ok(_) => {
+                        write_or_recover(&self.snapshot).volume_muted = muted;
+                    }
+                    Err(e) => {
+                        self.push_toast(format!("Failed to update mute: {e}"), true);
+                        self.refresh_fast(true);
+                    }
                 }
-                self.snapshot.write().unwrap().volume_muted = muted;
             }
             GuiCommand::RouteApp { app, target, save } => {
                 let res = if ipc_is_running(None) {
@@ -1004,7 +1089,7 @@ impl WorkerState {
                     )
                     .map_err(|e| e.to_string())
                 } else {
-                    let _sync = self.controller_sync_lock.lock().unwrap();
+                    let _sync = lock_or_recover(&self.controller_sync_lock);
                     self.controller
                         .route_app(&app, Some(&target), save)
                         .map_err(|e| e.to_string())
@@ -1027,7 +1112,7 @@ impl WorkerState {
                     )
                     .map_err(|e| e.to_string())
                 } else {
-                    let _sync = self.controller_sync_lock.lock().unwrap();
+                    let _sync = lock_or_recover(&self.controller_sync_lock);
                     self.controller
                         .unroute_app(Some(&app), remove_rule)
                         .map_err(|e| e.to_string())
@@ -1080,7 +1165,7 @@ impl WorkerState {
                         }
                     })
                 } else {
-                    let _sync = self.controller_sync_lock.lock().unwrap();
+                    let _sync = lock_or_recover(&self.controller_sync_lock);
                     match direction.as_deref() {
                         Some(dir) => self.controller.enable_mic(dir).map_err(|e| e.to_string()),
                         None => self.controller.disable_mic().map_err(|e| e.to_string()),
@@ -1121,7 +1206,7 @@ impl WorkerState {
                     )
                     .map_err(|e| e.to_string())
                 } else {
-                    let _sync = self.controller_sync_lock.lock().unwrap();
+                    let _sync = lock_or_recover(&self.controller_sync_lock);
                     self.controller
                         .pair_peer("lan-group", Some(&trimmed))
                         .map_err(|e| e.to_string())
@@ -1151,7 +1236,7 @@ impl WorkerState {
                     .map(|_| ())
                     .map_err(|e| e.to_string())
                 } else {
-                    let _sync = self.controller_sync_lock.lock().unwrap();
+                    let _sync = lock_or_recover(&self.controller_sync_lock);
                     self.controller.clear_pairing();
                     Ok(())
                 };
@@ -1170,10 +1255,10 @@ impl WorkerState {
                 }
             }
             GuiCommand::AndroidInstallTools => {
-                self.snapshot.write().unwrap().android_installing = true;
+                write_or_recover(&self.snapshot).android_installing = true;
                 self.request_repaint();
                 let res = self.controller.android_manager.install_scrcpy(None, None);
-                self.snapshot.write().unwrap().android_installing = false;
+                write_or_recover(&self.snapshot).android_installing = false;
                 match res {
                     Ok(_) => {
                         self.push_toast("Audio helper installed and ready!", false);
@@ -1316,7 +1401,7 @@ impl WorkerState {
                     .map(|v| v.get("ok").and_then(|x| x.as_bool()).unwrap_or(false))
                     .unwrap_or(false)
                 } else {
-                    let cfg = self.controller.config.lock().unwrap().clone();
+                    let cfg = lock_or_recover(&self.controller.config).clone();
                     open_ports(
                         cfg.sharing.port,
                         cfg.discovery.port,
@@ -1338,17 +1423,40 @@ impl WorkerState {
             }
             GuiCommand::SetAutostart { enabled } => {
                 if enabled {
-                    let _ = install_service(true, true, true);
-                    self.apply_config_patch(
-                        serde_json::json!({ "ui": { "start_tray": true } }),
-                        Some("SoundHop will now start quietly when you log in.".to_string()),
-                    );
+                    let svc_res = install_service(true, true, true);
+                    let ok = svc_res
+                        .get("enabled")
+                        .and_then(|v| v.as_bool())
+                        .unwrap_or(false)
+                        || !svc_res
+                            .get("tray_autostart")
+                            .and_then(|v| v.as_str())
+                            .unwrap_or("")
+                            .is_empty();
+                    if ok {
+                        self.apply_config_patch(
+                            serde_json::json!({ "ui": { "start_tray": true } }),
+                            Some("SoundHop will now start quietly when you log in.".to_string()),
+                        );
+                    } else {
+                        self.push_toast("Couldn't enable login startup automatically.", true);
+                    }
                 } else {
                     let _ = uninstall_service();
-                    self.apply_config_patch(
-                        serde_json::json!({ "ui": { "start_tray": false } }),
-                        Some("Removed SoundHop from login startup.".to_string()),
-                    );
+                    let st = service_status();
+                    let still_on = st.get("enabled").and_then(|v| v.as_bool()).unwrap_or(false)
+                        || st
+                            .get("tray_autostart")
+                            .and_then(|v| v.as_bool())
+                            .unwrap_or(false);
+                    if !still_on {
+                        self.apply_config_patch(
+                            serde_json::json!({ "ui": { "start_tray": false } }),
+                            Some("Removed SoundHop from login startup.".to_string()),
+                        );
+                    } else {
+                        self.push_toast("Couldn't completely remove login startup.", true);
+                    }
                 }
                 self.refresh_system();
             }
@@ -1373,37 +1481,80 @@ impl WorkerState {
                 }
                 self.apply_config_patch(ui_patch, None);
 
-                if ipc_is_running(None) {
-                    let _ = ipc_request(
+                let mut failures: Vec<&str> = Vec::new();
+                let share_ok = if ipc_is_running(None) {
+                    ipc_request(
                         "share",
                         serde_json::json!({ "enabled": enable_sharing }),
                         None,
                         Duration::from_secs(4),
-                    );
+                    )
+                    .map(|v| v.get("ok").and_then(|x| x.as_bool()).unwrap_or(true))
+                    .unwrap_or(false)
                 } else {
-                    let _ = self.controller.share(enable_sharing, Some(true));
+                    let _sync = lock_or_recover(&self.controller_sync_lock);
+                    self.controller.share(enable_sharing, Some(true)).is_ok()
+                };
+                if !share_ok {
+                    failures.push("speaker sharing");
                 }
 
                 if enable_autostart {
-                    let _ = install_service(true, true, true);
+                    let svc_res = install_service(true, true, true);
+                    let svc_ok = svc_res
+                        .get("enabled")
+                        .and_then(|v| v.as_bool())
+                        .unwrap_or(false)
+                        || !svc_res
+                            .get("tray_autostart")
+                            .and_then(|v| v.as_str())
+                            .unwrap_or("")
+                            .is_empty();
+                    if !svc_ok {
+                        failures.push("login startup");
+                    }
                 }
                 if open_firewall {
-                    let cfg = self.controller.config.lock().unwrap().clone();
-                    let _ = open_ports(
-                        cfg.sharing.port,
-                        cfg.discovery.port,
-                        false,
-                        cfg.discovery.mdns,
+                    let fw_ok = if ipc_is_running(None) {
+                        ipc_request(
+                            "firewall_open",
+                            serde_json::json!({}),
+                            None,
+                            Duration::from_secs(15),
+                        )
+                        .map(|v| v.get("ok").and_then(|x| x.as_bool()).unwrap_or(false))
+                        .unwrap_or(false)
+                    } else {
+                        let cfg = lock_or_recover(&self.controller.config).clone();
+                        open_ports(
+                            cfg.sharing.port,
+                            cfg.discovery.port,
+                            false,
+                            cfg.discovery.mdns,
+                        )
+                        .ok
+                    };
+                    if !fw_ok {
+                        failures.push("firewall rules");
+                    }
+                }
+                self.onboarding_reopened.store(false, Ordering::SeqCst);
+                write_or_recover(&self.snapshot).show_onboarding = false;
+                if failures.is_empty() {
+                    self.push_toast("You're all set! SoundHop is ready.", false);
+                } else {
+                    self.push_toast(
+                        format!("Setup finished, but failed to configure: {}.", failures.join(", ")),
+                        true,
                     );
                 }
-                self.snapshot.write().unwrap().show_onboarding = false;
-                self.push_toast("You're all set! SoundHop is ready.", false);
                 self.refresh_fast(true);
                 self.refresh_peers();
                 self.refresh_system();
             }
             GuiCommand::ReopenOnboarding => {
-                self.snapshot.write().unwrap().show_onboarding = true;
+                self.onboarding_reopened.store(true, Ordering::SeqCst);
+                write_or_recover(&self.snapshot).show_onboarding = true;
             }
         }
     }
@@ -1427,7 +1578,7 @@ impl WorkerState {
                         return;
                     }
                     {
-                        let _sync = self.controller_sync_lock.lock().unwrap();
+                        let _sync = lock_or_recover(&self.controller_sync_lock);
                         self.controller.reload_from_disk();
                     }
                     if let Some(msg) = toast {
@@ -1442,8 +1593,8 @@ impl WorkerState {
             }
         } else {
             let res = {
-                let _sync = self.controller_sync_lock.lock().unwrap();
-                let r = self.controller.config.lock().unwrap().apply_patch(&patch);
+                let _sync = lock_or_recover(&self.controller_sync_lock);
+                let r = lock_or_recover(&self.controller.config).apply_patch(&patch);
                 if r.is_ok() {
                     self.controller.save();
                     let _ = self.controller.enforce_routed_apps();
@@ -1466,10 +1617,7 @@ impl WorkerState {
     }
 
     fn find_peer_for_id(&self, peer_id: &str) -> Option<Peer> {
-        if let Some(p) = self
-            .cached_live_peers
-            .lock()
-            .unwrap()
+        if let Some(p) = lock_or_recover(&self.cached_live_peers)
             .iter()
             .find(|p| p.id == peer_id)
         {
@@ -1491,26 +1639,26 @@ impl WorkerState {
                         .iter()
                         .filter_map(|item| serde_json::from_value::<Peer>(item.clone()).ok())
                         .collect();
-                    *self.cached_live_peers.lock().unwrap() = parsed;
+                    *lock_or_recover(&self.cached_live_peers) = parsed;
                     return;
                 }
             }
         }
-        let cfg = self.controller.config.lock().unwrap().clone();
+        let cfg = lock_or_recover(&self.controller.config).clone();
         let psk = (!cfg.sharing.psk_hash.is_empty()).then_some(cfg.sharing.psk_hash.as_str());
         let found = discover_once_with_psk(0.7, cfg.discovery.port, &cfg.device.id, psk);
         for p in &found {
             self.controller.remember_peer(p);
         }
         if !found.is_empty() {
-            *self.cached_live_peers.lock().unwrap() = found;
+            *lock_or_recover(&self.cached_live_peers) = found;
         }
     }
 
     fn refresh_android(&mut self) {
         let tools = self.controller.android_manager.get_tool_status();
         let devices = self.controller.android_manager.list_devices();
-        let mut guard = self.snapshot.write().unwrap();
+        let mut guard = write_or_recover(&self.snapshot);
         guard.android_tools = tools;
         guard.android_devices = devices;
     }
@@ -1546,7 +1694,7 @@ impl WorkerState {
         };
 
         let svc = service_status();
-        let mut guard = self.snapshot.write().unwrap();
+        let mut guard = write_or_recover(&self.snapshot);
         guard.firewall_kind = fw_kind;
         guard.firewall_active = fw_active;
         guard.firewall_detail = fw_detail;
@@ -1594,11 +1742,11 @@ impl WorkerState {
             None
         };
 
-        let live_peers = self.cached_live_peers.lock().unwrap().clone();
+        let live_peers = lock_or_recover(&self.cached_live_peers).clone();
 
         let (cfg, st, local_telem, status_json, apps_json) = {
             let _sync_guard = if allow_during_command {
-                Some(self.controller_sync_lock.lock().unwrap())
+                Some(lock_or_recover(&self.controller_sync_lock))
             } else {
                 if self.active_commands.load(Ordering::SeqCst) > 0
                     || self.mutation_seq.load(Ordering::SeqCst) != seq_before
@@ -1612,8 +1760,8 @@ impl WorkerState {
             };
 
             self.controller.reload_from_disk();
-            let cfg = self.controller.config.lock().unwrap().clone();
-            let st = self.controller.state.lock().unwrap().clone();
+            let cfg = lock_or_recover(&self.controller.config).clone();
+            let st = lock_or_recover(&self.controller.state).clone();
             let local_telem = self.controller.telemetry_snapshot();
 
             let status_json =
@@ -1840,7 +1988,11 @@ impl WorkerState {
             return;
         }
 
-        let mut guard = self.snapshot.write().unwrap();
+        let mut guard = write_or_recover(&self.snapshot);
+        if !guard.hydrated && !self.onboarding_reopened.load(Ordering::Relaxed) {
+            guard.show_onboarding = !cfg.ui.onboarding_completed && st.known_peers.is_empty();
+        }
+        guard.hydrated = true;
         guard.daemon_connected = daemon_up;
         guard.config = cfg;
         guard.connected = connected;
@@ -2010,6 +2162,7 @@ mod tests {
             cached_live_peers: Arc::new(Mutex::new(Vec::new())),
             mutation_seq: Arc::clone(&mutation_seq),
             active_commands: Arc::clone(&active_commands),
+            onboarding_reopened: Arc::new(AtomicBool::new(false)),
             controller_sync_lock: Arc::new(Mutex::new(())),
             use_ipc: false,
         };
@@ -2026,5 +2179,29 @@ mod tests {
         active_commands.store(0, Ordering::SeqCst);
         worker.refresh_fast(true);
         assert!(snapshot.read().unwrap().sharing_enabled);
+        assert!(snapshot.read().unwrap().hydrated);
+    }
+
+    #[test]
+    fn test_lock_recovery_after_poison() {
+        let m = Arc::new(Mutex::new(42));
+        let m2 = Arc::clone(&m);
+        let _ = std::thread::spawn(move || {
+            let _g = m2.lock().unwrap();
+            panic!("intentional poison");
+        })
+        .join();
+        assert_eq!(*lock_or_recover(&m), 42);
+
+        let rw = Arc::new(RwLock::new(99));
+        let rw2 = Arc::clone(&rw);
+        let _ = std::thread::spawn(move || {
+            let _g = rw2.write().unwrap();
+            panic!("intentional rw poison");
+        })
+        .join();
+        assert_eq!(*read_or_recover(&rw), 99);
+        *write_or_recover(&rw) = 100;
+        assert_eq!(*read_or_recover(&rw), 100);
     }
 }

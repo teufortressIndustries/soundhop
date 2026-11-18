@@ -5,8 +5,10 @@
 use std::collections::HashSet;
 use std::process::Command;
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::{Arc, OnceLock};
+use std::sync::{mpsc, Arc, OnceLock};
 use std::time::{Duration, Instant};
+
+use crate::lock_or_recover;
 
 use muda::{CheckMenuItem, Menu, MenuEvent, MenuId, MenuItem, PredefinedMenuItem, Submenu};
 use soundhop_core::constants::{PROTOCOL_VERSION, VERSION};
@@ -102,32 +104,19 @@ pub fn build_tray_icon(state: TrayBadgeState) -> Icon {
     Icon::from_rgba(rgba, 64, 64).expect("Valid 64x64 RGBA icon")
 }
 
-fn compute_badge_state(controller: &Controller) -> TrayBadgeState {
-    let st = controller.state.lock().unwrap().clone();
-    let cfg = controller.config.lock().unwrap().clone();
-    if st.is_multiroom() {
-        TrayBadgeState::MultiRoom
-    } else if st.is_connected() {
-        TrayBadgeState::Connected
-    } else if cfg.sharing.enabled || st.listener_module > 0 {
-        TrayBadgeState::Sharing
-    } else {
-        TrayBadgeState::Idle
-    }
+fn is_external_daemon(daemon: &Daemon) -> bool {
+    lock_or_recover(&daemon.ipc).is_none() && ipc_is_running(None)
 }
 
 fn daemon_peers(daemon: &Daemon) -> Vec<Peer> {
-    let mut peers: Vec<Peer> = daemon
-        .discovery
-        .lock()
-        .unwrap()
+    let mut peers: Vec<Peer> = lock_or_recover(&daemon.discovery)
         .as_ref()
         .map(|d| d.peers())
         .unwrap_or_default();
     let mut seen_ids: HashSet<String> = peers.iter().map(|p| p.id.clone()).collect();
-    let own_id = daemon.controller.config.lock().unwrap().device.id.clone();
+    let own_id = lock_or_recover(&daemon.controller.config).device.id.clone();
 
-    if daemon.ipc.lock().unwrap().is_none() && ipc_is_running(None) {
+    if is_external_daemon(daemon) {
         if let Ok(resp) = ipc_request(
             "peers",
             serde_json::json!({}),
@@ -199,7 +188,7 @@ fn daemon_peers(daemon: &Daemon) -> Vec<Peer> {
         }
     }
 
-    let st = daemon.controller.state.lock().unwrap().clone();
+    let st = lock_or_recover(&daemon.controller.state).clone();
     for kp in st.known_peers.values() {
         if kp.id.is_empty()
             || kp.id == own_id
@@ -233,18 +222,107 @@ fn daemon_peers(daemon: &Daemon) -> Vec<Peer> {
 }
 
 pub fn build_tray_menu(controller: &Controller, peers: &[Peer]) -> Menu {
+    let st = lock_or_recover(&controller.state).clone();
+    let cfg = lock_or_recover(&controller.config).clone();
+    let streams = controller.list_apps();
+    let and_running = controller.android_session.is_active();
+    let snap = TrayMenuSnapshot::from_parts(peers.to_vec(), streams, st, cfg, and_running);
+    build_tray_menu_from_snapshot(&snap)
+}
+
+#[derive(Clone)]
+struct TrayMenuSnapshot {
+    peers: Vec<Peer>,
+    streams: Vec<serde_json::Value>,
+    connected: bool,
+    multiroom: bool,
+    connected_peer: String,
+    connected_name: String,
+    connected_host: String,
+    multiroom_peer_ids: Vec<String>,
+    keep_local: bool,
+    sharing_enabled: bool,
+    auto_enabled: bool,
+    mic_active: bool,
+    mic_direction: String,
+    routed_apps_lower: HashSet<String>,
+    android_active: bool,
+    badge: TrayBadgeState,
+    signature: String,
+}
+
+impl TrayMenuSnapshot {
+    fn from_parts(
+        peers: Vec<Peer>,
+        streams: Vec<serde_json::Value>,
+        st: soundhop_core::state::State,
+        cfg: soundhop_core::config::Config,
+        android_active: bool,
+    ) -> Self {
+        let connected = st.is_connected();
+        let multiroom = st.is_multiroom();
+        let multiroom_peer_ids: Vec<String> = st
+            .multiroom_peers
+            .iter()
+            .map(|s| s.peer_id.clone())
+            .collect();
+        let sharing_enabled = cfg.sharing.enabled || st.listener_module > 0;
+        let auto_enabled = cfg.connection.auto_connect && !st.auto_paused;
+        let mic_active = !st.connected_source.is_empty();
+        let routed_apps_lower: HashSet<String> = st.routed_apps.keys().cloned().collect();
+        let badge = if multiroom {
+            TrayBadgeState::MultiRoom
+        } else if connected {
+            TrayBadgeState::Connected
+        } else if sharing_enabled {
+            TrayBadgeState::Sharing
+        } else {
+            TrayBadgeState::Idle
+        };
+        let signature = compute_menu_signature(
+            &peers,
+            &streams,
+            &st.connected_peer,
+            multiroom_peer_ids.len(),
+            sharing_enabled,
+            auto_enabled,
+            st.keep_local,
+            &st.mic_direction,
+            android_active,
+        );
+        Self {
+            peers,
+            streams,
+            connected,
+            multiroom,
+            connected_peer: st.connected_peer,
+            connected_name: st.connected_name,
+            connected_host: st.connected_host,
+            multiroom_peer_ids,
+            keep_local: st.keep_local,
+            sharing_enabled,
+            auto_enabled,
+            mic_active,
+            mic_direction: st.mic_direction,
+            routed_apps_lower,
+            android_active,
+            badge,
+            signature,
+        }
+    }
+}
+
+fn build_tray_menu_from_snapshot(snap: &TrayMenuSnapshot) -> Menu {
     let menu = Menu::new();
-    let st = controller.state.lock().unwrap().clone();
-    let cfg = controller.config.lock().unwrap().clone();
 
     let open_item = MenuItem::with_id(MenuId::new("open_gui"), "Open SoundHop", true, None);
     let _ = menu.append(&open_item);
 
-    let status_text = if st.is_multiroom() {
-        format!("Multi-room: {}", st.connected_name)
-    } else if st.is_connected() {
-        format!("Playing on: {}", st.connected_name)
-    } else if cfg.sharing.enabled {
+    let status_text = if snap.multiroom {
+        format!("Multi-room: {}", snap.connected_name)
+    } else if snap.connected {
+        format!("Playing on: {}", snap.connected_name)
+    } else if snap.sharing_enabled {
         "Ready • Sharing my speakers".to_string()
     } else {
         "Ready • Playing on this device".to_string()
@@ -253,14 +331,11 @@ pub fn build_tray_menu(controller: &Controller, peers: &[Peer]) -> Menu {
     let _ = menu.append(&header_item);
     let _ = menu.append(&PredefinedMenuItem::separator());
 
-    let connected_ids: HashSet<String> = if !st.multiroom_peers.is_empty() {
-        st.multiroom_peers
-            .iter()
-            .map(|s| s.peer_id.clone())
-            .collect()
-    } else if !st.connected_peer.is_empty() {
+    let connected_ids: HashSet<String> = if !snap.multiroom_peer_ids.is_empty() {
+        snap.multiroom_peer_ids.iter().cloned().collect()
+    } else if !snap.connected_peer.is_empty() {
         let mut s = HashSet::new();
-        s.insert(st.connected_peer.clone());
+        s.insert(snap.connected_peer.clone());
         s
     } else {
         HashSet::new()
@@ -272,13 +347,13 @@ pub fn build_tray_menu(controller: &Controller, peers: &[Peer]) -> Menu {
     let local_chk = CheckMenuItem::with_id(
         MenuId::new("action_disconnect"),
         "This Device (Local Speakers)",
-        st.is_connected(),
-        !st.is_connected(),
+        snap.connected,
+        !snap.connected,
         None,
     );
     let _ = menu.append(&local_chk);
 
-    if peers.is_empty() {
+    if snap.peers.is_empty() {
         let no_peers = MenuItem::with_id(
             MenuId::new("noop_peers"),
             "Looking for nearby speakers...",
@@ -287,9 +362,9 @@ pub fn build_tray_menu(controller: &Controller, peers: &[Peer]) -> Menu {
         );
         let _ = menu.append(&no_peers);
     } else {
-        for peer in peers {
+        for peer in &snap.peers {
             let is_conn = connected_ids.contains(&peer.id)
-                || (st.connected_host == peer.host && !st.connected_peer.is_empty());
+                || (snap.connected_host == peer.host && !snap.connected_peer.is_empty());
             let rtt_suffix = peer
                 .rtt_ms
                 .map(|r| format!(" ({r:.0} ms)"))
@@ -305,9 +380,9 @@ pub fn build_tray_menu(controller: &Controller, peers: &[Peer]) -> Menu {
             let _ = menu.append(&item);
         }
 
-        if peers.len() > 1 {
+        if snap.peers.len() > 1 {
             let multi_sub = Submenu::new("Multiple Speakers", true);
-            for peer in peers {
+            for peer in &snap.peers {
                 let is_in_group = connected_ids.contains(&peer.id);
                 let chk = CheckMenuItem::with_id(
                     MenuId::new(format!("multiroom_toggle:{}", peer.id)),
@@ -323,7 +398,7 @@ pub fn build_tray_menu(controller: &Controller, peers: &[Peer]) -> Menu {
                 MenuId::new("multiroom_keep_local"),
                 "Keep Playing on This Device Too",
                 true,
-                st.keep_local,
+                snap.keep_local,
                 None,
             );
             let _ = multi_sub.append(&keep_local_chk);
@@ -344,7 +419,7 @@ pub fn build_tray_menu(controller: &Controller, peers: &[Peer]) -> Menu {
         MenuId::new("toggle_share"),
         "Share My Speakers",
         true,
-        cfg.sharing.enabled || st.listener_module > 0,
+        snap.sharing_enabled,
         None,
     );
     let _ = menu.append(&share_chk);
@@ -353,15 +428,14 @@ pub fn build_tray_menu(controller: &Controller, peers: &[Peer]) -> Menu {
         MenuId::new("toggle_autoconnect"),
         "Auto-Connect to Last Speaker",
         true,
-        cfg.connection.auto_connect && !st.auto_paused,
+        snap.auto_enabled,
         None,
     );
     let _ = menu.append(&auto_chk);
 
     // Apps submenu (plain labels, no & mnemonics)
     let app_sub = Submenu::new("Apps", true);
-    let streams = controller.list_apps();
-    if streams.is_empty() {
+    if snap.streams.is_empty() {
         let empty = MenuItem::with_id(
             MenuId::new("noop_apps"),
             "No apps playing right now",
@@ -370,7 +444,7 @@ pub fn build_tray_menu(controller: &Controller, peers: &[Peer]) -> Menu {
         );
         let _ = app_sub.append(&empty);
     } else {
-        for stream in streams {
+        for stream in &snap.streams {
             let app_name = stream
                 .get("app_name")
                 .and_then(|v| v.as_str())
@@ -396,7 +470,7 @@ pub fn build_tray_menu(controller: &Controller, peers: &[Peer]) -> Menu {
             let chk = CheckMenuItem::with_id(
                 MenuId::new(format!("app_route:{app_name}")),
                 label,
-                st.is_connected(),
+                snap.connected,
                 is_routed,
                 None,
             );
@@ -406,12 +480,12 @@ pub fn build_tray_menu(controller: &Controller, peers: &[Peer]) -> Menu {
     let _ = menu.append(&app_sub);
 
     // Volume submenu (avoid '&' which GTK treats as mnemonic underline)
-    let vol_sub = Submenu::new("Volume and Mute", st.is_connected());
+    let vol_sub = Submenu::new("Volume and Mute", snap.connected);
     for pct in [25u32, 50, 75, 100, 125] {
         let item = MenuItem::with_id(
             MenuId::new(format!("vol_set:{pct}")),
             format!("Volume {pct}%"),
-            st.is_connected(),
+            snap.connected,
             None,
         );
         let _ = vol_sub.append(&item);
@@ -420,39 +494,37 @@ pub fn build_tray_menu(controller: &Controller, peers: &[Peer]) -> Menu {
     let mute_item = MenuItem::with_id(
         MenuId::new("vol_mute_toggle"),
         "Toggle Mute",
-        st.is_connected(),
+        snap.connected,
         None,
     );
     let _ = vol_sub.append(&mute_item);
     let _ = menu.append(&vol_sub);
 
     // Microphone submenu
-    let mic_active = !st.connected_source.is_empty();
     let mic_sub = Submenu::new("Microphone", true);
     let mic_send = CheckMenuItem::with_id(
         MenuId::new("mic_send_toggle"),
         "Send My Microphone",
-        st.is_connected() || mic_active,
-        mic_active && st.mic_direction == "send",
+        snap.connected || snap.mic_active,
+        snap.mic_active && snap.mic_direction == "send",
         None,
     );
     let mic_recv = CheckMenuItem::with_id(
         MenuId::new("mic_recv_toggle"),
         "Hear Peer Microphone",
-        st.is_connected() || mic_active,
-        mic_active && st.mic_direction == "receive",
+        snap.connected || snap.mic_active,
+        snap.mic_active && snap.mic_direction == "receive",
         None,
     );
     let _ = mic_sub.append(&mic_send);
     let _ = mic_sub.append(&mic_recv);
-    if mic_active {
+    if snap.mic_active {
         let mic_off = MenuItem::with_id(MenuId::new("mic_stop"), "Turn Off Microphone", true, None);
         let _ = mic_sub.append(&mic_off);
     }
     let _ = menu.append(&mic_sub);
 
     // Phone Audio action
-    let and_running = controller.android_session.is_active();
     let and_wiz = MenuItem::with_id(
         MenuId::new("open_android_wizard"),
         "Phone Audio...",
@@ -460,7 +532,7 @@ pub fn build_tray_menu(controller: &Controller, peers: &[Peer]) -> Menu {
         None,
     );
     let _ = menu.append(&and_wiz);
-    if and_running {
+    if snap.android_active {
         let and_stop =
             MenuItem::with_id(MenuId::new("android_stop"), "Stop Phone Audio", true, None);
         let _ = menu.append(&and_stop);
@@ -491,9 +563,162 @@ fn spawn_self_args(args: &[&str]) {
     }
 }
 
+fn collect_tray_snapshot(daemon: &Daemon) -> TrayMenuSnapshot {
+    let peers = daemon_peers(daemon);
+    if is_external_daemon(daemon) {
+        let status_json = ipc_request(
+            "status",
+            serde_json::json!({}),
+            None,
+            Duration::from_millis(600),
+        )
+        .ok();
+        let apps = ipc_request(
+            "apps",
+            serde_json::json!({}),
+            None,
+            Duration::from_millis(500),
+        )
+        .ok()
+        .and_then(|v| v.get("apps").and_then(|a| a.as_array()).cloned())
+        .unwrap_or_default();
+
+        if let Some(st_json) = status_json {
+            let conn = st_json.get("connection").filter(|c| !c.is_null());
+            let connected = conn.is_some();
+            let multiroom = conn
+                .and_then(|c| c.get("multiroom"))
+                .and_then(|v| v.as_bool())
+                .unwrap_or(false);
+            let connected_peer = conn
+                .and_then(|c| c.get("peer_id"))
+                .and_then(|v| v.as_str())
+                .unwrap_or("")
+                .to_string();
+            let connected_name = conn
+                .and_then(|c| c.get("name"))
+                .and_then(|v| v.as_str())
+                .unwrap_or("")
+                .to_string();
+            let connected_host = conn
+                .and_then(|c| c.get("host"))
+                .and_then(|v| v.as_str())
+                .unwrap_or("")
+                .to_string();
+            let keep_local = conn
+                .and_then(|c| c.get("keep_local"))
+                .and_then(|v| v.as_bool())
+                .unwrap_or(false);
+            let multiroom_peer_ids: Vec<String> = conn
+                .and_then(|c| c.get("multiroom_peers"))
+                .and_then(|v| v.as_array())
+                .map(|arr| {
+                    arr.iter()
+                        .filter_map(|p| {
+                            p.get("peer_id")
+                                .and_then(|x| x.as_str())
+                                .map(|s| s.to_string())
+                        })
+                        .collect()
+                })
+                .unwrap_or_default();
+            let sharing_enabled = st_json
+                .get("sharing")
+                .and_then(|s| s.get("enabled"))
+                .and_then(|v| v.as_bool())
+                .unwrap_or(false);
+            let auto_enabled = st_json
+                .get("auto")
+                .and_then(|a| a.get("enabled"))
+                .and_then(|v| v.as_bool())
+                .unwrap_or(false)
+                && !st_json
+                    .get("auto")
+                    .and_then(|a| a.get("paused"))
+                    .and_then(|v| v.as_bool())
+                    .unwrap_or(false);
+            let mic_active = conn
+                .and_then(|c| c.get("with_mic"))
+                .and_then(|v| v.as_bool())
+                .unwrap_or(false);
+            let mic_direction = conn
+                .and_then(|c| c.get("mic_direction"))
+                .and_then(|v| v.as_str())
+                .unwrap_or("")
+                .to_string();
+            let android_active = st_json
+                .get("android")
+                .and_then(|a| a.get("active"))
+                .and_then(|v| v.as_bool())
+                .unwrap_or(false);
+            let routed_apps_lower: HashSet<String> = apps
+                .iter()
+                .filter(|a| {
+                    a.get("is_remote").and_then(|v| v.as_bool()).unwrap_or(false)
+                        || a.get("routed_rule")
+                            .and_then(|v| v.as_str())
+                            .map(|r| r == "remote")
+                            .unwrap_or(false)
+                })
+                .filter_map(|a| {
+                    a.get("app_name")
+                        .and_then(|v| v.as_str())
+                        .map(|s| s.to_lowercase())
+                })
+                .collect();
+            let badge = if multiroom {
+                TrayBadgeState::MultiRoom
+            } else if connected {
+                TrayBadgeState::Connected
+            } else if sharing_enabled {
+                TrayBadgeState::Sharing
+            } else {
+                TrayBadgeState::Idle
+            };
+            let signature = compute_menu_signature(
+                &peers,
+                &apps,
+                &connected_peer,
+                multiroom_peer_ids.len(),
+                sharing_enabled,
+                auto_enabled,
+                keep_local,
+                &mic_direction,
+                android_active,
+            );
+            return TrayMenuSnapshot {
+                peers,
+                streams: apps,
+                connected,
+                multiroom,
+                connected_peer,
+                connected_name,
+                connected_host,
+                multiroom_peer_ids,
+                keep_local,
+                sharing_enabled,
+                auto_enabled,
+                mic_active,
+                mic_direction,
+                routed_apps_lower,
+                android_active,
+                badge,
+                signature,
+            };
+        }
+    }
+
+    let ctrl = &daemon.controller;
+    let st = lock_or_recover(&ctrl.state).clone();
+    let cfg = lock_or_recover(&ctrl.config).clone();
+    let streams = ctrl.list_apps();
+    let and_running = ctrl.android_session.is_active();
+    TrayMenuSnapshot::from_parts(peers, streams, st, cfg, and_running)
+}
+
 fn handle_menu_action(id_str: &str, daemon: &Daemon, running: &AtomicBool) {
     let ctrl = &daemon.controller;
-    let peers = daemon_peers(daemon);
+    let external = is_external_daemon(daemon);
 
     if id_str == "quit_tray" {
         running.store(false, Ordering::SeqCst);
@@ -512,180 +737,367 @@ fn handle_menu_action(id_str: &str, daemon: &Daemon, running: &AtomicBool) {
         return;
     }
     if id_str == "android_stop" {
-        let _ = ctrl.android_session.stop();
+        if external {
+            let _ = ipc_request("android_stop", serde_json::json!({}), None, Duration::from_secs(5));
+        } else {
+            let _ = ctrl.android_session.stop();
+        }
         return;
     }
     if id_str == "action_disconnect" {
-        let _ = ctrl.disconnect(false, None, true, Some(true), false, false);
+        if external {
+            let _ = ipc_request("disconnect", serde_json::json!({}), None, Duration::from_secs(6));
+        } else {
+            let _ = ctrl.disconnect(false, None, true, Some(true), false, false);
+        }
         return;
     }
     if id_str == "toggle_share" {
-        let currently_enabled = ctrl.config.lock().unwrap().sharing.enabled;
-        let next_enabled = !currently_enabled;
-        let _ = ctrl.share(next_enabled, Some(true));
-        if let Some(disc) = daemon.discovery.lock().unwrap().as_ref() {
-            disc.set_advertising(next_enabled);
+        if external {
+            let currently_enabled = ipc_request("status", serde_json::json!({}), None, Duration::from_millis(600))
+                .ok()
+                .and_then(|v| v.get("sharing").and_then(|s| s.get("enabled")).and_then(|b| b.as_bool()))
+                .unwrap_or_else(|| lock_or_recover(&ctrl.config).sharing.enabled);
+            let _ = ipc_request(
+                "share",
+                serde_json::json!({ "enabled": !currently_enabled }),
+                None,
+                Duration::from_secs(5),
+            );
+        } else {
+            let currently_enabled = lock_or_recover(&ctrl.config).sharing.enabled;
+            let next_enabled = !currently_enabled;
+            let _ = ctrl.share(next_enabled, Some(true));
+            if let Some(disc) = lock_or_recover(&daemon.discovery).as_ref() {
+                disc.set_advertising(next_enabled);
+            }
         }
         return;
     }
     if id_str == "toggle_autoconnect" {
-        let cur = ctrl.config.lock().unwrap().connection.auto_connect;
-        let _ = ctrl.set_auto(!cur);
+        if external {
+            let cur = ipc_request("status", serde_json::json!({}), None, Duration::from_millis(600))
+                .ok()
+                .and_then(|v| v.get("auto").and_then(|a| a.get("enabled")).and_then(|b| b.as_bool()))
+                .unwrap_or_else(|| lock_or_recover(&ctrl.config).connection.auto_connect);
+            let _ = ipc_request(
+                "auto",
+                serde_json::json!({ "action": if cur { "off" } else { "on" } }),
+                None,
+                Duration::from_secs(3),
+            );
+        } else {
+            let cur = lock_or_recover(&ctrl.config).connection.auto_connect;
+            let _ = ctrl.set_auto(!cur);
+        }
         return;
     }
+
+    let peers = daemon_peers(daemon);
+
     if let Some(peer_id) = id_str.strip_prefix("peer_toggle:") {
-        let st = ctrl.state.lock().unwrap().clone();
-        if st.connected_peer == peer_id {
-            let _ = ctrl.disconnect(false, None, true, Some(true), false, false);
-        } else if let Some(peer) = peers.iter().find(|p| p.id == peer_id) {
-            let _ = ctrl.connect(
-                peer,
-                ConnectOptions {
-                    notify_user: Some(true),
-                    by: "tray".to_string(),
-                    ..Default::default()
-                },
-            );
+        if external {
+            let snap = collect_tray_snapshot(daemon);
+            if snap.connected_peer == peer_id {
+                let _ = ipc_request("disconnect", serde_json::json!({}), None, Duration::from_secs(6));
+            } else {
+                let _ = ipc_request(
+                    "connect",
+                    serde_json::json!({ "peer": peer_id }),
+                    None,
+                    Duration::from_secs(10),
+                );
+            }
+        } else {
+            let st = lock_or_recover(&ctrl.state).clone();
+            if st.connected_peer == peer_id {
+                let _ = ctrl.disconnect(false, None, true, Some(true), false, false);
+            } else if let Some(peer) = peers.iter().find(|p| p.id == peer_id) {
+                let _ = ctrl.connect(
+                    peer,
+                    ConnectOptions {
+                        notify_user: Some(true),
+                        by: "tray".to_string(),
+                        ..Default::default()
+                    },
+                );
+            }
         }
         return;
     }
     if let Some(peer_id) = id_str.strip_prefix("multiroom_toggle:") {
-        let st = ctrl.state.lock().unwrap().clone();
-        let mut active_ids: Vec<String> = if !st.multiroom_peers.is_empty() {
-            st.multiroom_peers
-                .iter()
-                .map(|s| s.peer_id.clone())
-                .collect()
-        } else if !st.connected_peer.is_empty() {
-            vec![st.connected_peer.clone()]
+        if external {
+            let snap = collect_tray_snapshot(daemon);
+            let mut active_ids = if !snap.multiroom_peer_ids.is_empty() {
+                snap.multiroom_peer_ids
+            } else if !snap.connected_peer.is_empty() {
+                vec![snap.connected_peer]
+            } else {
+                Vec::new()
+            };
+            if active_ids.iter().any(|x| x == peer_id) {
+                active_ids.retain(|x| x != peer_id);
+            } else {
+                active_ids.push(peer_id.to_string());
+            }
+            if active_ids.is_empty() {
+                let _ = ipc_request("disconnect", serde_json::json!({}), None, Duration::from_secs(6));
+            } else {
+                let _ = ipc_request(
+                    "connect",
+                    serde_json::json!({ "peers": active_ids, "keep_local": snap.keep_local }),
+                    None,
+                    Duration::from_secs(12),
+                );
+            }
         } else {
-            Vec::new()
-        };
-        if active_ids.contains(&peer_id.to_string()) {
-            active_ids.retain(|x| x != peer_id);
-        } else {
-            active_ids.push(peer_id.to_string());
-        }
-        let target_peers: Vec<Peer> = peers
-            .into_iter()
-            .filter(|p| active_ids.contains(&p.id))
-            .collect();
-        if target_peers.is_empty() {
-            let _ = ctrl.disconnect(false, None, true, Some(true), false, false);
-        } else {
-            let _ = ctrl.connect_multi(
-                &target_peers,
-                ConnectOptions {
-                    keep_local: st.keep_local,
-                    notify_user: Some(true),
-                    by: "tray".to_string(),
-                    ..Default::default()
-                },
-            );
+            let st = lock_or_recover(&ctrl.state).clone();
+            let mut active_ids: Vec<String> = if !st.multiroom_peers.is_empty() {
+                st.multiroom_peers
+                    .iter()
+                    .map(|s| s.peer_id.clone())
+                    .collect()
+            } else if !st.connected_peer.is_empty() {
+                vec![st.connected_peer.clone()]
+            } else {
+                Vec::new()
+            };
+            if active_ids.contains(&peer_id.to_string()) {
+                active_ids.retain(|x| x != peer_id);
+            } else {
+                active_ids.push(peer_id.to_string());
+            }
+            let target_peers: Vec<Peer> = peers
+                .into_iter()
+                .filter(|p| active_ids.contains(&p.id))
+                .collect();
+            if target_peers.is_empty() {
+                let _ = ctrl.disconnect(false, None, true, Some(true), false, false);
+            } else {
+                let _ = ctrl.connect_multi(
+                    &target_peers,
+                    ConnectOptions {
+                        keep_local: st.keep_local,
+                        notify_user: Some(true),
+                        by: "tray".to_string(),
+                        ..Default::default()
+                    },
+                );
+            }
         }
         return;
     }
     if id_str == "multiroom_keep_local" {
-        let st = ctrl.state.lock().unwrap().clone();
-        let new_keep = !st.keep_local;
-        let active_ids: Vec<String> = st
-            .multiroom_peers
-            .iter()
-            .map(|s| s.peer_id.clone())
-            .collect();
-        let target_peers: Vec<Peer> = peers
-            .into_iter()
-            .filter(|p| active_ids.contains(&p.id))
-            .collect();
-        if !target_peers.is_empty() {
-            let _ = ctrl.connect_multi(
-                &target_peers,
-                ConnectOptions {
-                    keep_local: new_keep,
-                    notify_user: Some(true),
-                    by: "tray".to_string(),
-                    ..Default::default()
-                },
-            );
+        if external {
+            let snap = collect_tray_snapshot(daemon);
+            if !snap.multiroom_peer_ids.is_empty() {
+                let _ = ipc_request(
+                    "connect",
+                    serde_json::json!({
+                        "peers": snap.multiroom_peer_ids,
+                        "keep_local": !snap.keep_local,
+                    }),
+                    None,
+                    Duration::from_secs(12),
+                );
+            }
+        } else {
+            let st = lock_or_recover(&ctrl.state).clone();
+            let new_keep = !st.keep_local;
+            let active_ids: Vec<String> = st
+                .multiroom_peers
+                .iter()
+                .map(|s| s.peer_id.clone())
+                .collect();
+            let target_peers: Vec<Peer> = peers
+                .into_iter()
+                .filter(|p| active_ids.contains(&p.id))
+                .collect();
+            if !target_peers.is_empty() {
+                let _ = ctrl.connect_multi(
+                    &target_peers,
+                    ConnectOptions {
+                        keep_local: new_keep,
+                        notify_user: Some(true),
+                        by: "tray".to_string(),
+                        ..Default::default()
+                    },
+                );
+            }
         }
         return;
     }
     if id_str == "multiroom_broadcast_all" {
         if !peers.is_empty() {
-            let st = ctrl.state.lock().unwrap().clone();
-            let _ = ctrl.connect_multi(
-                &peers,
-                ConnectOptions {
-                    keep_local: st.keep_local,
-                    notify_user: Some(true),
-                    by: "tray".to_string(),
-                    ..Default::default()
-                },
-            );
+            if external {
+                let snap = collect_tray_snapshot(daemon);
+                let all_ids: Vec<String> = peers.into_iter().map(|p| p.id).collect();
+                let _ = ipc_request(
+                    "connect",
+                    serde_json::json!({ "peers": all_ids, "keep_local": snap.keep_local }),
+                    None,
+                    Duration::from_secs(12),
+                );
+            } else {
+                let st = lock_or_recover(&ctrl.state).clone();
+                let _ = ctrl.connect_multi(
+                    &peers,
+                    ConnectOptions {
+                        keep_local: st.keep_local,
+                        notify_user: Some(true),
+                        by: "tray".to_string(),
+                        ..Default::default()
+                    },
+                );
+            }
         }
         return;
     }
     if let Some(app_name) = id_str.strip_prefix("app_route:") {
-        let st = ctrl.state.lock().unwrap().clone();
-        let already = st.routed_apps.contains_key(&app_name.to_lowercase());
-        if already {
-            let _ = ctrl.route_app(app_name, Some("local"), false);
+        if external {
+            let snap = collect_tray_snapshot(daemon);
+            let already = snap.routed_apps_lower.contains(&app_name.to_lowercase());
+            let target = if already { "local" } else { "remote" };
+            let _ = ipc_request(
+                "route",
+                serde_json::json!({ "app": app_name, "target": target, "save": false }),
+                None,
+                Duration::from_secs(4),
+            );
         } else {
-            let _ = ctrl.route_app(app_name, Some("remote"), false);
+            let st = lock_or_recover(&ctrl.state).clone();
+            let already = st.routed_apps.contains_key(&app_name.to_lowercase());
+            if already {
+                let _ = ctrl.route_app(app_name, Some("local"), false);
+            } else {
+                let _ = ctrl.route_app(app_name, Some("remote"), false);
+            }
         }
         return;
     }
     if id_str == "mic_send_toggle" {
-        let st = ctrl.state.lock().unwrap().clone();
-        if !st.connected_source.is_empty() && st.mic_direction == "send" {
-            let _ = ctrl.disable_mic();
+        if external {
+            let snap = collect_tray_snapshot(daemon);
+            let payload = if snap.mic_active && snap.mic_direction == "send" {
+                serde_json::json!({ "action": "off" })
+            } else {
+                serde_json::json!({ "action": "enable", "direction": "send" })
+            };
+            let _ = ipc_request("mic", payload, None, Duration::from_secs(5));
         } else {
-            let _ = ctrl.enable_mic("send");
+            let st = lock_or_recover(&ctrl.state).clone();
+            if !st.connected_source.is_empty() && st.mic_direction == "send" {
+                let _ = ctrl.disable_mic();
+            } else {
+                let _ = ctrl.enable_mic("send");
+            }
         }
         return;
     }
     if id_str == "mic_recv_toggle" {
-        let st = ctrl.state.lock().unwrap().clone();
-        if !st.connected_source.is_empty() && st.mic_direction == "receive" {
-            let _ = ctrl.disable_mic();
+        if external {
+            let snap = collect_tray_snapshot(daemon);
+            let payload = if snap.mic_active && snap.mic_direction == "receive" {
+                serde_json::json!({ "action": "off" })
+            } else {
+                serde_json::json!({ "action": "enable", "direction": "receive" })
+            };
+            let _ = ipc_request("mic", payload, None, Duration::from_secs(5));
         } else {
-            let _ = ctrl.enable_mic("receive");
+            let st = lock_or_recover(&ctrl.state).clone();
+            if !st.connected_source.is_empty() && st.mic_direction == "receive" {
+                let _ = ctrl.disable_mic();
+            } else {
+                let _ = ctrl.enable_mic("receive");
+            }
         }
         return;
     }
     if id_str == "mic_stop" {
-        let _ = ctrl.disable_mic();
+        if external {
+            let _ = ipc_request(
+                "mic",
+                serde_json::json!({ "action": "off" }),
+                None,
+                Duration::from_secs(5),
+            );
+        } else {
+            let _ = ctrl.disable_mic();
+        }
         return;
     }
     if let Some(pct_str) = id_str.strip_prefix("vol_set:") {
         if let Ok(pct) = pct_str.parse::<u32>() {
-            let _ = ctrl.set_volume(Some(pct), None, true);
+            if external {
+                let _ = ipc_request(
+                    "volume",
+                    serde_json::json!({ "volume": pct }),
+                    None,
+                    Duration::from_secs(2),
+                );
+            } else {
+                let _ = ctrl.set_volume(Some(pct), None, true);
+            }
         }
         return;
     }
     if id_str == "vol_mute_toggle" {
-        let v = ctrl.get_volume();
-        let cur_mute = v.get("mute").and_then(|x| x.as_bool()).unwrap_or(false);
-        let _ = ctrl.set_volume(None, Some(!cur_mute), true);
+        if external {
+            let cur_mute = ipc_request("status", serde_json::json!({}), None, Duration::from_millis(600))
+                .ok()
+                .and_then(|v| v.get("volume").and_then(|vol| vol.get("mute")).and_then(|b| b.as_bool()))
+                .unwrap_or(false);
+            let _ = ipc_request(
+                "volume",
+                serde_json::json!({ "mute": !cur_mute }),
+                None,
+                Duration::from_secs(2),
+            );
+        } else {
+            let v = ctrl.get_volume();
+            let cur_mute = v.get("mute").and_then(|x| x.as_bool()).unwrap_or(false);
+            let _ = ctrl.set_volume(None, Some(!cur_mute), true);
+        }
     }
 }
 
-fn menu_state_signature(controller: &Controller, peers: &[Peer]) -> String {
-    let st = controller.state.lock().unwrap().clone();
-    let cfg = controller.config.lock().unwrap().clone();
+#[allow(clippy::too_many_arguments)]
+fn compute_menu_signature(
+    peers: &[Peer],
+    streams: &[serde_json::Value],
+    connected_peer: &str,
+    multiroom_count: usize,
+    sharing_enabled: bool,
+    auto_enabled: bool,
+    keep_local: bool,
+    mic_direction: &str,
+    android_active: bool,
+) -> String {
     let peer_sig: Vec<String> = peers
         .iter()
         .map(|p| format!("{}:{}:{}:{}", p.id, p.name, p.host, p.port))
         .collect();
+    let app_sig: Vec<String> = streams
+        .iter()
+        .map(|a| {
+            let name = a.get("app_name").and_then(|v| v.as_str()).unwrap_or("");
+            let media = a.get("media_name").and_then(|v| v.as_str()).unwrap_or("");
+            let remote = a.get("is_remote").and_then(|v| v.as_bool()).unwrap_or(false);
+            let rule = a.get("routed_rule").and_then(|v| v.as_str()).unwrap_or("");
+            format!("{name}:{media}:{remote}:{rule}")
+        })
+        .collect();
     format!(
-        "peers={}|conn={}|multi={}|share={}|auto={}|keep={}|mic={}",
+        "peers={}|apps={}|conn={}|multi={}|share={}|auto={}|keep={}|mic={}|and={}",
         peer_sig.join(","),
-        st.connected_peer,
-        st.multiroom_peers.len(),
-        cfg.sharing.enabled,
-        cfg.connection.auto_connect && !st.auto_paused,
-        st.keep_local,
-        st.mic_direction
+        app_sig.join(","),
+        connected_peer,
+        multiroom_count,
+        sharing_enabled,
+        auto_enabled,
+        keep_local,
+        mic_direction,
+        android_active,
     )
 }
 
@@ -736,12 +1148,18 @@ pub fn run_tray(verbose: bool) -> Result<i32, String> {
     }
 
     let ctrl = Arc::clone(&daemon.controller);
-    let initial_peers = daemon_peers(&daemon);
-    let initial_badge = compute_badge_state(&ctrl);
-    let initial_icon = build_tray_icon(initial_badge);
-    let initial_menu = build_tray_menu(&ctrl, &initial_peers);
-
-    let dev_name = ctrl.config.lock().unwrap().device.name.clone();
+    let initial_st = lock_or_recover(&ctrl.state).clone();
+    let initial_cfg = lock_or_recover(&ctrl.config).clone();
+    let dev_name = initial_cfg.device.name.clone();
+    let initial_snap = TrayMenuSnapshot::from_parts(
+        Vec::new(),
+        Vec::new(),
+        initial_st,
+        initial_cfg,
+        ctrl.android_session.is_active(),
+    );
+    let initial_icon = build_tray_icon(initial_snap.badge);
+    let initial_menu = build_tray_menu_from_snapshot(&initial_snap);
     let tray_icon = TrayIconBuilder::new()
         .with_tooltip(format!("SoundHop — {dev_name}"))
         .with_icon(initial_icon)
@@ -751,9 +1169,44 @@ pub fn run_tray(verbose: bool) -> Result<i32, String> {
 
     soundhop_core::util::install_signal_handlers();
     let running = Arc::new(AtomicBool::new(true));
-    let mut last_badge = initial_badge;
-    let mut last_refresh = Instant::now();
-    let mut last_sig = menu_state_signature(&ctrl, &initial_peers);
+    let mut last_badge = initial_snap.badge;
+    let mut last_sig = initial_snap.signature;
+
+    let (cmd_tx, cmd_rx) = mpsc::channel::<String>();
+    let (ui_tx, ui_rx) = mpsc::channel::<TrayMenuSnapshot>();
+    let worker_daemon = Arc::clone(&daemon);
+    let worker_running = Arc::clone(&running);
+
+    let _worker_handle = std::thread::spawn(move || {
+        let _ = ui_tx.send(collect_tray_snapshot(&worker_daemon));
+        let mut last_refresh = Instant::now();
+        while worker_running.load(Ordering::Relaxed)
+            && !soundhop_core::util::signal_stop_requested()
+        {
+            match cmd_rx.recv_timeout(Duration::from_millis(200)) {
+                Ok(id_str) => {
+                    handle_menu_action(&id_str, &worker_daemon, &worker_running);
+                    let snap = collect_tray_snapshot(&worker_daemon);
+                    let _ = ui_tx.send(snap);
+                    last_refresh = Instant::now();
+                }
+                Err(mpsc::RecvTimeoutError::Timeout) => {
+                    if last_refresh.elapsed() >= Duration::from_secs(2) {
+                        let snap = collect_tray_snapshot(&worker_daemon);
+                        if snap.peers.is_empty() {
+                            if let Some(disc) = lock_or_recover(&worker_daemon.discovery).as_ref() {
+                                disc.probe();
+                            }
+                        }
+                        let _ = ui_tx.send(snap);
+                        let _ = now_secs();
+                        last_refresh = Instant::now();
+                    }
+                }
+                Err(mpsc::RecvTimeoutError::Disconnected) => break,
+            }
+        }
+    });
 
     while running.load(Ordering::Relaxed) && !soundhop_core::util::signal_stop_requested() {
         #[cfg(target_os = "linux")]
@@ -770,42 +1223,40 @@ pub fn run_tray(verbose: bool) -> Result<i32, String> {
         }
 
         while let Ok(event) = MenuEvent::receiver().try_recv() {
-            handle_menu_action(event.id.0.as_str(), &daemon, &running);
-            let peers = daemon_peers(&daemon);
-            let new_badge = compute_badge_state(&ctrl);
-            if new_badge != last_badge {
-                let _ = tray_icon.set_icon(Some(build_tray_icon(new_badge)));
-                last_badge = new_badge;
+            let id_str = event.id.0;
+            if id_str == "quit_tray" {
+                running.store(false, Ordering::SeqCst);
+                break;
+            } else if id_str == "open_gui" {
+                spawn_self_args(&["--gui-tab", "home"]);
+            } else if id_str == "open_settings" {
+                spawn_self_args(&["--gui-tab", "settings"]);
+            } else if id_str == "open_android_wizard" {
+                spawn_self_args(&["--gui-tab", "phone"]);
+            } else {
+                let _ = cmd_tx.send(id_str);
             }
-            tray_icon.set_menu(Some(Box::new(build_tray_menu(&ctrl, &peers))));
-            last_sig = menu_state_signature(&ctrl, &peers);
-            last_refresh = Instant::now();
         }
 
-        if last_refresh.elapsed() >= Duration::from_secs(2) {
-            let peers = daemon_peers(&daemon);
-            if peers.is_empty() {
-                if let Some(disc) = daemon.discovery.lock().unwrap().as_ref() {
-                    disc.probe();
-                }
+        let mut latest_snap: Option<TrayMenuSnapshot> = None;
+        while let Ok(snap) = ui_rx.try_recv() {
+            latest_snap = Some(snap);
+        }
+        if let Some(snap) = latest_snap {
+            if snap.badge != last_badge {
+                let _ = tray_icon.set_icon(Some(build_tray_icon(snap.badge)));
+                last_badge = snap.badge;
             }
-            let badge = compute_badge_state(&ctrl);
-            let sig = menu_state_signature(&ctrl, &peers);
-            if badge != last_badge {
-                let _ = tray_icon.set_icon(Some(build_tray_icon(badge)));
-                last_badge = badge;
+            if snap.signature != last_sig {
+                tray_icon.set_menu(Some(Box::new(build_tray_menu_from_snapshot(&snap))));
+                last_sig = snap.signature;
             }
-            if sig != last_sig {
-                tray_icon.set_menu(Some(Box::new(build_tray_menu(&ctrl, &peers))));
-                last_sig = sig;
-            }
-            let _ = now_secs();
-            last_refresh = Instant::now();
         }
 
         std::thread::sleep(Duration::from_millis(30));
     }
 
+    drop(cmd_tx);
     daemon.shutdown();
     Ok(0)
 }
@@ -841,5 +1292,49 @@ mod tests {
                 "Tray menu must not contain single '&' mnemonic string: {forbidden}"
             );
         }
+    }
+
+    #[test]
+    fn test_compute_menu_signature_tracks_apps_and_android() {
+        let s1 = compute_menu_signature(
+            &[],
+            &[],
+            "",
+            0,
+            false,
+            false,
+            false,
+            "",
+            false,
+        );
+        let s2 = compute_menu_signature(
+            &[],
+            &[serde_json::json!({
+                "app_name": "spotify",
+                "media_name": "Track 1",
+                "is_remote": true,
+                "routed_rule": "remote"
+            })],
+            "",
+            0,
+            false,
+            false,
+            false,
+            "",
+            false,
+        );
+        let s3 = compute_menu_signature(
+            &[],
+            &[],
+            "",
+            0,
+            false,
+            false,
+            false,
+            "",
+            true,
+        );
+        assert_ne!(s1, s2);
+        assert_ne!(s1, s3);
     }
 }

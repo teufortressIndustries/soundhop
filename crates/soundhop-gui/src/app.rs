@@ -106,6 +106,8 @@ pub struct ControlCenterApp {
     onboarding_state: onboarding::OnboardingState,
     logo_texture: Option<egui::TextureHandle>,
     system_dark_hint: Option<bool>,
+    last_theme_state: Option<(ThemeMode, bool)>,
+    cached_palette: Palette,
 }
 
 impl ControlCenterApp {
@@ -121,6 +123,8 @@ impl ControlCenterApp {
             onboarding_state: onboarding::OnboardingState::default(),
             logo_texture: None,
             system_dark_hint: None,
+            last_theme_state: None,
+            cached_palette: Palette::dark(),
         }
     }
 
@@ -147,10 +151,18 @@ impl eframe::App for ControlCenterApp {
         if self.system_dark_hint.is_none() {
             self.system_dark_hint = Some(ctx.style().visuals.dark_mode);
         }
+        let system_dark = ctx
+            .system_theme()
+            .map(|t| matches!(t, egui::Theme::Dark))
+            .unwrap_or_else(|| self.system_dark_hint.unwrap_or(true));
 
         let snap = self.backend.read();
         let mode = ThemeMode::from_str_loose(&snap.config.ui.theme);
-        let pal = apply_theme(ctx, mode, self.system_dark_hint.unwrap_or(true));
+        if self.last_theme_state != Some((mode, system_dark)) {
+            self.cached_palette = apply_theme(ctx, mode, system_dark);
+            self.last_theme_state = Some((mode, system_dark));
+        }
+        let pal = self.cached_palette;
 
         let repaint_ms = if snap.audio_active || snap.connected || snap.busy_message.is_some() {
             66
