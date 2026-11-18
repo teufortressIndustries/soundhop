@@ -57,6 +57,7 @@ pub struct WindowsAudioBackend {
     listener_thread: Mutex<Option<JoinHandle<()>>>,
     listener_port: Mutex<Option<u16>>,
     listener_security: Mutex<String>,
+    listener_allowed_networks: Mutex<Vec<String>>,
     next_module_id: AtomicU32,
     modules: Mutex<Vec<Module>>,
     default_sink: Mutex<Option<String>>,
@@ -71,6 +72,19 @@ impl Default for WindowsAudioBackend {
     }
 }
 
+impl Drop for WindowsAudioBackend {
+    fn drop(&mut self) {
+        self.stop_listener_internal();
+        let mut senders = self
+            .active_senders
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        for (_, sess) in senders.drain() {
+            sess.stop();
+        }
+    }
+}
+
 impl WindowsAudioBackend {
     pub fn new() -> Self {
         Self {
@@ -78,6 +92,7 @@ impl WindowsAudioBackend {
             listener_thread: Mutex::new(None),
             listener_port: Mutex::new(None),
             listener_security: Mutex::new("trusted-lan".to_string()),
+            listener_allowed_networks: Mutex::new(Vec::new()),
             next_module_id: AtomicU32::new(101),
             modules: Mutex::new(Vec::new()),
             default_sink: Mutex::new(None),
@@ -317,14 +332,24 @@ impl AudioBackend for WindowsAudioBackend {
         security: &str,
         allowed_networks: &[String],
     ) -> Result<Listener, BackendError> {
-        if let Some(active_port) = *self.listener_port.lock().unwrap() {
-            if active_port == port {
+        if let Some(active_port) = *self.listener_port.lock().unwrap_or_else(|e| e.into_inner()) {
+            let current_sec = self
+                .listener_security
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .clone();
+            let current_nets = self
+                .listener_allowed_networks
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .clone();
+            if active_port == port && current_sec == security && current_nets == allowed_networks {
                 return Ok(Listener {
                     module_id: 100,
                     created: false,
-                    args: format!("port={port}"),
+                    args: format!("port={port} security={current_sec}"),
                     port,
-                    security: self.listener_security.lock().unwrap().clone(),
+                    security: current_sec,
                 });
             }
         }
@@ -338,8 +363,15 @@ impl AudioBackend for WindowsAudioBackend {
         tcp.set_nonblocking(true).ok();
 
         self.listener_stop.store(false, Ordering::SeqCst);
-        *self.listener_port.lock().unwrap() = Some(bound_port);
-        *self.listener_security.lock().unwrap() = security.to_string();
+        *self.listener_port.lock().unwrap_or_else(|e| e.into_inner()) = Some(bound_port);
+        *self
+            .listener_security
+            .lock()
+            .unwrap_or_else(|e| e.into_inner()) = security.to_string();
+        *self
+            .listener_allowed_networks
+            .lock()
+            .unwrap_or_else(|e| e.into_inner()) = allowed_networks.to_vec();
 
         const MAX_CONCURRENT_PA_CLIENTS: usize = 16;
         let stop_clone = Arc::clone(&self.listener_stop);
@@ -563,7 +595,7 @@ impl AudioBackend for WindowsAudioBackend {
         _port: u16,
         _description: &str,
         _local_source: &str,
-    ) -> Result<(u32, u32, u32, u32, String), BackendError> {
+    ) -> Result<(Option<u32>, Option<u32>, u32, u32, String), BackendError> {
         Err(BackendError::Message(
             "Microphone pass-through requires PipeWire/PulseAudio".to_string(),
         ))
@@ -573,8 +605,8 @@ impl AudioBackend for WindowsAudioBackend {
         &self,
         _host: &str,
         _port: u16,
-        _remote_null_id: u32,
-        _remote_remap_id: u32,
+        _remote_null_id: Option<u32>,
+        _remote_remap_id: Option<u32>,
         _local_tunnel_id: u32,
         _local_loopback_id: u32,
     ) {
@@ -706,7 +738,8 @@ fn handle_incoming_pa_client_with_cookie(
                 PA_COMMAND_CREATE_PLAYBACK_STREAM => {
                     let spec = r.read_sample_spec().unwrap_or_default();
                     if player.is_none() {
-                        let wp = WindowsPlayer::new(48_000, 2);
+                        let wp =
+                            WindowsPlayer::new(spec.rate.max(8_000), spec.channels.max(1));
                         wp.start();
                         player = Some(wp);
                     }

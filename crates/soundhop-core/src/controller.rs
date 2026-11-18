@@ -9,8 +9,7 @@ use thiserror::Error;
 
 use crate::android::{AndroidCaptureSession, AndroidManager};
 use crate::backend::{
-    create_backend, listener_security_from_args, AudioBackend, Listener, Module,
-    SourceTunnelParams, TunnelParams,
+    create_backend, AudioBackend, Listener, Module, SourceTunnelParams, TunnelParams,
 };
 use crate::config::Config;
 use crate::constants::{
@@ -73,6 +72,7 @@ pub struct Controller {
     state_path: Option<PathBuf>,
     notify_enabled: bool,
     save_enabled: Mutex<bool>,
+    connect_lock: Mutex<()>,
 }
 
 impl Controller {
@@ -107,6 +107,7 @@ impl Controller {
             state_path,
             notify_enabled,
             save_enabled: Mutex::new(true),
+            connect_lock: Mutex::new(()),
         }
     }
 
@@ -123,14 +124,18 @@ impl Controller {
     }
 
     pub fn reload_from_disk(&self) {
-        if !*self.save_enabled.lock().unwrap() {
+        if !*self.save_enabled.lock().unwrap_or_else(|e| e.into_inner()) {
             return;
         }
+        // Skip overwriting in-memory state if a connect/disconnect/mic operation is in flight.
+        let Ok(_op_guard) = self.connect_lock.try_lock() else {
+            return;
+        };
         if let Ok(disk_cfg) = Config::load(self.config_path.as_deref()) {
-            *self.config.lock().unwrap() = disk_cfg;
+            *self.config.lock().unwrap_or_else(|e| e.into_inner()) = disk_cfg;
         }
         let mut disk_state = State::load(self.state_path.as_deref());
-        let mut guard = self.state.lock().unwrap();
+        let mut guard = self.state.lock().unwrap_or_else(|e| e.into_inner());
         for (k, v) in &guard.known_peers {
             if !is_own_non_loopback_ip(&v.host) {
                 disk_state
@@ -456,9 +461,9 @@ impl Controller {
     }
 
     fn ensure_listener_internal(&self) -> Result<Listener, ControllerError> {
-        let cfg = self.config.lock().unwrap().clone();
+        let cfg = self.config.lock().unwrap_or_else(|e| e.into_inner()).clone();
         let (mod_id, created) = {
-            let st = self.state.lock().unwrap();
+            let st = self.state.lock().unwrap_or_else(|e| e.into_inner());
             (st.listener_module, st.listener_created)
         };
         if mod_id > 0 {
@@ -468,22 +473,9 @@ impl Controller {
                         .arg("port")
                         .and_then(|p| p.parse::<u16>().ok())
                         .unwrap_or(4713);
-                    if mod_port == cfg.sharing.port {
-                        let actual_sec = listener_security_from_args(&m.args);
-                        let mut st = self.state.lock().unwrap();
-                        st.listener_port = cfg.sharing.port;
-                        st.listener_security = actual_sec.clone();
-                        return Ok(Listener {
-                            module_id: m.id,
-                            created,
-                            args: m.args,
-                            port: cfg.sharing.port,
-                            security: actual_sec,
-                        });
-                    }
-                    if created {
+                    if mod_port != cfg.sharing.port && created {
                         let _ = self.backend.unload_module(m.id, true);
-                        let mut st = self.state.lock().unwrap();
+                        let mut st = self.state.lock().unwrap_or_else(|e| e.into_inner());
                         st.listener_module = 0;
                         st.listener_created = false;
                     }
@@ -496,7 +488,7 @@ impl Controller {
             &cfg.sharing.allowed_networks,
         )?;
         {
-            let mut st = self.state.lock().unwrap();
+            let mut st = self.state.lock().unwrap_or_else(|e| e.into_inner());
             st.listener_module = listener.module_id;
             st.listener_created = listener.created;
             st.listener_port = listener.port;
@@ -550,12 +542,38 @@ impl Controller {
         peer: &Peer,
         opts: ConnectOptions,
     ) -> Result<serde_json::Value, ControllerError> {
-        self.reload_from_disk();
-        let cfg = self.config.lock().unwrap().clone();
+        let _op_guard = self.connect_lock.lock().unwrap_or_else(|e| e.into_inner());
+        self.connect_internal(peer, opts)
+    }
+
+    fn connect_internal(
+        &self,
+        peer: &Peer,
+        opts: ConnectOptions,
+    ) -> Result<serde_json::Value, ControllerError> {
+        if !*self.save_enabled.lock().unwrap_or_else(|e| e.into_inner()) {
+            // Skip disk reload when persistence is disabled
+        } else {
+            if let Ok(disk_cfg) = Config::load(self.config_path.as_deref()) {
+                *self.config.lock().unwrap_or_else(|e| e.into_inner()) = disk_cfg;
+            }
+            let mut disk_state = State::load(self.state_path.as_deref());
+            let mut guard = self.state.lock().unwrap_or_else(|e| e.into_inner());
+            for (k, v) in &guard.known_peers {
+                if !is_own_non_loopback_ip(&v.host) {
+                    disk_state
+                        .known_peers
+                        .entry(k.clone())
+                        .or_insert_with(|| v.clone());
+                }
+            }
+            *guard = disk_state;
+        }
+        let cfg = self.config.lock().unwrap_or_else(|e| e.into_inner()).clone();
         if opts.keep_local || cfg.connection.keep_local_output {
             let mut m_opts = opts;
             m_opts.keep_local = true;
-            return self.connect_multi(std::slice::from_ref(peer), m_opts);
+            return self.connect_multi_internal(std::slice::from_ref(peer), m_opts);
         }
         self.ensure_backend()?;
         let resolved_peer = self.resolve_live_peer(peer, &cfg);
@@ -631,7 +649,7 @@ impl Controller {
         self.remember_peer(peer);
 
         if opts.with_mic {
-            let _ = self.enable_mic(&opts.mic_direction);
+            let _ = self.enable_mic_internal(&opts.mic_direction);
         }
         self.save();
 
@@ -656,13 +674,22 @@ impl Controller {
         peers: &[Peer],
         opts: ConnectOptions,
     ) -> Result<serde_json::Value, ControllerError> {
+        let _op_guard = self.connect_lock.lock().unwrap_or_else(|e| e.into_inner());
+        self.connect_multi_internal(peers, opts)
+    }
+
+    fn connect_multi_internal(
+        &self,
+        peers: &[Peer],
+        opts: ConnectOptions,
+    ) -> Result<serde_json::Value, ControllerError> {
         if peers.is_empty() {
             return Err(ControllerError::Message(
                 "At least one peer is required for connection".to_string(),
             ));
         }
         if peers.len() == 1 && !opts.keep_local {
-            return self.connect(&peers[0], opts);
+            return self.connect_internal(&peers[0], opts);
         }
         self.ensure_backend()?;
         let cfg = self.config.lock().unwrap().clone();
@@ -768,7 +795,11 @@ impl Controller {
             st.connected_by = opts.by;
             st.auto_paused = false;
         }
-        self.config.lock().unwrap().connection.last_peer = first.peer_id.clone();
+        self.config.lock().unwrap_or_else(|e| e.into_inner()).connection.last_peer =
+            first.peer_id.clone();
+        if opts.with_mic {
+            let _ = self.enable_mic_internal(&opts.mic_direction);
+        }
         self.save();
 
         let switch_default = opts.switch_default.unwrap_or(cfg.connection.switch_default);
@@ -823,8 +854,29 @@ impl Controller {
         all_tunnels: bool,
         stop_android: bool,
     ) -> Result<serde_json::Value, ControllerError> {
-        self.reload_from_disk();
-        let cfg_restore = self.config.lock().unwrap().connection.restore_default;
+        let _op_guard = self.connect_lock.lock().unwrap_or_else(|e| e.into_inner());
+        if *self.save_enabled.lock().unwrap_or_else(|e| e.into_inner()) {
+            if let Ok(disk_cfg) = Config::load(self.config_path.as_deref()) {
+                *self.config.lock().unwrap_or_else(|e| e.into_inner()) = disk_cfg;
+            }
+            let mut disk_state = State::load(self.state_path.as_deref());
+            let mut guard = self.state.lock().unwrap_or_else(|e| e.into_inner());
+            for (k, v) in &guard.known_peers {
+                if !is_own_non_loopback_ip(&v.host) {
+                    disk_state
+                        .known_peers
+                        .entry(k.clone())
+                        .or_insert_with(|| v.clone());
+                }
+            }
+            *guard = disk_state;
+        }
+        let cfg_restore = self
+            .config
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .connection
+            .restore_default;
         self.disconnect_internal(
             forget,
             restore.unwrap_or(cfg_restore),
@@ -873,7 +925,7 @@ impl Controller {
             }
         }
         if !st_snapshot.connected_source.is_empty() || !st_snapshot.mic_direction.is_empty() {
-            let _ = self.disable_mic();
+            let _ = self.disable_mic_internal();
         }
         if let Ok(extra) = self.backend.unload_tunnels(SINK_PREFIX) {
             for id in extra {
@@ -1032,7 +1084,12 @@ impl Controller {
     // -- Microphone Pass-Through -----------------------------------------
 
     pub fn enable_mic(&self, direction: &str) -> Result<serde_json::Value, ControllerError> {
-        let st_snap = self.state.lock().unwrap().clone();
+        let _op_guard = self.connect_lock.lock().unwrap_or_else(|e| e.into_inner());
+        self.enable_mic_internal(direction)
+    }
+
+    fn enable_mic_internal(&self, direction: &str) -> Result<serde_json::Value, ControllerError> {
+        let st_snap = self.state.lock().unwrap_or_else(|e| e.into_inner()).clone();
         if !st_snap.is_connected() {
             return Err(ControllerError::Message(
                 "Not connected to a remote speaker".to_string(),
@@ -1051,22 +1108,30 @@ impl Controller {
                     "source": st_snap.connected_source,
                 }));
             }
-            let _ = self.disable_mic();
+            let _ = self.disable_mic_internal();
         }
 
         if dir_val == "send" {
-            let dev_name = self.config.lock().unwrap().device.name.clone();
+            let dev_name = self
+                .config
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .device
+                .name
+                .clone();
             let (r_null, r_remap, l_tun, l_loop, r_src) = self.backend.send_mic_to_remote(
                 &st_snap.connected_host,
                 st_snap.connected_port,
                 &dev_name,
                 "@DEFAULT_SOURCE@",
             )?;
-            let mut st = self.state.lock().unwrap();
+            let mut st = self.state.lock().unwrap_or_else(|e| e.into_inner());
             st.connected_source = r_src.clone();
             st.connected_source_module = l_tun;
-            st.remote_mic_null_module = r_null;
-            st.remote_mic_remap_module = r_remap;
+            st.remote_mic_null_module = r_null.unwrap_or(0);
+            st.remote_mic_null_set = r_null.is_some();
+            st.remote_mic_remap_module = r_remap.unwrap_or(0);
+            st.remote_mic_remap_set = r_remap.is_some();
             st.local_mic_loopback_module = l_loop;
             st.mic_direction = "send".to_string();
             drop(st);
@@ -1104,7 +1169,7 @@ impl Controller {
                 extra_args: &[],
             })?;
             {
-                let mut st = self.state.lock().unwrap();
+                let mut st = self.state.lock().unwrap_or_else(|e| e.into_inner());
                 st.connected_source = source_name.clone();
                 st.connected_source_module = mod_id;
                 st.mic_direction = "receive".to_string();
@@ -1122,16 +1187,32 @@ impl Controller {
     }
 
     pub fn disable_mic(&self) -> Result<serde_json::Value, ControllerError> {
-        let st_snap = self.state.lock().unwrap().clone();
+        let _op_guard = self.connect_lock.lock().unwrap_or_else(|e| e.into_inner());
+        self.disable_mic_internal()
+    }
+
+    fn disable_mic_internal(&self) -> Result<serde_json::Value, ControllerError> {
+        let st_snap = self.state.lock().unwrap_or_else(|e| e.into_inner()).clone();
         if st_snap.connected_source.is_empty() && st_snap.mic_direction.is_empty() {
             return Ok(serde_json::json!({ "enabled": false }));
         }
         if st_snap.mic_direction == "send" {
+            let null_opt = if st_snap.remote_mic_null_set || st_snap.remote_mic_null_module > 0 {
+                Some(st_snap.remote_mic_null_module)
+            } else {
+                None
+            };
+            let remap_opt = if st_snap.remote_mic_remap_set || st_snap.remote_mic_remap_module > 0
+            {
+                Some(st_snap.remote_mic_remap_module)
+            } else {
+                None
+            };
             self.backend.stop_send_mic_to_remote(
                 &st_snap.connected_host,
                 st_snap.connected_port,
-                st_snap.remote_mic_null_module,
-                st_snap.remote_mic_remap_module,
+                null_opt,
+                remap_opt,
                 st_snap.connected_source_module,
                 st_snap.local_mic_loopback_module,
             );
@@ -1155,11 +1236,13 @@ impl Controller {
                 .disconnect_tunnel_source(&st_snap.connected_source);
         }
         {
-            let mut st = self.state.lock().unwrap();
+            let mut st = self.state.lock().unwrap_or_else(|e| e.into_inner());
             st.connected_source.clear();
             st.connected_source_module = 0;
             st.remote_mic_null_module = 0;
+            st.remote_mic_null_set = false;
             st.remote_mic_remap_module = 0;
+            st.remote_mic_remap_set = false;
             st.local_mic_loopback_module = 0;
             st.mic_direction.clear();
         }
@@ -1925,5 +2008,78 @@ mod tests {
         assert!(unloaded_cmds.iter().any(|c| c.contains("202")));
         drop(listener1);
         drop(listener2);
+    }
+
+    #[test]
+    fn test_connect_keep_local_preserves_with_mic() {
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let port = listener.local_addr().unwrap().port();
+        let peer = Peer {
+            id: "p_mic".to_string(),
+            name: "MicPeer".to_string(),
+            host: "127.0.0.1".to_string(),
+            port,
+            version: VERSION.to_string(),
+            protocol: PROTOCOL_VERSION,
+            security: "open".to_string(),
+            platform: "linux".to_string(),
+            last_seen: now_secs(),
+            source: "manual".to_string(),
+            rtt_ms: None,
+        };
+        let sname = Controller::sink_name_for(&peer);
+        let sname_c = sname.clone();
+        let loaded = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let loaded_c = Arc::clone(&loaded);
+        let runner = Arc::new(MockRunner::new(move |args, _| {
+            let joined = args.join(" ");
+            let stdout = if joined.contains("info") {
+                "Server Name: PulseAudio (on PipeWire 1.2.0)\nDefault Sink: alsa_output.pci\n"
+                    .to_string()
+            } else if joined.contains("list short sinks") {
+                if loaded_c.load(std::sync::atomic::Ordering::SeqCst) {
+                    format!(
+                        "1\talsa_output.pci\tPipeWire\ts16le 2ch 48000Hz\tRUNNING\n2\t{sname_c}\tmodule-tunnel-sink\ts16le 2ch 48000Hz\tRUNNING\n3\t{MULTIROOM_SINK_NAME}\tmodule-combine-sink\ts16le 2ch 48000Hz\tRUNNING\n"
+                    )
+                } else {
+                    "1\talsa_output.pci\tPipeWire\ts16le 2ch 48000Hz\tRUNNING\n".to_string()
+                }
+            } else if joined.contains("load-module") {
+                loaded_c.store(true, std::sync::atomic::Ordering::SeqCst);
+                "55\n".to_string()
+            } else {
+                String::new()
+            };
+            Ok(CommandResult {
+                args: args.to_vec(),
+                returncode: 0,
+                stdout,
+                stderr: String::new(),
+            })
+        }));
+        let backend = Arc::new(LinuxAudioBackend::with_runner(runner));
+        let ctrl = Controller::new(
+            Some(Config::default()),
+            Some(State::default()),
+            Some(backend),
+            None,
+            None,
+            false,
+        );
+        ctrl.set_save_enabled(false);
+        let res = ctrl
+            .connect(
+                &peer,
+                ConnectOptions {
+                    keep_local: true,
+                    with_mic: true,
+                    mic_direction: "send".to_string(),
+                    ..Default::default()
+                },
+            )
+            .unwrap();
+        assert_eq!(res["with_mic"], true);
+        assert_eq!(res["mic_direction"], "send");
+        drop(listener);
     }
 }

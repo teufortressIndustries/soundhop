@@ -45,7 +45,8 @@ impl IpcServer {
 
     pub fn start(&self) -> Result<(), IpcError> {
         if let Some(parent) = self.path.parent() {
-            let _ = ensure_dir(parent);
+            ensure_dir(parent)
+                .map_err(|e| IpcError::Error(format!("Unsafe IPC directory: {e}")))?;
         }
         let _ = fs::remove_file(&self.path);
         let port_file = self.path.with_extension("port");
@@ -96,8 +97,10 @@ impl IpcServer {
             .port();
         let token_bytes: [u8; 32] = rand::thread_rng().gen();
         let token = hex::encode(token_bytes);
-        let _ = crate::util::atomic_write(&port_file, &format!("{port}\n"));
-        let _ = crate::util::atomic_write(&auth_file, &format!("{token}\n"));
+        crate::util::atomic_write(&port_file, &format!("{port}\n"))
+            .map_err(|e| IpcError::Error(format!("Failed to write IPC port file: {e}")))?;
+        crate::util::atomic_write(&auth_file, &format!("{token}\n"))
+            .map_err(|e| IpcError::Error(format!("Failed to write IPC auth file: {e}")))?;
         let _ = tcp.set_nonblocking(true);
         let stop = Arc::clone(&self.stop_flag);
         let handler = Arc::clone(&self.handler);
@@ -286,7 +289,17 @@ pub fn is_soundhop_process(pid: u64) -> bool {
     }
     #[cfg(all(unix, not(target_os = "linux")))]
     {
-        true
+        std::process::Command::new("ps")
+            .args(["-p", &pid.to_string(), "-o", "comm="])
+            .output()
+            .ok()
+            .filter(|o| o.status.success())
+            .map(|o| {
+                String::from_utf8_lossy(&o.stdout)
+                    .to_lowercase()
+                    .contains("soundhop")
+            })
+            .unwrap_or(false)
     }
     #[cfg(not(unix))]
     {

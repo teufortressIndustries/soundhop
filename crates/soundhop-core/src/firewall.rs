@@ -146,25 +146,82 @@ pub fn detect_with_runner(runner: &dyn ProcessRunner) -> FirewallState {
     }
 
     if runner.command_exists("nft") {
+        let mut active = false;
+        let mut detail =
+            "nftables is installed but inactive or status could not be determined".to_string();
+        if let Ok(res) = runner.run(
+            &[
+                "systemctl".to_string(),
+                "is-active".to_string(),
+                "--quiet".to_string(),
+                "nftables".to_string(),
+            ],
+            None,
+            Duration::from_secs(5),
+        ) {
+            if res.ok() {
+                active = true;
+                detail =
+                    "nftables is active; SoundHop will print commands instead of editing rules"
+                        .to_string();
+            }
+        } else if is_admin() {
+            if let Ok(res) = runner.run(
+                &["nft".to_string(), "list".to_string(), "tables".to_string()],
+                None,
+                Duration::from_secs(5),
+            ) {
+                if res.ok() && !res.stdout.trim().is_empty() {
+                    active = true;
+                    detail =
+                        "nftables is active; SoundHop will print commands instead of editing rules"
+                            .to_string();
+                }
+            }
+        }
         return FirewallState {
             kind: "nftables".to_string(),
-            active: true,
-            detail: "nftables is present; SoundHop will print commands instead of editing rules"
-                .to_string(),
+            active,
+            detail,
         };
     }
 
     FirewallState::default()
 }
 
-fn sudo_prefix() -> Vec<String> {
+fn sudo_prefix(interactive: bool) -> Vec<String> {
     if is_admin() || !command_exists("sudo") {
         return Vec::new();
     }
-    if std::io::stdin().is_terminal() {
+    if interactive && std::io::stdin().is_terminal() {
         vec!["sudo".to_string()]
     } else {
         vec!["sudo".to_string(), "-n".to_string()]
+    }
+}
+
+fn execute_firewall_commands(result: &mut FirewallResult, interactive: bool) {
+    result.ran = true;
+    for cmd in &result.commands {
+        let is_interactive_sudo = interactive
+            && cmd.first().map(|s| s.as_str()) == Some("sudo")
+            && !cmd.iter().any(|a| a == "-n");
+        let run_res = if is_interactive_sudo {
+            SystemRunner.run_interactive(cmd, None, Duration::from_secs(60))
+        } else {
+            SystemRunner.run(cmd, None, Duration::from_secs(15))
+        };
+        match run_res {
+            Ok(res) if res.ok() => {}
+            Ok(res) => {
+                result.ok = false;
+                result.errors.push(res.combined_output());
+            }
+            Err(err) => {
+                result.ok = false;
+                result.errors.push(err.to_string());
+            }
+        }
     }
 }
 
@@ -173,6 +230,27 @@ pub fn open_ports(
     discovery_port: u16,
     dry_run: bool,
     include_mdns: bool,
+) -> FirewallResult {
+    open_ports_with_mode(audio_port, discovery_port, dry_run, include_mdns, true)
+}
+
+/// Non-interactive variant for background daemons/IPC: always uses `sudo -n` so it
+/// never blocks on a TTY password prompt.
+pub fn open_ports_non_interactive(
+    audio_port: u16,
+    discovery_port: u16,
+    dry_run: bool,
+    include_mdns: bool,
+) -> FirewallResult {
+    open_ports_with_mode(audio_port, discovery_port, dry_run, include_mdns, false)
+}
+
+fn open_ports_with_mode(
+    audio_port: u16,
+    discovery_port: u16,
+    dry_run: bool,
+    include_mdns: bool,
+    interactive: bool,
 ) -> FirewallResult {
     let state = detect();
     let mut result = FirewallResult {
@@ -188,7 +266,7 @@ pub fn open_ports(
         return result;
     }
 
-    let sudo = sudo_prefix();
+    let sudo = sudo_prefix(interactive);
     match state.kind.as_str() {
         "ufw" => {
             let mut c1 = sudo.clone();
@@ -299,20 +377,7 @@ pub fn open_ports(
         return result;
     }
 
-    result.ran = true;
-    for cmd in &result.commands {
-        match SystemRunner.run(cmd, None, Duration::from_secs(30)) {
-            Ok(res) if res.ok() => {}
-            Ok(res) => {
-                result.ok = false;
-                result.errors.push(res.combined_output());
-            }
-            Err(err) => {
-                result.ok = false;
-                result.errors.push(err.to_string());
-            }
-        }
-    }
+    execute_firewall_commands(&mut result, interactive);
     result
 }
 
@@ -330,7 +395,7 @@ pub fn close_ports(audio_port: u16, discovery_port: u16, dry_run: bool) -> Firew
         result.note = state.detail;
         return result;
     }
-    let sudo = sudo_prefix();
+    let sudo = sudo_prefix(true);
     match state.kind.as_str() {
         "ufw" => {
             let mut c1 = sudo.clone();
@@ -390,21 +455,17 @@ pub fn close_ports(audio_port: u16, discovery_port: u16, dry_run: bool) -> Firew
                 format!("name=SoundHop Discovery ({discovery_port}/udp)"),
             ]);
         }
-        _ => return result,
+        _ => {
+            result.note =
+                "nftables is active; remove SoundHop rules manually with `nft`.".to_string();
+            return result;
+        }
     }
 
     if dry_run {
         return result;
     }
-    result.ran = true;
-    for cmd in &result.commands {
-        if let Ok(res) = SystemRunner.run(cmd, None, Duration::from_secs(30)) {
-            if !res.ok() {
-                result.ok = false;
-                result.errors.push(res.combined_output());
-            }
-        }
-    }
+    execute_firewall_commands(&mut result, true);
     result
 }
 
@@ -437,6 +498,27 @@ mod tests {
         let st = detect_with_runner(&runner);
         assert_eq!(st.kind, "ufw");
         assert!(st.active);
+    }
+
+    #[test]
+    #[cfg(not(windows))]
+    fn test_detect_nftables_inactive_when_systemctl_fails() {
+        let runner = MockRunner::new(|args, _| {
+            Ok(CommandResult {
+                args: args.to_vec(),
+                returncode: 3,
+                stdout: String::new(),
+                stderr: "inactive".to_string(),
+            })
+        });
+        runner
+            .available_commands
+            .lock()
+            .unwrap()
+            .insert("nft".to_string());
+        let st = detect_with_runner(&runner);
+        assert_eq!(st.kind, "nftables");
+        assert!(!st.active);
     }
 
     #[test]

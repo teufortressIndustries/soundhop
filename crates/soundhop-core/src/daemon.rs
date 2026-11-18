@@ -201,14 +201,20 @@ impl Daemon {
             .connection
             .disconnect_on_quit;
         if disconnect_on_quit {
-            if self.controller.state.lock().unwrap().is_connected() {
+            if self
+                .controller
+                .state
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .is_connected()
+            {
                 let _ = self
                     .controller
                     .disconnect(false, None, false, Some(false), true, false);
             }
-            if self.controller.android_session.is_active() {
-                let _ = self.controller.android_session.stop();
-            }
+        }
+        if self.controller.android_session.is_active() {
+            let _ = self.controller.android_session.stop();
         }
         let _ = fs::remove_file(pid_path());
     }
@@ -356,12 +362,27 @@ impl Daemon {
                 .stdout(Stdio::piped())
                 .stderr(Stdio::null());
             crate::util::close_fds_pre_exec(&mut cmd);
-            let Ok(mut child) = cmd.spawn() else {
+            let stdout_opt = {
+                let mut child_guard = self
+                    .audio_monitor_child
+                    .lock()
+                    .unwrap_or_else(|e| e.into_inner());
+                if self.stop_flag.load(Ordering::SeqCst) {
+                    break;
+                }
+                match cmd.spawn() {
+                    Ok(mut child) => {
+                        let out = child.stdout.take();
+                        *child_guard = Some(child);
+                        out
+                    }
+                    Err(_) => None,
+                }
+            };
+            if stdout_opt.is_none() {
                 thread::sleep(Duration::from_secs(3));
                 continue;
-            };
-            let stdout_opt = child.stdout.take();
-            *self.audio_monitor_child.lock().unwrap() = Some(child);
+            }
 
             if let Some(stdout) = stdout_opt {
                 let reader = BufReader::new(stdout);
@@ -691,8 +712,13 @@ impl Daemon {
                 })
             }
             "firewall_open" => {
-                let cfg = self.controller.config.lock().unwrap().clone();
-                let res = crate::firewall::open_ports(
+                let cfg = self
+                    .controller
+                    .config
+                    .lock()
+                    .unwrap_or_else(|e| e.into_inner())
+                    .clone();
+                let res = crate::firewall::open_ports_non_interactive(
                     cfg.sharing.port,
                     cfg.discovery.port,
                     false,

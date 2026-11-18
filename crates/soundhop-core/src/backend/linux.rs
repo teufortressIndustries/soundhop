@@ -82,7 +82,12 @@ impl LinuxAudioBackend {
 
     pub fn info(&self, refresh: bool) -> Result<HashMap<String, String>, BackendError> {
         if !refresh {
-            if let Some(cached) = self.info_cache.lock().unwrap().clone() {
+            if let Some(cached) = self
+                .info_cache
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .clone()
+            {
                 return Ok(cached);
             }
         }
@@ -93,7 +98,7 @@ impl LinuxAudioBackend {
                 map.insert(k.trim().to_string(), v.trim().to_string());
             }
         }
-        *self.info_cache.lock().unwrap() = Some(map.clone());
+        *self.info_cache.lock().unwrap_or_else(|e| e.into_inner()) = Some(map.clone());
         Ok(map)
     }
 
@@ -144,6 +149,30 @@ impl LinuxAudioBackend {
             (self.sleep_fn)(Duration::from_millis(80));
         }
     }
+
+    fn source_output_owner_modules(&self) -> HashMap<u32, u32> {
+        let mut map = HashMap::new();
+        let Ok(res) = self.pactl_call(&["list", "source-outputs"], false) else {
+            return map;
+        };
+        if !res.ok() {
+            return map;
+        }
+        let mut current_id: Option<u32> = None;
+        for line in res.stdout.lines() {
+            let trimmed = line.trim();
+            if let Some(rest) = trimmed.strip_prefix("Source Output #") {
+                current_id = rest.trim().parse::<u32>().ok();
+            } else if let Some(id) = current_id {
+                if let Some(rest) = trimmed.strip_prefix("Owner Module:") {
+                    if let Ok(mod_id) = rest.trim().parse::<u32>() {
+                        map.insert(id, mod_id);
+                    }
+                }
+            }
+        }
+        map
+    }
 }
 
 impl AudioBackend for LinuxAudioBackend {
@@ -157,7 +186,7 @@ impl AudioBackend for LinuxAudioBackend {
     }
 
     fn invalidate(&self) {
-        *self.info_cache.lock().unwrap() = None;
+        *self.info_cache.lock().unwrap_or_else(|e| e.into_inner()) = None;
     }
 
     fn server_name(&self) -> Result<String, BackendError> {
@@ -574,10 +603,19 @@ impl AudioBackend for LinuxAudioBackend {
             None
         };
         let exclude_set: HashSet<u32> = exclude_modules.iter().copied().collect();
+        let owner_modules: HashMap<u32, u32> = if exclude_set.is_empty() {
+            HashMap::new()
+        } else {
+            self.source_output_owner_modules()
+        };
         let mut moved = 0;
         for so in self.source_outputs()? {
-            if exclude_set.contains(&so.client) {
-                continue;
+            if !exclude_set.is_empty() {
+                if let Some(owner_mod) = owner_modules.get(&so.id) {
+                    if exclude_set.contains(owner_mod) {
+                        continue;
+                    }
+                }
             }
             if let Some(wanted) = wanted_src_id {
                 if so.source != wanted {
@@ -631,6 +669,16 @@ impl AudioBackend for LinuxAudioBackend {
         security: &str,
         allowed_networks: &[String],
     ) -> Result<Listener, BackendError> {
+        let desired_sec = match security {
+            "psk" | "pin" | "cookie" => "cookie",
+            "open" => "open",
+            _ => "trusted-lan",
+        };
+        let desired_acl = if desired_sec == "open" {
+            None
+        } else {
+            Some(effective_allowed_networks(allowed_networks).join(";"))
+        };
         for module in self.modules()? {
             if module.name != "module-native-protocol-tcp" {
                 continue;
@@ -640,13 +688,20 @@ impl AudioBackend for LinuxAudioBackend {
                 .and_then(|p| p.parse::<u16>().ok())
                 .unwrap_or(4713);
             if mod_port == port {
-                return Ok(Listener {
-                    module_id: module.id,
-                    created: false,
-                    args: module.args.clone(),
-                    port,
-                    security: listener_security_from_args(&module.args),
-                });
+                let actual_sec = listener_security_from_args(&module.args);
+                let actual_acl = module.arg("auth-ip-acl");
+                let matches = actual_sec == desired_sec && actual_acl == desired_acl;
+                if matches {
+                    return Ok(Listener {
+                        module_id: module.id,
+                        created: false,
+                        args: module.args.clone(),
+                        port,
+                        security: actual_sec,
+                    });
+                }
+                // Security mode or allowed_networks changed: replace the existing listener
+                let _ = self.unload_module(module.id, true);
             }
         }
 
@@ -843,7 +898,7 @@ impl AudioBackend for LinuxAudioBackend {
         port: u16,
         description: &str,
         local_source: &str,
-    ) -> Result<(u32, u32, u32, u32, String), BackendError> {
+    ) -> Result<(Option<u32>, Option<u32>, u32, u32, String), BackendError> {
         let safe_desc = sanitize_sink_name(description, 32).to_lowercase();
         let remote_sink_name = format!("soundhop_rem_mic_sink_{safe_desc}");
         let remote_source_name = format!("soundhop_rem_mic_{safe_desc}");
@@ -864,10 +919,9 @@ impl AudioBackend for LinuxAudioBackend {
         let remote_null_id = res
             .stdout
             .split_whitespace()
-            .find_map(|t| t.parse::<u32>().ok())
-            .unwrap_or(0);
+            .find_map(|t| t.parse::<u32>().ok());
 
-        let mut remote_remap_id = 0;
+        let mut remote_remap_id: Option<u32> = None;
         let mut actual_source = format!("{remote_sink_name}.monitor");
         if let Ok(remap_res) = self.pactl_call(
             &[
@@ -886,7 +940,7 @@ impl AudioBackend for LinuxAudioBackend {
                     .split_whitespace()
                     .find_map(|t| t.parse::<u32>().ok())
                 {
-                    remote_remap_id = id;
+                    remote_remap_id = Some(id);
                     actual_source = remote_source_name;
                 }
             }
@@ -953,8 +1007,8 @@ impl AudioBackend for LinuxAudioBackend {
         &self,
         host: &str,
         port: u16,
-        remote_null_id: u32,
-        remote_remap_id: u32,
+        remote_null_id: Option<u32>,
+        remote_remap_id: Option<u32>,
         local_tunnel_id: u32,
         local_loopback_id: u32,
     ) {
@@ -966,24 +1020,24 @@ impl AudioBackend for LinuxAudioBackend {
         }
         if !host.is_empty() && port > 0 {
             let remote_target = tcp_server_arg(host, port);
-            if remote_remap_id > 0 {
+            if let Some(remap_id) = remote_remap_id {
                 let _ = self.pactl_call(
                     &[
                         "-s",
                         &remote_target,
                         "unload-module",
-                        &remote_remap_id.to_string(),
+                        &remap_id.to_string(),
                     ],
                     false,
                 );
             }
-            if remote_null_id > 0 {
+            if let Some(null_id) = remote_null_id {
                 let _ = self.pactl_call(
                     &[
                         "-s",
                         &remote_target,
                         "unload-module",
-                        &remote_null_id.to_string(),
+                        &null_id.to_string(),
                     ],
                     false,
                 );
@@ -1370,5 +1424,56 @@ mod tests {
         assert!(!load_call.iter().any(|a| a == "cookie=/etc/shadow"));
         assert!(!load_call.iter().any(|a| a == "server=tcp:evil:4713"));
         assert!(load_call.iter().any(|a| a == "latency_msec=90"));
+    }
+
+    #[test]
+    fn test_ensure_tcp_listener_replaces_mismatched_security_and_mic_id_zero() {
+        let unloaded = Arc::new(Mutex::new(Vec::<String>::new()));
+        let unloaded_c = Arc::clone(&unloaded);
+        let runner = Arc::new(MockRunner::new(move |args, _| {
+            let joined = args.join(" ");
+            if joined.contains("unload-module") {
+                unloaded_c.lock().unwrap().push(joined.clone());
+            }
+            let stdout = if joined.contains("list short modules") {
+                "10\tmodule-native-protocol-tcp\tport=4713 auth-anonymous=1\n"
+            } else if joined.contains("load-module") {
+                "0\n"
+            } else {
+                ""
+            };
+            Ok(CommandResult {
+                args: args.to_vec(),
+                returncode: 0,
+                stdout: stdout.to_string(),
+                stderr: String::new(),
+            })
+        }));
+
+        let backend = LinuxAudioBackend::with_runner(runner);
+        let listener = backend
+            .ensure_tcp_listener(4713, "psk", &["192.168.1.0/24".to_string()])
+            .unwrap();
+        assert!(listener.created);
+        assert_eq!(listener.security, "psk");
+        assert!(unloaded
+            .lock()
+            .unwrap()
+            .iter()
+            .any(|c| c.contains("unload-module 10")));
+
+        // Verify module ID 0 is tracked as Some(0) and unloaded on stop
+        unloaded.lock().unwrap().clear();
+        let (r_null, r_remap, l_tun, l_loop, _) = backend
+            .send_mic_to_remote("192.168.1.50", 4713, "Desk", "@DEFAULT_SOURCE@")
+            .unwrap();
+        assert_eq!(r_null, Some(0));
+        assert_eq!(r_remap, Some(0));
+        backend.stop_send_mic_to_remote("192.168.1.50", 4713, r_null, r_remap, l_tun, l_loop);
+        let calls = unloaded.lock().unwrap();
+        assert_eq!(
+            calls.iter().filter(|c| c.contains("unload-module 0")).count(),
+            2
+        );
     }
 }

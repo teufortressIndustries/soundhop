@@ -332,7 +332,21 @@ fn run_audio_capture_loop(
         crate::util::close_fds_pre_exec(&mut cmd);
 
         let started = Instant::now();
-        let Ok(mut child) = cmd.spawn() else {
+        let stdout_opt = {
+            let mut child_guard = active_child.lock().unwrap_or_else(|e| e.into_inner());
+            if stop_flag.load(Ordering::SeqCst) {
+                return;
+            }
+            match cmd.spawn() {
+                Ok(mut child) => {
+                    let out = child.stdout.take();
+                    *child_guard = Some(child);
+                    out
+                }
+                Err(_) => None,
+            }
+        };
+        if stdout_opt.is_none() {
             for _ in 0..10 {
                 if stop_flag.load(Ordering::SeqCst) {
                     return;
@@ -340,10 +354,7 @@ fn run_audio_capture_loop(
                 thread::sleep(Duration::from_millis(100));
             }
             continue;
-        };
-
-        let stdout_opt = child.stdout.take();
-        *active_child.lock().unwrap() = Some(child);
+        }
 
         if let Some(mut stdout) = stdout_opt {
             let mut buf = [0u8; 1600]; // ~25ms at 16kHz stereo s16le
@@ -393,8 +404,7 @@ fn run_audio_capture_loop(
 
 fn run_network_probe_loop(controller: Arc<Controller>, stop_flag: Arc<AtomicBool>) {
     while !stop_flag.load(Ordering::SeqCst) {
-        controller.reload_from_disk();
-        let st = controller.state.lock().unwrap().clone();
+        let st = controller.state.lock().unwrap_or_else(|e| e.into_inner()).clone();
         let mut targets: Vec<(String, String, u16)> = Vec::new();
         let mut seen = HashSet::new();
 

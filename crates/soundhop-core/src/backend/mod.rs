@@ -222,13 +222,13 @@ pub trait AudioBackend: Send + Sync {
         port: u16,
         description: &str,
         local_source: &str,
-    ) -> Result<(u32, u32, u32, u32, String), BackendError>;
+    ) -> Result<(Option<u32>, Option<u32>, u32, u32, String), BackendError>;
     fn stop_send_mic_to_remote(
         &self,
         host: &str,
         port: u16,
-        remote_null_id: u32,
-        remote_remap_id: u32,
+        remote_null_id: Option<u32>,
+        remote_remap_id: Option<u32>,
         local_tunnel_id: u32,
         local_loopback_id: u32,
     );

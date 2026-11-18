@@ -72,6 +72,20 @@ pub trait ProcessRunner: Send + Sync {
 #[derive(Debug, Default, Clone)]
 pub struct SystemRunner;
 
+impl SystemRunner {
+    /// Execute a command allowing interactive terminal input (no `process_group(0)`,
+    /// inherited `stdin`) so tools like `sudo` can prompt on `/dev/tty`, while still
+    /// capturing `stdout` and `stderr`.
+    pub fn run_interactive(
+        &self,
+        args: &[String],
+        env_vars: Option<&HashMap<String, String>>,
+        timeout: Duration,
+    ) -> Result<CommandResult, UtilError> {
+        run_with_system_options(args, env_vars, timeout, true)
+    }
+}
+
 /// Terminates `child` and, on Unix, its entire process group so forked
 /// grandchildren do not keep inherited stdout/stderr pipes open after timeout.
 fn terminate_child(child: &mut std::process::Child) {
@@ -86,6 +100,125 @@ fn terminate_child(child: &mut std::process::Child) {
     let _ = child.wait();
 }
 
+fn run_with_system_options(
+    args: &[String],
+    env_vars: Option<&HashMap<String, String>>,
+    timeout: Duration,
+    interactive: bool,
+) -> Result<CommandResult, UtilError> {
+    let Some(program) = args.first() else {
+        return Err(UtilError::ToolMissing(String::new()));
+    };
+    let mut cmd = Command::new(program);
+    if args.len() > 1 {
+        cmd.args(&args[1..]);
+    }
+    cmd.stdin(if interactive {
+        Stdio::inherit()
+    } else {
+        Stdio::null()
+    })
+    .stdout(Stdio::piped())
+    .stderr(Stdio::piped());
+    if let Some(vars) = env_vars {
+        for (k, v) in vars {
+            cmd.env(k, v);
+        }
+    }
+    #[cfg(windows)]
+    {
+        use std::os::windows::process::CommandExt;
+        const CREATE_NO_WINDOW: u32 = 0x08000000;
+        cmd.creation_flags(CREATE_NO_WINDOW);
+    }
+    #[cfg(unix)]
+    if !interactive {
+        use std::os::unix::process::CommandExt;
+        cmd.process_group(0);
+    }
+    close_fds_pre_exec(&mut cmd);
+    let mut child = match cmd.spawn() {
+        Ok(c) => c,
+        Err(err) if err.kind() == std::io::ErrorKind::NotFound => {
+            return Err(UtilError::ToolMissing(program.clone()));
+        }
+        Err(err) => return Err(UtilError::Io(err)),
+    };
+
+    let stdout_handle = child.stdout.take().map(|mut out| {
+        std::thread::spawn(move || {
+            let mut buf = Vec::new();
+            let _ = std::io::Read::read_to_end(&mut out, &mut buf);
+            String::from_utf8_lossy(&buf).into_owned()
+        })
+    });
+    let stderr_handle = child.stderr.take().map(|mut err| {
+        std::thread::spawn(move || {
+            let mut buf = Vec::new();
+            let _ = std::io::Read::read_to_end(&mut err, &mut buf);
+            String::from_utf8_lossy(&buf).into_owned()
+        })
+    });
+
+    let effective_timeout = if timeout.is_zero() {
+        Duration::from_secs(10)
+    } else {
+        timeout
+    };
+    let start = Instant::now();
+    let mut timed_out = false;
+    let status_code = loop {
+        match child.try_wait() {
+            Ok(Some(status)) => break status.code().unwrap_or(1),
+            Ok(None) => {
+                if start.elapsed() >= effective_timeout {
+                    timed_out = true;
+                    if interactive {
+                        let _ = child.kill();
+                        let _ = child.wait();
+                    } else {
+                        terminate_child(&mut child);
+                    }
+                    break 124;
+                }
+                std::thread::sleep(Duration::from_millis(10));
+            }
+            Err(err) => {
+                if interactive {
+                    let _ = child.kill();
+                    let _ = child.wait();
+                } else {
+                    terminate_child(&mut child);
+                }
+                return Err(UtilError::Io(err));
+            }
+        }
+    };
+
+    let stdout = stdout_handle
+        .and_then(|h| h.join().ok())
+        .unwrap_or_default();
+    let mut stderr = stderr_handle
+        .and_then(|h| h.join().ok())
+        .unwrap_or_default();
+    if timed_out {
+        if !stderr.is_empty() && !stderr.ends_with('\n') {
+            stderr.push('\n');
+        }
+        stderr.push_str(&format!(
+            "Command timed out after {:.1}s",
+            effective_timeout.as_secs_f64()
+        ));
+    }
+
+    Ok(CommandResult {
+        args: args.to_vec(),
+        returncode: status_code,
+        stdout,
+        stderr,
+    })
+}
+
 impl ProcessRunner for SystemRunner {
     fn run(
         &self,
@@ -93,103 +226,7 @@ impl ProcessRunner for SystemRunner {
         env_vars: Option<&HashMap<String, String>>,
         timeout: Duration,
     ) -> Result<CommandResult, UtilError> {
-        let Some(program) = args.first() else {
-            return Err(UtilError::ToolMissing(String::new()));
-        };
-        let mut cmd = Command::new(program);
-        if args.len() > 1 {
-            cmd.args(&args[1..]);
-        }
-        cmd.stdin(Stdio::null())
-            .stdout(Stdio::piped())
-            .stderr(Stdio::piped());
-        if let Some(vars) = env_vars {
-            for (k, v) in vars {
-                cmd.env(k, v);
-            }
-        }
-        #[cfg(windows)]
-        {
-            use std::os::windows::process::CommandExt;
-            const CREATE_NO_WINDOW: u32 = 0x08000000;
-            cmd.creation_flags(CREATE_NO_WINDOW);
-        }
-        #[cfg(unix)]
-        {
-            use std::os::unix::process::CommandExt;
-            cmd.process_group(0);
-        }
-        close_fds_pre_exec(&mut cmd);
-        let mut child = match cmd.spawn() {
-            Ok(c) => c,
-            Err(err) if err.kind() == std::io::ErrorKind::NotFound => {
-                return Err(UtilError::ToolMissing(program.clone()));
-            }
-            Err(err) => return Err(UtilError::Io(err)),
-        };
-
-        let stdout_handle = child.stdout.take().map(|mut out| {
-            std::thread::spawn(move || {
-                let mut buf = Vec::new();
-                let _ = std::io::Read::read_to_end(&mut out, &mut buf);
-                String::from_utf8_lossy(&buf).into_owned()
-            })
-        });
-        let stderr_handle = child.stderr.take().map(|mut err| {
-            std::thread::spawn(move || {
-                let mut buf = Vec::new();
-                let _ = std::io::Read::read_to_end(&mut err, &mut buf);
-                String::from_utf8_lossy(&buf).into_owned()
-            })
-        });
-
-        let effective_timeout = if timeout.is_zero() {
-            Duration::from_secs(10)
-        } else {
-            timeout
-        };
-        let start = Instant::now();
-        let mut timed_out = false;
-        let status_code = loop {
-            match child.try_wait() {
-                Ok(Some(status)) => break status.code().unwrap_or(1),
-                Ok(None) => {
-                    if start.elapsed() >= effective_timeout {
-                        timed_out = true;
-                        terminate_child(&mut child);
-                        break 124;
-                    }
-                    std::thread::sleep(Duration::from_millis(10));
-                }
-                Err(err) => {
-                    terminate_child(&mut child);
-                    return Err(UtilError::Io(err));
-                }
-            }
-        };
-
-        let stdout = stdout_handle
-            .and_then(|h| h.join().ok())
-            .unwrap_or_default();
-        let mut stderr = stderr_handle
-            .and_then(|h| h.join().ok())
-            .unwrap_or_default();
-        if timed_out {
-            if !stderr.is_empty() && !stderr.ends_with('\n') {
-                stderr.push('\n');
-            }
-            stderr.push_str(&format!(
-                "Command timed out after {:.1}s",
-                effective_timeout.as_secs_f64()
-            ));
-        }
-
-        Ok(CommandResult {
-            args: args.to_vec(),
-            returncode: status_code,
-            stdout,
-            stderr,
-        })
+        run_with_system_options(args, env_vars, timeout, false)
     }
 
     fn command_exists(&self, name: &str) -> bool {
@@ -229,7 +266,7 @@ impl MockRunner {
     }
 
     pub fn recorded_calls(&self) -> Vec<Vec<String>> {
-        self.calls.lock().unwrap().clone()
+        self.calls.lock().unwrap_or_else(|e| e.into_inner()).clone()
     }
 }
 
@@ -240,12 +277,18 @@ impl ProcessRunner for MockRunner {
         env_vars: Option<&HashMap<String, String>>,
         _timeout: Duration,
     ) -> Result<CommandResult, UtilError> {
-        self.calls.lock().unwrap().push(args.to_vec());
+        self.calls
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .push(args.to_vec());
         (self.handler)(args, env_vars)
     }
 
     fn command_exists(&self, name: &str) -> bool {
-        self.available_commands.lock().unwrap().contains(name)
+        self.available_commands
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .contains(name)
     }
 }
 
@@ -1086,11 +1129,16 @@ pub fn tcp_reachable(host: &str, port: u16, timeout: Duration) -> bool {
 /// Connect to `(host, port)` and return the TCP handshake RTT in milliseconds.
 pub fn tcp_probe_rtt(host: &str, port: u16, timeout: Duration) -> Option<f64> {
     let clean = host.trim().trim_start_matches('[').trim_end_matches(']');
-    let clean = clean.split('%').next().unwrap_or(clean);
     let addr: SocketAddr = if let Ok(ip) = clean.parse::<IpAddr>() {
         SocketAddr::new(ip, port)
+    } else if let Ok(sa) = format!("[{clean}]:{port}").parse::<SocketAddr>() {
+        sa
+    } else if let Some(sa) = (clean, port).to_socket_addrs().ok().and_then(|mut it| it.next()) {
+        sa
     } else {
-        (clean, port).to_socket_addrs().ok()?.next()?
+        let no_zone = clean.split('%').next().unwrap_or(clean);
+        let ip = no_zone.parse::<IpAddr>().ok()?;
+        SocketAddr::new(ip, port)
     };
     let start = Instant::now();
     TcpStream::connect_timeout(&addr, timeout).ok()?;

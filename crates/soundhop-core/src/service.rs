@@ -170,9 +170,29 @@ pub fn remove_tray_autostart() -> bool {
 
 pub fn install(enable: bool, start: bool, tray: bool) -> serde_json::Value {
     let dir = systemd_dir();
-    let _ = ensure_dir(&dir);
+    if let Err(err) = ensure_dir(&dir) {
+        return serde_json::json!({
+            "ok": false,
+            "error": format!("Failed to prepare systemd user directory: {err}"),
+            "unit": unit_path().to_string_lossy(),
+            "daemon_reloaded": false,
+            "enabled": false,
+            "started": false,
+            "tray_autostart": String::new(),
+        });
+    }
     let path = unit_path();
-    let _ = fs::write(&path, unit_text());
+    if let Err(err) = fs::write(&path, unit_text()) {
+        return serde_json::json!({
+            "ok": false,
+            "error": format!("Failed to write systemd unit {}: {err}", path.display()),
+            "unit": path.to_string_lossy(),
+            "daemon_reloaded": false,
+            "enabled": false,
+            "started": false,
+            "tray_autostart": String::new(),
+        });
+    }
     #[cfg(unix)]
     {
         use std::os::unix::fs::PermissionsExt;
@@ -186,7 +206,9 @@ pub fn install(enable: bool, start: bool, tray: bool) -> serde_json::Value {
     } else {
         false
     };
+    let ok = (!enable || enabled) && (!start || started) && (!tray || tray_written);
     serde_json::json!({
+        "ok": ok,
         "unit": path.to_string_lossy(),
         "daemon_reloaded": reloaded,
         "enabled": enabled,

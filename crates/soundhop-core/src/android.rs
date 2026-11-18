@@ -771,6 +771,13 @@ pub struct AndroidCaptureSession {
     pub manager: Arc<AndroidManager>,
     backend: Arc<dyn AudioBackend>,
     inner: Arc<Mutex<CaptureInner>>,
+    op_lock: Mutex<()>,
+}
+
+impl Drop for AndroidCaptureSession {
+    fn drop(&mut self) {
+        let _ = self.stop();
+    }
 }
 
 impl AndroidCaptureSession {
@@ -792,11 +799,12 @@ impl AndroidCaptureSession {
                 log_lines: VecDeque::new(),
                 last_error: String::new(),
             })),
+            op_lock: Mutex::new(()),
         }
     }
 
     pub fn is_active(&self) -> bool {
-        let mut guard = self.inner.lock().unwrap();
+        let mut guard = self.inner.lock().unwrap_or_else(|e| e.into_inner());
         if let Some(ref mut child) = guard.child {
             if let Ok(None) = child.try_wait() {
                 return true;
@@ -806,7 +814,7 @@ impl AndroidCaptureSession {
     }
 
     pub fn status(&self) -> serde_json::Value {
-        let mut guard = self.inner.lock().unwrap();
+        let mut guard = self.inner.lock().unwrap_or_else(|e| e.into_inner());
         let mut active = false;
         let mut pid = 0u32;
         if let Some(ref mut child) = guard.child {
@@ -858,6 +866,7 @@ impl AndroidCaptureSession {
         bit_rate: Option<u32>,
         duplicate: bool,
     ) -> Result<serde_json::Value, AndroidError> {
+        let _op_guard = self.op_lock.lock().unwrap_or_else(|e| e.into_inner());
         if self.is_active() {
             return Err(AndroidError::Message(
                 "Audio capture is already active. Stop the current capture before starting another."
@@ -922,42 +931,27 @@ impl AndroidCaptureSession {
 
         crate::util::close_fds_pre_exec(&mut cmd);
 
-        let mut child = cmd
-            .spawn()
-            .map_err(|e| AndroidError::Message(format!("Failed to start scrcpy: {e}")))?;
+        let mut child = match cmd.spawn() {
+            Ok(c) => c,
+            Err(e) => {
+                if virt_src_mod > 0 {
+                    let _ = self.backend.unload_module(virt_src_mod, true);
+                }
+                if virt_sink_mod > 0 {
+                    let _ = self.backend.unload_module(virt_sink_mod, true);
+                }
+                if !prev_source.is_empty() {
+                    let _ = self.backend.set_default_source(&prev_source);
+                }
+                return Err(AndroidError::Message(format!("Failed to start scrcpy: {e}")));
+            }
+        };
 
-        if let Some(stdout) = child.stdout.take() {
-            let inner_clone = Arc::clone(&self.inner);
-            thread::spawn(move || {
-                let reader = BufReader::new(stdout);
-                for line in reader.lines().map_while(Result::ok) {
-                    let mut g = inner_clone.lock().unwrap();
-                    if g.log_lines.len() >= 200 {
-                        g.log_lines.pop_front();
-                    }
-                    g.log_lines.push_back(line);
-                }
-            });
-        }
-        if let Some(stderr) = child.stderr.take() {
-            let inner_clone = Arc::clone(&self.inner);
-            thread::spawn(move || {
-                let reader = BufReader::new(stderr);
-                for line in reader.lines().map_while(Result::ok) {
-                    let mut g = inner_clone.lock().unwrap();
-                    if !line.trim().is_empty() {
-                        g.last_error = line.clone();
-                    }
-                    if g.log_lines.len() >= 200 {
-                        g.log_lines.pop_front();
-                    }
-                    g.log_lines.push_back(line);
-                }
-            });
-        }
+        let stdout_opt = child.stdout.take();
+        let stderr_opt = child.stderr.take();
 
         {
-            let mut g = self.inner.lock().unwrap();
+            let mut g = self.inner.lock().unwrap_or_else(|e| e.into_inner());
             g.child = Some(child);
             g.serial = serial.to_string();
             g.device_name = if device_name.is_empty() {
@@ -976,12 +970,43 @@ impl AndroidCaptureSession {
             g.last_error.clear();
         }
 
+        if let Some(stdout) = stdout_opt {
+            let inner_clone = Arc::clone(&self.inner);
+            thread::spawn(move || {
+                let reader = BufReader::new(stdout);
+                for line in reader.lines().map_while(Result::ok) {
+                    let mut g = inner_clone.lock().unwrap_or_else(|e| e.into_inner());
+                    if g.log_lines.len() >= 200 {
+                        g.log_lines.pop_front();
+                    }
+                    g.log_lines.push_back(line);
+                }
+            });
+        }
+        if let Some(stderr) = stderr_opt {
+            let inner_clone = Arc::clone(&self.inner);
+            thread::spawn(move || {
+                let reader = BufReader::new(stderr);
+                for line in reader.lines().map_while(Result::ok) {
+                    let mut g = inner_clone.lock().unwrap_or_else(|e| e.into_inner());
+                    if !line.trim().is_empty() {
+                        g.last_error = line.clone();
+                    }
+                    if g.log_lines.len() >= 200 {
+                        g.log_lines.pop_front();
+                    }
+                    g.log_lines.push_back(line);
+                }
+            });
+        }
+
         Ok(self.status())
     }
 
     pub fn stop(&self) -> serde_json::Value {
+        let _op_guard = self.op_lock.lock().unwrap_or_else(|e| e.into_inner());
         {
-            let mut guard = self.inner.lock().unwrap();
+            let mut guard = self.inner.lock().unwrap_or_else(|e| e.into_inner());
             if let Some(mut child) = guard.child.take() {
                 let _ = child.kill();
                 let _ = child.wait();

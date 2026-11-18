@@ -577,10 +577,11 @@ impl DiscoveryManager {
             match ServiceDaemon::new() {
                 Ok(mdns) => {
                     if advertising {
+                        let id_prefix: String = self.device_id.chars().take(6).collect();
                         let instance_name = format!(
                             "{}-{}",
                             slugify(&self.name, 20),
-                            &self.device_id[..self.device_id.len().min(6)]
+                            id_prefix
                         );
                         let host_fqdn = format!("{instance_name}.local.");
                         let addrs = local_addresses(false);

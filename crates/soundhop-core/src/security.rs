@@ -119,13 +119,22 @@ pub fn write_pa_cookie(
     path: Option<&Path>,
     cookie: &[u8; PA_COOKIE_SIZE],
 ) -> std::io::Result<PathBuf> {
+    use std::io::Write;
     let target = path
         .map(Path::to_path_buf)
         .unwrap_or_else(soundhop_cookie_path);
     if let Some(parent) = target.parent() {
         ensure_dir(parent)?;
     }
-    fs::write(&target, cookie)?;
+    let mut opts = fs::OpenOptions::new();
+    opts.write(true).create(true).truncate(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+        opts.mode(0o600);
+    }
+    let mut file = opts.open(&target)?;
+    file.write_all(cookie)?;
     #[cfg(unix)]
     {
         use std::os::unix::fs::PermissionsExt;

@@ -125,7 +125,9 @@ pub struct State {
     pub keep_local: bool,
     pub mic_direction: String,
     pub remote_mic_null_module: u32,
+    pub remote_mic_null_set: bool,
     pub remote_mic_remap_module: u32,
+    pub remote_mic_remap_set: bool,
     pub local_mic_loopback_module: u32,
     pub connected_since: f64,
     pub connected_by: String,
@@ -169,7 +171,9 @@ impl Default for State {
             keep_local: false,
             mic_direction: String::new(),
             remote_mic_null_module: 0,
+            remote_mic_null_set: false,
             remote_mic_remap_module: 0,
+            remote_mic_remap_set: false,
             local_mic_loopback_module: 0,
             connected_since: 0.0,
             connected_by: "manual".to_string(),
@@ -243,7 +247,9 @@ impl State {
         self.keep_local = false;
         self.mic_direction.clear();
         self.remote_mic_null_module = 0;
+        self.remote_mic_null_set = false;
         self.remote_mic_remap_module = 0;
+        self.remote_mic_remap_set = false;
         self.local_mic_loopback_module = 0;
         self.connected_since = 0.0;
         self.connected_by = "manual".to_string();
