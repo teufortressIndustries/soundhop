@@ -6,14 +6,19 @@ pkgdesc="Seamless cross-distro local network audio sharing, multi-room broadcast
 arch=('x86_64' 'aarch64')
 url="https://github.com/teufortressIndustries/soundhop"
 license=('MIT')
-depends=('pipewire-pulse' 'gtk3' 'libappindicator-gtk3' 'libxdo')
+depends=('pipewire-pulse' 'gtk3' 'libappindicator-gtk3' 'libxdo' 'libxcb' 'libxkbcommon' 'libxkbcommon-x11' 'wayland' 'libglvnd')
 optdepends=(
     'libnotify: desktop notifications'
     'scrcpy: Android audio capture bridge'
 )
-makedepends=('cargo')
-source=("$pkgname-$pkgver.tar.gz")
+makedepends=('cargo' 'pkgconf')
+source=("$pkgname-$pkgver.tar.gz::$url/archive/refs/tags/v$pkgver.tar.gz")
 sha256sums=('SKIP')
+
+prepare() {
+    cd "$srcdir/$pkgname-$pkgver"
+    cargo fetch --locked --target "$(rustc -vV | sed -n 's/host: //p')"
+}
 
 build() {
     cd "$srcdir/$pkgname-$pkgver"

@@ -8,8 +8,8 @@ set -euo pipefail
 
 SCRIPT_DIR="$(cd "$(dirname "$(readlink -f "${BASH_SOURCE[0]}")")" && pwd)"
 
-if [[ ! -f /etc/arch-release && -z "${ALLOW_NON_ARCH:-}" ]]; then
-    echo "Non-Arch host detected; building AnyLinux AppImage in Arch Linux container..."
+if [[ ! -f /.dockerenv && ! -f /run/.containerenv && -z "${GITHUB_ACTIONS:-}" && -z "${ALLOW_HOST_MUTATION:-}" ]]; then
+    echo "Building AnyLinux AppImage in Arch Linux container (set ALLOW_HOST_MUTATION=1 on Arch to run natively)..."
     exec "$SCRIPT_DIR/build-appimage-container.sh"
 fi
 

@@ -36,7 +36,7 @@ RUN printf 'Server = https://mirrors.kernel.org/archlinux/$repo/os/$arch\nServer
         rustup pkgconf wget curl file strace binutils patchelf zsync \
         squashfs-tools desktop-file-utils appstream xorg-server-xvfb \
         gtk3 libayatana-appindicator xdotool libxcb libxcursor libxi libxrandr \
-        libxkbcommon libxkbcommon-x11 wayland mesa openssl && break || sleep 3; \
+        libxkbcommon libxkbcommon-x11 wayland mesa && break || sleep 3; \
     done \
     && mkdir -p /tmp/debloated-pkgs \
     && host_arch="$(uname -m)" \
@@ -59,14 +59,20 @@ fi
 
 chmod +x "$REPO_DIR/packaging/container-build.sh"
 
-TTY_FLAGS="-i"
+TTY_FLAG="-i"
 if [ -t 0 ] && [ -t 1 ]; then
-    TTY_FLAGS="-it"
+    TTY_FLAG="-it"
 fi
 
-$CONTAINER_CMD run --rm $TTY_FLAGS \
-    ${UPDATE_REPO:+-e UPDATE_REPO="$UPDATE_REPO"} \
-    ${VERSION:+-e VERSION="$VERSION"} \
+RUN_ARGS=(--rm "$TTY_FLAG")
+if [ -n "${UPDATE_REPO:-}" ]; then
+    RUN_ARGS+=(-e "UPDATE_REPO=$UPDATE_REPO")
+fi
+if [ -n "${VERSION:-}" ]; then
+    RUN_ARGS+=(-e "VERSION=$VERSION")
+fi
+
+"$CONTAINER_CMD" run "${RUN_ARGS[@]}" \
     -v "$REPO_DIR:/work:Z" \
     -w /work \
     "$IMAGE_NAME" /work/packaging/container-build.sh

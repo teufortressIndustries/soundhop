@@ -16,7 +16,6 @@ BuildRequires:  libxcb-devel
 BuildRequires:  libxkbcommon-devel
 BuildRequires:  wayland-devel
 BuildRequires:  mesa-libGL-devel
-BuildRequires:  openssl-devel
 
 Requires:       pipewire-pulseaudio
 Requires:       gtk3
@@ -24,7 +23,7 @@ Requires:       libappindicator-gtk3
 Requires:       libxdo
 
 %description
-SoundHop v2.0 lets you seamlessly stream and share audio between Linux and Windows
+SoundHop lets you seamlessly stream and share audio between Linux and Windows
 devices over your local network using native PipeWire/PulseAudio protocol tunnels,
 multi-room combine sinks, persistent per-app routing rules, PIN/PSK HMAC pairing,
 an interactive terminal UI (TUI), and a native system tray.
@@ -33,7 +32,7 @@ an interactive terminal UI (TUI), and a native system tray.
 %autosetup -n %{name}-%{version}
 
 %build
-cargo build --release --workspace
+cargo build --release --workspace --locked
 
 %install
 install -Dpm 0755 target/release/soundhop %{buildroot}%{_bindir}/soundhop
@@ -52,5 +51,8 @@ install -Dpm 0644 assets/soundhop.png %{buildroot}%{_datadir}/icons/hicolor/256x
 %{_datadir}/icons/hicolor/256x256/apps/soundhop.png
 
 %changelog
+* Wed Nov 18 2026 SoundHop Contributors <soundhop@example.com> - 2.1.1-1
+- Release 2.1.1 with packaging and CI alignment.
+
 * Sun Nov 08 2026 SoundHop Contributors <soundhop@example.com> - 2.0.0-1
 - Complete Rust rewrite with TUI, Multi-Room Broadcast, Persistent App Routing, PIN/PSK Pairing, and Live Telemetry.

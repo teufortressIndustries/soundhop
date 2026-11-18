@@ -1,10 +1,17 @@
-app-id: io.github.soundhop.SoundHop
+app-id: io.github.soundhop
 runtime: org.freedesktop.Platform
-runtime-version: '23.08'
+runtime-version: '24.08'
 sdk: org.freedesktop.Sdk
+sdk-extensions:
+  - org.freedesktop.Sdk.Extension.rust-stable
 command: soundhop
 command-args:
-  - tray
+  - gui
+
+build-options:
+  append-path: /usr/lib/sdk/rust-stable/bin
+  env:
+    CARGO_HOME: /run/build/soundhop/cargo
 
 finish-args:
   # Network access for UDP 47777 discovery and TCP 4713 audio streaming
@@ -23,19 +30,18 @@ finish-args:
   - --persist=.local/state/soundhop
 
 modules:
-  - name: python3-zeroconf
-    buildsystem: simple
-    build-commands:
-      - pip3 install --no-index --find-links="file://${PWD}" --prefix=${FLATPAK_DEST} zeroconf
-    sources: []
-
   - name: soundhop
     buildsystem: simple
     build-commands:
-      - pip3 install --no-deps --prefix=${FLATPAK_DEST} .
-      - install -Dm644 packaging/io.github.soundhop.desktop ${FLATPAK_DEST}/share/applications/io.github.soundhop.SoundHop.desktop
-      - install -Dm644 src/soundhop/assets/soundhop.png ${FLATPAK_DEST}/share/icons/hicolor/256x256/apps/io.github.soundhop.SoundHop.png
-      - install -Dm644 src/soundhop/assets/soundhop.svg ${FLATPAK_DEST}/share/icons/hicolor/scalable/apps/io.github.soundhop.SoundHop.svg
+      # For offline Flathub builds, generate cargo-sources.json with flatpak-cargo-generator
+      # and pass --offline to cargo build.
+      - cargo build --release --workspace --locked
+      - install -Dm755 target/release/soundhop ${FLATPAK_DEST}/bin/soundhop
+      - install -Dm644 packaging/io.github.soundhop.desktop ${FLATPAK_DEST}/share/applications/io.github.soundhop.desktop
+      - desktop-file-edit --set-icon=io.github.soundhop ${FLATPAK_DEST}/share/applications/io.github.soundhop.desktop
+      - install -Dm644 packaging/io.github.soundhop.metainfo.xml ${FLATPAK_DEST}/share/metainfo/io.github.soundhop.metainfo.xml
+      - install -Dm644 assets/soundhop.png ${FLATPAK_DEST}/share/icons/hicolor/256x256/apps/io.github.soundhop.png
+      - install -Dm644 assets/soundhop.svg ${FLATPAK_DEST}/share/icons/hicolor/scalable/apps/io.github.soundhop.svg
     sources:
       - type: dir
-        path: ../
+        path: ..

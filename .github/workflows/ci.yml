@@ -37,7 +37,7 @@ jobs:
             sudo DEBIAN_FRONTEND=noninteractive NEEDRESTART_MODE=l apt-get install -y --no-install-recommends \
               pkg-config libgtk-3-dev libayatana-appindicator3-dev libxdo-dev \
               libxcb1-dev libxkbcommon-dev libxkbcommon-x11-dev libwayland-dev \
-              libgl1-mesa-dev libssl-dev && break || sleep 3
+              libgl1-mesa-dev && break || sleep 3
           done
 
       - name: Install Rust toolchain
@@ -78,7 +78,7 @@ jobs:
               base-devel rustup pkgconf wget curl file strace binutils patchelf zsync \
               squashfs-tools desktop-file-utils appstream xorg-server-xvfb \
               gtk3 libayatana-appindicator xdotool libxcb libxcursor libxi libxrandr \
-              libxkbcommon libxkbcommon-x11 wayland mesa openssl git && break || sleep 3
+              libxkbcommon libxkbcommon-x11 wayland mesa git && break || sleep 3
           done
 
       - name: Initialize Rust toolchain

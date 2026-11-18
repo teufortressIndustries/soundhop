@@ -8,7 +8,13 @@ export PATH="$HOME/.cargo/bin:/root/.cargo/bin:$PATH"
 
 if [[ ! -f /etc/arch-release && -z "${ALLOW_NON_ARCH:-}" ]]; then
     echo "Error: container-build.sh is meant to run inside an Arch Linux container or Arch host."
-    echo "Please run ./build-appimage-container.sh or ./packaging/build-appimage.sh."
+    echo "Please run ./packaging/build-appimage-container.sh or ./packaging/build-appimage.sh."
+    exit 1
+fi
+
+if [[ ! -f /.dockerenv && ! -f /run/.containerenv && -z "${GITHUB_ACTIONS:-}" && -z "${ALLOW_HOST_MUTATION:-}" ]]; then
+    echo "Error: container-build.sh mutates system packages (mesa-nano/gtk3-mini), /usr, and \$HOME/.wgetrc."
+    echo "Run ./packaging/build-appimage-container.sh instead, or set ALLOW_HOST_MUTATION=1 if you explicitly want to run on this host."
     exit 1
 fi
 
@@ -55,7 +61,7 @@ if ! command -v patchelf >/dev/null 2>&1 || ! command -v zsyncmake >/dev/null 2>
             base-devel rustup pkgconf wget curl file strace binutils patchelf zsync \
             squashfs-tools desktop-file-utils appstream xorg-server-xvfb \
             gtk3 libayatana-appindicator xdotool libxcb libxcursor libxi libxrandr \
-            libxkbcommon libxkbcommon-x11 wayland mesa openssl && break || sleep 3
+            libxkbcommon libxkbcommon-x11 wayland mesa && break || sleep 3
     done
 fi
 
@@ -131,24 +137,27 @@ export ICON="$ICON_PATH"
 export UPINFO="gh-releases-zsync|${UPDATE_REPO%/*}|${UPDATE_REPO#*/}|latest|SoundHop-*$ARCH.AppImage.zsync"
 export DEPLOY_GTK=1
 export USE_HOST_DRIVERS="${USE_HOST_DRIVERS:-1}"
+EXTRA_GL_LIBS=()
 if [ "$USE_HOST_DRIVERS" != "1" ]; then
     export DEPLOY_OPENGL=1
+    EXTRA_GL_LIBS=(
+        /usr/lib/libGL.so*
+        /usr/lib/libEGL.so*
+        /usr/lib/libGLX.so*
+    )
 fi
-export STRACE_FLAGS="--settings-dialog"
 
 OUTPUT_FILE="$OUTPUT_DIR/$OUTNAME"
 rm -f "$OUTPUT_FILE" "$OUTPUT_FILE.zsync"
 trap 'rm -f "$OUTPUT_FILE" "$OUTPUT_FILE.zsync"' ERR INT TERM
 
 echo "4. Deploying SoundHop & libraries with quick-sharun..."
-# Pass soundhop plus dlopened tray, X11, Wayland, and GLVND helper libraries so they are always bundled
+# Pass soundhop plus dlopened tray, X11, and Wayland helper libraries so they are always bundled
 "$QUICK_SHARUN" \
     /usr/bin/soundhop \
     /usr/lib/libayatana-appindicator3.so* \
     /usr/lib/libxdo.so* \
-    /usr/lib/libGL.so* \
-    /usr/lib/libEGL.so* \
-    /usr/lib/libGLX.so* \
+    "${EXTRA_GL_LIBS[@]}" \
     /usr/lib/libXcursor.so* \
     /usr/lib/libXi.so* \
     /usr/lib/libXrandr.so* \

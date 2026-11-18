@@ -12,6 +12,7 @@ Updates:
 """
 
 import argparse
+import datetime
 import re
 import subprocess
 import sys
@@ -101,9 +102,9 @@ def main() -> int:
     cargo_path = ROOT_DIR / "Cargo.toml"
     if update_file(
         cargo_path,
-        r'^version\s*=\s*"[0-9.]+"',
-        f'version = "{new_ver}"',
-        flags=re.MULTILINE,
+        r'(^\[workspace\.package\][^\[]*?^version\s*=\s*)"[0-9.]+"',
+        rf'\1"{new_ver}"',
+        flags=re.MULTILINE | re.DOTALL,
     ):
         changes.append("✓ Cargo.toml")
 
@@ -116,7 +117,9 @@ def main() -> int:
         changes.append("✓ crates/soundhop-core/src/constants.rs")
 
     pkg_path = ROOT_DIR / "packaging" / "PKGBUILD"
-    if update_file(pkg_path, r'pkgver=[0-9.]+', f'pkgver={new_ver}'):
+    pkg_changed = update_file(pkg_path, r'^pkgver=[0-9.]+', f'pkgver={new_ver}', flags=re.MULTILINE)
+    if pkg_changed:
+        update_file(pkg_path, r'^pkgrel=[0-9]+', 'pkgrel=1', flags=re.MULTILINE)
         changes.append("✓ packaging/PKGBUILD")
 
     spec_path = ROOT_DIR / "packaging" / "soundhop.spec"
@@ -139,11 +142,12 @@ def main() -> int:
     ):
         changes.append("✓ packaging/io.github.soundhop.desktop")
 
+    today = datetime.date.today().isoformat()
     metainfo_path = ROOT_DIR / "packaging" / "io.github.soundhop.metainfo.xml"
     if update_file(
         metainfo_path,
-        r'<release version="[^"]+"',
-        f'<release version="{new_ver}"',
+        r'<release version="[^"]+"(?:\s+date="[^"]+")?',
+        f'<release version="{new_ver}" date="{today}"',
     ):
         changes.append("✓ packaging/io.github.soundhop.metainfo.xml")
 
