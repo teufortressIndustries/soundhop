@@ -32,7 +32,7 @@ use crate::core_cmds::{
 use crate::doctor::{run_bug_report, run_doctor};
 use crate::parser::{Cli, Commands};
 use crate::tui::run_tui;
-use crate::ui::{error, set_no_color};
+use crate::ui::{emit_error, error, set_no_color};
 
 pub fn run_cli() -> i32 {
     let cli = Cli::parse();
@@ -75,7 +75,7 @@ pub fn run_cli() -> i32 {
         Some(Commands::Tui) => match run_tui(controller) {
             Ok(code) => code,
             Err(e) => {
-                error(&e);
+                emit_error(&e, cli.json);
                 1
             }
         },
@@ -92,7 +92,7 @@ pub fn run_cli() -> i32 {
         Some(Commands::Mic(ref args)) => handle_mic(&controller, args, cli.json),
         Some(Commands::Volume(ref args)) => handle_volume(&controller, args, cli.json),
         Some(Commands::Auto(ref args)) => handle_auto(&controller, args, cli.json),
-        Some(Commands::Daemon) => handle_daemon(cli.verbose),
+        Some(Commands::Daemon) => handle_daemon(cli.verbose, cli.json),
         Some(Commands::Stop) => handle_stop(&controller, cli.json),
         Some(Commands::Service(ref args)) => handle_service(args, cli.json),
         Some(Commands::Firewall(ref args)) => handle_firewall(&controller, args, cli.json),
@@ -102,7 +102,7 @@ pub fn run_cli() -> i32 {
         Some(Commands::Tray) => match run_tray(cli.verbose) {
             Ok(code) => code,
             Err(e) => {
-                error(&e);
+                emit_error(&e, cli.json);
                 1
             }
         },

@@ -4,6 +4,7 @@
 
 use std::io::{self, IsTerminal, Write};
 use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::{Mutex, MutexGuard};
 
 static NO_COLOR: AtomicBool = AtomicBool::new(false);
 
@@ -130,5 +131,40 @@ pub fn header(title: &str) {
 pub fn print_json<T: serde::Serialize>(value: &T) {
     if let Ok(s) = serde_json::to_string_pretty(value) {
         safe_print(&s);
+    }
+}
+
+pub fn emit_error(msg: &str, json_out: bool) {
+    if json_out {
+        print_json(&serde_json::json!({
+            "ok": false,
+            "error": msg,
+        }));
+    } else {
+        error(msg);
+    }
+}
+
+pub fn lock_or_recover<T>(mutex: &Mutex<T>) -> MutexGuard<'_, T> {
+    mutex.lock().unwrap_or_else(|e| e.into_inner())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::sync::Arc;
+
+    #[test]
+    fn test_lock_or_recover_handles_poisoned_mutex() {
+        let m = Arc::new(Mutex::new(42));
+        let m2 = Arc::clone(&m);
+        let _ = std::thread::spawn(move || {
+            let _guard = m2.lock().unwrap();
+            panic!("intentional poison");
+        })
+        .join();
+        assert!(m.is_poisoned());
+        let guard = lock_or_recover(&m);
+        assert_eq!(*guard, 42);
     }
 }

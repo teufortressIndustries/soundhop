@@ -10,7 +10,8 @@ use std::io;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
-use crossterm::event::{self, Event, KeyCode, KeyEventKind};
+use crossterm::cursor::Show;
+use crossterm::event::{self, Event, KeyCode, KeyEventKind, KeyModifiers};
 use crossterm::execute;
 use crossterm::terminal::{
     disable_raw_mode, enable_raw_mode, EnterAlternateScreen, LeaveAlternateScreen,
@@ -23,7 +24,11 @@ use ratatui::widgets::{Block, Borders, Gauge, List, ListItem, Paragraph, Tabs};
 use ratatui::{Frame, Terminal};
 use soundhop_core::controller::{ConnectOptions, Controller};
 use soundhop_core::discovery::{discover_once_with_psk, DiscoveryManager, Peer};
-use soundhop_core::util::{is_own_non_loopback_ip, is_private_address};
+use soundhop_core::util::{
+    install_signal_handlers, is_own_non_loopback_ip, is_private_address, signal_stop_requested,
+};
+
+use crate::ui::lock_or_recover;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum TuiTab {
@@ -65,7 +70,7 @@ pub struct TuiState {
 
 impl TuiState {
     pub fn new(controller: Arc<Controller>) -> Self {
-        let st = controller.state.lock().unwrap().clone();
+        let st = lock_or_recover(&controller.state).clone();
         let mut multiroom_selected = HashSet::new();
         for s in &st.multiroom_peers {
             multiroom_selected.insert(s.peer_id.clone());
@@ -249,7 +254,7 @@ impl TuiState {
                 }
             }
             KeyCode::Char('s') => {
-                let cur = self.controller.config.lock().unwrap().sharing.enabled;
+                let cur = lock_or_recover(&self.controller.config).sharing.enabled;
                 match self.controller.share(!cur, Some(true)) {
                     Ok(_) => {
                         self.status_message = format!(
@@ -261,7 +266,7 @@ impl TuiState {
                 }
             }
             KeyCode::Char('r') => {
-                let cfg = self.controller.config.lock().unwrap().clone();
+                let cfg = lock_or_recover(&self.controller.config).clone();
                 let psk =
                     (!cfg.sharing.psk_hash.is_empty()).then_some(cfg.sharing.psk_hash.as_str());
                 self.peers = discover_once_with_psk(0.8, cfg.discovery.port, &cfg.device.id, psk);
@@ -444,8 +449,8 @@ fn draw_peers_tab(frame: &mut Frame<'_>, area: Rect, state: &TuiState) {
         .constraints([Constraint::Percentage(62), Constraint::Percentage(38)])
         .split(area);
 
-    let st = state.controller.state.lock().unwrap().clone();
-    let cfg = state.controller.config.lock().unwrap().clone();
+    let st = lock_or_recover(&state.controller.state).clone();
+    let cfg = lock_or_recover(&state.controller.config).clone();
 
     let items: Vec<ListItem<'_>> = if state.peers.is_empty() {
         vec![ListItem::new(
@@ -620,7 +625,7 @@ fn draw_apps_tab(frame: &mut Frame<'_>, area: Rect, state: &TuiState) {
 }
 
 fn draw_mic_android_tab(frame: &mut Frame<'_>, area: Rect, state: &TuiState) {
-    let st = state.controller.state.lock().unwrap().clone();
+    let st = lock_or_recover(&state.controller.state).clone();
     let and_st = state.controller.android_session.status();
     let and_active = and_st
         .get("active")
@@ -729,8 +734,33 @@ fn draw_footer_bar(frame: &mut Frame<'_>, area: Rect, state: &TuiState) {
     frame.render_widget(footer, area);
 }
 
+struct TerminalGuard {
+    active: bool,
+}
+
+impl TerminalGuard {
+    fn enter() -> Result<Self, String> {
+        enable_raw_mode().map_err(|e| format!("Failed to enable terminal raw mode: {e}"))?;
+        if let Err(e) = execute!(io::stdout(), EnterAlternateScreen) {
+            let _ = disable_raw_mode();
+            return Err(format!("Failed to enter alternate screen: {e}"));
+        }
+        Ok(Self { active: true })
+    }
+}
+
+impl Drop for TerminalGuard {
+    fn drop(&mut self) {
+        if self.active {
+            let _ = disable_raw_mode();
+            let _ = execute!(io::stdout(), LeaveAlternateScreen, Show);
+        }
+    }
+}
+
 pub fn run_tui(controller: Arc<Controller>) -> Result<i32, String> {
-    let cfg = controller.config.lock().unwrap().clone();
+    install_signal_handlers();
+    let cfg = lock_or_recover(&controller.config).clone();
     if cfg.sharing.enabled {
         let _ = controller.start_listener(Some(false));
     }
@@ -757,11 +787,8 @@ pub fn run_tui(controller: Arc<Controller>) -> Result<i32, String> {
     let _ = disc.start(cfg.sharing.enabled);
     let telem_monitor = controller.start_telemetry_monitor();
 
-    enable_raw_mode().map_err(|e| format!("Failed to enable terminal raw mode: {e}"))?;
-    let mut stdout = io::stdout();
-    execute!(stdout, EnterAlternateScreen)
-        .map_err(|e| format!("Failed to enter alternate screen: {e}"))?;
-    let backend = CrosstermBackend::new(stdout);
+    let _term_guard = TerminalGuard::enter()?;
+    let backend = CrosstermBackend::new(io::stdout());
     let mut terminal =
         Terminal::new(backend).map_err(|e| format!("Failed to initialize TUI terminal: {e}"))?;
 
@@ -771,7 +798,7 @@ pub fn run_tui(controller: Arc<Controller>) -> Result<i32, String> {
     let mut last_tick = Instant::now();
 
     let loop_res: Result<(), String> = (|| {
-        while !tui_state.should_quit {
+        while !tui_state.should_quit && !signal_stop_requested() {
             terminal
                 .draw(|f| draw_tui(f, &tui_state))
                 .map_err(|e| e.to_string())?;
@@ -779,10 +806,16 @@ pub fn run_tui(controller: Arc<Controller>) -> Result<i32, String> {
             if event::poll(Duration::from_millis(50)).map_err(|e| e.to_string())? {
                 if let Event::Key(key) = event::read().map_err(|e| e.to_string())? {
                     if key.kind == KeyEventKind::Press {
-                        tui_state.handle_key(key.code);
-                        let share_now = controller.config.lock().unwrap().sharing.enabled;
-                        disc.set_advertising(share_now);
-                        tui_state.merge_live_peers(disc.peers());
+                        if key.code == KeyCode::Char('c')
+                            && key.modifiers.contains(KeyModifiers::CONTROL)
+                        {
+                            tui_state.should_quit = true;
+                        } else {
+                            tui_state.handle_key(key.code);
+                            let share_now = lock_or_recover(&controller.config).sharing.enabled;
+                            disc.set_advertising(share_now);
+                            tui_state.merge_live_peers(disc.peers());
+                        }
                     }
                 }
             }
@@ -801,9 +834,7 @@ pub fn run_tui(controller: Arc<Controller>) -> Result<i32, String> {
 
     telem_monitor.stop();
     disc.stop();
-    let _ = disable_raw_mode();
-    let _ = execute!(terminal.backend_mut(), LeaveAlternateScreen);
-    let _ = terminal.show_cursor();
+    drop(_term_guard);
 
     loop_res?;
     Ok(0)

@@ -9,16 +9,19 @@ use soundhop_core::ipc::is_running as ipc_is_running;
 use soundhop_core::service::{install as install_service, status as service_status};
 use soundhop_core::util::{config_path, local_addresses, state_path};
 
-use crate::ui::{error, header, info, ok, print_json, safe_print, warning};
+use crate::ui::{error, header, info, lock_or_recover, ok, print_json, safe_print, warning};
 
 pub fn run_doctor(controller: &Arc<Controller>, fix: bool, json_out: bool) -> i32 {
-    let cfg = controller.config.lock().unwrap().clone();
+    let cfg = lock_or_recover(&controller.config).clone();
     let backend_ok = controller.backend.available();
     let server_name = controller.backend.server_label().unwrap_or_default();
     let is_pw = controller.backend.is_pipewire().unwrap_or(false);
     let def_sink = controller.backend.default_sink().unwrap_or_default();
 
     let mut fixed_actions: Vec<String> = Vec::new();
+    let mut fix_errors: Vec<String> = Vec::new();
+    let mut fix_failed = false;
+
     if fix {
         let rec = controller.reconcile();
         if let Some(arr) = rec.get("actions").and_then(|v| v.as_array()) {
@@ -38,8 +41,19 @@ pub fn run_doctor(controller: &Arc<Controller>, fix: bool, json_out: bool) -> i3
             false,
             cfg.discovery.mdns,
         );
-        if fw_res.ran && fw_res.ok {
-            fixed_actions.push(format!("Opened firewall ports on {}", fw.kind));
+        if fw_res.ran {
+            if fw_res.ok {
+                fixed_actions.push(format!("Opened firewall ports on {}", fw.kind));
+            } else {
+                fix_failed = true;
+                if fw_res.errors.is_empty() {
+                    fix_errors.push(format!("Failed to open firewall ports on {}", fw.kind));
+                } else {
+                    for err in fw_res.errors {
+                        fix_errors.push(format!("Firewall ({}): {err}", fw.kind));
+                    }
+                }
+            }
         }
     }
 
@@ -47,8 +61,23 @@ pub fn run_doctor(controller: &Arc<Controller>, fix: bool, json_out: bool) -> i3
     let svc_active = svc.get("active").and_then(|v| v.as_bool()).unwrap_or(false);
     let daemon_ipc = ipc_is_running(None);
     if fix && !svc_active && !daemon_ipc {
-        let _ = install_service(true, true, true);
-        fixed_actions.push("Installed and started user service".to_string());
+        let svc_res = install_service(true, true, true);
+        let enabled = svc_res
+            .get("enabled")
+            .and_then(|v| v.as_bool())
+            .unwrap_or(false);
+        let started = svc_res
+            .get("started")
+            .and_then(|v| v.as_bool())
+            .unwrap_or(false);
+        if started {
+            fixed_actions.push("Installed and started user service".to_string());
+        } else {
+            fix_failed = true;
+            fix_errors.push(format!(
+                "Failed to install/start user service (enabled={enabled}, started={started})"
+            ));
+        }
     }
 
     #[cfg(target_os = "linux")]
@@ -84,9 +113,27 @@ pub fn run_doctor(controller: &Arc<Controller>, fix: bool, json_out: bool) -> i3
             let mut cmd = std::process::Command::new("fusermount");
             cmd.args(["-u", m]);
             soundhop_core::util::close_fds_pre_exec(&mut cmd);
-            if let Ok(out) = cmd.output() {
-                if out.status.success() {
+            match cmd.output() {
+                Ok(out) if out.status.success() => {
                     fixed_actions.push(format!("Unmounted stale AppImage mount {m}"));
+                }
+                Ok(out) => {
+                    fix_failed = true;
+                    let stderr = String::from_utf8_lossy(&out.stderr).trim().to_string();
+                    fix_errors.push(format!(
+                        "Failed to unmount stale AppImage mount {m}{}",
+                        if stderr.is_empty() {
+                            String::new()
+                        } else {
+                            format!(": {stderr}")
+                        }
+                    ));
+                }
+                Err(e) => {
+                    fix_failed = true;
+                    fix_errors.push(format!(
+                        "Failed to run fusermount -u {m}: {e}"
+                    ));
                 }
             }
         }
@@ -94,8 +141,10 @@ pub fn run_doctor(controller: &Arc<Controller>, fix: bool, json_out: bool) -> i3
 
     let addrs = local_addresses(false);
     let tools = controller.android_tool_status();
+    let exit_ok = backend_ok && !fix_failed;
 
     let report = serde_json::json!({
+        "ok": exit_ok,
         "version": VERSION,
         "protocol": PROTOCOL_VERSION,
         "backend": {
@@ -115,12 +164,13 @@ pub fn run_doctor(controller: &Arc<Controller>, fix: bool, json_out: bool) -> i3
         "daemon_ipc_running": daemon_ipc,
         "android_tools": tools,
         "fixed_actions": fixed_actions,
-        "healthy": backend_ok && !addrs.is_empty(),
+        "fix_errors": fix_errors,
+        "healthy": backend_ok && !addrs.is_empty() && !fix_failed,
     });
 
     if json_out {
         print_json(&report);
-        return if backend_ok { 0 } else { 1 };
+        return if exit_ok { 0 } else { 1 };
     }
 
     header(&format!("SoundHop v{VERSION} System Diagnostics"));
@@ -180,8 +230,11 @@ pub fn run_doctor(controller: &Arc<Controller>, fix: bool, json_out: bool) -> i3
     for act in &fixed_actions {
         ok(&format!("Fixed: {act}"));
     }
+    for ferr in &fix_errors {
+        error(ferr);
+    }
 
-    if backend_ok {
+    if exit_ok {
         0
     } else {
         1
