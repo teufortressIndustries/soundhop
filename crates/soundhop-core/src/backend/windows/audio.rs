@@ -17,7 +17,7 @@ pub struct AudioEndpoint {
 }
 
 pub fn list_audio_endpoints() -> Vec<AudioEndpoint> {
-    #[cfg(windows)]
+    #[cfg(all(windows, not(test)))]
     {
         use cpal::traits::{DeviceTrait, HostTrait};
         let host = cpal::default_host();
@@ -128,7 +128,7 @@ fn pop_frame_pair(buf: &mut VecDeque<i16>, src_channels: usize) -> (i16, i16) {
     (l, r)
 }
 
-#[cfg(windows)]
+#[cfg(all(windows, not(test)))]
 fn run_playback_worker(
     closed: Arc<AtomicBool>,
     buffer: Arc<Mutex<VecDeque<i16>>>,
@@ -244,7 +244,7 @@ fn run_playback_worker(
     drop(stream);
 }
 
-#[cfg(windows)]
+#[cfg(all(windows, not(test)))]
 #[allow(clippy::too_many_arguments)]
 fn write_resampled_output<F: FnMut(usize, i16)>(
     buffer: &Mutex<VecDeque<i16>>,
@@ -290,7 +290,7 @@ fn write_resampled_output<F: FnMut(usize, i16)>(
     }
 }
 
-#[cfg(not(windows))]
+#[cfg(any(not(windows), test))]
 fn run_playback_worker(
     closed: Arc<AtomicBool>,
     buffer: Arc<Mutex<VecDeque<i16>>>,
@@ -366,7 +366,7 @@ impl Drop for WindowsLoopbackRecorder {
 
 type CaptureCallback = Arc<dyn Fn(&[u8]) + Send + Sync>;
 
-#[cfg(windows)]
+#[cfg(all(windows, not(test)))]
 fn emit_captured_s16le(frames: &[(i16, i16)], src_rate: u32, cb: &CaptureCallback) {
     if frames.is_empty() {
         return;
@@ -390,7 +390,7 @@ fn emit_captured_s16le(frames: &[(i16, i16)], src_rate: u32, cb: &CaptureCallbac
     cb(&bytes);
 }
 
-#[cfg(windows)]
+#[cfg(all(windows, not(test)))]
 fn run_loopback_worker(
     stop_flag: Arc<AtomicBool>,
     cb: CaptureCallback,
@@ -521,7 +521,7 @@ fn run_loopback_worker(
     drop(stream);
 }
 
-#[cfg(not(windows))]
+#[cfg(any(not(windows), test))]
 fn run_loopback_worker(
     stop_flag: Arc<AtomicBool>,
     cb: CaptureCallback,

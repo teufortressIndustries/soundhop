@@ -24,11 +24,12 @@ ureq.workspace = true
 flate2.workspace = true
 tar.workspace = true
 zip.workspace = true
+
+[target.'cfg(unix)'.dependencies]
 libc.workspace = true
 
 [target.'cfg(windows)'.dependencies]
 cpal.workspace = true
-winreg = "0.52"
 
 [dev-dependencies]
 tempfile.workspace = true
