@@ -4,6 +4,12 @@ members = [
     "crates/soundhop-core",
     "crates/soundhop-gui",
     "crates/soundhop-cli",
+    "xtask",
+]
+default-members = [
+    "crates/soundhop-core",
+    "crates/soundhop-gui",
+    "crates/soundhop-cli",
 ]
 
 [workspace.package]
