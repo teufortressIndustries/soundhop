@@ -208,7 +208,7 @@ pub struct PairArgs {
     /// Peer name, ID, or IP, or "status" / "clear" / "generate"
     pub target: Option<String>,
 
-    /// 6-digit PIN or passphrase to derive shared PSK & PulseAudio cookie
+    /// 12-character alphanumeric pairing code or passphrase to derive shared PSK & PulseAudio cookie
     #[arg(long)]
     pub pin: Option<String>,
 }
@@ -299,7 +299,7 @@ pub struct ConfigArgs {
     #[arg(default_value = "show")]
     pub action: String,
 
-    /// Dotted config key (e.g. `general.device_name`, `routing.default_mode`)
+    /// Dotted config key (e.g. `device.name`, `routing.default_mode`)
     pub key: Option<String>,
 
     /// Value to assign when action is `set`

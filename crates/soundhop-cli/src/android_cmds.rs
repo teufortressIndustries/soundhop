@@ -8,6 +8,7 @@ use soundhop_core::controller::Controller;
 use soundhop_core::util::{install_signal_handlers, signal_stop_requested};
 use soundhop_gui::open_android_wizard;
 
+use crate::core_cmds::try_ipc;
 use crate::parser::AndroidArgs;
 use crate::ui::{emit_error, header, info, ok, print_json};
 
@@ -242,6 +243,42 @@ pub fn handle_android(controller: &Arc<Controller>, args: &AndroidArgs, json_out
                     }
                 }
             };
+            if !args.foreground {
+                let payload = serde_json::json!({
+                    "serial": serial,
+                    "device_name": dev_name,
+                    "codec": codec,
+                    "source": source,
+                    "as_mic": args.as_mic,
+                    "buffer_ms": args.buffer,
+                    "bit_rate": br,
+                    "duplicate": false,
+                });
+                return match try_ipc("android_start", payload, Duration::from_secs(10)) {
+                    Some(Ok(resp)) => {
+                        if json_out {
+                            print_json(resp.get("session").unwrap_or(&resp));
+                        } else {
+                            ok(&format!(
+                                "Started Android audio stream from {dev_name} (codec={codec}, source={source}, as_mic={})",
+                                args.as_mic
+                            ));
+                        }
+                        0
+                    }
+                    Some(Err(e)) => {
+                        emit_error(&format!("Failed to start Android stream: {e}"), json_out);
+                        1
+                    }
+                    None => {
+                        emit_error(
+                            "SoundHop daemon is not running. Start it with `soundhop daemon` or `soundhop service start`, or pass `--foreground` to stream in the foreground.",
+                            json_out,
+                        );
+                        1
+                    }
+                };
+            }
             match controller.android_session.start(
                 &serial,
                 &dev_name,
@@ -261,21 +298,19 @@ pub fn handle_android(controller: &Arc<Controller>, args: &AndroidArgs, json_out
                             args.as_mic
                         ));
                     }
-                    if args.foreground {
-                        install_signal_handlers();
-                        if !json_out {
-                            info("Streaming in foreground. Press Ctrl-C to stop...");
-                        }
-                        while controller.android_session.is_active() {
-                            if signal_stop_requested() {
-                                let _ = controller.android_session.stop();
-                                if !json_out {
-                                    ok("Stopped Android audio capture session.");
-                                }
-                                break;
+                    install_signal_handlers();
+                    if !json_out {
+                        info("Streaming in foreground. Press Ctrl-C to stop...");
+                    }
+                    while controller.android_session.is_active() {
+                        if signal_stop_requested() {
+                            let _ = controller.android_session.stop();
+                            if !json_out {
+                                ok("Stopped Android audio capture session.");
                             }
-                            thread::sleep(Duration::from_millis(250));
+                            break;
                         }
+                        thread::sleep(Duration::from_millis(250));
                     }
                     0
                 }
@@ -286,24 +321,71 @@ pub fn handle_android(controller: &Arc<Controller>, args: &AndroidArgs, json_out
             }
         }
         "stop" => {
+            if let Some(ipc_res) = try_ipc(
+                "android_stop",
+                serde_json::json!({}),
+                Duration::from_secs(5),
+            ) {
+                return match ipc_res {
+                    Ok(resp) => {
+                        if json_out {
+                            print_json(resp.get("session").unwrap_or(&resp));
+                        } else {
+                            ok("Stopped Android audio capture session.");
+                        }
+                        0
+                    }
+                    Err(e) => {
+                        emit_error(&e, json_out);
+                        1
+                    }
+                };
+            }
             let st = controller.android_session.stop();
             if json_out {
                 print_json(&st);
             } else {
-                ok("Stopped Android audio capture session.");
+                info("SoundHop daemon is not running; no background Android audio session active.");
             }
             0
         }
         "status" => {
-            let sess = controller.android_session.status();
-            let tools = controller.android_tool_status();
-            let devs = controller.android_list_devices();
+            let (sess, tools, devs, ipc_resp) = match try_ipc(
+                "android_status",
+                serde_json::json!({}),
+                Duration::from_secs(4),
+            ) {
+                Some(Ok(resp)) => {
+                    let sess = resp.get("session").cloned().unwrap_or_default();
+                    let tools = resp.get("tools").cloned().unwrap_or_default();
+                    let devs = resp
+                        .get("devices")
+                        .and_then(|v| v.as_array())
+                        .cloned()
+                        .unwrap_or_default();
+                    (sess, tools, devs, Some(resp))
+                }
+                Some(Err(e)) => {
+                    emit_error(&e, json_out);
+                    return 1;
+                }
+                None => (
+                    controller.android_session.status(),
+                    controller.android_tool_status(),
+                    controller.android_list_devices(),
+                    None,
+                ),
+            };
             if json_out {
-                print_json(&serde_json::json!({
-                    "session": sess,
-                    "tools": tools,
-                    "devices": devs,
-                }));
+                if let Some(resp) = ipc_resp {
+                    print_json(&resp);
+                } else {
+                    print_json(&serde_json::json!({
+                        "session": sess,
+                        "tools": tools,
+                        "devices": devs,
+                    }));
+                }
             } else {
                 header("SoundHop Android Audio Bridge Status");
                 let active = sess
@@ -388,6 +470,42 @@ mod tests {
         let args = AndroidArgs {
             action: "bogus".to_string(),
             target: None,
+            source: "output".to_string(),
+            codec: "opus".to_string(),
+            bitrate: "128K".to_string(),
+            buffer: 50,
+            as_mic: false,
+            foreground: false,
+        };
+        assert_eq!(handle_android(&ctrl, &args, true), 1);
+    }
+
+    #[test]
+    fn test_android_start_without_foreground_or_daemon_returns_error() {
+        if soundhop_core::ipc::is_running(None) {
+            return;
+        }
+        let runner = Arc::new(MockRunner::new(|args, _| {
+            Ok(CommandResult {
+                args: args.to_vec(),
+                returncode: 0,
+                stdout: String::new(),
+                stderr: String::new(),
+            })
+        }));
+        let backend = Arc::new(LinuxAudioBackend::with_runner(runner));
+        let ctrl = Arc::new(Controller::new(
+            Some(Config::default()),
+            Some(State::default()),
+            Some(backend),
+            None,
+            None,
+            false,
+        ));
+        ctrl.set_save_enabled(false);
+        let args = AndroidArgs {
+            action: "start".to_string(),
+            target: Some("emulator-5554".to_string()),
             source: "output".to_string(),
             codec: "opus".to_string(),
             bitrate: "128K".to_string(),

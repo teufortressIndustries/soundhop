@@ -32,7 +32,7 @@ use crate::core_cmds::{
 use crate::doctor::{run_bug_report, run_doctor};
 use crate::parser::{Cli, Commands};
 use crate::tui::run_tui;
-use crate::ui::{emit_error, error, set_no_color};
+use crate::ui::{emit_error, set_no_color};
 
 pub fn run_cli() -> i32 {
     let cli = Cli::parse();
@@ -46,14 +46,14 @@ pub fn run_cli() -> i32 {
 
     if let Some(ref tab_name) = cli.gui_tab {
         let tab = GuiTab::from_arg(tab_name);
-        return launch_control_center_with_tray(tab);
+        return launch_control_center_with_tray(tab, cli.json);
     }
 
     if cli.settings_dialog {
         return match run_standalone_settings() {
             Ok(code) => code,
             Err(e) => {
-                error(&e);
+                emit_error(&e, cli.json);
                 1
             }
         };
@@ -63,7 +63,7 @@ pub fn run_cli() -> i32 {
         return match run_standalone_android_wizard() {
             Ok(code) => code,
             Err(e) => {
-                error(&e);
+                emit_error(&e, cli.json);
                 1
             }
         };
@@ -98,7 +98,7 @@ pub fn run_cli() -> i32 {
         Some(Commands::Firewall(ref args)) => handle_firewall(&controller, args, cli.json),
         Some(Commands::Config(ref args)) => handle_config(&controller, args, cli.json),
         Some(Commands::Doctor(ref args)) => run_doctor(&controller, args.fix, cli.json),
-        Some(Commands::Gui) => launch_control_center_with_tray(GuiTab::Home),
+        Some(Commands::Gui) => launch_control_center_with_tray(GuiTab::Home, cli.json),
         Some(Commands::Tray) => match run_tray(cli.verbose) {
             Ok(code) => code,
             Err(e) => {
@@ -116,7 +116,7 @@ pub fn run_cli() -> i32 {
                 match run_tui(controller) {
                     Ok(code) => code,
                     Err(e) => {
-                        error(&e);
+                        emit_error(&e, cli.json);
                         1
                     }
                 }
@@ -150,7 +150,7 @@ fn ensure_background_tray_running() {
     }
 }
 
-fn launch_control_center_with_tray(tab: GuiTab) -> i32 {
+fn launch_control_center_with_tray(tab: GuiTab, json_out: bool) -> i32 {
     let old_instance_running = ipc_ping(None).is_some_and(|p| p.version != VERSION)
         || soundhop_core::util::read_instance_lock_info("tray")
             .is_some_and(|h| h.version != VERSION);
@@ -170,7 +170,7 @@ fn launch_control_center_with_tray(tab: GuiTab) -> i32 {
     match run_standalone_control_center_with_toast(tab, startup_toast) {
         Ok(code) => code,
         Err(e) => {
-            error(&e);
+            emit_error(&e, json_out);
             1
         }
     }

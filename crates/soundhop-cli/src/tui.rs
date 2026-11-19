@@ -269,11 +269,17 @@ impl TuiState {
                 let cfg = lock_or_recover(&self.controller.config).clone();
                 let psk =
                     (!cfg.sharing.psk_hash.is_empty()).then_some(cfg.sharing.psk_hash.as_str());
-                self.peers = discover_once_with_psk(0.8, cfg.discovery.port, &cfg.device.id, psk);
-                for p in &self.peers {
+                let found = discover_once_with_psk(0.8, cfg.discovery.port, &cfg.device.id, psk);
+                let found_count = found.len();
+                for p in &found {
                     self.controller.remember_peer(p);
                 }
-                self.status_message = format!("Discovered {} LAN speaker(s).", self.peers.len());
+                self.merge_live_peers(found);
+                self.refresh_data();
+                self.status_message = format!(
+                    "Discovered {found_count} LAN speaker(s) ({} total).",
+                    self.peers.len()
+                );
             }
             _ => {}
         }
@@ -734,8 +740,16 @@ fn draw_footer_bar(frame: &mut Frame<'_>, area: Rect, state: &TuiState) {
     frame.render_widget(footer, area);
 }
 
+type PanicHook = Arc<dyn Fn(&std::panic::PanicHookInfo<'_>) + Send + Sync + 'static>;
+
+fn restore_terminal() {
+    let _ = disable_raw_mode();
+    let _ = execute!(io::stdout(), LeaveAlternateScreen, Show);
+}
+
 struct TerminalGuard {
     active: bool,
+    prev_hook: Option<PanicHook>,
 }
 
 impl TerminalGuard {
@@ -745,15 +759,29 @@ impl TerminalGuard {
             let _ = disable_raw_mode();
             return Err(format!("Failed to enter alternate screen: {e}"));
         }
-        Ok(Self { active: true })
+        let prev_hook: PanicHook = Arc::from(std::panic::take_hook());
+        let prev_for_panic = Arc::clone(&prev_hook);
+        std::panic::set_hook(Box::new(move |info| {
+            restore_terminal();
+            prev_for_panic(info);
+        }));
+        Ok(Self {
+            active: true,
+            prev_hook: Some(prev_hook),
+        })
     }
 }
 
 impl Drop for TerminalGuard {
     fn drop(&mut self) {
         if self.active {
-            let _ = disable_raw_mode();
-            let _ = execute!(io::stdout(), LeaveAlternateScreen, Show);
+            restore_terminal();
+            if !std::thread::panicking() {
+                if let Some(prev) = self.prev_hook.take() {
+                    std::panic::set_hook(Box::new(move |info| prev(info)));
+                }
+            }
+            self.active = false;
         }
     }
 }
@@ -885,5 +913,46 @@ mod tests {
 
         tui_state.handle_key(KeyCode::Char('q'));
         assert!(tui_state.should_quit);
+    }
+
+    #[test]
+    fn test_merge_live_peers_preserves_existing_private_peers() {
+        let runner = Arc::new(MockRunner::new(|args, _| {
+            Ok(CommandResult {
+                args: args.to_vec(),
+                returncode: 0,
+                stdout: String::new(),
+                stderr: String::new(),
+            })
+        }));
+        let backend = Arc::new(LinuxAudioBackend::with_runner(runner));
+        let ctrl = Arc::new(Controller::new(
+            Some(Config::default()),
+            Some(State::default()),
+            Some(backend),
+            None,
+            None,
+            false,
+        ));
+        ctrl.set_save_enabled(false);
+
+        let mut tui_state = TuiState::new(ctrl);
+        let existing = Peer {
+            id: "peer-old".to_string(),
+            name: "Bedroom".to_string(),
+            host: "192.168.10.20".to_string(),
+            port: 4713,
+            version: soundhop_core::constants::VERSION.to_string(),
+            protocol: soundhop_core::constants::PROTOCOL_VERSION,
+            security: "trusted-lan".to_string(),
+            platform: "linux".to_string(),
+            last_seen: 100.0,
+            source: "udp".to_string(),
+            rtt_ms: Some(1.5),
+        };
+        tui_state.peers = vec![existing.clone()];
+        tui_state.merge_live_peers(Vec::new());
+        assert_eq!(tui_state.peers.len(), 1);
+        assert_eq!(tui_state.peers[0].id, existing.id);
     }
 }

@@ -11,6 +11,41 @@ use soundhop_core::util::{config_path, local_addresses, state_path};
 
 use crate::ui::{error, header, info, lock_or_recover, ok, print_json, safe_print, warning};
 
+#[cfg(target_os = "linux")]
+fn list_appimage_mounts() -> Vec<String> {
+    let mut mounts = Vec::new();
+    if let Ok(content) = std::fs::read_to_string("/proc/self/mountinfo") {
+        for line in content.lines() {
+            if let Some(pos) = line.find(" /tmp/.mount_SoundH") {
+                let part = &line[pos + 1..];
+                if let Some(end) = part.find(' ') {
+                    let path = part[..end].to_string();
+                    if !mounts.contains(&path) {
+                        mounts.push(path);
+                    }
+                }
+            }
+        }
+    }
+    mounts
+}
+
+#[cfg(target_os = "linux")]
+fn unmount_fuse(mount_point: &str) -> std::io::Result<std::process::Output> {
+    let mut cmd = std::process::Command::new("fusermount");
+    cmd.args(["-u", mount_point]);
+    soundhop_core::util::close_fds_pre_exec(&mut cmd);
+    match cmd.output() {
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+            let mut cmd3 = std::process::Command::new("fusermount3");
+            cmd3.args(["-u", mount_point]);
+            soundhop_core::util::close_fds_pre_exec(&mut cmd3);
+            cmd3.output()
+        }
+        res => res,
+    }
+}
+
 pub fn run_doctor(controller: &Arc<Controller>, fix: bool, json_out: bool) -> i32 {
     let cfg = lock_or_recover(&controller.config).clone();
     let backend_ok = controller.backend.available();
@@ -33,7 +68,7 @@ pub fn run_doctor(controller: &Arc<Controller>, fix: bool, json_out: bool) -> i3
         }
     }
 
-    let fw = detect_firewall();
+    let mut fw = detect_firewall();
     if fix && fw.active {
         let fw_res = open_ports(
             cfg.sharing.port,
@@ -55,11 +90,12 @@ pub fn run_doctor(controller: &Arc<Controller>, fix: bool, json_out: bool) -> i3
                 }
             }
         }
+        fw = detect_firewall();
     }
 
-    let svc = service_status();
-    let svc_active = svc.get("active").and_then(|v| v.as_bool()).unwrap_or(false);
-    let daemon_ipc = ipc_is_running(None);
+    let mut svc = service_status();
+    let mut svc_active = svc.get("active").and_then(|v| v.as_bool()).unwrap_or(false);
+    let mut daemon_ipc = ipc_is_running(None);
     if fix && !svc_active && !daemon_ipc {
         let svc_res = install_service(true, true, true);
         let enabled = svc_res
@@ -78,26 +114,13 @@ pub fn run_doctor(controller: &Arc<Controller>, fix: bool, json_out: bool) -> i3
                 "Failed to install/start user service (enabled={enabled}, started={started})"
             ));
         }
+        svc = service_status();
+        svc_active = svc.get("active").and_then(|v| v.as_bool()).unwrap_or(false);
+        daemon_ipc = ipc_is_running(None);
     }
 
     #[cfg(target_os = "linux")]
-    let appimage_mounts: Vec<String> = {
-        let mut mounts = Vec::new();
-        if let Ok(content) = std::fs::read_to_string("/proc/self/mountinfo") {
-            for line in content.lines() {
-                if let Some(pos) = line.find(" /tmp/.mount_SoundH") {
-                    let part = &line[pos + 1..];
-                    if let Some(end) = part.find(' ') {
-                        let path = part[..end].to_string();
-                        if !mounts.contains(&path) {
-                            mounts.push(path);
-                        }
-                    }
-                }
-            }
-        }
-        mounts
-    };
+    let mut appimage_mounts: Vec<String> = list_appimage_mounts();
     #[cfg(not(target_os = "linux"))]
     let appimage_mounts: Vec<String> = Vec::new();
 
@@ -110,10 +133,7 @@ pub fn run_doctor(controller: &Arc<Controller>, fix: bool, json_out: bool) -> i3
             .iter()
             .filter(|m| own_mount.as_deref() != Some(m.as_str()))
         {
-            let mut cmd = std::process::Command::new("fusermount");
-            cmd.args(["-u", m]);
-            soundhop_core::util::close_fds_pre_exec(&mut cmd);
-            match cmd.output() {
+            match unmount_fuse(m) {
                 Ok(out) if out.status.success() => {
                     fixed_actions.push(format!("Unmounted stale AppImage mount {m}"));
                 }
@@ -131,10 +151,11 @@ pub fn run_doctor(controller: &Arc<Controller>, fix: bool, json_out: bool) -> i3
                 }
                 Err(e) => {
                     fix_failed = true;
-                    fix_errors.push(format!("Failed to run fusermount -u {m}: {e}"));
+                    fix_errors.push(format!("Failed to run fusermount/fusermount3 -u {m}: {e}"));
                 }
             }
         }
+        appimage_mounts = list_appimage_mounts();
     }
 
     let addrs = local_addresses(false);

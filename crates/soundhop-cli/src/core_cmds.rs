@@ -34,7 +34,7 @@ use crate::ui::{
     emit_error, header, info, lock_or_recover, ok, print_json, safe_print, sym_arrow, warning,
 };
 
-fn try_ipc(
+pub(crate) fn try_ipc(
     command: &str,
     payload: serde_json::Value,
     timeout: Duration,
@@ -268,8 +268,17 @@ pub fn handle_status(controller: &Arc<Controller>, json_out: bool) -> i32 {
 }
 
 pub fn handle_discover(controller: &Arc<Controller>, args: &DiscoverArgs, json_out: bool) -> i32 {
-    let peers: Vec<Peer> = match try_ipc("discover", serde_json::json!({}), Duration::from_secs(5))
-    {
+    let timeout = if args.timeout.is_finite() {
+        args.timeout.max(0.3)
+    } else {
+        2.5
+    };
+    let ipc_timeout = Duration::from_secs_f64((timeout + 3.0).max(5.0));
+    let peers: Vec<Peer> = match try_ipc(
+        "discover",
+        serde_json::json!({ "timeout": timeout }),
+        ipc_timeout,
+    ) {
         Some(Ok(resp)) => resp
             .get("peers")
             .and_then(|v| v.as_array())
@@ -286,11 +295,6 @@ pub fn handle_discover(controller: &Arc<Controller>, args: &DiscoverArgs, json_o
         None => {
             let cfg = lock_or_recover(&controller.config).clone();
             let psk = (!cfg.sharing.psk_hash.is_empty()).then_some(cfg.sharing.psk_hash.as_str());
-            let timeout = if args.timeout.is_finite() {
-                args.timeout.max(0.3)
-            } else {
-                2.5
-            };
             let found = discover_once_with_psk(timeout, cfg.discovery.port, &cfg.device.id, psk);
             for p in &found {
                 controller.remember_peer(p);
@@ -401,19 +405,24 @@ pub fn handle_connect(controller: &Arc<Controller>, args: &ConnectArgs, json_out
         None
     };
 
-    let payload = if args.targets.len() > 1 || args.combine {
+    let mut payload = if args.targets.len() > 1 || args.combine {
         serde_json::json!({
             "peers": args.targets,
             "keep_local": args.keep_local,
             "switch_default": switch_default,
+            "remember": args.remember,
         })
     } else {
         serde_json::json!({
             "peer": args.targets.first().cloned().unwrap_or_default(),
             "keep_local": args.keep_local,
             "switch_default": switch_default,
+            "remember": args.remember,
         })
     };
+    if let Some(lat) = args.latency {
+        payload["latency_ms"] = serde_json::json!(lat);
+    }
     if let Some(ipc_res) = try_ipc("connect", payload, Duration::from_secs(12)) {
         return match ipc_res {
             Ok(resp) => {
@@ -532,26 +541,27 @@ pub fn handle_disconnect(controller: &Arc<Controller>, json_out: bool) -> i32 {
 }
 
 pub fn handle_share(controller: &Arc<Controller>, args: &ShareArgs, json_out: bool) -> i32 {
-    if let Some(p) = args.port {
-        lock_or_recover(&controller.config).sharing.port = p;
-    }
+    let mut port_override = args.port;
     let enable_opt: Option<bool> = match &args.action {
         Some(ShareAction::On { port }) => {
             if let Some(p) = port {
-                lock_or_recover(&controller.config).sharing.port = *p;
+                port_override = Some(*p);
             }
             Some(true)
         }
         Some(ShareAction::Off) => Some(false),
         Some(ShareAction::Status) | None => None,
     };
+    if let Some(p) = port_override {
+        lock_or_recover(&controller.config).sharing.port = p;
+    }
 
     if let Some(enable) = enable_opt {
-        if let Some(ipc_res) = try_ipc(
-            "share",
-            serde_json::json!({ "enabled": enable }),
-            Duration::from_secs(4),
-        ) {
+        let mut payload = serde_json::json!({ "enabled": enable });
+        if let Some(p) = port_override {
+            payload["port"] = serde_json::json!(p);
+        }
+        if let Some(ipc_res) = try_ipc("share", payload, Duration::from_secs(4)) {
             return match ipc_res {
                 Ok(resp) => {
                     if json_out {
@@ -652,7 +662,7 @@ pub fn handle_pair(controller: &Arc<Controller>, args: &PairArgs, json_out: bool
         if json_out {
             print_json(&serde_json::json!({ "pin": pin }));
         } else {
-            ok(&format!("Generated 6-digit pairing PIN: {pin}"));
+            ok(&format!("Generated 12-character pairing code: {pin}"));
         }
         return 0;
     }
@@ -1394,7 +1404,98 @@ pub fn handle_service(args: &ServiceArgs, json_out: bool) -> i32 {
     if json_out {
         print_json(&res);
     } else {
-        safe_print(&serde_json::to_string_pretty(&res).unwrap_or_default());
+        match act.as_str() {
+            "install" => {
+                if action_ok {
+                    ok("Installed, enabled, and started SoundHop user service.");
+                    if let Some(tray_path) = res
+                        .get("tray_autostart")
+                        .and_then(|v| v.as_str())
+                        .filter(|s| !s.is_empty())
+                    {
+                        info(&format!("Tray autostart: {tray_path}"));
+                    }
+                } else if let Some(err) = res.get("error").and_then(|v| v.as_str()) {
+                    emit_error(err, false);
+                } else {
+                    let enabled = res
+                        .get("enabled")
+                        .and_then(|v| v.as_bool())
+                        .unwrap_or(false);
+                    let started = res
+                        .get("started")
+                        .and_then(|v| v.as_bool())
+                        .unwrap_or(false);
+                    emit_error(
+                        &format!(
+                            "Failed to install/start SoundHop user service (enabled={enabled}, started={started})."
+                        ),
+                        false,
+                    );
+                }
+            }
+            "uninstall" | "remove" => {
+                if action_ok {
+                    ok("Removed SoundHop user service and autostart entries.");
+                } else {
+                    info("SoundHop user service was not installed.");
+                }
+            }
+            "start" => {
+                if action_ok {
+                    ok("Started SoundHop user service.");
+                } else {
+                    emit_error("Failed to start SoundHop user service.", false);
+                }
+            }
+            "stop" => {
+                if action_ok {
+                    ok("Stopped SoundHop user service.");
+                } else {
+                    emit_error("Failed to stop SoundHop user service.", false);
+                }
+            }
+            "restart" => {
+                if action_ok {
+                    ok("Restarted SoundHop user service.");
+                } else {
+                    emit_error("Failed to restart SoundHop user service.", false);
+                }
+            }
+            "status" => {
+                let installed = res
+                    .get("installed")
+                    .and_then(|v| v.as_bool())
+                    .unwrap_or(false);
+                let enabled = res
+                    .get("enabled")
+                    .and_then(|v| v.as_bool())
+                    .unwrap_or(false);
+                let active = res.get("active").and_then(|v| v.as_bool()).unwrap_or(false);
+                let tray = res
+                    .get("tray_autostart")
+                    .and_then(|v| v.as_bool())
+                    .unwrap_or(false);
+                let unit = res.get("unit").and_then(|v| v.as_str()).unwrap_or("");
+                header("SoundHop User Service Status");
+                if active {
+                    ok("Service: active (running)");
+                } else if installed {
+                    warning("Service: inactive (stopped)");
+                } else {
+                    info("Service: not installed");
+                }
+                info(&format!(
+                    "Enabled: {}  Tray autostart: {}",
+                    if enabled { "yes" } else { "no" },
+                    if tray { "yes" } else { "no" }
+                ));
+                if !unit.is_empty() {
+                    info(&format!("Unit: {unit}"));
+                }
+            }
+            _ => {}
+        }
     }
     if action_ok {
         0
@@ -1456,6 +1557,43 @@ pub fn handle_firewall(controller: &Arc<Controller>, args: &FirewallArgs, json_o
     }
 }
 
+fn config_json_diff(
+    before: &serde_json::Value,
+    after: &serde_json::Value,
+    dotted_key: &str,
+) -> serde_json::Value {
+    let mut patch = serde_json::Map::new();
+    if let (Some(b_obj), Some(a_obj)) = (before.as_object(), after.as_object()) {
+        for (sec_name, a_sec) in a_obj {
+            if let (Some(b_sec_obj), Some(a_sec_obj)) = (
+                b_obj.get(sec_name).and_then(|v| v.as_object()),
+                a_sec.as_object(),
+            ) {
+                let mut sec_diff = serde_json::Map::new();
+                for (k, v) in a_sec_obj {
+                    if b_sec_obj.get(k) != Some(v) {
+                        sec_diff.insert(k.clone(), v.clone());
+                    }
+                }
+                if !sec_diff.is_empty() {
+                    patch.insert(sec_name.clone(), serde_json::Value::Object(sec_diff));
+                }
+            }
+        }
+        if patch.is_empty() {
+            let parts: Vec<&str> = dotted_key.split('.').collect();
+            if parts.len() == 2 {
+                if let Some(val) = a_obj.get(parts[0]).and_then(|s| s.get(parts[1])) {
+                    let mut sec = serde_json::Map::new();
+                    sec.insert(parts[1].to_string(), val.clone());
+                    patch.insert(parts[0].to_string(), serde_json::Value::Object(sec));
+                }
+            }
+        }
+    }
+    serde_json::Value::Object(patch)
+}
+
 pub fn handle_config(controller: &Arc<Controller>, args: &ConfigArgs, json_out: bool) -> i32 {
     let act = args.action.trim().to_lowercase();
     match act.as_str() {
@@ -1470,6 +1608,31 @@ pub fn handle_config(controller: &Arc<Controller>, args: &ConfigArgs, json_out: 
         }
         "reset" => {
             let mut def = Config::default();
+            if let Some(ipc_res) = try_ipc(
+                "config_patch",
+                serde_json::json!({ "patch": def.to_json_value() }),
+                Duration::from_secs(4),
+            ) {
+                return match ipc_res {
+                    Ok(resp) => {
+                        if let Some(cfg_val) = resp.get("config") {
+                            if let Ok(parsed) = serde_json::from_value::<Config>(cfg_val.clone()) {
+                                *lock_or_recover(&controller.config) = parsed;
+                            }
+                        }
+                        if json_out {
+                            print_json(resp.get("config").unwrap_or(&def.to_json_value()));
+                        } else {
+                            ok("Reset configuration to defaults.");
+                        }
+                        0
+                    }
+                    Err(e) => {
+                        emit_error(&e, json_out);
+                        1
+                    }
+                };
+            }
             if let Err(e) = def.save(None) {
                 emit_error(
                     &format!("Failed to save reset configuration: {e}"),
@@ -1520,8 +1683,34 @@ pub fn handle_config(controller: &Arc<Controller>, args: &ConfigArgs, json_out: 
                 return 1;
             };
             let mut cfg = lock_or_recover(&controller.config).clone();
+            let before_json = cfg.to_json_value();
             match cfg.set_dotted(key, val) {
                 Ok(()) => {
+                    let after_json = cfg.to_json_value();
+                    let patch = config_json_diff(&before_json, &after_json, key);
+                    if let Some(ipc_res) = try_ipc(
+                        "config_patch",
+                        serde_json::json!({ "patch": patch }),
+                        Duration::from_secs(4),
+                    ) {
+                        return match ipc_res {
+                            Ok(_) => {
+                                *lock_or_recover(&controller.config) = cfg;
+                                if json_out {
+                                    print_json(
+                                        &serde_json::json!({ "ok": true, "key": key, "value": val }),
+                                    );
+                                } else {
+                                    ok(&format!("Updated {key} = {val}"));
+                                }
+                                0
+                            }
+                            Err(e) => {
+                                emit_error(&e, json_out);
+                                1
+                            }
+                        };
+                    }
                     if let Err(e) = cfg.save(None) {
                         emit_error(&format!("Failed to save configuration: {e}"), json_out);
                         return 1;
@@ -1560,6 +1749,46 @@ pub fn handle_config(controller: &Arc<Controller>, args: &ConfigArgs, json_out: 
 }
 
 pub fn handle_logs(controller: &Arc<Controller>, args: &LogsArgs, json_out: bool) -> i32 {
+    if let Some(ipc_res) = try_ipc(
+        "logs",
+        serde_json::json!({ "lines": args.lines }),
+        Duration::from_secs(4),
+    ) {
+        return match ipc_res {
+            Ok(resp) => {
+                let all_lines: Vec<String> = resp
+                    .get("lines")
+                    .and_then(|v| v.as_array())
+                    .map(|arr| {
+                        arr.iter()
+                            .filter_map(|item| item.as_str().map(ToString::to_string))
+                            .collect()
+                    })
+                    .unwrap_or_default();
+                let start = all_lines.len().saturating_sub(args.lines);
+                let tail = &all_lines[start..];
+                if json_out {
+                    print_json(&serde_json::json!({
+                        "ok": true,
+                        "lines": args.lines,
+                        "logs": tail,
+                    }));
+                } else if tail.is_empty() {
+                    info("No recent daemon/session logs recorded.");
+                } else {
+                    for line in tail {
+                        safe_print(line);
+                    }
+                }
+                0
+            }
+            Err(e) => {
+                emit_error(&e, json_out);
+                1
+            }
+        };
+    }
+
     let sess = controller.android_session.status();
     let logs = sess
         .get("recent_logs")
@@ -1568,11 +1797,13 @@ pub fn handle_logs(controller: &Arc<Controller>, args: &LogsArgs, json_out: bool
         .unwrap_or_default();
     if json_out {
         print_json(&serde_json::json!({
+            "ok": true,
+            "daemon_running": false,
             "lines": args.lines,
             "logs": logs,
         }));
     } else if logs.is_empty() {
-        info("No recent session logs recorded.");
+        info("SoundHop daemon is not running; no recent session logs available.");
     } else {
         for l in logs.iter().rev().take(args.lines).rev() {
             if let Some(s) = l.as_str() {
@@ -1751,5 +1982,25 @@ mod tests {
             .routing
             .always_remote
             .is_empty());
+    }
+
+    #[test]
+    fn test_config_json_diff_builds_minimal_patch() {
+        let mut cfg = Config::default();
+        let before = cfg.to_json_value();
+        cfg.set_dotted("device.name", "LivingRoom").unwrap();
+        let after = cfg.to_json_value();
+
+        let patch = config_json_diff(&before, &after, "device.name");
+        assert_eq!(
+            patch,
+            serde_json::json!({ "device": { "name": "LivingRoom" } })
+        );
+
+        let same_patch = config_json_diff(&after, &after, "device.name");
+        assert_eq!(
+            same_patch,
+            serde_json::json!({ "device": { "name": "LivingRoom" } })
+        );
     }
 }
