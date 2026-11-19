@@ -51,9 +51,9 @@ pub const PA_COMMAND_PREBUF_PLAYBACK_STREAM: u32 = 60;
 pub const PA_COMMAND_REQUEST: u32 = 61;
 pub const PA_COMMAND_OVERFLOW: u32 = 62;
 pub const PA_COMMAND_UNDERFLOW: u32 = 63;
-pub const PA_COMMAND_SET_SINK_INPUT_MUTE: u32 = 70;
-pub const PA_COMMAND_SET_PLAYBACK_STREAM_BUFFER_ATTR: u32 = 73;
-pub const PA_COMMAND_STARTED: u32 = 87;
+pub const PA_COMMAND_SET_SINK_INPUT_MUTE: u32 = 69;
+pub const PA_COMMAND_SET_PLAYBACK_STREAM_BUFFER_ATTR: u32 = 72;
+pub const PA_COMMAND_STARTED: u32 = 86;
 
 // PulseAudio Error Codes (from src/pulse/def.h)
 pub const PA_ERR_ACCESS: u32 = 1;
@@ -1216,6 +1216,27 @@ mod tests {
                 "unconsumed reply bytes at protocol v{ver}"
             );
         }
+    }
+
+    #[test]
+    fn test_command_id_constants_match_native_common_h() {
+        assert_eq!(PA_COMMAND_ERROR, 0);
+        assert_eq!(PA_COMMAND_REPLY, 2);
+        assert_eq!(PA_COMMAND_CREATE_PLAYBACK_STREAM, 3);
+        assert_eq!(PA_COMMAND_AUTH, 8);
+        assert_eq!(PA_COMMAND_SET_CLIENT_NAME, 9);
+        assert_eq!(PA_COMMAND_DRAIN_PLAYBACK_STREAM, 12);
+        assert_eq!(PA_COMMAND_GET_PLAYBACK_LATENCY, 14);
+        assert_eq!(PA_COMMAND_GET_SERVER_INFO, 20);
+        assert_eq!(PA_COMMAND_GET_SINK_INFO, 21);
+        assert_eq!(PA_COMMAND_GET_SINK_INFO_LIST, 22);
+        assert_eq!(PA_COMMAND_CORK_PLAYBACK_STREAM, 41);
+        assert_eq!(PA_COMMAND_FLUSH_PLAYBACK_STREAM, 42);
+        assert_eq!(PA_COMMAND_REQUEST, 61);
+        assert_eq!(PA_COMMAND_UNDERFLOW, 63);
+        assert_eq!(PA_COMMAND_SET_SINK_INPUT_MUTE, 69);
+        assert_eq!(PA_COMMAND_SET_PLAYBACK_STREAM_BUFFER_ATTR, 72);
+        assert_eq!(PA_COMMAND_STARTED, 86);
     }
 
     #[test]
