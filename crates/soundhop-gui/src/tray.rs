@@ -1233,6 +1233,77 @@ fn find_legacy_tray_holder() -> Option<InstanceLockInfo> {
     None
 }
 
+/// Pump pending native OS UI events without blocking.
+///
+/// Returns `false` if the platform event loop signaled a quit request
+/// (e.g., `WM_QUIT` on Windows), or `true` to keep running.
+#[cfg(target_os = "linux")]
+fn pump_platform_events() -> bool {
+    while gtk::events_pending() {
+        gtk::main_iteration_do(false);
+    }
+    true
+}
+
+/// Pump pending native OS UI events without blocking.
+///
+/// Returns `false` if the platform event loop signaled a quit request
+/// (`WM_QUIT`), or `true` to keep running.
+#[cfg(target_os = "windows")]
+fn pump_platform_events() -> bool {
+    use windows_sys::Win32::UI::WindowsAndMessaging::{
+        DispatchMessageW, PeekMessageW, TranslateMessage, MSG, PM_REMOVE, WM_QUIT,
+    };
+
+    // SAFETY: `MSG` is a plain-old-data C struct populated by `PeekMessageW`.
+    let mut msg: MSG = unsafe { std::mem::zeroed() };
+    // SAFETY: Passing a null HWND pumps all queued messages for the current thread
+    // (required on Windows for `tray-icon` and `muda` menu callbacks).
+    while unsafe { PeekMessageW(&mut msg, std::ptr::null_mut(), 0, 0, PM_REMOVE) } != 0 {
+        if msg.message == WM_QUIT {
+            return false;
+        }
+        // SAFETY: `msg` was just populated by `PeekMessageW`.
+        unsafe {
+            TranslateMessage(&msg);
+            DispatchMessageW(&msg);
+        }
+    }
+    true
+}
+
+/// Pump pending native OS UI events without blocking.
+///
+/// Returns `false` if the platform event loop signaled a quit request,
+/// or `true` to keep running.
+#[cfg(target_os = "macos")]
+fn pump_platform_events() -> bool {
+    use core_foundation::runloop::{
+        kCFRunLoopDefaultMode, kCFRunLoopRunHandledSource, CFRunLoopRunInMode,
+    };
+
+    const MAX_PUMP_ITERATIONS: usize = 64;
+    for _ in 0..MAX_PUMP_ITERATIONS {
+        // SAFETY: `kCFRunLoopDefaultMode` is a valid CoreFoundation run-loop mode
+        // constant, and `CFRunLoopRunInMode` is called on the main thread with a
+        // zero timeout and `returnAfterSourceHandled = 1` (non-blocking).
+        let result = unsafe { CFRunLoopRunInMode(kCFRunLoopDefaultMode, 0.0, 1) };
+        if result != kCFRunLoopRunHandledSource {
+            break;
+        }
+    }
+    true
+}
+
+/// Pump pending native OS UI events without blocking.
+///
+/// Returns `false` if the platform event loop signaled a quit request,
+/// or `true` to keep running.
+#[cfg(not(any(target_os = "linux", target_os = "windows", target_os = "macos")))]
+fn pump_platform_events() -> bool {
+    true
+}
+
 /// Runs the native system tray and embedded background daemon loop.
 pub fn run_tray(verbose: bool) -> Result<i32, String> {
     let _ = sync_appimage_paths_if_installed(true);
@@ -1319,11 +1390,9 @@ pub fn run_tray(verbose: bool) -> Result<i32, String> {
     });
 
     while running.load(Ordering::Relaxed) && !soundhop_core::util::signal_stop_requested() {
-        #[cfg(target_os = "linux")]
-        {
-            while gtk::events_pending() {
-                gtk::main_iteration_do(false);
-            }
+        if !pump_platform_events() {
+            running.store(false, Ordering::SeqCst);
+            break;
         }
 
         while let Ok(event) = TrayIconEvent::receiver().try_recv() {

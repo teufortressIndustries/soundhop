@@ -3675,6 +3675,7 @@ dependencies = [
 name = "soundhop-gui"
 version = "2.1.2"
 dependencies = [
+ "core-foundation",
  "eframe",
  "egui",
  "gtk",
@@ -3685,6 +3686,7 @@ dependencies = [
  "soundhop-core",
  "tracing",
  "tray-icon",
+ "windows-sys 0.61.2",
 ]
 
 [[package]]
