@@ -18,11 +18,21 @@ use crate::backend::windows::audio::{
     list_audio_endpoints, WindowsLoopbackRecorder, WindowsPlayer,
 };
 use crate::backend::windows::protocol::{
-    make_command_auth, make_command_create_playback_stream, make_command_set_client_name,
-    make_reply_auth, make_reply_create_playback_stream, make_reply_ok, make_reply_server_info,
-    read_packet, write_packet, SampleSpec, TagStructReader, PA_COMMAND_AUTH,
-    PA_COMMAND_CREATE_PLAYBACK_STREAM, PA_COMMAND_GET_SERVER_INFO, PA_COMMAND_REPLY,
-    PA_COMMAND_SET_CLIENT_NAME,
+    default_channel_map, make_command_auth, make_command_create_playback_stream,
+    make_command_request, make_command_set_client_name, make_reply_auth,
+    make_reply_create_playback_stream, make_reply_error, make_reply_ok,
+    make_reply_playback_latency, make_reply_server_info, make_reply_set_client_name,
+    make_reply_sink_info, make_reply_u32, negotiate_protocol_version, parse_create_playback_stream,
+    read_packet, write_packet, BufferAttr, SampleSpec, TagStructReader, DEFAULT_MINREQ,
+    PA_COMMAND_AUTH, PA_COMMAND_CORK_PLAYBACK_STREAM, PA_COMMAND_CREATE_PLAYBACK_STREAM,
+    PA_COMMAND_DELETE_PLAYBACK_STREAM, PA_COMMAND_DRAIN_PLAYBACK_STREAM, PA_COMMAND_EXIT,
+    PA_COMMAND_FLUSH_PLAYBACK_STREAM, PA_COMMAND_GET_PLAYBACK_LATENCY, PA_COMMAND_GET_SERVER_INFO,
+    PA_COMMAND_GET_SINK_INFO, PA_COMMAND_GET_SINK_INFO_LIST, PA_COMMAND_LOOKUP_SINK,
+    PA_COMMAND_OVERFLOW, PA_COMMAND_PREBUF_PLAYBACK_STREAM, PA_COMMAND_REPLY,
+    PA_COMMAND_SET_CLIENT_NAME, PA_COMMAND_SET_SINK_INPUT_MUTE, PA_COMMAND_SET_SINK_INPUT_VOLUME,
+    PA_COMMAND_SET_SINK_MUTE, PA_COMMAND_SET_SINK_VOLUME, PA_COMMAND_SUBSCRIBE,
+    PA_COMMAND_TRIGGER_PLAYBACK_STREAM, PA_COMMAND_UNDERFLOW, PA_ERR_ACCESS, PA_INVALID_INDEX,
+    PA_PROTOCOL_VERSION, PA_PROTOCOL_VERSION_MASK,
 };
 use crate::backend::{
     AudioBackend, BackendError, Listener, Module, Sink, SinkInput, SinkInputInfo, Source,
@@ -467,7 +477,7 @@ impl AudioBackend for WindowsAudioBackend {
         // PulseAudio Native Protocol Handshake
         let cookie = load_cookie_bytes().unwrap_or([0u8; 256]);
         stream
-            .write_all(&make_command_auth(0, 35, &cookie))
+            .write_all(&make_command_auth(0, PA_PROTOCOL_VERSION, &cookie))
             .map_err(|e| BackendError::Message(format!("PA auth send failed: {e}")))?;
         let auth_reply = read_packet(&mut stream)
             .map_err(|e| BackendError::Message(format!("No PA auth reply: {e}")))?;
@@ -475,15 +485,23 @@ impl AudioBackend for WindowsAudioBackend {
         if r.read_u32().unwrap_or(0) != PA_COMMAND_REPLY {
             return Err(BackendError::Message("PA auth rejected".to_string()));
         }
+        let _auth_tag = r.read_u32().unwrap_or(0);
+        let server_ver = r.read_u32().unwrap_or(PA_PROTOCOL_VERSION) & PA_PROTOCOL_VERSION_MASK;
+        let negotiated_ver = server_ver.min(PA_PROTOCOL_VERSION);
 
         stream
-            .write_all(&make_command_set_client_name(1, "SoundHop-Windows"))
+            .write_all(&make_command_set_client_name(
+                1,
+                negotiated_ver,
+                "SoundHop-Windows",
+            ))
             .ok();
         let _ = read_packet(&mut stream);
 
         stream
             .write_all(&make_command_create_playback_stream(
                 2,
+                negotiated_ver,
                 None,
                 SampleSpec::default(),
             ))
@@ -497,8 +515,8 @@ impl AudioBackend for WindowsAudioBackend {
             ));
         }
         let _tag = sr.read_u32().unwrap_or(0);
-        let _stream_index = sr.read_u32().unwrap_or(0);
         let data_channel = sr.read_u32().unwrap_or(0);
+        let _stream_index = sr.read_u32().unwrap_or(0);
 
         let mod_id = self.next_module_id.fetch_add(1, Ordering::SeqCst);
         let stop_flag = Arc::new(AtomicBool::new(false));
@@ -797,7 +815,12 @@ fn handle_incoming_pa_client_with_cookie(
     let _ = stream.set_read_timeout(Some(Duration::from_millis(500)));
 
     let mut authenticated = !cookie_required;
+    let mut protocol_version = PA_PROTOCOL_VERSION;
     let mut player: Option<WindowsPlayer> = None;
+    let stream_channel: u32 = 0;
+    let mut minreq: u32 = DEFAULT_MINREQ;
+    let mut bytes_written: i64 = 0;
+    let mut uncredited_bytes: u32 = 0;
 
     while !stop_flag.load(Ordering::SeqCst) {
         let pkt = match read_packet(&mut stream) {
@@ -820,31 +843,115 @@ fn handle_incoming_pa_client_with_cookie(
             let Ok(tag) = r.read_u32() else {
                 continue;
             };
+            let mut follow_up: Option<Vec<u8>> = None;
+            let mut should_close = false;
             let reply = match cmd {
                 PA_COMMAND_AUTH => {
-                    let _proto_ver = r.read_u32();
+                    let raw_ver = r.read_u32().unwrap_or(0);
                     let client_cookie = r.read_arbitrary().unwrap_or_default();
                     if let Some(ref exp) = expected_cookie {
                         if !crate::security::constant_time_eq(&client_cookie, exp) {
+                            let _ = stream.write_all(&make_reply_error(tag, PA_ERR_ACCESS));
                             break;
                         }
                     }
-                    authenticated = true;
-                    Some(make_reply_auth(tag, 35))
+                    match negotiate_protocol_version(raw_ver) {
+                        Ok(ver) => {
+                            protocol_version = ver;
+                            authenticated = true;
+                            Some(make_reply_auth(tag, ver))
+                        }
+                        Err(err_code) => {
+                            let _ = stream.write_all(&make_reply_error(tag, err_code));
+                            break;
+                        }
+                    }
                 }
                 _ if !authenticated => {
+                    let _ = stream.write_all(&make_reply_error(tag, PA_ERR_ACCESS));
                     break;
                 }
-                PA_COMMAND_SET_CLIENT_NAME => Some(make_reply_ok(tag)),
-                PA_COMMAND_GET_SERVER_INFO => Some(make_reply_server_info(tag)),
+                PA_COMMAND_SET_CLIENT_NAME => {
+                    Some(make_reply_set_client_name(tag, protocol_version, 0))
+                }
+                PA_COMMAND_GET_SERVER_INFO => Some(make_reply_server_info(tag, protocol_version)),
+                PA_COMMAND_GET_SINK_INFO | PA_COMMAND_GET_SINK_INFO_LIST => {
+                    Some(make_reply_sink_info(tag, protocol_version, 100, false))
+                }
+                PA_COMMAND_LOOKUP_SINK => Some(make_reply_u32(tag, 0)),
                 PA_COMMAND_CREATE_PLAYBACK_STREAM => {
-                    let spec = r.read_sample_spec().unwrap_or_default();
+                    let parsed = parse_create_playback_stream(&mut r, protocol_version);
+                    let (spec, ch_map, buf_attr) = match parsed {
+                        Ok(req) => (req.spec, req.channel_map, req.buffer_attr),
+                        Err(_) => {
+                            let spec = SampleSpec::default();
+                            (
+                                spec,
+                                default_channel_map(spec.channels),
+                                BufferAttr::default(),
+                            )
+                        }
+                    };
                     if player.is_none() {
                         let wp = WindowsPlayer::new(spec.rate.max(8_000), spec.channels.max(1));
                         wp.start();
                         player = Some(wp);
                     }
-                    Some(make_reply_create_playback_stream(tag, 0, 0, spec))
+                    minreq = buf_attr.minreq.max(1_024);
+                    uncredited_bytes = 0;
+                    let initial_missing = (buf_attr.tlength / 2).max(minreq);
+                    let initial_request =
+                        buf_attr.tlength.saturating_sub(initial_missing).max(minreq);
+                    follow_up = Some(make_command_request(stream_channel, initial_request));
+                    Some(make_reply_create_playback_stream(
+                        tag,
+                        protocol_version,
+                        stream_channel,
+                        0,
+                        initial_missing,
+                        buf_attr,
+                        spec,
+                        &ch_map,
+                    ))
+                }
+                PA_COMMAND_GET_PLAYBACK_LATENCY => {
+                    let _idx = r.read_u32().unwrap_or(0);
+                    let client_tv = r.read_timeval().unwrap_or((0, 0));
+                    Some(make_reply_playback_latency(
+                        tag,
+                        protocol_version,
+                        client_tv,
+                        bytes_written,
+                        bytes_written,
+                    ))
+                }
+                PA_COMMAND_DELETE_PLAYBACK_STREAM => {
+                    if let Some(p) = player.take() {
+                        p.close();
+                    }
+                    uncredited_bytes = 0;
+                    Some(make_reply_ok(tag))
+                }
+                PA_COMMAND_DRAIN_PLAYBACK_STREAM
+                | PA_COMMAND_FLUSH_PLAYBACK_STREAM
+                | PA_COMMAND_CORK_PLAYBACK_STREAM
+                | PA_COMMAND_TRIGGER_PLAYBACK_STREAM
+                | PA_COMMAND_PREBUF_PLAYBACK_STREAM
+                | PA_COMMAND_SET_SINK_INPUT_VOLUME
+                | PA_COMMAND_SET_SINK_INPUT_MUTE
+                | PA_COMMAND_SET_SINK_VOLUME
+                | PA_COMMAND_SET_SINK_MUTE
+                | PA_COMMAND_SUBSCRIBE => Some(make_reply_ok(tag)),
+                PA_COMMAND_UNDERFLOW | PA_COMMAND_OVERFLOW => {
+                    if tag == PA_INVALID_INDEX {
+                        None
+                    } else {
+                        Some(make_reply_ok(tag))
+                    }
+                }
+                PA_COMMAND_EXIT => {
+                    should_close = true;
+                    Some(make_reply_ok(tag))
                 }
                 _ => Some(make_reply_ok(tag)),
             };
@@ -853,6 +960,14 @@ fn handle_incoming_pa_client_with_cookie(
                     break;
                 }
             }
+            if let Some(extra) = follow_up {
+                if stream.write_all(&extra).is_err() {
+                    break;
+                }
+            }
+            if should_close {
+                break;
+            }
         } else if authenticated {
             let p = player.get_or_insert_with(|| {
                 let wp = WindowsPlayer::new(48_000, 2);
@@ -860,6 +975,16 @@ fn handle_incoming_pa_client_with_cookie(
                 wp
             });
             p.write(&pkt.data);
+            bytes_written = bytes_written.saturating_add(pkt.data.len() as i64);
+            uncredited_bytes = uncredited_bytes.saturating_add(pkt.data.len() as u32);
+            if uncredited_bytes >= minreq {
+                let credit = uncredited_bytes;
+                uncredited_bytes = 0;
+                let req = make_command_request(pkt.channel, credit);
+                if stream.write_all(&req).is_err() {
+                    break;
+                }
+            }
         } else {
             break;
         }
@@ -932,13 +1057,19 @@ mod tests {
 
         let mut bad_client = TcpStream::connect(addr2).unwrap();
         bad_client
-            .write_all(&make_command_auth(0, 35, &[0x99u8; 256]))
+            .write_all(&make_command_auth(0, PA_PROTOCOL_VERSION, &[0x99u8; 256]))
             .unwrap();
+        // Server rejects with PA_COMMAND_ERROR(PA_ERR_ACCESS) and closes the connection
+        let err_pkt = read_packet(&mut bad_client).unwrap();
+        let mut er = TagStructReader::new(&err_pkt.data);
+        assert_eq!(er.read_u32().unwrap(), protocol::PA_COMMAND_ERROR);
+        assert_eq!(er.read_u32().unwrap(), 0);
+        assert_eq!(er.read_u32().unwrap(), PA_ERR_ACCESS);
         assert!(read_packet(&mut bad_client).is_err());
 
         let mut good_client = TcpStream::connect(addr2).unwrap();
         good_client
-            .write_all(&make_command_auth(0, 35, &expected))
+            .write_all(&make_command_auth(0, PA_PROTOCOL_VERSION, &expected))
             .unwrap();
         let reply = read_packet(&mut good_client).unwrap();
         let mut r = TagStructReader::new(&reply.data);
@@ -1101,7 +1232,11 @@ mod tests {
 
         // Server must still be connected and answer subsequent commands
         client
-            .write_all(&make_command_set_client_name(1, "IdleTest"))
+            .write_all(&make_command_set_client_name(
+                1,
+                PA_PROTOCOL_VERSION,
+                "IdleTest",
+            ))
             .unwrap();
         let reply = read_packet(&mut client).unwrap();
         assert_eq!(
@@ -1110,6 +1245,187 @@ mod tests {
         );
 
         stop.store(true, Ordering::SeqCst);
+        h.join().unwrap();
+    }
+
+    #[test]
+    fn test_windows_pa_full_loopback_handshake_request_credit_and_audio_stream() {
+        use protocol::{
+            TagStructWriter, PA_COMMAND_REQUEST, PA_CONTROL_CHANNEL, PA_ENCODING_PCM,
+            PA_PROTOCOL_FLAG_MEMFD, PA_PROTOCOL_FLAG_SHM,
+        };
+
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let addr = listener.local_addr().unwrap();
+        let stop = Arc::new(AtomicBool::new(false));
+        let stop_c = Arc::clone(&stop);
+
+        let h = thread::spawn(move || {
+            let (s, _) = listener.accept().unwrap();
+            handle_incoming_pa_client_with_cookie(s, stop_c, false, None);
+        });
+
+        let mut client = TcpStream::connect(addr).unwrap();
+        client
+            .set_read_timeout(Some(Duration::from_secs(2)))
+            .unwrap();
+
+        // 1. AUTH with SHM + MEMFD flags set in upper bits (like real libpulse)
+        let mut auth_w = TagStructWriter::new();
+        auth_w.write_u32(PA_COMMAND_AUTH);
+        auth_w.write_u32(0);
+        auth_w.write_u32(PA_PROTOCOL_VERSION | PA_PROTOCOL_FLAG_SHM | PA_PROTOCOL_FLAG_MEMFD);
+        auth_w.write_arbitrary(&[0u8; 256]);
+        client
+            .write_all(&write_packet(PA_CONTROL_CHANNEL, &auth_w.into_bytes()))
+            .unwrap();
+
+        let auth_reply = read_packet(&mut client).unwrap();
+        let mut ar = TagStructReader::new(&auth_reply.data);
+        assert_eq!(ar.read_u32().unwrap(), PA_COMMAND_REPLY);
+        assert_eq!(ar.read_u32().unwrap(), 0);
+        let negotiated = ar.read_u32().unwrap();
+        assert_eq!(negotiated, PA_PROTOCOL_VERSION);
+        assert_eq!(negotiated & !PA_PROTOCOL_VERSION_MASK, 0);
+
+        // 2. SET_CLIENT_NAME -> must reply with client_index u32 for v >= 13
+        client
+            .write_all(&make_command_set_client_name(
+                1,
+                negotiated,
+                "module-tunnel-sink",
+            ))
+            .unwrap();
+        let name_reply = read_packet(&mut client).unwrap();
+        let mut nr = TagStructReader::new(&name_reply.data);
+        assert_eq!(nr.read_u32().unwrap(), PA_COMMAND_REPLY);
+        assert_eq!(nr.read_u32().unwrap(), 1);
+        let _client_idx = nr.read_u32().unwrap();
+        assert_eq!(nr.remaining(), 0);
+
+        // 3. GET_SERVER_INFO & GET_SINK_INFO_LIST
+        let mut info_w = TagStructWriter::new();
+        info_w.write_u32(PA_COMMAND_GET_SERVER_INFO);
+        info_w.write_u32(2);
+        client
+            .write_all(&write_packet(PA_CONTROL_CHANNEL, &info_w.into_bytes()))
+            .unwrap();
+        let info_reply = read_packet(&mut client).unwrap();
+        let mut ir = TagStructReader::new(&info_reply.data);
+        assert_eq!(ir.read_u32().unwrap(), PA_COMMAND_REPLY);
+        assert_eq!(ir.read_u32().unwrap(), 2);
+        assert!(ir.read_string().unwrap().is_some()); // package name
+        assert!(ir.read_string().unwrap().is_some()); // version
+        assert!(ir.read_string().unwrap().is_some()); // user
+        assert!(ir.read_string().unwrap().is_some()); // host
+        let _ss = ir.read_sample_spec().unwrap();
+        assert_eq!(
+            ir.read_string().unwrap().as_deref(),
+            Some("SoundHop-Speakers")
+        );
+        let _src = ir.read_string().unwrap();
+        let _cookie = ir.read_u32().unwrap();
+        assert_eq!(ir.read_channel_map().unwrap(), vec![1, 2]); // v >= 15
+        assert_eq!(ir.remaining(), 0);
+
+        let mut sink_w = TagStructWriter::new();
+        sink_w.write_u32(PA_COMMAND_GET_SINK_INFO_LIST);
+        sink_w.write_u32(3);
+        client
+            .write_all(&write_packet(PA_CONTROL_CHANNEL, &sink_w.into_bytes()))
+            .unwrap();
+        let sink_reply = read_packet(&mut client).unwrap();
+        let mut skr = TagStructReader::new(&sink_reply.data);
+        assert_eq!(skr.read_u32().unwrap(), PA_COMMAND_REPLY);
+        assert_eq!(skr.read_u32().unwrap(), 3);
+        assert_eq!(skr.read_u32().unwrap(), 0); // sink index
+        assert_eq!(
+            skr.read_string().unwrap().as_deref(),
+            Some("SoundHop-Speakers")
+        );
+
+        // 4. CREATE_PLAYBACK_STREAM -> reply + immediate PA_COMMAND_REQUEST credit
+        let spec = SampleSpec::default();
+        client
+            .write_all(&make_command_create_playback_stream(
+                4,
+                negotiated,
+                Some("SoundHop-Speakers"),
+                spec,
+            ))
+            .unwrap();
+        let stream_reply = read_packet(&mut client).unwrap();
+        let mut sr = TagStructReader::new(&stream_reply.data);
+        assert_eq!(sr.read_u32().unwrap(), PA_COMMAND_REPLY);
+        assert_eq!(sr.read_u32().unwrap(), 4);
+        let channel = sr.read_u32().unwrap();
+        let _stream_idx = sr.read_u32().unwrap();
+        let initial_missing = sr.read_u32().unwrap();
+        assert!(initial_missing > 0);
+        let _maxlength = sr.read_u32().unwrap();
+        let _tlength = sr.read_u32().unwrap();
+        let _prebuf = sr.read_u32().unwrap();
+        let minreq = sr.read_u32().unwrap();
+        assert_eq!(sr.read_sample_spec().unwrap(), spec);
+        assert_eq!(sr.read_channel_map().unwrap(), vec![1, 2]);
+        assert_eq!(sr.read_u32().unwrap(), 0);
+        assert_eq!(
+            sr.read_string().unwrap().as_deref(),
+            Some("SoundHop-Speakers")
+        );
+        assert!(!sr.read_boolean().unwrap());
+        let _latency = sr.read_usec().unwrap();
+        let (enc, _) = sr.read_format_info().unwrap();
+        assert_eq!(enc, PA_ENCODING_PCM);
+        assert_eq!(sr.remaining(), 0);
+
+        // Server immediately sends PA_COMMAND_REQUEST (61) credit
+        let req_pkt = read_packet(&mut client).unwrap();
+        assert!(req_pkt.is_control());
+        let mut rq = TagStructReader::new(&req_pkt.data);
+        assert_eq!(rq.read_u32().unwrap(), PA_COMMAND_REQUEST);
+        assert_eq!(rq.read_u32().unwrap(), PA_INVALID_INDEX);
+        assert_eq!(rq.read_u32().unwrap(), channel);
+        let initial_credit = rq.read_u32().unwrap();
+        assert!(initial_credit >= minreq);
+        assert_eq!(rq.remaining(), 0);
+
+        // 5. Stream audio packet (>= minreq bytes) -> server replenishes via PA_COMMAND_REQUEST
+        let pcm = vec![0u8; (minreq as usize) + 1024];
+        client.write_all(&write_packet(channel, &pcm)).unwrap();
+        let replenish_pkt = read_packet(&mut client).unwrap();
+        let mut rpq = TagStructReader::new(&replenish_pkt.data);
+        assert_eq!(rpq.read_u32().unwrap(), PA_COMMAND_REQUEST);
+        assert_eq!(rpq.read_u32().unwrap(), PA_INVALID_INDEX);
+        assert_eq!(rpq.read_u32().unwrap(), channel);
+        assert_eq!(rpq.read_u32().unwrap(), pcm.len() as u32);
+
+        // 6. Teardown commands (CORK, FLUSH, DRAIN, DELETE) succeed cleanly
+        for (i, cmd) in [
+            PA_COMMAND_CORK_PLAYBACK_STREAM,
+            PA_COMMAND_FLUSH_PLAYBACK_STREAM,
+            PA_COMMAND_DRAIN_PLAYBACK_STREAM,
+            PA_COMMAND_DELETE_PLAYBACK_STREAM,
+        ]
+        .into_iter()
+        .enumerate()
+        {
+            let tag = 10 + i as u32;
+            let mut w = TagStructWriter::new();
+            w.write_u32(cmd);
+            w.write_u32(tag);
+            w.write_u32(channel);
+            client
+                .write_all(&write_packet(PA_CONTROL_CHANNEL, &w.into_bytes()))
+                .unwrap();
+            let rep = read_packet(&mut client).unwrap();
+            let mut rr = TagStructReader::new(&rep.data);
+            assert_eq!(rr.read_u32().unwrap(), PA_COMMAND_REPLY);
+            assert_eq!(rr.read_u32().unwrap(), tag);
+        }
+
+        stop.store(true, Ordering::SeqCst);
+        drop(client);
         h.join().unwrap();
     }
 }
