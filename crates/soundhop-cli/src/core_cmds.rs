@@ -23,6 +23,7 @@ use soundhop_core::service::{
     install as install_service, restart_service, start_service, status as service_status,
     stop_service, sync_appimage_paths_if_installed, uninstall as uninstall_service,
 };
+use soundhop_core::state::PairedPeer;
 use soundhop_core::util::{config_path, is_private_address, split_host_port};
 
 use crate::parser::{
@@ -655,6 +656,20 @@ pub fn handle_share(controller: &Arc<Controller>, args: &ShareArgs, json_out: bo
     }
 }
 
+fn pair_status_json(controller: &Controller) -> serde_json::Value {
+    let st = lock_or_recover(&controller.state).clone();
+    let cfg = lock_or_recover(&controller.config).clone();
+    serde_json::json!({
+        "security": cfg.sharing.security,
+        "psk_active": !cfg.sharing.psk_hash.is_empty(),
+        "paired_peers": st
+            .paired_peers
+            .values()
+            .map(PairedPeer::to_public_json)
+            .collect::<Vec<_>>(),
+    })
+}
+
 pub fn handle_pair(controller: &Arc<Controller>, args: &PairArgs, json_out: bool) -> i32 {
     let target = args.target.as_deref().unwrap_or("status").trim();
     if target.eq_ignore_ascii_case("generate") {
@@ -702,19 +717,21 @@ pub fn handle_pair(controller: &Arc<Controller>, args: &PairArgs, json_out: bool
         return 0;
     }
     if target.eq_ignore_ascii_case("status") && args.pin.is_none() {
-        let st = lock_or_recover(&controller.state).clone();
-        let cfg = lock_or_recover(&controller.config).clone();
-        let out = serde_json::json!({
-            "security": cfg.sharing.security,
-            "psk_active": !cfg.sharing.psk_hash.is_empty(),
-            "paired_peers": st.paired_peers.values().cloned().collect::<Vec<_>>(),
-        });
+        let out = pair_status_json(controller);
         if json_out {
             print_json(&out);
         } else {
+            let security = out
+                .get("security")
+                .and_then(|v| v.as_str())
+                .unwrap_or("trusted-lan");
+            let count = out
+                .get("paired_peers")
+                .and_then(|v| v.as_array())
+                .map_or(0, Vec::len);
             header("SoundHop PIN / PSK Pairing Status");
-            info(&format!("Security Mode: {}", cfg.sharing.security));
-            info(&format!("Paired Peers: {}", st.paired_peers.len()));
+            info(&format!("Security Mode: {security}"));
+            info(&format!("Paired Peers: {count}"));
         }
         return 0;
     }
@@ -2002,5 +2019,61 @@ mod tests {
             same_patch,
             serde_json::json!({ "device": { "name": "LivingRoom" } })
         );
+    }
+
+    #[test]
+    fn test_pair_status_json_redacts_secrets() {
+        let ctrl = test_controller();
+        let secret_key = "deadbeefcafebabe0123456789abcdef0123456789abcdef0123456789abcdef";
+        let secret_cookie = "feedface11223344556677889900aabbccddeeff";
+        {
+            let mut cfg = lock_or_recover(&ctrl.config);
+            cfg.sharing.security = "pin-paired".to_string();
+            cfg.sharing.psk_hash = "hashed-psk".to_string();
+        }
+        {
+            let mut st = lock_or_recover(&ctrl.state);
+            st.paired_peers.insert(
+                "peer-1".to_string(),
+                PairedPeer {
+                    peer_id: "peer-1".to_string(),
+                    name: "Studio Speaker".to_string(),
+                    shared_key_hex: secret_key.to_string(),
+                    cookie_hex: secret_cookie.to_string(),
+                    paired_at: 1_700_000_000.0,
+                },
+            );
+        }
+
+        let out = pair_status_json(&ctrl);
+        assert_eq!(out["security"], "pin-paired");
+        assert_eq!(out["psk_active"], true);
+
+        let peers = out["paired_peers"].as_array().expect("paired_peers array");
+        assert_eq!(peers.len(), 1);
+        let peer = &peers[0];
+        assert_eq!(peer["peer_id"], "peer-1");
+        assert_eq!(peer["name"], "Studio Speaker");
+        assert_eq!(peer["paired_at"], 1_700_000_000.0);
+        assert_eq!(peer["has_shared_key"], true);
+        assert_eq!(peer["has_cookie"], true);
+        assert!(peer.get("shared_key_hex").is_none());
+        assert!(peer.get("cookie_hex").is_none());
+
+        let serialized = serde_json::to_string(&out).expect("serialize pair status");
+        assert!(!serialized.contains("shared_key_hex"));
+        assert!(!serialized.contains("cookie_hex"));
+        assert!(!serialized.contains(secret_key));
+        assert!(!serialized.contains(secret_cookie));
+
+        let code = handle_pair(
+            &ctrl,
+            &PairArgs {
+                target: Some("status".to_string()),
+                pin: None,
+            },
+            true,
+        );
+        assert_eq!(code, 0);
     }
 }
