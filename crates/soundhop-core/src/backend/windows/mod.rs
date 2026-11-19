@@ -52,8 +52,14 @@ impl ActiveTunnelSession {
     }
 }
 
+impl Drop for ActiveTunnelSession {
+    fn drop(&mut self) {
+        self.stop();
+    }
+}
+
 pub struct WindowsAudioBackend {
-    listener_stop: Arc<AtomicBool>,
+    listener_stop: Mutex<Option<Arc<AtomicBool>>>,
     listener_thread: Mutex<Option<JoinHandle<()>>>,
     listener_port: Mutex<Option<u16>>,
     listener_security: Mutex<String>,
@@ -88,7 +94,7 @@ impl Drop for WindowsAudioBackend {
 impl WindowsAudioBackend {
     pub fn new() -> Self {
         Self {
-            listener_stop: Arc::new(AtomicBool::new(false)),
+            listener_stop: Mutex::new(None),
             listener_thread: Mutex::new(None),
             listener_port: Mutex::new(None),
             listener_security: Mutex::new("trusted-lan".to_string()),
@@ -103,17 +109,29 @@ impl WindowsAudioBackend {
     }
 
     fn stop_listener_internal(&self) {
-        self.listener_stop.store(true, Ordering::SeqCst);
-        if let Some(port) = *self.listener_port.lock().unwrap() {
+        if let Some(stop_flag) = self
+            .listener_stop
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .take()
+        {
+            stop_flag.store(true, Ordering::SeqCst);
+        }
+        if let Some(port) = *self.listener_port.lock().unwrap_or_else(|e| e.into_inner()) {
             let _ = TcpStream::connect_timeout(
                 &SocketAddr::from(([127, 0, 0, 1], port)),
                 Duration::from_millis(100),
             );
         }
-        if let Some(handle) = self.listener_thread.lock().unwrap().take() {
+        if let Some(handle) = self
+            .listener_thread
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .take()
+        {
             let _ = handle.join();
         }
-        *self.listener_port.lock().unwrap() = None;
+        *self.listener_port.lock().unwrap_or_else(|e| e.into_inner()) = None;
     }
 }
 
@@ -362,7 +380,9 @@ impl AudioBackend for WindowsAudioBackend {
         let bound_port = tcp.local_addr().map(|a| a.port()).unwrap_or(port);
         tcp.set_nonblocking(true).ok();
 
-        self.listener_stop.store(false, Ordering::SeqCst);
+        let generation_stop = Arc::new(AtomicBool::new(false));
+        *self.listener_stop.lock().unwrap_or_else(|e| e.into_inner()) =
+            Some(Arc::clone(&generation_stop));
         *self.listener_port.lock().unwrap_or_else(|e| e.into_inner()) = Some(bound_port);
         *self
             .listener_security
@@ -374,9 +394,9 @@ impl AudioBackend for WindowsAudioBackend {
             .unwrap_or_else(|e| e.into_inner()) = allowed_networks.to_vec();
 
         const MAX_CONCURRENT_PA_CLIENTS: usize = 16;
-        let stop_clone = Arc::clone(&self.listener_stop);
+        let stop_clone = generation_stop;
         let sec_owned = security.to_string();
-        let nets_owned: Vec<String> = allowed_networks.to_vec();
+        let nets_owned: Vec<String> = effective_allowed_networks(allowed_networks);
         let active_clients = Arc::new(AtomicUsize::new(0));
         let handle = thread::spawn(move || {
             while !stop_clone.load(Ordering::SeqCst) {
@@ -385,10 +405,7 @@ impl AudioBackend for WindowsAudioBackend {
                         if stop_clone.load(Ordering::SeqCst) {
                             break;
                         }
-                        if sec_owned != "open"
-                            && !nets_owned.is_empty()
-                            && !ip_allowed(&peer_addr.ip(), &nets_owned)
-                        {
+                        if sec_owned != "open" && !ip_allowed(&peer_addr.ip(), &nets_owned) {
                             continue;
                         }
                         let prev =
@@ -453,7 +470,7 @@ impl AudioBackend for WindowsAudioBackend {
             .write_all(&make_command_auth(0, 35, &cookie))
             .map_err(|e| BackendError::Message(format!("PA auth send failed: {e}")))?;
         let auth_reply = read_packet(&mut stream)
-            .ok_or_else(|| BackendError::Message("No PA auth reply".to_string()))?;
+            .map_err(|e| BackendError::Message(format!("No PA auth reply: {e}")))?;
         let mut r = TagStructReader::new(&auth_reply.data);
         if r.read_u32().unwrap_or(0) != PA_COMMAND_REPLY {
             return Err(BackendError::Message("PA auth rejected".to_string()));
@@ -472,7 +489,7 @@ impl AudioBackend for WindowsAudioBackend {
             ))
             .map_err(|e| BackendError::Message(format!("PA create stream failed: {e}")))?;
         let stream_reply = read_packet(&mut stream)
-            .ok_or_else(|| BackendError::Message("No PA stream reply".to_string()))?;
+            .map_err(|e| BackendError::Message(format!("No PA stream reply: {e}")))?;
         let mut sr = TagStructReader::new(&stream_reply.data);
         if sr.read_u32().unwrap_or(0) != PA_COMMAND_REPLY {
             return Err(BackendError::Message(
@@ -487,31 +504,47 @@ impl AudioBackend for WindowsAudioBackend {
         let stop_flag = Arc::new(AtomicBool::new(false));
         let writer_stream = Arc::new(Mutex::new(stream));
         let writer_for_rec = Arc::clone(&writer_stream);
-        let recorder = WindowsLoopbackRecorder::new(move |pcm_chunk| {
+        let recorder = WindowsLoopbackRecorder::try_new(move |pcm_chunk| {
             let pkt = write_packet(data_channel, pcm_chunk);
             if let Ok(mut guard) = writer_for_rec.lock() {
                 let _ = guard.write_all(&pkt);
             }
-        });
+        })
+        .map_err(BackendError::Message)?;
 
-        self.active_senders.lock().unwrap().insert(
-            sink_name.clone(),
-            ActiveTunnelSession {
-                module_id: mod_id,
-                stop_flag,
-                recorder: Some(recorder),
-                writer_stream: Some(writer_stream),
-                data_channel,
-            },
-        );
-        self.modules.lock().unwrap().push(Module {
-            id: mod_id,
-            name: "module-tunnel-sink".to_string(),
-            args: format!(
-                "server=tcp:{}:{} sink_name={sink_name}",
-                params.host, params.port
-            ),
-        });
+        let replaced = self
+            .active_senders
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .insert(
+                sink_name.clone(),
+                ActiveTunnelSession {
+                    module_id: mod_id,
+                    stop_flag,
+                    recorder: Some(recorder),
+                    writer_stream: Some(writer_stream),
+                    data_channel,
+                },
+            );
+        if let Some(old_sess) = replaced {
+            let old_id = old_sess.module_id;
+            old_sess.stop();
+            self.modules
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .retain(|m| m.id != old_id);
+        }
+        self.modules
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .push(Module {
+                id: mod_id,
+                name: "module-tunnel-sink".to_string(),
+                args: format!(
+                    "server=tcp:{}:{} sink_name={sink_name}",
+                    params.host, params.port
+                ),
+            });
         Ok(mod_id)
     }
 
@@ -519,7 +552,7 @@ impl AudioBackend for WindowsAudioBackend {
         let mod_id = self
             .active_senders
             .lock()
-            .unwrap()
+            .unwrap_or_else(|e| e.into_inner())
             .get(sink_name)
             .map(|s| s.module_id);
         if let Some(id) = mod_id {
@@ -534,48 +567,95 @@ impl AudioBackend for WindowsAudioBackend {
         _description: &str,
         slave_sinks: &[String],
     ) -> Result<u32, BackendError> {
+        let sink_name = sanitize_sink_name(sink_name, 64);
+        if let Some(old_sess) = self
+            .active_senders
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .remove(&sink_name)
+        {
+            let old_id = old_sess.module_id;
+            old_sess.stop();
+            self.modules
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .retain(|m| m.id != old_id);
+        }
+
         let mod_id = self.next_module_id.fetch_add(1, Ordering::SeqCst);
         let stop_flag = Arc::new(AtomicBool::new(false));
+        let mut slave_recorders_to_stop = Vec::new();
         let targets: Vec<(Arc<Mutex<TcpStream>>, u32)> = {
-            let senders = self.active_senders.lock().unwrap();
+            let mut senders = self
+                .active_senders
+                .lock()
+                .unwrap_or_else(|e| e.into_inner());
             slave_sinks
                 .iter()
                 .filter_map(|name| {
-                    senders.get(name).and_then(|sess| {
-                        sess.writer_stream
+                    senders.get_mut(name).and_then(|sess| {
+                        let target = sess
+                            .writer_stream
                             .as_ref()
-                            .map(|ws| (Arc::clone(ws), sess.data_channel))
+                            .map(|ws| (Arc::clone(ws), sess.data_channel));
+                        if target.is_some() {
+                            if let Some(rec) = sess.recorder.take() {
+                                slave_recorders_to_stop.push(rec);
+                            }
+                        }
+                        target
                     })
                 })
                 .collect()
         };
+        for rec in slave_recorders_to_stop {
+            rec.stop();
+        }
         let recorder = if targets.is_empty() {
             None
         } else {
-            Some(WindowsLoopbackRecorder::new(move |pcm_chunk| {
-                for (ws, ch) in &targets {
-                    let pkt = write_packet(*ch, pcm_chunk);
-                    if let Ok(mut guard) = ws.lock() {
-                        let _ = guard.write_all(&pkt);
+            Some(
+                WindowsLoopbackRecorder::try_new(move |pcm_chunk| {
+                    for (ws, ch) in &targets {
+                        let pkt = write_packet(*ch, pcm_chunk);
+                        if let Ok(mut guard) = ws.lock() {
+                            let _ = guard.write_all(&pkt);
+                        }
                     }
-                }
-            }))
+                })
+                .map_err(BackendError::Message)?,
+            )
         };
-        self.active_senders.lock().unwrap().insert(
-            sink_name.to_string(),
-            ActiveTunnelSession {
-                module_id: mod_id,
-                stop_flag,
-                recorder,
-                writer_stream: None,
-                data_channel: 0,
-            },
-        );
-        self.modules.lock().unwrap().push(Module {
-            id: mod_id,
-            name: "module-combine-sink".to_string(),
-            args: format!("sink_name={sink_name} slaves={}", slave_sinks.join(",")),
-        });
+        let replaced = self
+            .active_senders
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .insert(
+                sink_name.clone(),
+                ActiveTunnelSession {
+                    module_id: mod_id,
+                    stop_flag,
+                    recorder,
+                    writer_stream: None,
+                    data_channel: 0,
+                },
+            );
+        if let Some(old_sess) = replaced {
+            let old_id = old_sess.module_id;
+            old_sess.stop();
+            self.modules
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .retain(|m| m.id != old_id);
+        }
+        self.modules
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .push(Module {
+                id: mod_id,
+                name: "module-combine-sink".to_string(),
+                args: format!("sink_name={sink_name} slaves={}", slave_sinks.join(",")),
+            });
         Ok(mod_id)
     }
 
@@ -641,6 +721,19 @@ impl AudioBackend for WindowsAudioBackend {
     }
 }
 
+fn effective_allowed_networks(allowed_networks: &[String]) -> Vec<String> {
+    if !allowed_networks.is_empty() {
+        return allowed_networks.to_vec();
+    }
+    let mut nets: Vec<String> = crate::constants::DEFAULT_LAN_NETWORKS
+        .iter()
+        .map(|s| (*s).to_string())
+        .collect();
+    nets.push("169.254.0.0/16".to_string());
+    nets.push("fe80::/10".to_string());
+    nets
+}
+
 fn ip_allowed(ip: &IpAddr, allowed_networks: &[String]) -> bool {
     if ip.is_loopback() {
         return true;
@@ -701,14 +794,23 @@ fn handle_incoming_pa_client_with_cookie(
         return;
     }
     let _ = stream.set_nonblocking(false);
-    let _ = stream.set_read_timeout(Some(Duration::from_secs(5)));
+    let _ = stream.set_read_timeout(Some(Duration::from_millis(500)));
 
     let mut authenticated = !cookie_required;
     let mut player: Option<WindowsPlayer> = None;
 
     while !stop_flag.load(Ordering::SeqCst) {
-        let Some(pkt) = read_packet(&mut stream) else {
-            break;
+        let pkt = match read_packet(&mut stream) {
+            Ok(pkt) => pkt,
+            Err(e)
+                if matches!(
+                    e.kind(),
+                    std::io::ErrorKind::TimedOut | std::io::ErrorKind::WouldBlock
+                ) =>
+            {
+                continue;
+            }
+            Err(_) => break,
         };
         if pkt.is_control() {
             let mut r = TagStructReader::new(&pkt.data);
@@ -812,7 +914,7 @@ mod tests {
         });
         let mut c1 = TcpStream::connect(addr).unwrap();
         let _ = c1.write_all(&make_command_auth(0, 35, &[0u8; 256]));
-        assert!(read_packet(&mut c1).is_none());
+        assert!(read_packet(&mut c1).is_err());
         h1.join().unwrap();
 
         // Wrong cookie is rejected; right cookie succeeds
@@ -832,7 +934,7 @@ mod tests {
         bad_client
             .write_all(&make_command_auth(0, 35, &[0x99u8; 256]))
             .unwrap();
-        assert!(read_packet(&mut bad_client).is_none());
+        assert!(read_packet(&mut bad_client).is_err());
 
         let mut good_client = TcpStream::connect(addr2).unwrap();
         good_client
@@ -844,5 +946,170 @@ mod tests {
         drop(good_client);
         stop.store(true, Ordering::SeqCst);
         h2.join().unwrap();
+    }
+
+    #[test]
+    fn test_windows_listener_restart_uses_new_generation_stop_flag() {
+        let receiver = WindowsAudioBackend::new();
+        let l1 = receiver
+            .ensure_tcp_listener(0, "open", &["127.0.0.1".to_string()])
+            .unwrap();
+
+        let mut old_client = TcpStream::connect(("127.0.0.1", l1.port)).unwrap();
+        old_client
+            .set_read_timeout(Some(Duration::from_secs(2)))
+            .unwrap();
+        old_client
+            .write_all(&make_command_auth(0, 35, &[0u8; 256]))
+            .unwrap();
+        let reply = read_packet(&mut old_client).unwrap();
+        assert_eq!(
+            TagStructReader::new(&reply.data).read_u32().unwrap(),
+            PA_COMMAND_REPLY
+        );
+
+        // Restart listener (new generation) while old_client is still connected.
+        let l2 = receiver
+            .ensure_tcp_listener(0, "trusted-lan", &["127.0.0.1".to_string()])
+            .unwrap();
+        assert!(l2.created);
+
+        // Old client's handler must see its generation stop flag = true and close the connection,
+        // even though the new listener generation is active.
+        let res = read_packet(&mut old_client);
+        assert!(
+            res.is_err(),
+            "old client should be disconnected after listener restart"
+        );
+
+        receiver.remove_listener(l2.module_id).unwrap();
+    }
+
+    #[test]
+    fn test_windows_empty_allowed_networks_defaults_to_private_lan_acl() {
+        let nets = effective_allowed_networks(&[]);
+        assert!(ip_allowed(&"127.0.0.1".parse().unwrap(), &nets));
+        assert!(ip_allowed(&"192.168.1.42".parse().unwrap(), &nets));
+        assert!(ip_allowed(&"10.0.0.5".parse().unwrap(), &nets));
+        assert!(ip_allowed(&"172.16.5.1".parse().unwrap(), &nets));
+        assert!(ip_allowed(&"169.254.10.20".parse().unwrap(), &nets));
+        assert!(ip_allowed(&"fe80::1".parse().unwrap(), &nets));
+        // Public IPs must be rejected (fail-closed)
+        assert!(!ip_allowed(&"8.8.8.8".parse().unwrap(), &nets));
+        assert!(!ip_allowed(&"203.0.113.5".parse().unwrap(), &nets));
+        assert!(!ip_allowed(&"2001:db8::1".parse().unwrap(), &nets));
+    }
+
+    #[test]
+    fn test_windows_multiroom_stops_per_tunnel_recorders_and_replaces_duplicates() {
+        let r1 = WindowsAudioBackend::new();
+        let l1 = r1
+            .ensure_tcp_listener(0, "open", &["127.0.0.1".to_string()])
+            .unwrap();
+        let r2 = WindowsAudioBackend::new();
+        let l2 = r2
+            .ensure_tcp_listener(0, "open", &["127.0.0.1".to_string()])
+            .unwrap();
+
+        let sender = WindowsAudioBackend::new();
+        let m1 = sender
+            .connect_tunnel(&TunnelParams {
+                host: "127.0.0.1",
+                port: l1.port,
+                sink_name: "soundhop_room_a",
+                description: "RoomA",
+                reconnect_delay_ms: 1000,
+                latency_ms: None,
+                extra_args: &[],
+            })
+            .unwrap();
+        // Reconnecting with the same sink_name must replace & clean up the old module
+        let m1_new = sender
+            .connect_tunnel(&TunnelParams {
+                host: "127.0.0.1",
+                port: l1.port,
+                sink_name: "soundhop_room_a",
+                description: "RoomA",
+                reconnect_delay_ms: 1000,
+                latency_ms: None,
+                extra_args: &[],
+            })
+            .unwrap();
+        assert_ne!(m1, m1_new);
+        assert!(sender.module(m1).unwrap().is_none());
+
+        let _m2 = sender
+            .connect_tunnel(&TunnelParams {
+                host: "127.0.0.1",
+                port: l2.port,
+                sink_name: "soundhop_room_b",
+                description: "RoomB",
+                reconnect_delay_ms: 1000,
+                latency_ms: None,
+                extra_args: &[],
+            })
+            .unwrap();
+
+        let _comb = sender
+            .create_combined_sink(
+                "soundhop_multiroom",
+                "AllRooms",
+                &["soundhop_room_a".to_string(), "soundhop_room_b".to_string()],
+            )
+            .unwrap();
+
+        // Slave per-tunnel recorders must be stopped/cleared when combined sink takes over
+        {
+            let senders = sender.active_senders.lock().unwrap();
+            assert!(senders.get("soundhop_room_a").unwrap().recorder.is_none());
+            assert!(senders.get("soundhop_room_b").unwrap().recorder.is_none());
+            assert!(senders
+                .get("soundhop_multiroom")
+                .unwrap()
+                .recorder
+                .is_some());
+        }
+
+        sender.unload_tunnels("soundhop_").unwrap();
+        r1.remove_listener(l1.module_id).unwrap();
+        r2.remove_listener(l2.module_id).unwrap();
+    }
+
+    #[test]
+    fn test_windows_idle_client_stays_connected_across_read_timeout() {
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let addr = listener.local_addr().unwrap();
+        let stop = Arc::new(AtomicBool::new(false));
+        let stop_c = Arc::clone(&stop);
+
+        let h = thread::spawn(move || {
+            let (s, _) = listener.accept().unwrap();
+            handle_incoming_pa_client_with_cookie(s, stop_c, false, None);
+        });
+
+        let mut client = TcpStream::connect(addr).unwrap();
+        client
+            .set_read_timeout(Some(Duration::from_secs(2)))
+            .unwrap();
+        client
+            .write_all(&make_command_auth(0, 35, &[0u8; 256]))
+            .unwrap();
+        let _ = read_packet(&mut client).unwrap();
+
+        // Remain idle longer than the server's 500ms read timeout
+        thread::sleep(Duration::from_millis(650));
+
+        // Server must still be connected and answer subsequent commands
+        client
+            .write_all(&make_command_set_client_name(1, "IdleTest"))
+            .unwrap();
+        let reply = read_packet(&mut client).unwrap();
+        assert_eq!(
+            TagStructReader::new(&reply.data).read_u32().unwrap(),
+            PA_COMMAND_REPLY
+        );
+
+        stop.store(true, Ordering::SeqCst);
+        h.join().unwrap();
     }
 }

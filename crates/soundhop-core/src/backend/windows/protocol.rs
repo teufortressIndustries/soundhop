@@ -106,11 +106,15 @@ impl<'a> TagStructReader<'a> {
     }
 
     fn read_slice(&mut self, len: usize) -> io::Result<&'a [u8]> {
-        if self.pos + len > self.data.len() {
+        let end = self
+            .pos
+            .checked_add(len)
+            .ok_or_else(|| io::Error::new(io::ErrorKind::UnexpectedEof, "EOF"))?;
+        if end > self.data.len() {
             return Err(io::Error::new(io::ErrorKind::UnexpectedEof, "EOF"));
         }
-        let s = &self.data[self.pos..self.pos + len];
-        self.pos += len;
+        let s = &self.data[self.pos..end];
+        self.pos = end;
         Ok(s)
     }
 
@@ -358,9 +362,33 @@ impl TagStructWriter {
     }
 }
 
-pub fn read_packet<R: Read>(stream: &mut R) -> Option<Packet> {
+pub fn read_packet<R: Read>(stream: &mut R) -> io::Result<Packet> {
     let mut header = [0u8; 8];
-    stream.read_exact(&mut header).ok()?;
+    let first = loop {
+        match stream.read(&mut header[..1]) {
+            Ok(0) => {
+                return Err(io::Error::new(
+                    io::ErrorKind::UnexpectedEof,
+                    "EOF reading packet header",
+                ));
+            }
+            Ok(n) => break n,
+            Err(e) if e.kind() == io::ErrorKind::Interrupted => continue,
+            Err(e) => return Err(e),
+        }
+    };
+    if first < 8 {
+        stream.read_exact(&mut header[first..]).map_err(|e| {
+            if matches!(
+                e.kind(),
+                io::ErrorKind::TimedOut | io::ErrorKind::WouldBlock
+            ) {
+                io::Error::new(io::ErrorKind::UnexpectedEof, "Timed out mid-header")
+            } else {
+                e
+            }
+        })?;
+    }
     let channel = u32::from_be_bytes([header[0], header[1], header[2], header[3]]);
     let length = u32::from_be_bytes([header[4], header[5], header[6], header[7]]) as usize;
     let max_len = if channel == PA_CONTROL_CHANNEL {
@@ -369,11 +397,23 @@ pub fn read_packet<R: Read>(stream: &mut R) -> Option<Packet> {
         MAX_AUDIO_PACKET_BYTES
     };
     if length > max_len {
-        return None;
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            format!("Packet length {length} exceeds maximum {max_len}"),
+        ));
     }
     let mut data = vec![0u8; length];
-    stream.read_exact(&mut data).ok()?;
-    Some(Packet { channel, data })
+    stream.read_exact(&mut data).map_err(|e| {
+        if matches!(
+            e.kind(),
+            io::ErrorKind::TimedOut | io::ErrorKind::WouldBlock
+        ) {
+            io::Error::new(io::ErrorKind::UnexpectedEof, "Timed out mid-packet")
+        } else {
+            e
+        }
+    })?;
+    Ok(Packet { channel, data })
 }
 
 pub fn write_packet(channel: u32, data: &[u8]) -> Vec<u8> {
@@ -514,6 +554,42 @@ mod tests {
         oversized_hdr.extend_from_slice(&PA_CONTROL_CHANNEL.to_be_bytes());
         oversized_hdr.extend_from_slice(&((MAX_CONTROL_PACKET_BYTES + 1) as u32).to_be_bytes());
         let mut bad_cur = Cursor::new(oversized_hdr);
-        assert!(read_packet(&mut bad_cur).is_none());
+        assert_eq!(
+            read_packet(&mut bad_cur).unwrap_err().kind(),
+            io::ErrorKind::InvalidData
+        );
+    }
+
+    #[test]
+    fn test_read_packet_distinguishes_timeout_vs_eof() {
+        struct ErrorReader(io::ErrorKind);
+        impl Read for ErrorReader {
+            fn read(&mut self, _buf: &mut [u8]) -> io::Result<usize> {
+                Err(io::Error::new(self.0, "simulated"))
+            }
+        }
+
+        let err_timeout = read_packet(&mut ErrorReader(io::ErrorKind::TimedOut)).unwrap_err();
+        assert_eq!(err_timeout.kind(), io::ErrorKind::TimedOut);
+
+        let err_would_block = read_packet(&mut ErrorReader(io::ErrorKind::WouldBlock)).unwrap_err();
+        assert_eq!(err_would_block.kind(), io::ErrorKind::WouldBlock);
+
+        let mut empty = Cursor::new(Vec::<u8>::new());
+        let err_eof = read_packet(&mut empty).unwrap_err();
+        assert_eq!(err_eof.kind(), io::ErrorKind::UnexpectedEof);
+    }
+
+    #[test]
+    fn test_tagstruct_read_slice_checked_add_overflow() {
+        let data = [PA_TAG_ARBITRARY, 0xFF, 0xFF, 0xFF, 0xFF];
+        let mut r = TagStructReader::new(&data);
+        let err = r.read_slice(usize::MAX).unwrap_err();
+        assert_eq!(err.kind(), io::ErrorKind::UnexpectedEof);
+
+        // Also advance pos > 0 and test pos + usize::MAX overflow
+        let _ = r.read_byte().unwrap();
+        let err2 = r.read_slice(usize::MAX).unwrap_err();
+        assert_eq!(err2.kind(), io::ErrorKind::UnexpectedEof);
     }
 }

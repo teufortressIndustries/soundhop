@@ -317,19 +317,32 @@ pub struct WindowsLoopbackRecorder {
 }
 
 impl WindowsLoopbackRecorder {
-    pub fn new<F>(callback: F) -> Self
+    pub fn try_new<F>(callback: F) -> Result<Self, String>
     where
         F: Fn(&[u8]) + Send + Sync + 'static,
     {
         let stop_flag = Arc::new(AtomicBool::new(false));
         let flag_clone = Arc::clone(&stop_flag);
         let cb = Arc::new(callback);
+        let (tx, rx) = std::sync::mpsc::sync_channel(1);
         let handle = thread::spawn(move || {
-            run_loopback_worker(flag_clone, cb);
+            run_loopback_worker(flag_clone, cb, tx);
         });
-        Self {
-            stop_flag,
-            handle: Mutex::new(Some(handle)),
+        match rx.recv() {
+            Ok(Ok(())) => Ok(Self {
+                stop_flag,
+                handle: Mutex::new(Some(handle)),
+            }),
+            Ok(Err(err)) => {
+                stop_flag.store(true, Ordering::SeqCst);
+                let _ = handle.join();
+                Err(err)
+            }
+            Err(_) => {
+                stop_flag.store(true, Ordering::SeqCst);
+                let _ = handle.join();
+                Err("WASAPI loopback worker exited unexpectedly".to_string())
+            }
         }
     }
 
@@ -339,9 +352,15 @@ impl WindowsLoopbackRecorder {
 
     pub fn stop(&self) {
         self.stop_flag.store(true, Ordering::SeqCst);
-        if let Some(h) = self.handle.lock().unwrap().take() {
+        if let Some(h) = self.handle.lock().unwrap_or_else(|e| e.into_inner()).take() {
             let _ = h.join();
         }
+    }
+}
+
+impl Drop for WindowsLoopbackRecorder {
+    fn drop(&mut self) {
+        self.stop();
     }
 }
 
@@ -372,118 +391,143 @@ fn emit_captured_s16le(frames: &[(i16, i16)], src_rate: u32, cb: &CaptureCallbac
 }
 
 #[cfg(windows)]
-fn run_loopback_worker(stop_flag: Arc<AtomicBool>, cb: CaptureCallback) {
+fn run_loopback_worker(
+    stop_flag: Arc<AtomicBool>,
+    cb: CaptureCallback,
+    startup_tx: std::sync::mpsc::SyncSender<Result<(), String>>,
+) {
     use cpal::traits::{DeviceTrait, HostTrait, StreamTrait};
     use cpal::{SampleFormat, StreamConfig};
 
     let host = cpal::default_host();
     // On WASAPI, capturing from an output device provides system loopback audio.
-    let target = host
-        .default_output_device()
-        .and_then(|dev| dev.default_output_config().ok().map(|cfg| (dev, cfg)))
-        .or_else(|| {
-            host.default_input_device()
-                .and_then(|dev| dev.default_input_config().ok().map(|cfg| (dev, cfg)))
-        });
-
-    if let Some((device, default_cfg)) = target {
-        let format = default_cfg.sample_format();
-        let config: StreamConfig = default_cfg.into();
-        let ch = (config.channels as usize).max(1);
-        let rate = config.sample_rate.0.max(8_000);
-
-        let stream_opt = match format {
-            SampleFormat::F32 => {
-                let err_flag = Arc::clone(&stop_flag);
-                let cb_c = Arc::clone(&cb);
-                device
-                    .build_input_stream(
-                        &config,
-                        move |data: &[f32], _| {
-                            let mut pairs = Vec::with_capacity(data.len() / ch);
-                            for frame in data.chunks_exact(ch) {
-                                let l = (frame[0].clamp(-1.0, 1.0) * 32767.0) as i16;
-                                let r = if ch > 1 {
-                                    (frame[1].clamp(-1.0, 1.0) * 32767.0) as i16
-                                } else {
-                                    l
-                                };
-                                pairs.push((l, r));
-                            }
-                            emit_captured_s16le(&pairs, rate, &cb_c);
-                        },
-                        move |_| err_flag.store(true, Ordering::SeqCst),
-                        None,
-                    )
-                    .ok()
-            }
-            SampleFormat::I16 => {
-                let err_flag = Arc::clone(&stop_flag);
-                let cb_c = Arc::clone(&cb);
-                device
-                    .build_input_stream(
-                        &config,
-                        move |data: &[i16], _| {
-                            let mut pairs = Vec::with_capacity(data.len() / ch);
-                            for frame in data.chunks_exact(ch) {
-                                let l = frame[0];
-                                let r = if ch > 1 { frame[1] } else { l };
-                                pairs.push((l, r));
-                            }
-                            emit_captured_s16le(&pairs, rate, &cb_c);
-                        },
-                        move |_| err_flag.store(true, Ordering::SeqCst),
-                        None,
-                    )
-                    .ok()
-            }
-            SampleFormat::U16 => {
-                let err_flag = Arc::clone(&stop_flag);
-                let cb_c = Arc::clone(&cb);
-                device
-                    .build_input_stream(
-                        &config,
-                        move |data: &[u16], _| {
-                            let mut pairs = Vec::with_capacity(data.len() / ch);
-                            for frame in data.chunks_exact(ch) {
-                                let l = (i32::from(frame[0]) - 32768) as i16;
-                                let r = if ch > 1 {
-                                    (i32::from(frame[1]) - 32768) as i16
-                                } else {
-                                    l
-                                };
-                                pairs.push((l, r));
-                            }
-                            emit_captured_s16le(&pairs, rate, &cb_c);
-                        },
-                        move |_| err_flag.store(true, Ordering::SeqCst),
-                        None,
-                    )
-                    .ok()
-            }
-            _ => None,
-        };
-
-        if let Some(stream) = stream_opt {
-            if stream.play().is_ok() {
-                while !stop_flag.load(Ordering::SeqCst) {
-                    thread::sleep(Duration::from_millis(20));
-                }
-                drop(stream);
-                return;
-            }
+    // Never fall back to `default_input_device()`, which would silently capture a live mic.
+    let Some(device) = host.default_output_device() else {
+        stop_flag.store(true, Ordering::SeqCst);
+        let _ = startup_tx.send(Err(
+            "No default audio output device available for WASAPI loopback capture".to_string(),
+        ));
+        return;
+    };
+    let default_cfg = match device.default_output_config() {
+        Ok(cfg) => cfg,
+        Err(e) => {
+            stop_flag.store(true, Ordering::SeqCst);
+            let _ = startup_tx.send(Err(format!(
+                "Failed to read default output config for WASAPI loopback: {e}"
+            )));
+            return;
         }
+    };
+
+    let format = default_cfg.sample_format();
+    let config: StreamConfig = default_cfg.into();
+    let ch = (config.channels as usize).max(1);
+    let rate = config.sample_rate.0.max(8_000);
+
+    let stream_res = match format {
+        SampleFormat::F32 => {
+            let err_flag = Arc::clone(&stop_flag);
+            let cb_c = Arc::clone(&cb);
+            device
+                .build_input_stream(
+                    &config,
+                    move |data: &[f32], _| {
+                        let mut pairs = Vec::with_capacity(data.len() / ch);
+                        for frame in data.chunks_exact(ch) {
+                            let l = (frame[0].clamp(-1.0, 1.0) * 32767.0) as i16;
+                            let r = if ch > 1 {
+                                (frame[1].clamp(-1.0, 1.0) * 32767.0) as i16
+                            } else {
+                                l
+                            };
+                            pairs.push((l, r));
+                        }
+                        emit_captured_s16le(&pairs, rate, &cb_c);
+                    },
+                    move |_| err_flag.store(true, Ordering::SeqCst),
+                    None,
+                )
+                .map_err(|e| format!("Failed to build F32 WASAPI loopback stream: {e}"))
+        }
+        SampleFormat::I16 => {
+            let err_flag = Arc::clone(&stop_flag);
+            let cb_c = Arc::clone(&cb);
+            device
+                .build_input_stream(
+                    &config,
+                    move |data: &[i16], _| {
+                        let mut pairs = Vec::with_capacity(data.len() / ch);
+                        for frame in data.chunks_exact(ch) {
+                            let l = frame[0];
+                            let r = if ch > 1 { frame[1] } else { l };
+                            pairs.push((l, r));
+                        }
+                        emit_captured_s16le(&pairs, rate, &cb_c);
+                    },
+                    move |_| err_flag.store(true, Ordering::SeqCst),
+                    None,
+                )
+                .map_err(|e| format!("Failed to build I16 WASAPI loopback stream: {e}"))
+        }
+        SampleFormat::U16 => {
+            let err_flag = Arc::clone(&stop_flag);
+            let cb_c = Arc::clone(&cb);
+            device
+                .build_input_stream(
+                    &config,
+                    move |data: &[u16], _| {
+                        let mut pairs = Vec::with_capacity(data.len() / ch);
+                        for frame in data.chunks_exact(ch) {
+                            let l = (i32::from(frame[0]) - 32768) as i16;
+                            let r = if ch > 1 {
+                                (i32::from(frame[1]) - 32768) as i16
+                            } else {
+                                l
+                            };
+                            pairs.push((l, r));
+                        }
+                        emit_captured_s16le(&pairs, rate, &cb_c);
+                    },
+                    move |_| err_flag.store(true, Ordering::SeqCst),
+                    None,
+                )
+                .map_err(|e| format!("Failed to build U16 WASAPI loopback stream: {e}"))
+        }
+        other => Err(format!(
+            "Unsupported WASAPI loopback sample format: {other:?}"
+        )),
+    };
+
+    let stream = match stream_res {
+        Ok(s) => s,
+        Err(err) => {
+            stop_flag.store(true, Ordering::SeqCst);
+            let _ = startup_tx.send(Err(err));
+            return;
+        }
+    };
+
+    if let Err(e) = stream.play() {
+        stop_flag.store(true, Ordering::SeqCst);
+        let _ = startup_tx.send(Err(format!("Failed to start WASAPI loopback stream: {e}")));
+        return;
     }
 
-    let silence = vec![0u8; 4096];
+    let _ = startup_tx.send(Ok(()));
     while !stop_flag.load(Ordering::SeqCst) {
-        cb(&silence);
         thread::sleep(Duration::from_millis(20));
     }
+    drop(stream);
 }
 
 #[cfg(not(windows))]
-fn run_loopback_worker(stop_flag: Arc<AtomicBool>, cb: CaptureCallback) {
+fn run_loopback_worker(
+    stop_flag: Arc<AtomicBool>,
+    cb: CaptureCallback,
+    startup_tx: std::sync::mpsc::SyncSender<Result<(), String>>,
+) {
+    let _ = startup_tx.send(Ok(()));
     let silence = vec![0u8; 4096];
     while !stop_flag.load(Ordering::SeqCst) {
         cb(&silence);

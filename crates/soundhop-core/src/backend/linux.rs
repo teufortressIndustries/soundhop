@@ -20,6 +20,7 @@ pub struct LinuxAudioBackend {
     runner: Arc<dyn ProcessRunner>,
     sleep_fn: Arc<dyn Fn(Duration) + Send + Sync>,
     info_cache: Mutex<Option<HashMap<String, String>>>,
+    remote_prev_default_sources: Mutex<HashMap<String, String>>,
 }
 
 impl Default for LinuxAudioBackend {
@@ -35,6 +36,7 @@ impl LinuxAudioBackend {
             runner: Arc::new(SystemRunner),
             sleep_fn: Arc::new(std::thread::sleep),
             info_cache: Mutex::new(None),
+            remote_prev_default_sources: Mutex::new(HashMap::new()),
         }
     }
 
@@ -44,6 +46,7 @@ impl LinuxAudioBackend {
             runner,
             sleep_fn: Arc::new(|_| {}),
             info_cache: Mutex::new(None),
+            remote_prev_default_sources: Mutex::new(HashMap::new()),
         }
     }
 
@@ -54,6 +57,8 @@ impl LinuxAudioBackend {
             full.push((*a).to_string());
         }
         let mut env_map = HashMap::new();
+        env_map.insert("LC_ALL".to_string(), "C".to_string());
+        env_map.insert("LANG".to_string(), "C".to_string());
         if args.contains(&"-s") {
             let cookie_file = soundhop_cookie_path();
             if cookie_file.exists() {
@@ -63,12 +68,9 @@ impl LinuxAudioBackend {
                 );
             }
         }
-        let env_ref = if env_map.is_empty() {
-            None
-        } else {
-            Some(&env_map)
-        };
-        let res = self.runner.run(&full, env_ref, Duration::from_secs(15))?;
+        let res = self
+            .runner
+            .run(&full, Some(&env_map), Duration::from_secs(15))?;
         if check && !res.ok() {
             let msg = res.combined_output();
             return Err(BackendError::Message(if msg.is_empty() {
@@ -134,6 +136,64 @@ impl LinuxAudioBackend {
                 return false;
             }
             (self.sleep_fn)(Duration::from_millis(80));
+        }
+    }
+
+    fn wait_for_sink_gone(&self, name: &str, timeout_secs: f64) -> bool {
+        let deadline = Instant::now() + Duration::from_secs_f64(timeout_secs);
+        loop {
+            if !self.sink_exists(name).unwrap_or(false) {
+                return true;
+            }
+            if Instant::now() >= deadline {
+                return false;
+            }
+            (self.sleep_fn)(Duration::from_millis(80));
+        }
+    }
+
+    fn stop_send_mic_to_remote_internal(
+        &self,
+        host: &str,
+        port: u16,
+        remote_null_id: Option<u32>,
+        remote_remap_id: Option<u32>,
+        local_tunnel_id: Option<u32>,
+        local_loopback_id: Option<u32>,
+    ) {
+        if let Some(loopback_id) = local_loopback_id {
+            let _ = self.unload_module(loopback_id, true);
+        }
+        if let Some(tunnel_id) = local_tunnel_id {
+            let _ = self.unload_module(tunnel_id, true);
+        }
+        if !host.is_empty() && port > 0 {
+            let remote_target = tcp_server_arg(host, port);
+            if let Some(prev_src) = self
+                .remote_prev_default_sources
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .remove(&remote_target)
+            {
+                if !prev_src.is_empty() {
+                    let _ = self.pactl_call(
+                        &["-s", &remote_target, "set-default-source", &prev_src],
+                        false,
+                    );
+                }
+            }
+            if let Some(remap_id) = remote_remap_id {
+                let _ = self.pactl_call(
+                    &["-s", &remote_target, "unload-module", &remap_id.to_string()],
+                    false,
+                );
+            }
+            if let Some(null_id) = remote_null_id {
+                let _ = self.pactl_call(
+                    &["-s", &remote_target, "unload-module", &null_id.to_string()],
+                    false,
+                );
+            }
         }
     }
 
@@ -679,6 +739,11 @@ impl AudioBackend for LinuxAudioBackend {
         } else {
             Some(effective_allowed_networks(allowed_networks).join(";"))
         };
+        let desired_cookie = if desired_sec == "cookie" {
+            Some(soundhop_cookie_path().to_string_lossy().into_owned())
+        } else {
+            None
+        };
         for module in self.modules()? {
             if module.name != "module-native-protocol-tcp" {
                 continue;
@@ -690,29 +755,37 @@ impl AudioBackend for LinuxAudioBackend {
             if mod_port == port {
                 let actual_sec = listener_security_from_args(&module.args);
                 let actual_acl = module.arg("auth-ip-acl");
-                let matches = actual_sec == desired_sec && actual_acl == desired_acl;
+                let actual_cookie = module.arg("auth-cookie");
+                let cookie_matches = if desired_sec == "cookie" {
+                    actual_cookie == desired_cookie
+                        && module.arg("auth-cookie-enabled").as_deref() != Some("0")
+                } else {
+                    true
+                };
+                let matches =
+                    actual_sec == desired_sec && actual_acl == desired_acl && cookie_matches;
                 if matches {
                     return Ok(Listener {
                         module_id: module.id,
                         created: false,
                         args: module.args.clone(),
                         port,
-                        security: actual_sec,
+                        security: desired_sec.to_string(),
                     });
                 }
-                // Security mode or allowed_networks changed: replace the existing listener
+                // Security mode, cookie path, or allowed_networks changed: replace the existing listener
                 let _ = self.unload_module(module.id, true);
             }
         }
 
-        let args: Vec<String> = match security {
-            "psk" | "pin" | "cookie" => {
+        let args: Vec<String> = match desired_sec {
+            "cookie" => {
                 let cookie_file = ensure_pa_cookie(None).map_err(|e| {
                     BackendError::Message(format!("Failed to prepare PulseAudio cookie: {e}"))
                 })?;
-                build_listener_args(port, security, allowed_networks, Some(&cookie_file))
+                build_listener_args(port, desired_sec, allowed_networks, Some(&cookie_file))
             }
-            _ => build_listener_args(port, security, allowed_networks, None),
+            _ => build_listener_args(port, desired_sec, allowed_networks, None),
         };
         let module_id = self.load_module("module-native-protocol-tcp", &args)?;
         Ok(Listener {
@@ -720,7 +793,7 @@ impl AudioBackend for LinuxAudioBackend {
             created: true,
             args: args.join(" "),
             port,
-            security: security.to_string(),
+            security: desired_sec.to_string(),
         })
     }
 
@@ -803,6 +876,11 @@ impl AudioBackend for LinuxAudioBackend {
         let sink_name = sanitize_sink_name(sink_name, 64);
         if let Some(existing_mod) = self.module_for_sink(&sink_name)? {
             let _ = self.unload_module(existing_mod.id, true);
+            if !self.wait_for_sink_gone(&sink_name, SINK_TIMEOUT_SECS) {
+                return Err(BackendError::Message(format!(
+                    "Existing combined sink {sink_name:?} did not disappear after unload"
+                )));
+            }
         }
         let safe_desc = sanitize_sink_name(description, 64).replace('_', "-");
         let slaves_arg = slave_sinks.join(",");
@@ -946,11 +1024,6 @@ impl AudioBackend for LinuxAudioBackend {
             }
         }
 
-        let _ = self.pactl_call(
-            &["-s", &remote_target, "set-default-source", &actual_source],
-            false,
-        );
-
         let mut tunnel_args = vec![
             format!("server={remote_target}"),
             format!("sink={remote_sink_name}"),
@@ -967,10 +1040,21 @@ impl AudioBackend for LinuxAudioBackend {
         let local_tunnel_id = match self.load_module("module-tunnel-sink", &tunnel_args) {
             Ok(id) => id,
             Err(e) => {
-                self.stop_send_mic_to_remote(host, port, remote_null_id, remote_remap_id, 0, 0);
+                self.stop_send_mic_to_remote_internal(
+                    host,
+                    port,
+                    remote_null_id,
+                    remote_remap_id,
+                    None,
+                    None,
+                );
                 return Err(e);
             }
         };
+
+        // Wait for the local tunnel sink to register in PipeWire/PulseAudio before
+        // attaching module-loopback so loopback does not race sink creation.
+        let _ = self.wait_for_sink(&local_tunnel_name, SINK_TIMEOUT_SECS);
 
         let local_loopback_id = match self.load_module(
             "module-loopback",
@@ -982,17 +1066,38 @@ impl AudioBackend for LinuxAudioBackend {
         ) {
             Ok(id) => id,
             Err(e) => {
-                self.stop_send_mic_to_remote(
+                self.stop_send_mic_to_remote_internal(
                     host,
                     port,
                     remote_null_id,
                     remote_remap_id,
-                    local_tunnel_id,
-                    0,
+                    Some(local_tunnel_id),
+                    None,
                 );
                 return Err(e);
             }
         };
+
+        // Only switch the remote default source after local tunnel & loopback setup succeeds.
+        if let Ok(info_res) = self.pactl_call(&["-s", &remote_target, "info"], false) {
+            if info_res.ok() {
+                if let Some(prev_src) = info_res.stdout.lines().find_map(|line| {
+                    let (k, v) = line.split_once(": ")?;
+                    (k.trim() == "Default Source").then(|| v.trim().to_string())
+                }) {
+                    if !prev_src.is_empty() && prev_src != actual_source {
+                        self.remote_prev_default_sources
+                            .lock()
+                            .unwrap_or_else(|e| e.into_inner())
+                            .insert(remote_target.clone(), prev_src);
+                    }
+                }
+            }
+        }
+        let _ = self.pactl_call(
+            &["-s", &remote_target, "set-default-source", &actual_source],
+            false,
+        );
 
         Ok((
             remote_null_id,
@@ -1012,27 +1117,14 @@ impl AudioBackend for LinuxAudioBackend {
         local_tunnel_id: u32,
         local_loopback_id: u32,
     ) {
-        if local_loopback_id > 0 {
-            let _ = self.unload_module(local_loopback_id, true);
-        }
-        if local_tunnel_id > 0 {
-            let _ = self.unload_module(local_tunnel_id, true);
-        }
-        if !host.is_empty() && port > 0 {
-            let remote_target = tcp_server_arg(host, port);
-            if let Some(remap_id) = remote_remap_id {
-                let _ = self.pactl_call(
-                    &["-s", &remote_target, "unload-module", &remap_id.to_string()],
-                    false,
-                );
-            }
-            if let Some(null_id) = remote_null_id {
-                let _ = self.pactl_call(
-                    &["-s", &remote_target, "unload-module", &null_id.to_string()],
-                    false,
-                );
-            }
-        }
+        self.stop_send_mic_to_remote_internal(
+            host,
+            port,
+            remote_null_id,
+            remote_remap_id,
+            Some(local_tunnel_id),
+            Some(local_loopback_id),
+        );
     }
 
     fn cleanup_orphaned_remote_mic_modules(&self) -> Result<Vec<u32>, BackendError> {
@@ -1420,13 +1512,20 @@ mod tests {
     fn test_ensure_tcp_listener_replaces_mismatched_security_and_mic_id_zero() {
         let unloaded = Arc::new(Mutex::new(Vec::<String>::new()));
         let unloaded_c = Arc::clone(&unloaded);
+        let calls_log = Arc::new(Mutex::new(Vec::<String>::new()));
+        let calls_log_c = Arc::clone(&calls_log);
         let runner = Arc::new(MockRunner::new(move |args, _| {
             let joined = args.join(" ");
+            calls_log_c.lock().unwrap().push(joined.clone());
             if joined.contains("unload-module") {
                 unloaded_c.lock().unwrap().push(joined.clone());
             }
             let stdout = if joined.contains("list short modules") {
                 "10\tmodule-native-protocol-tcp\tport=4713 auth-anonymous=1\n"
+            } else if joined.contains("list short sinks") {
+                "1\tsoundhop_tx_mic_desk\tmodule-tunnel-sink\ts16le 2ch 48000Hz\tRUNNING\n"
+            } else if joined.contains("info") {
+                "Default Source: alsa_input.remote_orig\n"
             } else if joined.contains("load-module") {
                 "0\n"
             } else {
@@ -1445,20 +1544,38 @@ mod tests {
             .ensure_tcp_listener(4713, "psk", &["192.168.1.0/24".to_string()])
             .unwrap();
         assert!(listener.created);
-        assert_eq!(listener.security, "psk");
+        assert_eq!(listener.security, "cookie");
         assert!(unloaded
             .lock()
             .unwrap()
             .iter()
             .any(|c| c.contains("unload-module 10")));
 
-        // Verify module ID 0 is tracked as Some(0) and unloaded on stop
+        // Verify module ID 0 is unloaded for all 4 modules (remote + local) and remote default source is restored
         unloaded.lock().unwrap().clear();
+        calls_log.lock().unwrap().clear();
         let (r_null, r_remap, l_tun, l_loop, _) = backend
             .send_mic_to_remote("192.168.1.50", 4713, "Desk", "@DEFAULT_SOURCE@")
             .unwrap();
         assert_eq!(r_null, Some(0));
         assert_eq!(r_remap, Some(0));
+        assert_eq!(l_tun, 0);
+        assert_eq!(l_loop, 0);
+
+        // Verify set-default-source happened AFTER module-loopback was loaded
+        {
+            let log = calls_log.lock().unwrap();
+            let loopback_pos = log
+                .iter()
+                .position(|c| c.contains("load-module module-loopback"))
+                .unwrap();
+            let set_def_pos = log
+                .iter()
+                .position(|c| c.contains("set-default-source soundhop_rem_mic_desk"))
+                .unwrap();
+            assert!(set_def_pos > loopback_pos);
+        }
+
         backend.stop_send_mic_to_remote("192.168.1.50", 4713, r_null, r_remap, l_tun, l_loop);
         let calls = unloaded.lock().unwrap();
         assert_eq!(
@@ -1466,7 +1583,137 @@ mod tests {
                 .iter()
                 .filter(|c| c.contains("unload-module 0"))
                 .count(),
-            2
+            4
+        );
+        assert!(calls_log
+            .lock()
+            .unwrap()
+            .iter()
+            .any(|c| c.contains("set-default-source alsa_input.remote_orig")));
+    }
+
+    #[test]
+    fn test_pactl_call_sets_c_locale_env() {
+        let seen_envs = Arc::new(Mutex::new(Vec::<HashMap<String, String>>::new()));
+        let seen_c = Arc::clone(&seen_envs);
+        let runner = Arc::new(MockRunner::new(move |args, env| {
+            if let Some(e) = env {
+                seen_c.lock().unwrap().push(e.clone());
+            }
+            Ok(CommandResult {
+                args: args.to_vec(),
+                returncode: 0,
+                stdout: "Server Name: PulseAudio\n".to_string(),
+                stderr: String::new(),
+            })
+        }));
+
+        let backend = LinuxAudioBackend::with_runner(runner);
+        let _ = backend.server_name().unwrap();
+        let envs = seen_envs.lock().unwrap();
+        assert_eq!(envs.len(), 1);
+        assert_eq!(envs[0].get("LC_ALL").map(String::as_str), Some("C"));
+        assert_eq!(envs[0].get("LANG").map(String::as_str), Some("C"));
+    }
+
+    #[test]
+    fn test_ensure_tcp_listener_checks_cookie_path_and_consistent_security() {
+        let cookie_path = soundhop_cookie_path().to_string_lossy().into_owned();
+        let unloaded = Arc::new(Mutex::new(Vec::<String>::new()));
+        let unloaded_c = Arc::clone(&unloaded);
+        let wrong_cookie = Arc::new(std::sync::atomic::AtomicBool::new(true));
+        let wrong_c = Arc::clone(&wrong_cookie);
+        let cookie_for_closure = cookie_path.clone();
+
+        let runner = Arc::new(MockRunner::new(move |args, _| {
+            let joined = args.join(" ");
+            if joined.contains("unload-module") {
+                unloaded_c.lock().unwrap().push(joined.clone());
+                wrong_c.store(false, std::sync::atomic::Ordering::SeqCst);
+            }
+            let stdout = if joined.contains("list short modules") {
+                if wrong_c.load(std::sync::atomic::Ordering::SeqCst) {
+                    "10\tmodule-native-protocol-tcp\tport=4713 auth-cookie=/wrong/path auth-cookie-enabled=1 auth-ip-acl=127.0.0.1;192.168.1.0/24\n".to_string()
+                } else {
+                    format!("11\tmodule-native-protocol-tcp\tport=4713 auth-cookie={cookie_for_closure} auth-cookie-enabled=1 auth-ip-acl=127.0.0.1;192.168.1.0/24\n")
+                }
+            } else if joined.contains("load-module") {
+                "11\n".to_string()
+            } else {
+                String::new()
+            };
+            Ok(CommandResult {
+                args: args.to_vec(),
+                returncode: 0,
+                stdout,
+                stderr: String::new(),
+            })
+        }));
+
+        let backend = LinuxAudioBackend::with_runner(runner);
+        // Wrong auth-cookie path must replace module 10
+        let first = backend
+            .ensure_tcp_listener(4713, "psk", &["192.168.1.0/24".to_string()])
+            .unwrap();
+        assert!(first.created);
+        assert_eq!(first.security, "cookie");
+        assert!(unloaded
+            .lock()
+            .unwrap()
+            .iter()
+            .any(|c| c.contains("unload-module 10")));
+
+        // Matching auth-cookie path must reuse module 11 with identical Listener.security
+        let second = backend
+            .ensure_tcp_listener(4713, "psk", &["192.168.1.0/24".to_string()])
+            .unwrap();
+        assert!(!second.created);
+        assert_eq!(second.module_id, 11);
+        assert_eq!(second.security, first.security);
+    }
+
+    #[test]
+    fn test_send_mic_to_remote_rolls_back_without_setting_remote_default_on_loopback_failure() {
+        let calls = Arc::new(Mutex::new(Vec::<String>::new()));
+        let calls_c = Arc::clone(&calls);
+        let runner = Arc::new(MockRunner::new(move |args, _| {
+            let joined = args.join(" ");
+            calls_c.lock().unwrap().push(joined.clone());
+            if joined.contains("load-module module-loopback") {
+                return Ok(CommandResult {
+                    args: args.to_vec(),
+                    returncode: 1,
+                    stdout: String::new(),
+                    stderr: "loopback failed".to_string(),
+                });
+            }
+            let stdout = if joined.contains("list short sinks") {
+                "1\tsoundhop_tx_mic_desk\tmodule-tunnel-sink\ts16le 2ch 48000Hz\tRUNNING\n"
+            } else if joined.contains("load-module") {
+                "0\n"
+            } else {
+                ""
+            };
+            Ok(CommandResult {
+                args: args.to_vec(),
+                returncode: 0,
+                stdout: stdout.to_string(),
+                stderr: String::new(),
+            })
+        }));
+
+        let backend = LinuxAudioBackend::with_runner(runner);
+        let err = backend
+            .send_mic_to_remote("192.168.1.50", 4713, "Desk", "@DEFAULT_SOURCE@")
+            .unwrap_err();
+        assert!(err.to_string().contains("loopback failed"));
+        let log = calls.lock().unwrap();
+        // Remote default source was never changed
+        assert!(!log.iter().any(|c| c.contains("set-default-source")));
+        // Local tunnel (id 0) + remote remap (id 0) + remote null (id 0) were all unloaded
+        assert_eq!(
+            log.iter().filter(|c| c.contains("unload-module 0")).count(),
+            3
         );
     }
 }
