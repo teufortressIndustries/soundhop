@@ -215,13 +215,15 @@ pub fn render(
     ui.add_space(6.0);
 
     card(ui, pal, None, |ui| {
+        let mut showed_above_divider = false;
         if saved_only.is_empty() && snap.apps.iter().all(|a| !a.persistent) {
             ui.label(
                 RichText::new("No saved app rules yet. Click \"Always Remember\" on any playing app or add one below.")
                     .color(pal.text_muted)
                     .size(12.0),
             );
-        } else {
+            showed_above_divider = true;
+        } else if !saved_only.is_empty() {
             for app in saved_only {
                 ui.horizontal(|ui| {
                     ui.label(RichText::new(&app.app_name).color(pal.text).strong());
@@ -241,11 +243,14 @@ pub fn render(
                 });
                 ui.add_space(4.0);
             }
+            showed_above_divider = true;
         }
 
-        ui.add_space(8.0);
-        ui.separator();
-        ui.add_space(8.0);
+        if showed_above_divider {
+            ui.add_space(8.0);
+            ui.separator();
+            ui.add_space(8.0);
+        }
         ui.horizontal(|ui| {
             ui.add(
                 egui::TextEdit::singleline(&mut state.custom_app_name)

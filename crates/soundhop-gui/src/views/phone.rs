@@ -284,8 +284,14 @@ pub fn render(
 
                     ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
                         if !snap.android_session_active && dev.is_ready() {
-                            ui.add_enabled_ui(snap.android_tools.ready(), |ui| {
-                                if primary_button(ui, pal, "Start Listening").clicked() {
+                            let can_start = snap.android_tools.ready() && !snap.android_starting;
+                            ui.add_enabled_ui(can_start, |ui| {
+                                let label = if snap.android_starting {
+                                    "Starting..."
+                                } else {
+                                    "Start Listening"
+                                };
+                                if primary_button(ui, pal, label).clicked() {
                                     state.selected_serial = dev.serial.clone();
                                     backend.send(GuiCommand::AndroidStart {
                                         serial: dev.serial.clone(),

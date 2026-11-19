@@ -34,6 +34,15 @@ impl HomeViewState {
             self.initialized_from_snap = true;
         }
     }
+
+    fn reconcile_with_snapshot(&mut self, snap: &GuiSnapshot) {
+        self.sync_initial(snap);
+        if snap.peers.len() <= 1 {
+            self.multiroom_mode = false;
+        }
+        self.selected_peers
+            .retain(|id| snap.peers.iter().any(|p| p.id == *id));
+    }
 }
 
 pub fn render(
@@ -43,7 +52,7 @@ pub fn render(
     state: &mut HomeViewState,
     backend: &GuiBackend,
 ) {
-    state.sync_initial(snap);
+    state.reconcile_with_snapshot(snap);
 
     // 1. Hero Output & Master Volume Card
     let hero_border = if snap.multiroom {
@@ -360,6 +369,57 @@ pub fn render(
                     });
                 });
             });
+            ui.add_space(6.0);
+        }
+
+        // Keep manual IP connect reachable even when nearby peers exist
+        ui.horizontal(|ui| {
+            let link_text = if state.show_manual_connect {
+                "Hide Manual Connect"
+            } else {
+                "+ Connect by IP Address"
+            };
+            if ui
+                .link(RichText::new(link_text).color(pal.accent))
+                .clicked()
+            {
+                state.show_manual_connect = !state.show_manual_connect;
+            }
+        });
+        let manual_list_t = ui.ctx().animate_bool_with_time_and_easing(
+            egui::Id::new("home_manual_connect_list_reveal"),
+            state.show_manual_connect,
+            0.14,
+            egui::emath::easing::cubic_out,
+        );
+        if state.show_manual_connect || manual_list_t > 0.02 {
+            ui.scope(|ui| {
+                ui.set_opacity(manual_list_t);
+                ui.add_space(4.0 * manual_list_t);
+                card(ui, pal, None, |ui| {
+                    ui.horizontal(|ui| {
+                        ui.label(
+                            RichText::new("Device IP or Hostname:")
+                                .color(pal.text_secondary)
+                                .size(12.5),
+                        );
+                        let resp = ui.add(
+                            egui::TextEdit::singleline(&mut state.manual_address)
+                                .hint_text("e.g. 192.168.1.50")
+                                .desired_width(210.0),
+                        );
+                        let enter =
+                            resp.lost_focus() && ui.input(|i| i.key_pressed(egui::Key::Enter));
+                        if (primary_button(ui, pal, "Connect").clicked() || enter)
+                            && !state.manual_address.trim().is_empty()
+                        {
+                            backend.send(GuiCommand::ConnectAddress {
+                                host_port: state.manual_address.clone(),
+                            });
+                        }
+                    });
+                });
+            });
         }
     }
 
@@ -484,5 +544,79 @@ pub fn render(
                 });
             });
         });
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::backend::PeerView;
+    use soundhop_core::backend::linux::LinuxAudioBackend;
+    use soundhop_core::config::Config;
+    use soundhop_core::controller::Controller;
+    use soundhop_core::state::State;
+    use soundhop_core::util::{CommandResult, MockRunner};
+    use std::sync::Arc;
+
+    fn test_snapshot() -> GuiSnapshot {
+        let runner = Arc::new(MockRunner::new(|args, _| {
+            Ok(CommandResult {
+                args: args.to_vec(),
+                returncode: 0,
+                stdout: String::new(),
+                stderr: String::new(),
+            })
+        }));
+        let backend = Arc::new(LinuxAudioBackend::with_runner(runner));
+        let ctrl = Controller::new(
+            Some(Config::default()),
+            Some(State::default()),
+            Some(backend),
+            None,
+            None,
+            false,
+        );
+        ctrl.set_save_enabled(false);
+        GuiSnapshot::from_controller(&ctrl)
+    }
+
+    fn peer(id: &str) -> PeerView {
+        PeerView {
+            id: id.to_string(),
+            name: id.to_string(),
+            host: "192.168.1.10".to_string(),
+            port: 4713,
+            platform: "linux".to_string(),
+            security: "trusted-lan".to_string(),
+            rtt_ms: None,
+            online: true,
+            paired: false,
+        }
+    }
+
+    #[test]
+    fn test_home_reconcile_resets_multiroom_and_prunes_selected_peers() {
+        let mut snap = test_snapshot();
+        snap.hydrated = true;
+        snap.peers = vec![peer("p1"), peer("p2")];
+
+        let mut state = HomeViewState::default();
+        state.reconcile_with_snapshot(&snap);
+        state.multiroom_mode = true;
+        state.selected_peers.insert("p1".to_string());
+        state.selected_peers.insert("p2".to_string());
+        state.selected_peers.insert("stale".to_string());
+
+        state.reconcile_with_snapshot(&snap);
+        assert!(state.multiroom_mode);
+        assert_eq!(state.selected_peers.len(), 2);
+        assert!(!state.selected_peers.contains("stale"));
+
+        // Drop down to 1 peer: multiroom_mode must reset and vanished peer pruned
+        snap.peers = vec![peer("p1")];
+        state.reconcile_with_snapshot(&snap);
+        assert!(!state.multiroom_mode);
+        assert_eq!(state.selected_peers.len(), 1);
+        assert!(state.selected_peers.contains("p1"));
     }
 }

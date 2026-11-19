@@ -41,8 +41,14 @@ impl Default for OnboardingState {
 }
 
 impl OnboardingState {
+    pub fn reset(&mut self) {
+        self.step = 0;
+        self.initialized = false;
+        self.step_transition_start = None;
+    }
+
     fn sync_initial(&mut self, snap: &GuiSnapshot) {
-        if !self.initialized {
+        if !self.initialized && snap.hydrated {
             self.device_name = snap.config.device.name.clone();
             self.enable_autostart = snap.autostart_installed || snap.config.ui.start_tray;
             self.open_firewall = snap.firewall_active && snap.firewall_kind != "none";
@@ -325,4 +331,72 @@ pub fn render(
                 });
             });
         });
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use soundhop_core::backend::linux::LinuxAudioBackend;
+    use soundhop_core::config::Config;
+    use soundhop_core::controller::Controller;
+    use soundhop_core::state::State;
+    use soundhop_core::util::{CommandResult, MockRunner};
+    use std::sync::Arc;
+
+    fn test_snapshot() -> GuiSnapshot {
+        let runner = Arc::new(MockRunner::new(|args, _| {
+            Ok(CommandResult {
+                args: args.to_vec(),
+                returncode: 0,
+                stdout: String::new(),
+                stderr: String::new(),
+            })
+        }));
+        let backend = Arc::new(LinuxAudioBackend::with_runner(runner));
+        let ctrl = Controller::new(
+            Some(Config::default()),
+            Some(State::default()),
+            Some(backend),
+            None,
+            None,
+            false,
+        );
+        ctrl.set_save_enabled(false);
+        GuiSnapshot::from_controller(&ctrl)
+    }
+
+    #[test]
+    fn test_onboarding_waits_for_hydration_and_resets_on_replay() {
+        let mut snap = test_snapshot();
+        snap.hydrated = false;
+        snap.config.device.name = "Initial".to_string();
+        snap.firewall_active = false;
+        snap.firewall_kind = "none".to_string();
+
+        let mut state = OnboardingState::default();
+        state.sync_initial(&snap);
+        assert!(!state.initialized);
+
+        snap.hydrated = true;
+        snap.config.device.name = "Living Room".to_string();
+        snap.firewall_active = true;
+        snap.firewall_kind = "ufw".to_string();
+        snap.autostart_installed = true;
+        state.sync_initial(&snap);
+        assert!(state.initialized);
+        assert_eq!(state.device_name, "Living Room");
+        assert!(state.open_firewall);
+        assert!(state.enable_autostart);
+
+        // Simulate completing tour and replaying it later with updated config
+        state.step = 2;
+        state.reset();
+        assert_eq!(state.step, 0);
+        assert!(!state.initialized);
+
+        snap.config.device.name = "Studio PC".to_string();
+        state.sync_initial(&snap);
+        assert!(state.initialized);
+        assert_eq!(state.device_name, "Studio PC");
+    }
 }

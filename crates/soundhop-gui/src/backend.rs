@@ -106,6 +106,7 @@ pub struct GuiSnapshot {
     pub android_session_active: bool,
     pub android_session_device: String,
     pub android_installing: bool,
+    pub android_starting: bool,
     pub firewall_kind: String,
     pub firewall_active: bool,
     pub firewall_detail: String,
@@ -165,6 +166,7 @@ impl GuiSnapshot {
             android_session_active: st.android_active,
             android_session_device: st.android_model,
             android_installing: false,
+            android_starting: false,
             firewall_kind: "none".to_string(),
             firewall_active: false,
             firewall_detail: String::new(),
@@ -503,9 +505,9 @@ impl GuiBackend {
                 snap.busy_message = Some("Connecting to speaker...".to_string());
             }
             GuiCommand::ConnectAddress { host_port } => {
-                let trimmed = host_port.trim();
-                if !trimmed.is_empty() {
-                    snap.busy_message = Some(format!("Connecting to {trimmed}..."));
+                let (host, _) = split_host_port(host_port.trim(), 4713);
+                if !host.is_empty() {
+                    snap.busy_message = Some(format!("Connecting to {host}..."));
                 }
             }
             GuiCommand::ConnectMulti { peer_ids, .. } => {
@@ -530,17 +532,20 @@ impl GuiBackend {
             }
             GuiCommand::RouteApp { app, target, save } => {
                 let is_remote = target == "remote";
-                if let Some(existing) = snap
+                let mut matched = false;
+                for existing in snap
                     .apps
                     .iter_mut()
-                    .find(|a| a.app_name.eq_ignore_ascii_case(app))
+                    .filter(|a| a.app_name.eq_ignore_ascii_case(app))
                 {
+                    matched = true;
                     existing.is_remote = is_remote;
                     existing.routed_rule = target.clone();
                     if *save {
                         existing.persistent = true;
                     }
-                } else if *save {
+                }
+                if !matched && *save {
                     snap.apps.push(AppStreamView {
                         app_name: app.clone(),
                         media_name: String::new(),
@@ -552,10 +557,10 @@ impl GuiBackend {
                 }
             }
             GuiCommand::UnrouteApp { app, remove_rule } => {
-                if let Some(existing) = snap
+                for existing in snap
                     .apps
                     .iter_mut()
-                    .find(|a| a.app_name.eq_ignore_ascii_case(app))
+                    .filter(|a| a.app_name.eq_ignore_ascii_case(app))
                 {
                     existing.is_remote = false;
                     if *remove_rule {
@@ -601,6 +606,7 @@ impl GuiBackend {
             }
             GuiCommand::AndroidDisconnectWifi { .. } => {}
             GuiCommand::AndroidStart { device_name, .. } => {
+                snap.android_starting = true;
                 snap.busy_message = Some(format!("Starting audio from {device_name}..."));
             }
             GuiCommand::AndroidStop => {
@@ -767,6 +773,7 @@ impl WorkerState {
             GuiCommand::ConnectAddress { host_port } => {
                 let (host, port) = split_host_port(host_port.trim(), 4713);
                 if host.is_empty() {
+                    self.set_busy(None);
                     self.push_toast("Enter an IP address or hostname first.", true);
                     return;
                 }
@@ -834,6 +841,7 @@ impl WorkerState {
                 keep_local,
             } => {
                 if peer_ids.is_empty() {
+                    self.set_busy(None);
                     self.push_toast("Select at least one speaker.", true);
                     return;
                 }
@@ -1294,6 +1302,7 @@ impl WorkerState {
             GuiCommand::AndroidConnectWifi { ip_port } => {
                 let target = ip_port.trim();
                 if target.is_empty() {
+                    self.set_busy(None);
                     self.push_toast("Enter your phone's Wi-Fi IP address.", true);
                     return;
                 }
@@ -1320,6 +1329,7 @@ impl WorkerState {
                 duplicate,
                 as_mic,
             } => {
+                write_or_recover(&self.snapshot).android_starting = true;
                 self.set_busy(Some(format!("Starting audio from {device_name}...")));
                 let res = if ipc_is_running(None) {
                     ipc_request(
@@ -1364,6 +1374,7 @@ impl WorkerState {
                         )
                         .map_err(|e| e.to_string())
                 };
+                write_or_recover(&self.snapshot).android_starting = false;
                 self.set_busy(None);
                 match res {
                     Ok(_) => {
@@ -1653,9 +1664,7 @@ impl WorkerState {
         for p in &found {
             self.controller.remember_peer(p);
         }
-        if !found.is_empty() {
-            *lock_or_recover(&self.cached_live_peers) = found;
-        }
+        *lock_or_recover(&self.cached_live_peers) = found;
     }
 
     fn refresh_android(&mut self) {
@@ -2206,5 +2215,112 @@ mod tests {
         assert_eq!(*read_or_recover(&rw), 99);
         *write_or_recover(&rw) = 100;
         assert_eq!(*read_or_recover(&rw), 100);
+    }
+
+    #[test]
+    fn test_connect_address_invalid_input_clears_busy() {
+        let ctrl = test_controller();
+        let initial = GuiSnapshot::from_controller(&ctrl);
+        let snapshot = Arc::new(RwLock::new(initial));
+        let toasts = Arc::new(Mutex::new(Vec::new()));
+        let (tx, _rx) = mpsc::channel();
+        let gui_backend = GuiBackend {
+            snapshot: Arc::clone(&snapshot),
+            tx: Some(tx),
+            toasts: Arc::clone(&toasts),
+            ctx: None,
+            mutation_seq: Arc::new(AtomicU64::new(0)),
+            active_commands: Arc::new(AtomicUsize::new(0)),
+            stop_flag: Arc::new(AtomicBool::new(false)),
+            poller_wake: Arc::new((Mutex::new(false), Condvar::new())),
+            cmd_handle: None,
+            poller_handle: None,
+        };
+
+        // Invalid host-less port input must not set optimistic busy_message
+        gui_backend.send(GuiCommand::ConnectAddress {
+            host_port: ":4713".to_string(),
+        });
+        assert!(gui_backend.read().busy_message.is_none());
+
+        // Even if busy_message was already set, handle_command early return clears it
+        snapshot.write().unwrap().busy_message = Some("Connecting...".to_string());
+        let mut worker = WorkerState {
+            controller: Arc::clone(&ctrl),
+            snapshot: Arc::clone(&snapshot),
+            toasts: Arc::clone(&toasts),
+            ctx: None,
+            cached_live_peers: Arc::new(Mutex::new(Vec::new())),
+            mutation_seq: Arc::new(AtomicU64::new(0)),
+            active_commands: Arc::new(AtomicUsize::new(0)),
+            onboarding_reopened: Arc::new(AtomicBool::new(false)),
+            controller_sync_lock: Arc::new(Mutex::new(())),
+            use_ipc: false,
+        };
+        worker.handle_command(GuiCommand::ConnectAddress {
+            host_port: ":4713".to_string(),
+        });
+        assert!(snapshot.read().unwrap().busy_message.is_none());
+        assert!(toasts.lock().unwrap().last().is_some_and(|t| t.is_error));
+    }
+
+    #[test]
+    fn test_optimistic_route_app_updates_all_matching_streams() {
+        let ctrl = test_controller();
+        let mut initial = GuiSnapshot::from_controller(&ctrl);
+        initial.apps = vec![
+            AppStreamView {
+                app_name: "Firefox".to_string(),
+                media_name: "Tab 1".to_string(),
+                is_remote: false,
+                routed_rule: String::new(),
+                persistent: false,
+                active: true,
+            },
+            AppStreamView {
+                app_name: "firefox".to_string(),
+                media_name: "Tab 2".to_string(),
+                is_remote: false,
+                routed_rule: String::new(),
+                persistent: false,
+                active: true,
+            },
+        ];
+        let snapshot = Arc::new(RwLock::new(initial));
+        let (tx, _rx) = mpsc::channel();
+        let gui_backend = GuiBackend {
+            snapshot: Arc::clone(&snapshot),
+            tx: Some(tx),
+            toasts: Arc::new(Mutex::new(Vec::new())),
+            ctx: None,
+            mutation_seq: Arc::new(AtomicU64::new(0)),
+            active_commands: Arc::new(AtomicUsize::new(0)),
+            stop_flag: Arc::new(AtomicBool::new(false)),
+            poller_wake: Arc::new((Mutex::new(false), Condvar::new())),
+            cmd_handle: None,
+            poller_handle: None,
+        };
+
+        gui_backend.send(GuiCommand::RouteApp {
+            app: "Firefox".to_string(),
+            target: "remote".to_string(),
+            save: true,
+        });
+        let snap = gui_backend.read();
+        assert_eq!(snap.apps.len(), 2);
+        assert!(snap
+            .apps
+            .iter()
+            .all(|a| a.is_remote && a.routed_rule == "remote" && a.persistent));
+
+        gui_backend.send(GuiCommand::UnrouteApp {
+            app: "Firefox".to_string(),
+            remove_rule: true,
+        });
+        let snap = gui_backend.read();
+        assert!(snap
+            .apps
+            .iter()
+            .all(|a| !a.is_remote && a.routed_rule.is_empty() && !a.persistent));
     }
 }

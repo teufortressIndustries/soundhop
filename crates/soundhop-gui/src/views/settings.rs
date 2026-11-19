@@ -101,16 +101,18 @@ pub fn render(
                 );
             });
             ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                let name_changed = state.device_name.trim() != snap.config.device.name;
-                if name_changed
-                    && primary_button(ui, pal, "Save").clicked()
-                    && !state.device_name.trim().is_empty()
-                {
-                    let next = state.device_name.trim().to_string();
-                    state.synced_name = next.clone();
-                    backend.send(GuiCommand::SaveConfigPatch {
-                        patch: serde_json::json!({ "device": { "name": next } }),
-                        toast: Some("Updated device name.".to_string()),
+                let trimmed = state.device_name.trim();
+                let name_changed = trimmed != snap.config.device.name;
+                if name_changed {
+                    ui.add_enabled_ui(!trimmed.is_empty(), |ui| {
+                        if primary_button(ui, pal, "Save").clicked() {
+                            let next = trimmed.to_string();
+                            state.synced_name = next.clone();
+                            backend.send(GuiCommand::SaveConfigPatch {
+                                patch: serde_json::json!({ "device": { "name": next } }),
+                                toast: Some("Updated device name.".to_string()),
+                            });
+                        }
                     });
                 }
                 ui.add(egui::TextEdit::singleline(&mut state.device_name).desired_width(180.0));

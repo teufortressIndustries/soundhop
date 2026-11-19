@@ -283,10 +283,12 @@ impl TrayMenuSnapshot {
             &peers,
             &streams,
             &st.connected_peer,
-            multiroom_peer_ids.len(),
+            &st.connected_name,
+            &multiroom_peer_ids,
             sharing_enabled,
             auto_enabled,
             st.keep_local,
+            mic_active,
             &st.mic_direction,
             android_active,
         );
@@ -397,7 +399,7 @@ fn build_tray_menu_from_snapshot(snap: &TrayMenuSnapshot) -> Menu {
             let keep_local_chk = CheckMenuItem::with_id(
                 MenuId::new("multiroom_keep_local"),
                 "Keep Playing on This Device Too",
-                true,
+                snap.multiroom && !snap.multiroom_peer_ids.is_empty(),
                 snap.keep_local,
                 None,
             );
@@ -681,10 +683,12 @@ fn collect_tray_snapshot(daemon: &Daemon) -> TrayMenuSnapshot {
                 &peers,
                 &apps,
                 &connected_peer,
-                multiroom_peer_ids.len(),
+                &connected_name,
+                &multiroom_peer_ids,
                 sharing_enabled,
                 auto_enabled,
                 keep_local,
+                mic_active,
                 &mic_direction,
                 android_active,
             );
@@ -828,7 +832,28 @@ fn handle_menu_action(id_str: &str, daemon: &Daemon, running: &AtomicBool) {
     if let Some(peer_id) = id_str.strip_prefix("peer_toggle:") {
         if external {
             let snap = collect_tray_snapshot(daemon);
-            if snap.connected_peer == peer_id {
+            if snap.multiroom && snap.multiroom_peer_ids.iter().any(|id| id == peer_id) {
+                let remaining: Vec<String> = snap
+                    .multiroom_peer_ids
+                    .into_iter()
+                    .filter(|id| id != peer_id)
+                    .collect();
+                if remaining.is_empty() {
+                    let _ = ipc_request(
+                        "disconnect",
+                        serde_json::json!({}),
+                        None,
+                        Duration::from_secs(6),
+                    );
+                } else {
+                    let _ = ipc_request(
+                        "connect",
+                        serde_json::json!({ "peers": remaining, "keep_local": snap.keep_local }),
+                        None,
+                        Duration::from_secs(12),
+                    );
+                }
+            } else if snap.connected_peer == peer_id {
                 let _ = ipc_request(
                     "disconnect",
                     serde_json::json!({}),
@@ -845,7 +870,34 @@ fn handle_menu_action(id_str: &str, daemon: &Daemon, running: &AtomicBool) {
             }
         } else {
             let st = lock_or_recover(&ctrl.state).clone();
-            if st.connected_peer == peer_id {
+            let active_multi: Vec<String> = st
+                .multiroom_peers
+                .iter()
+                .map(|s| s.peer_id.clone())
+                .collect();
+            if st.is_multiroom() && active_multi.iter().any(|id| id == peer_id) {
+                let remaining: Vec<String> = active_multi
+                    .into_iter()
+                    .filter(|id| id != peer_id)
+                    .collect();
+                let target_peers: Vec<Peer> = peers
+                    .into_iter()
+                    .filter(|p| remaining.contains(&p.id))
+                    .collect();
+                if target_peers.is_empty() {
+                    let _ = ctrl.disconnect(false, None, true, Some(true), false, false);
+                } else {
+                    let _ = ctrl.connect_multi(
+                        &target_peers,
+                        ConnectOptions {
+                            keep_local: st.keep_local,
+                            notify_user: Some(true),
+                            by: "tray".to_string(),
+                            ..Default::default()
+                        },
+                    );
+                }
+            } else if st.connected_peer == peer_id {
                 let _ = ctrl.disconnect(false, None, true, Some(true), false, false);
             } else if let Some(peer) = peers.iter().find(|p| p.id == peer_id) {
                 let _ = ctrl.connect(
@@ -1115,10 +1167,12 @@ fn compute_menu_signature(
     peers: &[Peer],
     streams: &[serde_json::Value],
     connected_peer: &str,
-    multiroom_count: usize,
+    connected_name: &str,
+    multiroom_peer_ids: &[String],
     sharing_enabled: bool,
     auto_enabled: bool,
     keep_local: bool,
+    mic_active: bool,
     mic_direction: &str,
     android_active: bool,
 ) -> String {
@@ -1139,15 +1193,19 @@ fn compute_menu_signature(
             format!("{name}:{media}:{remote}:{rule}")
         })
         .collect();
+    let mut sorted_multi: Vec<&str> = multiroom_peer_ids.iter().map(String::as_str).collect();
+    sorted_multi.sort_unstable();
     format!(
-        "peers={}|apps={}|conn={}|multi={}|share={}|auto={}|keep={}|mic={}|and={}",
+        "peers={}|apps={}|conn={}|cname={}|multi={}|share={}|auto={}|keep={}|mic_on={}|mic={}|and={}",
         peer_sig.join(","),
         app_sig.join(","),
         connected_peer,
-        multiroom_count,
+        connected_name,
+        sorted_multi.join(","),
         sharing_enabled,
         auto_enabled,
         keep_local,
+        mic_active,
         mic_direction,
         android_active,
     )
@@ -1229,7 +1287,7 @@ pub fn run_tray(verbose: bool) -> Result<i32, String> {
     let worker_daemon = Arc::clone(&daemon);
     let worker_running = Arc::clone(&running);
 
-    let _worker_handle = std::thread::spawn(move || {
+    let worker_handle = std::thread::spawn(move || {
         let _ = ui_tx.send(collect_tray_snapshot(&worker_daemon));
         let mut last_refresh = Instant::now();
         while worker_running.load(Ordering::Relaxed)
@@ -1308,7 +1366,9 @@ pub fn run_tray(verbose: bool) -> Result<i32, String> {
         std::thread::sleep(Duration::from_millis(30));
     }
 
+    running.store(false, Ordering::SeqCst);
     drop(cmd_tx);
+    let _ = worker_handle.join();
     daemon.shutdown();
     Ok(0)
 }
@@ -1348,7 +1408,8 @@ mod tests {
 
     #[test]
     fn test_compute_menu_signature_tracks_apps_and_android() {
-        let s1 = compute_menu_signature(&[], &[], "", 0, false, false, false, "", false);
+        let s1 =
+            compute_menu_signature(&[], &[], "", "", &[], false, false, false, false, "", false);
         let s2 = compute_menu_signature(
             &[],
             &[serde_json::json!({
@@ -1358,15 +1419,82 @@ mod tests {
                 "routed_rule": "remote"
             })],
             "",
-            0,
+            "",
+            &[],
+            false,
             false,
             false,
             false,
             "",
             false,
         );
-        let s3 = compute_menu_signature(&[], &[], "", 0, false, false, false, "", true);
+        let s3 =
+            compute_menu_signature(&[], &[], "", "", &[], false, false, false, false, "", true);
         assert_ne!(s1, s2);
         assert_ne!(s1, s3);
+    }
+
+    #[test]
+    fn test_compute_menu_signature_tracks_multiroom_mic_active_and_connected_name() {
+        let base = compute_menu_signature(
+            &[],
+            &[],
+            "peer-1",
+            "Living Room",
+            &["peer-1".to_string(), "peer-2".to_string()],
+            false,
+            false,
+            false,
+            false,
+            "send",
+            false,
+        );
+        // Same count of multiroom peers, different peer IDs
+        let diff_multi = compute_menu_signature(
+            &[],
+            &[],
+            "peer-1",
+            "Living Room",
+            &["peer-1".to_string(), "peer-3".to_string()],
+            false,
+            false,
+            false,
+            false,
+            "send",
+            false,
+        );
+        assert_ne!(base, diff_multi);
+
+        // Same mic_direction, different mic_active
+        let diff_mic = compute_menu_signature(
+            &[],
+            &[],
+            "peer-1",
+            "Living Room",
+            &["peer-1".to_string(), "peer-2".to_string()],
+            false,
+            false,
+            false,
+            true,
+            "send",
+            false,
+        );
+        assert_ne!(base, diff_mic);
+
+        // Different connected_name
+        let diff_name = compute_menu_signature(
+            &[],
+            &[],
+            "peer-1",
+            "Kitchen",
+            &["peer-1".to_string(), "peer-2".to_string()],
+            false,
+            false,
+            false,
+            false,
+            "send",
+            false,
+        );
+        assert_ne!(base, diff_name);
     }
 }

@@ -104,6 +104,7 @@ pub struct ControlCenterApp {
     phone_state: phone::PhoneViewState,
     settings_state: settings::SettingsViewState,
     onboarding_state: onboarding::OnboardingState,
+    was_showing_onboarding: bool,
     logo_texture: Option<egui::TextureHandle>,
     system_dark_hint: Option<bool>,
     last_theme_state: Option<(ThemeMode, bool)>,
@@ -121,6 +122,7 @@ impl ControlCenterApp {
             phone_state: phone::PhoneViewState::default(),
             settings_state: settings::SettingsViewState::default(),
             onboarding_state: onboarding::OnboardingState::default(),
+            was_showing_onboarding: false,
             logo_texture: None,
             system_dark_hint: None,
             last_theme_state: None,
@@ -172,9 +174,14 @@ impl eframe::App for ControlCenterApp {
         ctx.request_repaint_after(Duration::from_millis(repaint_ms));
 
         if snap.show_onboarding {
+            if !self.was_showing_onboarding {
+                self.onboarding_state.reset();
+                self.was_showing_onboarding = true;
+            }
             onboarding::render(ctx, &pal, &snap, &mut self.onboarding_state, &self.backend);
             return;
         }
+        self.was_showing_onboarding = false;
 
         // Left Navigation Rail
         egui::SidePanel::left("soundhop_nav_rail")
