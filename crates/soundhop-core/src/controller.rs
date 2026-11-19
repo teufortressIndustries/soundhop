@@ -134,15 +134,30 @@ impl Controller {
         if let Ok(disk_cfg) = Config::load(self.config_path.as_deref()) {
             *self.config.lock().unwrap_or_else(|e| e.into_inner()) = disk_cfg;
         }
-        let mut disk_state = State::load(self.state_path.as_deref());
+        let Ok(mut disk_state) = State::try_load(self.state_path.as_deref()) else {
+            return;
+        };
         let mut guard = self.state.lock().unwrap_or_else(|e| e.into_inner());
         for (k, v) in &guard.known_peers {
             if !is_own_non_loopback_ip(&v.host) {
-                disk_state
-                    .known_peers
-                    .entry(k.clone())
-                    .or_insert_with(|| v.clone());
+                match disk_state.known_peers.get_mut(k) {
+                    Some(disk_peer) => {
+                        if v.last_seen >= disk_peer.last_seen {
+                            *disk_peer = v.clone();
+                        }
+                    }
+                    None => {
+                        disk_state.known_peers.insert(k.clone(), v.clone());
+                    }
+                }
             }
+        }
+        if disk_state.connected_peer == guard.connected_peer
+            && disk_state.connected_sink == guard.connected_sink
+            && guard.last_synced_volume >= 0
+        {
+            disk_state.last_synced_volume = guard.last_synced_volume;
+            disk_state.last_synced_mute = guard.last_synced_mute;
         }
         *guard = disk_state;
     }
@@ -371,7 +386,11 @@ impl Controller {
             "telemetry": self.telemetry.snapshot(),
             "peers": peers_json,
             "known_peers": known_list,
-            "paired_peers": st.paired_peers.values().cloned().collect::<Vec<_>>(),
+            "paired_peers": st
+                .paired_peers
+                .values()
+                .map(PairedPeer::to_public_json)
+                .collect::<Vec<_>>(),
             "backend": backend_json,
         })
     }
@@ -2091,5 +2110,158 @@ mod tests {
         assert_eq!(res["with_mic"], true);
         assert_eq!(res["mic_direction"], "send");
         drop(listener);
+    }
+
+    #[test]
+    fn test_reload_from_disk_preserves_live_state_and_handles_corrupt_file() {
+        let dir = tempfile::tempdir().unwrap();
+        let cfg_path = dir.path().join("config.toml");
+        let state_path = dir.path().join("state.json");
+
+        let runner = Arc::new(MockRunner::new(|args, _| {
+            Ok(CommandResult {
+                args: args.to_vec(),
+                returncode: 0,
+                stdout: String::new(),
+                stderr: String::new(),
+            })
+        }));
+        let backend = Arc::new(LinuxAudioBackend::with_runner(runner));
+        let ctrl = Controller::new(
+            Some(Config::default()),
+            Some(State::default()),
+            Some(backend),
+            Some(cfg_path),
+            Some(state_path.clone()),
+            false,
+        );
+
+        // Populate live state and save to disk.
+        {
+            let mut st = ctrl.state.lock().unwrap();
+            st.connected_peer = "peer-1".to_string();
+            st.connected_sink = "soundhop_peer1".to_string();
+            st.known_peers.insert(
+                "peer-1".to_string(),
+                KnownPeer {
+                    id: "peer-1".to_string(),
+                    name: "Old Name".to_string(),
+                    host: "192.168.1.10".to_string(),
+                    port: 4713,
+                    last_seen: 100.0,
+                    ..Default::default()
+                },
+            );
+        }
+        ctrl.save();
+
+        // Update live state in memory without saving to disk.
+        {
+            let mut st = ctrl.state.lock().unwrap();
+            st.last_synced_volume = 72;
+            st.last_synced_mute = true;
+            st.known_peers.insert(
+                "peer-1".to_string(),
+                KnownPeer {
+                    id: "peer-1".to_string(),
+                    name: "New Name".to_string(),
+                    host: "192.168.1.25".to_string(),
+                    port: 4714,
+                    last_seen: 200.0,
+                    ..Default::default()
+                },
+            );
+        }
+
+        // Reloading valid disk state must preserve newer live known_peers & volume sync cache.
+        ctrl.reload_from_disk();
+        {
+            let st = ctrl.state.lock().unwrap();
+            assert_eq!(st.last_synced_volume, 72);
+            assert!(st.last_synced_mute);
+            let kp = st.known_peers.get("peer-1").unwrap();
+            assert_eq!(kp.name, "New Name");
+            assert_eq!(kp.host, "192.168.1.25");
+            assert_eq!(kp.port, 4714);
+        }
+
+        // Corrupt the state file on disk -> reload_from_disk must NOT wipe live state.
+        std::fs::write(&state_path, "{ invalid json").unwrap();
+        ctrl.reload_from_disk();
+        {
+            let st = ctrl.state.lock().unwrap();
+            assert_eq!(st.connected_peer, "peer-1");
+            assert_eq!(st.last_synced_volume, 72);
+            assert!(st.known_peers.contains_key("peer-1"));
+        }
+
+        // Remove the state file -> reload_from_disk must NOT wipe live state.
+        std::fs::remove_file(&state_path).unwrap();
+        ctrl.reload_from_disk();
+        {
+            let st = ctrl.state.lock().unwrap();
+            assert_eq!(st.connected_peer, "peer-1");
+            assert!(st.known_peers.contains_key("peer-1"));
+        }
+    }
+
+    #[test]
+    fn test_status_redacts_paired_peer_secrets_while_disk_preserves_them() {
+        let dir = tempfile::tempdir().unwrap();
+        let state_path = dir.path().join("state.json");
+        let cfg_path = dir.path().join("config.toml");
+
+        let runner = Arc::new(MockRunner::new(|args, _| {
+            Ok(CommandResult {
+                args: args.to_vec(),
+                returncode: 0,
+                stdout: String::new(),
+                stderr: String::new(),
+            })
+        }));
+        let backend = Arc::new(LinuxAudioBackend::with_runner(runner));
+        let ctrl = Controller::new(
+            Some(Config::default()),
+            Some(State::default()),
+            Some(backend),
+            Some(cfg_path),
+            Some(state_path.clone()),
+            false,
+        );
+
+        let secret_key = "deadbeef0123456789abcdef01234567";
+        let secret_cookie = "cafebabe9876543210fedcba98765432";
+        ctrl.state.lock().unwrap().paired_peers.insert(
+            "peer-sec".to_string(),
+            PairedPeer {
+                peer_id: "peer-sec".to_string(),
+                name: "Studio Speaker".to_string(),
+                shared_key_hex: secret_key.to_string(),
+                cookie_hex: secret_cookie.to_string(),
+                paired_at: 1234.5,
+            },
+        );
+        ctrl.save();
+
+        // Disk persistence must still contain the secrets.
+        let reloaded = State::try_load(Some(&state_path)).unwrap();
+        let saved_peer = reloaded.paired_peers.get("peer-sec").unwrap();
+        assert_eq!(saved_peer.shared_key_hex, secret_key);
+        assert_eq!(saved_peer.cookie_hex, secret_cookie);
+
+        // status() JSON must NOT expose raw secrets or secret keys.
+        let status = ctrl.status(None);
+        let serialized = serde_json::to_string(&status).unwrap();
+        assert!(!serialized.contains(secret_key));
+        assert!(!serialized.contains(secret_cookie));
+        assert!(!serialized.contains("shared_key_hex"));
+        assert!(!serialized.contains("cookie_hex"));
+
+        let paired = status["paired_peers"].as_array().unwrap();
+        assert_eq!(paired.len(), 1);
+        assert_eq!(paired[0]["peer_id"], "peer-sec");
+        assert_eq!(paired[0]["name"], "Studio Speaker");
+        assert_eq!(paired[0]["has_shared_key"], true);
+        assert_eq!(paired[0]["has_cookie"], true);
     }
 }

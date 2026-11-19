@@ -477,17 +477,35 @@ pub fn pid_path() -> PathBuf {
     runtime_dir().join("daemon.pid")
 }
 
-/// Closes non-standard file descriptors (>= 3) on Unix before executing child processes.
-/// This prevents leaking parent file descriptors (such as AppImage FUSE mount directory
-/// file descriptors like FD 1023) into child processes (pactl, parec, scrcpy, notify-send).
+/// Marks non-standard file descriptors (>= 3) as `FD_CLOEXEC` on Unix before executing
+/// child processes. Using `CLOEXEC` (instead of closing immediately) preserves Rust's
+/// internal `O_CLOEXEC` exec-error pipe so `Command::spawn` still reports `ENOENT`/`EACCES`,
+/// while preventing parent file descriptors (such as AppImage FUSE mount directory fds)
+/// from leaking into child processes (pactl, parec, scrcpy, notify-send).
 #[cfg(unix)]
 pub fn close_fds_pre_exec(cmd: &mut Command) {
     use std::os::unix::process::CommandExt;
+    let max_fd = unsafe {
+        let lim = libc::sysconf(libc::_SC_OPEN_MAX);
+        if lim > 3 {
+            lim.min(4096) as libc::c_int
+        } else {
+            1024
+        }
+    };
     unsafe {
-        cmd.pre_exec(|| {
-            if libc::close_range(3, !0, 0) != 0 {
-                for fd in 3..1024 {
-                    libc::close(fd);
+        cmd.pre_exec(move || {
+            #[cfg(target_os = "linux")]
+            let cloexec_done = libc::close_range(3, u32::MAX, libc::CLOSE_RANGE_CLOEXEC as _) == 0;
+            #[cfg(not(target_os = "linux"))]
+            let cloexec_done = false;
+
+            if !cloexec_done {
+                for fd in 3..max_fd {
+                    let flags = libc::fcntl(fd, libc::F_GETFD);
+                    if flags != -1 && (flags & libc::FD_CLOEXEC) == 0 {
+                        libc::fcntl(fd, libc::F_SETFD, flags | libc::FD_CLOEXEC);
+                    }
                 }
             }
             Ok(())
@@ -1360,5 +1378,16 @@ mod tests {
         std::os::unix::fs::symlink(&target, &link).unwrap();
         let res = ensure_dir(&link);
         assert!(res.is_err());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn test_close_fds_pre_exec_preserves_exec_error_reporting() {
+        let mut cmd = Command::new("/nonexistent/soundhop-missing-binary-for-test");
+        close_fds_pre_exec(&mut cmd);
+        let err = cmd
+            .spawn()
+            .expect_err("spawning a nonexistent binary must return Err(NotFound)");
+        assert_eq!(err.kind(), std::io::ErrorKind::NotFound);
     }
 }

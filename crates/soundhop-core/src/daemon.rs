@@ -490,13 +490,22 @@ impl Daemon {
         if let Some(kp) = self.controller.known_peer(q) {
             return Ok(kp);
         }
-        for kp in self.controller.state.lock().unwrap().known_peers.values() {
-            if kp.name.eq_ignore_ascii_case(q) || kp.host.eq_ignore_ascii_case(q) {
-                return self
-                    .controller
-                    .known_peer(&kp.id)
-                    .ok_or_else(|| format!("Unknown device: {q}"));
-            }
+        let matched_known_id = {
+            let st = self
+                .controller
+                .state
+                .lock()
+                .unwrap_or_else(|e| e.into_inner());
+            st.known_peers
+                .values()
+                .find(|kp| kp.name.eq_ignore_ascii_case(q) || kp.host.eq_ignore_ascii_case(q))
+                .map(|kp| kp.id.clone())
+        };
+        if let Some(id) = matched_known_id {
+            return self
+                .controller
+                .known_peer(&id)
+                .ok_or_else(|| format!("Unknown device: {q}"));
         }
         let psk = (!cfg.sharing.psk_hash.is_empty()).then_some(cfg.sharing.psk_hash.as_str());
         for found in discover_once_with_psk(0.8, cfg.discovery.port, &cfg.device.id, psk) {
@@ -563,9 +572,37 @@ impl Daemon {
                 st
             }
             "peers" | "discover" => {
-                if let Some(disc) = self.discovery.lock().unwrap().as_ref() {
+                let timeout = req
+                    .get("timeout")
+                    .and_then(|v| v.as_f64())
+                    .filter(|t| t.is_finite() && *t > 0.0)
+                    .map(|t| t.clamp(0.1, 15.0));
+                let disc_opt = self
+                    .discovery
+                    .lock()
+                    .unwrap_or_else(|e| e.into_inner())
+                    .clone();
+                if let Some(disc) = disc_opt {
                     disc.probe();
+                    if let Some(t) = timeout {
+                        thread::sleep(Duration::from_secs_f64(t));
+                    }
                     let list: Vec<Value> = disc.peers().into_iter().map(|p| p.to_json()).collect();
+                    serde_json::json!({ "ok": true, "peers": list })
+                } else if let Some(t) = timeout {
+                    let cfg = self
+                        .controller
+                        .config
+                        .lock()
+                        .unwrap_or_else(|e| e.into_inner())
+                        .clone();
+                    let psk =
+                        (!cfg.sharing.psk_hash.is_empty()).then_some(cfg.sharing.psk_hash.as_str());
+                    let found = discover_once_with_psk(t, cfg.discovery.port, &cfg.device.id, psk);
+                    for p in &found {
+                        self.controller.remember_peer(p);
+                    }
+                    let list: Vec<Value> = found.into_iter().map(|p| p.to_json()).collect();
                     serde_json::json!({ "ok": true, "peers": list })
                 } else {
                     serde_json::json!({ "ok": true, "peers": [] })
@@ -595,6 +632,24 @@ impl Daemon {
                     .and_then(|v| v.as_str())
                     .unwrap_or("send")
                     .to_string();
+                let latency_ms = req
+                    .get("latency_ms")
+                    .and_then(|v| v.as_u64())
+                    .and_then(|v| u32::try_from(v).ok())
+                    .filter(|&v| v > 0);
+                let remember = req
+                    .get("remember")
+                    .and_then(|v| v.as_bool())
+                    .unwrap_or(false);
+
+                if let Some(lat) = latency_ms {
+                    self.controller
+                        .config
+                        .lock()
+                        .unwrap_or_else(|e| e.into_inner())
+                        .connection
+                        .latency_ms = Some(lat);
+                }
 
                 let opts = ConnectOptions {
                     switch_default,
@@ -617,13 +672,39 @@ impl Daemon {
                         }
                     }
                     match self.controller.connect_multi(&resolved, opts) {
-                        Ok(res) => serde_json::json!({ "ok": true, "connection": res }),
+                        Ok(res) => {
+                            if remember {
+                                if let Some(first) = resolved.first() {
+                                    self.controller
+                                        .config
+                                        .lock()
+                                        .unwrap_or_else(|e| e.into_inner())
+                                        .connection
+                                        .last_peer = first.id.clone();
+                                    self.controller.remember_peer(first);
+                                    self.controller.save();
+                                }
+                            }
+                            serde_json::json!({ "ok": true, "connection": res })
+                        }
                         Err(e) => serde_json::json!({ "ok": false, "error": e.to_string() }),
                     }
                 } else {
                     match self.resolve_peer(peer_arg, host, port, name) {
                         Ok(peer) => match self.controller.connect(&peer, opts) {
-                            Ok(res) => serde_json::json!({ "ok": true, "connection": res }),
+                            Ok(res) => {
+                                if remember {
+                                    self.controller
+                                        .config
+                                        .lock()
+                                        .unwrap_or_else(|e| e.into_inner())
+                                        .connection
+                                        .last_peer = peer.id.clone();
+                                    self.controller.remember_peer(&peer);
+                                    self.controller.save();
+                                }
+                                serde_json::json!({ "ok": true, "connection": res })
+                            }
                             Err(e) => serde_json::json!({ "ok": false, "error": e.to_string() }),
                         },
                         Err(e) => serde_json::json!({ "ok": false, "error": e }),
@@ -662,11 +743,33 @@ impl Daemon {
             }
             "share" => {
                 let enabled = req.get("enabled").and_then(|v| v.as_bool()).unwrap_or(true);
+                let port_changed = if let Some(p) = req
+                    .get("port")
+                    .and_then(|v| v.as_u64())
+                    .and_then(|p| u16::try_from(p).ok())
+                    .filter(|&p| p > 0)
+                {
+                    let mut cfg = self
+                        .controller
+                        .config
+                        .lock()
+                        .unwrap_or_else(|e| e.into_inner());
+                    let changed = cfg.sharing.port != p;
+                    cfg.sharing.port = p;
+                    changed
+                } else {
+                    false
+                };
                 match self.controller.share(enabled, None) {
-                    Ok(res) => {
+                    Ok(mut res) => {
                         self.advertising.store(enabled, Ordering::SeqCst);
-                        if let Some(disc) = self.discovery.lock().unwrap().as_ref() {
+                        if port_changed {
+                            self.setup_discovery();
+                        } else if let Some(disc) = self.discovery.lock().unwrap().as_ref() {
                             disc.set_advertising(enabled);
+                        }
+                        if let Some(obj) = res.as_object_mut() {
+                            obj.entry("ok".to_string()).or_insert(Value::Bool(true));
                         }
                         res
                     }
@@ -862,6 +965,19 @@ impl Daemon {
                 let st = self.controller.android_session.stop();
                 serde_json::json!({ "ok": true, "session": st })
             }
+            "logs" => {
+                let limit = req
+                    .get("lines")
+                    .or_else(|| req.get("limit"))
+                    .and_then(|v| v.as_u64())
+                    .map(|n| (n as usize).clamp(1, 2000))
+                    .unwrap_or(200);
+                let lines = self.collect_recent_logs(limit);
+                serde_json::json!({
+                    "ok": true,
+                    "lines": lines,
+                })
+            }
             "stop" => {
                 self.request_stop();
                 serde_json::json!({ "ok": true, "stopping": true })
@@ -871,6 +987,37 @@ impl Daemon {
                 "error": format!("Unknown IPC command: {cmd}")
             }),
         }
+    }
+
+    fn collect_recent_logs(&self, max_lines: usize) -> Vec<String> {
+        let mut lines = Vec::new();
+        let path = crate::util::log_path();
+        if let Ok(raw) = fs::read_to_string(&path) {
+            for line in raw.lines() {
+                if !line.trim().is_empty() {
+                    lines.push(line.to_string());
+                }
+            }
+        }
+        {
+            let warnings = self.warnings.lock().unwrap_or_else(|e| e.into_inner());
+            for w in warnings.iter() {
+                lines.push(format!("[daemon] {w}"));
+            }
+        }
+        let android_st = self.controller.android_session.status();
+        if let Some(arr) = android_st.get("recent_logs").and_then(|v| v.as_array()) {
+            for item in arr {
+                if let Some(s) = item.as_str() {
+                    lines.push(s.to_string());
+                }
+            }
+        }
+        if lines.len() > max_lines {
+            let drain_count = lines.len() - max_lines;
+            lines.drain(0..drain_count);
+        }
+        lines
     }
 }
 
@@ -921,5 +1068,96 @@ mod tests {
 
         assert!(stop_called.load(Ordering::SeqCst));
         assert!(!is_reachable(Some(&sock)));
+    }
+
+    #[test]
+    fn test_resolve_peer_by_known_name_and_host_does_not_deadlock() {
+        let dir = tempfile::tempdir().unwrap();
+        let cfg_path = dir.path().join("config.toml");
+        let state_path = dir.path().join("state.json");
+        let daemon = Daemon::new(Some(cfg_path), Some(state_path), false, None);
+        daemon.controller.set_save_enabled(false);
+
+        daemon.controller.state.lock().unwrap().known_peers.insert(
+            "peer-living-room".to_string(),
+            crate::state::KnownPeer {
+                id: "peer-living-room".to_string(),
+                name: "Living Room".to_string(),
+                host: "192.168.1.50".to_string(),
+                port: 4713,
+                last_seen: now_secs(),
+                ..Default::default()
+            },
+        );
+
+        let by_name = daemon
+            .resolve_peer(Some("living room"), None, None, None)
+            .expect("resolve_peer by known name should succeed without deadlocking");
+        assert_eq!(by_name.id, "peer-living-room");
+        assert_eq!(by_name.host, "192.168.1.50");
+
+        let by_host = daemon
+            .resolve_peer(Some("192.168.1.50"), None, None, None)
+            .expect("resolve_peer by known host should succeed without deadlocking");
+        assert_eq!(by_host.id, "peer-living-room");
+    }
+
+    #[test]
+    fn test_ipc_logs_discover_and_connect_share_options() {
+        let dir = tempfile::tempdir().unwrap();
+        let cfg_path = dir.path().join("config.toml");
+        let state_path = dir.path().join("state.json");
+        let daemon = Daemon::new(Some(cfg_path), Some(state_path), false, None);
+        daemon.controller.set_save_enabled(false);
+
+        // "logs" returns {"ok": true, "lines": [...]} including daemon warnings.
+        daemon
+            .warnings
+            .lock()
+            .unwrap()
+            .push("test warning line".to_string());
+        let logs_resp = daemon.handle_ipc(serde_json::json!({ "cmd": "logs", "lines": 50 }));
+        assert_eq!(logs_resp["ok"], true);
+        let lines = logs_resp["lines"].as_array().unwrap();
+        assert!(lines
+            .iter()
+            .any(|l| l.as_str().is_some_and(|s| s.contains("test warning line"))));
+
+        // "discover" works both without and with optional "timeout".
+        let disc_default = daemon.handle_ipc(serde_json::json!({ "cmd": "discover" }));
+        assert_eq!(disc_default["ok"], true);
+        assert!(disc_default["peers"].is_array());
+
+        let disc_timeout =
+            daemon.handle_ipc(serde_json::json!({ "cmd": "discover", "timeout": 0.1 }));
+        assert_eq!(disc_timeout["ok"], true);
+        assert!(disc_timeout["peers"].is_array());
+
+        // "share" applies optional "port" to config (even if backend is unavailable in test env).
+        let _ = daemon.handle_ipc(serde_json::json!({
+            "cmd": "share",
+            "enabled": false,
+            "port": 4899,
+        }));
+        assert_eq!(daemon.controller.config.lock().unwrap().sharing.port, 4899);
+
+        // "connect" applies optional "latency_ms" to config.
+        let _ = daemon.handle_ipc(serde_json::json!({
+            "cmd": "connect",
+            "host": "127.0.0.1",
+            "port": 1,
+            "latency_ms": 45,
+            "remember": true,
+        }));
+        assert_eq!(
+            daemon
+                .controller
+                .config
+                .lock()
+                .unwrap()
+                .connection
+                .latency_ms,
+            Some(45)
+        );
     }
 }

@@ -1,7 +1,9 @@
 //! Firewall inspection and rule helpers for UFW, firewalld, nftables, and Windows Defender.
 
 use serde::{Deserialize, Serialize};
+use std::fs;
 use std::io::IsTerminal;
+use std::path::Path;
 use std::time::Duration;
 
 use crate::constants::MDNS_PORT;
@@ -59,11 +61,40 @@ pub fn is_admin() -> bool {
     }
 }
 
+fn parse_ufw_conf_enabled(content: &str) -> Option<bool> {
+    for raw_line in content.lines() {
+        let line = raw_line.trim();
+        if line.is_empty() || line.starts_with('#') {
+            continue;
+        }
+        let Some((key, val)) = line.split_once('=') else {
+            continue;
+        };
+        if key.trim().eq_ignore_ascii_case("ENABLED") {
+            let cleaned = val.trim().trim_matches(|c| c == '"' || c == '\'');
+            if cleaned.eq_ignore_ascii_case("yes") {
+                return Some(true);
+            }
+            if cleaned.eq_ignore_ascii_case("no") {
+                return Some(false);
+            }
+        }
+    }
+    None
+}
+
 pub fn detect() -> FirewallState {
     detect_with_runner(&SystemRunner)
 }
 
 pub fn detect_with_runner(runner: &dyn ProcessRunner) -> FirewallState {
+    detect_with_runner_and_ufw_conf(runner, Path::new("/etc/ufw/ufw.conf"))
+}
+
+fn detect_with_runner_and_ufw_conf(
+    runner: &dyn ProcessRunner,
+    ufw_conf_path: &Path,
+) -> FirewallState {
     if cfg!(windows) {
         if runner.command_exists("netsh") {
             let args = vec![
@@ -114,12 +145,45 @@ pub fn detect_with_runner(runner: &dyn ProcessRunner) -> FirewallState {
                     detail: "ufw is installed but inactive".to_string(),
                 };
             }
-            return FirewallState {
-                kind: "ufw".to_string(),
-                active: false,
-                detail: "ufw state could not be determined".to_string(),
-            };
         }
+        // `ufw status` requires root on most Linux distributions. Fall back to
+        // reading `/etc/ufw/ufw.conf` (world-readable) or querying systemd.
+        if let Ok(conf) = fs::read_to_string(ufw_conf_path) {
+            if let Some(enabled) = parse_ufw_conf_enabled(&conf) {
+                return FirewallState {
+                    kind: "ufw".to_string(),
+                    active: enabled,
+                    detail: if enabled {
+                        "ufw is active (detected from ufw.conf)".to_string()
+                    } else {
+                        "ufw is installed but inactive (detected from ufw.conf)".to_string()
+                    },
+                };
+            }
+        }
+        if let Ok(res) = runner.run(
+            &[
+                "systemctl".to_string(),
+                "is-active".to_string(),
+                "--quiet".to_string(),
+                "ufw".to_string(),
+            ],
+            None,
+            Duration::from_secs(5),
+        ) {
+            if res.ok() {
+                return FirewallState {
+                    kind: "ufw".to_string(),
+                    active: true,
+                    detail: "ufw is active (detected via systemd)".to_string(),
+                };
+            }
+        }
+        return FirewallState {
+            kind: "ufw".to_string(),
+            active: false,
+            detail: "ufw state could not be determined".to_string(),
+        };
     }
 
     if runner.command_exists("firewall-cmd") {
@@ -498,6 +562,59 @@ mod tests {
         let st = detect_with_runner(&runner);
         assert_eq!(st.kind, "ufw");
         assert!(st.active);
+    }
+
+    #[test]
+    #[cfg(not(windows))]
+    fn test_detect_ufw_non_root_falls_back_to_ufw_conf_and_systemd() {
+        let dir = tempfile::tempdir().unwrap();
+        let conf_yes = dir.path().join("ufw_yes.conf");
+        fs::write(&conf_yes, "# comment\nENABLED=yes\nLOGLEVEL=low\n").unwrap();
+        let conf_no = dir.path().join("ufw_no.conf");
+        fs::write(&conf_no, "ENABLED=no\n").unwrap();
+        let conf_missing = dir.path().join("missing.conf");
+
+        let runner = MockRunner::new(|args, _| {
+            if args.first().map(|s| s.as_str()) == Some("ufw") {
+                return Ok(CommandResult {
+                    args: args.to_vec(),
+                    returncode: 1,
+                    stdout: String::new(),
+                    stderr: "ERROR: You need to be root to run this script\n".to_string(),
+                });
+            }
+            if args.first().map(|s| s.as_str()) == Some("systemctl") {
+                return Ok(CommandResult {
+                    args: args.to_vec(),
+                    returncode: 0,
+                    stdout: String::new(),
+                    stderr: String::new(),
+                });
+            }
+            Ok(CommandResult {
+                args: args.to_vec(),
+                returncode: 1,
+                stdout: String::new(),
+                stderr: String::new(),
+            })
+        });
+        runner
+            .available_commands
+            .lock()
+            .unwrap()
+            .insert("ufw".to_string());
+
+        let st_yes = detect_with_runner_and_ufw_conf(&runner, &conf_yes);
+        assert_eq!(st_yes.kind, "ufw");
+        assert!(st_yes.active);
+
+        let st_no = detect_with_runner_and_ufw_conf(&runner, &conf_no);
+        assert_eq!(st_no.kind, "ufw");
+        assert!(!st_no.active);
+
+        let st_systemd = detect_with_runner_and_ufw_conf(&runner, &conf_missing);
+        assert_eq!(st_systemd.kind, "ufw");
+        assert!(st_systemd.active);
     }
 
     #[test]

@@ -803,55 +803,98 @@ impl AndroidCaptureSession {
         }
     }
 
+    fn take_exited_cleanup(guard: &mut CaptureInner) -> Option<(u32, u32, String)> {
+        guard.child = None;
+        let src_mod = std::mem::take(&mut guard.virtual_source_module);
+        let sink_mod = std::mem::take(&mut guard.virtual_sink_module);
+        let prev_src = std::mem::take(&mut guard.previous_default_source);
+        guard.as_mic = false;
+        if src_mod > 0 || sink_mod > 0 || !prev_src.is_empty() {
+            Some((src_mod, sink_mod, prev_src))
+        } else {
+            None
+        }
+    }
+
+    fn cleanup_virtual_mic(&self, virt_src_mod: u32, virt_sink_mod: u32, prev_source: &str) {
+        if virt_src_mod > 0 {
+            let _ = self.backend.unload_module(virt_src_mod, true);
+        }
+        if virt_sink_mod > 0 {
+            let _ = self.backend.unload_module(virt_sink_mod, true);
+        }
+        if !prev_source.is_empty() {
+            let _ = self.backend.set_default_source(prev_source);
+        }
+    }
+
     pub fn is_active(&self) -> bool {
-        let mut guard = self.inner.lock().unwrap_or_else(|e| e.into_inner());
-        if let Some(ref mut child) = guard.child {
-            if let Ok(None) = child.try_wait() {
-                return true;
+        let cleanup = {
+            let mut guard = self.inner.lock().unwrap_or_else(|e| e.into_inner());
+            if let Some(ref mut child) = guard.child {
+                if let Ok(None) = child.try_wait() {
+                    return true;
+                }
             }
+            Self::take_exited_cleanup(&mut guard)
+        };
+        if let Some((src_mod, sink_mod, prev_src)) = cleanup {
+            self.cleanup_virtual_mic(src_mod, sink_mod, &prev_src);
         }
         false
     }
 
     pub fn status(&self) -> serde_json::Value {
-        let mut guard = self.inner.lock().unwrap_or_else(|e| e.into_inner());
-        let mut active = false;
-        let mut pid = 0u32;
-        if let Some(ref mut child) = guard.child {
-            if let Ok(None) = child.try_wait() {
-                active = true;
-                pid = child.id();
+        let (val, cleanup) = {
+            let mut guard = self.inner.lock().unwrap_or_else(|e| e.into_inner());
+            let mut active = false;
+            let mut pid = 0u32;
+            if let Some(ref mut child) = guard.child {
+                if let Ok(None) = child.try_wait() {
+                    active = true;
+                    pid = child.id();
+                }
             }
-        }
-        let elapsed = if active {
-            (now_secs() - guard.started_at).max(0.0)
-        } else {
-            0.0
+            let cleanup = if !active {
+                Self::take_exited_cleanup(&mut guard)
+            } else {
+                None
+            };
+            let elapsed = if active {
+                (now_secs() - guard.started_at).max(0.0)
+            } else {
+                0.0
+            };
+            let recent_logs: Vec<String> = guard
+                .log_lines
+                .iter()
+                .rev()
+                .take(20)
+                .cloned()
+                .collect::<Vec<_>>()
+                .into_iter()
+                .rev()
+                .collect();
+            let val = serde_json::json!({
+                "active": active,
+                "serial": if active { &guard.serial } else { "" },
+                "device_name": if active { &guard.device_name } else { "" },
+                "codec": if active { &guard.codec } else { "" },
+                "source": if active { &guard.source } else { "" },
+                "as_mic": if active { guard.as_mic } else { false },
+                "virtual_source": if active && guard.as_mic { "soundhop_android_mic" } else { "" },
+                "pid": pid,
+                "started_at": if active { guard.started_at } else { 0.0 },
+                "uptime_s": elapsed,
+                "last_error": guard.last_error,
+                "recent_logs": recent_logs,
+            });
+            (val, cleanup)
         };
-        let recent_logs: Vec<String> = guard
-            .log_lines
-            .iter()
-            .rev()
-            .take(20)
-            .cloned()
-            .collect::<Vec<_>>()
-            .into_iter()
-            .rev()
-            .collect();
-        serde_json::json!({
-            "active": active,
-            "serial": if active { &guard.serial } else { "" },
-            "device_name": if active { &guard.device_name } else { "" },
-            "codec": if active { &guard.codec } else { "" },
-            "source": if active { &guard.source } else { "" },
-            "as_mic": if active { guard.as_mic } else { false },
-            "virtual_source": if active && guard.as_mic { "soundhop_android_mic" } else { "" },
-            "pid": pid,
-            "started_at": if active { guard.started_at } else { 0.0 },
-            "uptime_s": elapsed,
-            "last_error": guard.last_error,
-            "recent_logs": recent_logs,
-        })
+        if let Some((src_mod, sink_mod, prev_src)) = cleanup {
+            self.cleanup_virtual_mic(src_mod, sink_mod, &prev_src);
+        }
+        val
     }
 
     #[allow(clippy::too_many_arguments)]
@@ -903,16 +946,19 @@ impl AndroidCaptureSession {
         if as_mic {
             let sink_name = "soundhop_android_mic_sink";
             let source_name = "soundhop_android_mic";
-            if let Ok(nid) = self.backend.load_module(
-                "module-null-sink",
-                &[
-                    format!("sink_name={sink_name}"),
-                    "sink_properties=device.description=SoundHop-Android-Mic-Sink".to_string(),
-                ],
-            ) {
-                virt_sink_mod = nid;
-            }
-            if let Ok(rid) = self.backend.load_module(
+            virt_sink_mod = self
+                .backend
+                .load_module(
+                    "module-null-sink",
+                    &[
+                        format!("sink_name={sink_name}"),
+                        "sink_properties=device.description=SoundHop-Android-Mic-Sink".to_string(),
+                    ],
+                )
+                .map_err(|e| {
+                    AndroidError::Message(format!("Failed to create virtual mic sink: {e}"))
+                })?;
+            virt_src_mod = match self.backend.load_module(
                 "module-remap-source",
                 &[
                     format!("source_name={source_name}"),
@@ -920,8 +966,14 @@ impl AndroidCaptureSession {
                     "source_properties=device.description=Android-Microphone".to_string(),
                 ],
             ) {
-                virt_src_mod = rid;
-            }
+                Ok(rid) => rid,
+                Err(e) => {
+                    self.cleanup_virtual_mic(0, virt_sink_mod, "");
+                    return Err(AndroidError::Message(format!(
+                        "Failed to create virtual mic source: {e}"
+                    )));
+                }
+            };
             prev_source = self.backend.default_source().unwrap_or_default();
             let _ = self.backend.set_default_source(source_name);
             cmd.env("SDL_AUDIODRIVER", "pulseaudio")
@@ -934,15 +986,7 @@ impl AndroidCaptureSession {
         let mut child = match cmd.spawn() {
             Ok(c) => c,
             Err(e) => {
-                if virt_src_mod > 0 {
-                    let _ = self.backend.unload_module(virt_src_mod, true);
-                }
-                if virt_sink_mod > 0 {
-                    let _ = self.backend.unload_module(virt_sink_mod, true);
-                }
-                if !prev_source.is_empty() {
-                    let _ = self.backend.set_default_source(&prev_source);
-                }
+                self.cleanup_virtual_mic(virt_src_mod, virt_sink_mod, &prev_source);
                 return Err(AndroidError::Message(format!(
                     "Failed to start scrcpy: {e}"
                 )));
@@ -952,8 +996,9 @@ impl AndroidCaptureSession {
         let stdout_opt = child.stdout.take();
         let stderr_opt = child.stderr.take();
 
-        {
+        let prior_cleanup = {
             let mut g = self.inner.lock().unwrap_or_else(|e| e.into_inner());
+            let prior = Self::take_exited_cleanup(&mut g);
             g.child = Some(child);
             g.serial = serial.to_string();
             g.device_name = if device_name.is_empty() {
@@ -970,6 +1015,11 @@ impl AndroidCaptureSession {
             g.started_at = now_secs();
             g.log_lines.clear();
             g.last_error.clear();
+            prior
+        };
+        if let Some((old_src, old_sink, old_prev)) = prior_cleanup {
+            let restore = if as_mic { "" } else { old_prev.as_str() };
+            self.cleanup_virtual_mic(old_src, old_sink, restore);
         }
 
         if let Some(stdout) = stdout_opt {
@@ -1007,29 +1057,16 @@ impl AndroidCaptureSession {
 
     pub fn stop(&self) -> serde_json::Value {
         let _op_guard = self.op_lock.lock().unwrap_or_else(|e| e.into_inner());
-        {
+        let cleanup = {
             let mut guard = self.inner.lock().unwrap_or_else(|e| e.into_inner());
             if let Some(mut child) = guard.child.take() {
                 let _ = child.kill();
                 let _ = child.wait();
             }
-            if guard.virtual_source_module > 0 {
-                let _ = self
-                    .backend
-                    .unload_module(guard.virtual_source_module, true);
-                guard.virtual_source_module = 0;
-            }
-            if guard.virtual_sink_module > 0 {
-                let _ = self.backend.unload_module(guard.virtual_sink_module, true);
-                guard.virtual_sink_module = 0;
-            }
-            if !guard.previous_default_source.is_empty() {
-                let _ = self
-                    .backend
-                    .set_default_source(&guard.previous_default_source);
-                guard.previous_default_source.clear();
-            }
-            guard.as_mic = false;
+            Self::take_exited_cleanup(&mut guard)
+        };
+        if let Some((src_mod, sink_mod, prev_src)) = cleanup {
+            self.cleanup_virtual_mic(src_mod, sink_mod, &prev_src);
         }
         self.status()
     }
@@ -1089,5 +1126,120 @@ mod tests {
             .unwrap();
         assert!(args.contains(&"--audio-source=output".to_string()));
         assert!(args.contains(&"R58M123".to_string()));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn test_virtual_mic_cleanup_on_exited_child_and_load_failure() {
+        use crate::backend::linux::LinuxAudioBackend;
+        use crate::util::{CommandResult, MockRunner};
+        use std::sync::atomic::{AtomicBool, Ordering};
+
+        let dir = tempfile::tempdir().unwrap();
+        let fake_scrcpy = dir.path().join("scrcpy");
+        fs::write(&fake_scrcpy, b"#!/bin/sh\nexit 0\n").unwrap();
+        {
+            use std::os::unix::fs::PermissionsExt;
+            fs::set_permissions(&fake_scrcpy, fs::Permissions::from_mode(0o755)).unwrap();
+        }
+        let mgr = Arc::new(AndroidManager::new(&fake_scrcpy.to_string_lossy(), ""));
+
+        // Case 1: child exits on its own -> status()/is_active() cleans up modules and restores source.
+        let fail_remap = Arc::new(AtomicBool::new(false));
+        let fail_remap_c = Arc::clone(&fail_remap);
+        let calls: Arc<Mutex<Vec<String>>> = Arc::new(Mutex::new(Vec::new()));
+        let calls_c = Arc::clone(&calls);
+
+        let runner = Arc::new(MockRunner::new(move |args, _| {
+            let joined = args.join(" ");
+            calls_c.lock().unwrap().push(joined.clone());
+            if joined.contains("load-module module-null-sink") {
+                return Ok(CommandResult {
+                    args: args.to_vec(),
+                    returncode: 0,
+                    stdout: "101\n".to_string(),
+                    stderr: String::new(),
+                });
+            }
+            if joined.contains("load-module module-remap-source") {
+                if fail_remap_c.load(Ordering::SeqCst) {
+                    return Ok(CommandResult {
+                        args: args.to_vec(),
+                        returncode: 1,
+                        stdout: String::new(),
+                        stderr: "module load failed".to_string(),
+                    });
+                }
+                return Ok(CommandResult {
+                    args: args.to_vec(),
+                    returncode: 0,
+                    stdout: "102\n".to_string(),
+                    stderr: String::new(),
+                });
+            }
+            if joined.contains("info") {
+                return Ok(CommandResult {
+                    args: args.to_vec(),
+                    returncode: 0,
+                    stdout: "Default Source: alsa_input.orig_mic\n".to_string(),
+                    stderr: String::new(),
+                });
+            }
+            Ok(CommandResult {
+                args: args.to_vec(),
+                returncode: 0,
+                stdout: String::new(),
+                stderr: String::new(),
+            })
+        }));
+        let backend: Arc<dyn AudioBackend> = Arc::new(LinuxAudioBackend::with_runner(runner));
+        let session = AndroidCaptureSession::new(Arc::clone(&mgr), Arc::clone(&backend));
+
+        let _ = session
+            .start("R58M123", "Pixel", None, None, true, None, None, false)
+            .expect("start should succeed");
+
+        // Wait briefly for the immediate-exit fake scrcpy child to terminate.
+        for _ in 0..50 {
+            if !session.is_active() {
+                break;
+            }
+            thread::sleep(Duration::from_millis(20));
+        }
+        assert!(!session.is_active());
+        let recorded = calls.lock().unwrap().clone();
+        assert!(
+            recorded.iter().any(|c| c.contains("unload-module 102")),
+            "expected remap-source module 102 to be unloaded; calls: {recorded:?}"
+        );
+        assert!(
+            recorded.iter().any(|c| c.contains("unload-module 101")),
+            "expected null-sink module 101 to be unloaded; calls: {recorded:?}"
+        );
+        assert!(
+            recorded
+                .iter()
+                .any(|c| c.contains("set-default-source alsa_input.orig_mic")),
+            "expected default source to be restored; calls: {recorded:?}"
+        );
+
+        // Case 2: module-remap-source fails -> null-sink 101 is unloaded and default source is NOT changed.
+        calls.lock().unwrap().clear();
+        fail_remap.store(true, Ordering::SeqCst);
+        let err = session
+            .start("R58M123", "Pixel", None, None, true, None, None, false)
+            .expect_err("start should fail when remap-source load fails");
+        assert!(err.to_string().contains("virtual mic source"));
+        let recorded2 = calls.lock().unwrap().clone();
+        assert!(
+            recorded2.iter().any(|c| c.contains("unload-module 101")),
+            "expected null-sink 101 to be rolled back; calls: {recorded2:?}"
+        );
+        assert!(
+            !recorded2
+                .iter()
+                .any(|c| c.contains("set-default-source soundhop_android_mic")),
+            "must not switch default source when remap-source failed; calls: {recorded2:?}"
+        );
     }
 }

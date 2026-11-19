@@ -48,6 +48,19 @@ pub struct PairedPeer {
     pub paired_at: f64,
 }
 
+impl PairedPeer {
+    /// Returns a public JSON representation safe for status/IPC output, omitting raw secrets.
+    pub fn to_public_json(&self) -> serde_json::Value {
+        serde_json::json!({
+            "peer_id": self.peer_id,
+            "name": self.name,
+            "paired_at": self.paired_at,
+            "has_shared_key": !self.shared_key_hex.is_empty(),
+            "has_cookie": !self.cookie_hex.is_empty(),
+        })
+    }
+}
+
 #[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq)]
 #[serde(default)]
 pub struct ActivePeerSession {
@@ -202,18 +215,22 @@ impl Default for State {
 }
 
 impl State {
-    pub fn load(path: Option<&Path>) -> Self {
+    pub fn try_load(path: Option<&Path>) -> Result<Self, String> {
         let target = path.map(Path::to_path_buf).unwrap_or_else(state_path);
         if !target.exists() {
-            return Self::default();
+            return Err(format!("State file does not exist: {}", target.display()));
         }
-        let Ok(raw) = fs::read_to_string(&target) else {
-            return Self::default();
-        };
-        let mut st = serde_json::from_str::<Self>(&raw).unwrap_or_default();
+        let raw = fs::read_to_string(&target)
+            .map_err(|e| format!("Failed to read state file {}: {e}", target.display()))?;
+        let mut st = serde_json::from_str::<Self>(&raw)
+            .map_err(|e| format!("Failed to parse state file {}: {e}", target.display()))?;
         st.known_peers
             .retain(|_, p| !is_own_non_loopback_ip(&p.host));
-        st
+        Ok(st)
+    }
+
+    pub fn load(path: Option<&Path>) -> Self {
+        Self::try_load(path).unwrap_or_default()
     }
 
     pub fn save(&mut self, path: Option<&Path>) -> std::io::Result<PathBuf> {
