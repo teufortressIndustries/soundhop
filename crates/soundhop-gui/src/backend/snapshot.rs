@@ -7,7 +7,7 @@ use soundhop_core::android::{AdbDevice, ToolStatus};
 use soundhop_core::config::Config;
 use soundhop_core::controller::Controller;
 use soundhop_core::discovery::Peer;
-use soundhop_core::state::{ActivePeerSession, State};
+use soundhop_core::state::{ActivePeerSession, KnownAndroidDevice, State};
 use soundhop_core::telemetry::TelemetrySnapshot;
 use soundhop_core::util::{is_own_non_loopback_ip, is_private_address};
 
@@ -94,6 +94,7 @@ pub struct GuiSnapshot {
     pub jitter_ms: Option<f64>,
     pub android_tools: ToolStatus,
     pub android_devices: Vec<AdbDevice>,
+    pub android_history: Vec<KnownAndroidDevice>,
     pub android_session_active: bool,
     pub android_session_device: String,
     pub android_installing: bool,
@@ -101,9 +102,15 @@ pub struct GuiSnapshot {
     pub firewall_kind: String,
     pub firewall_active: bool,
     pub firewall_detail: String,
+    pub firewall_ports_allowed: Option<bool>,
     pub service_running: bool,
     pub service_enabled: bool,
     pub autostart_installed: bool,
+    pub diagnostics_running: bool,
+    pub diagnostics_summary: Option<String>,
+    pub diagnostics_healthy: Option<bool>,
+    pub bug_report_json: Option<String>,
+    pub bug_report_path: Option<String>,
     pub busy_message: Option<String>,
     pub refreshing_peers: bool,
     pub refreshing_android: bool,
@@ -156,6 +163,7 @@ impl GuiSnapshot {
                 is_managed: false,
             },
             android_devices: Vec::new(),
+            android_history: parse_android_history(controller.android_history()),
             android_session_active: st.android_active,
             android_session_device: st.android_model,
             android_installing: false,
@@ -163,9 +171,15 @@ impl GuiSnapshot {
             firewall_kind: "none".to_string(),
             firewall_active: false,
             firewall_detail: String::new(),
+            firewall_ports_allowed: None,
             service_running: false,
             service_enabled: false,
             autostart_installed: false,
+            diagnostics_running: false,
+            diagnostics_summary: None,
+            diagnostics_healthy: None,
+            bug_report_json: None,
+            bug_report_path: None,
             busy_message: None,
             refreshing_peers: false,
             refreshing_android: false,
@@ -224,6 +238,24 @@ impl GuiSnapshot {
     }
 }
 
+pub(super) fn parse_android_history(values: Vec<serde_json::Value>) -> Vec<KnownAndroidDevice> {
+    values
+        .into_iter()
+        .filter_map(|v| serde_json::from_value::<KnownAndroidDevice>(v).ok())
+        .collect()
+}
+
+pub(super) fn sort_android_history(state: &State) -> Vec<KnownAndroidDevice> {
+    let mut devs: Vec<KnownAndroidDevice> = state.known_android_devices.values().cloned().collect();
+    devs.sort_by(|a, b| {
+        b.last_connected
+            .max(b.last_seen)
+            .partial_cmp(&a.last_connected.max(a.last_seen))
+            .unwrap_or(std::cmp::Ordering::Equal)
+    });
+    devs
+}
+
 pub fn security_friendly_label(mode: &str) -> &'static str {
     match mode {
         "psk" => "PIN-Paired Devices Only",
@@ -260,6 +292,7 @@ pub(super) struct RefreshUpdate {
     audio_peak: f32,
     rtt_ms: Option<f64>,
     jitter_ms: Option<f64>,
+    android_history: Vec<KnownAndroidDevice>,
     android_session_active: bool,
     android_session_device: String,
     listener_security: String,
@@ -503,6 +536,7 @@ impl RefreshUpdate {
             .collect();
 
         let show_onboarding_initial = !cfg.ui.onboarding_completed && st.known_peers.is_empty();
+        let android_history = sort_android_history(&st);
         Self {
             daemon_connected: daemon_up,
             show_onboarding_initial,
@@ -530,6 +564,7 @@ impl RefreshUpdate {
             audio_peak,
             rtt_ms,
             jitter_ms,
+            android_history,
             android_session_active,
             android_session_device,
             listener_security,
@@ -567,6 +602,9 @@ impl RefreshUpdate {
         guard.audio_peak = self.audio_peak;
         guard.rtt_ms = self.rtt_ms;
         guard.jitter_ms = self.jitter_ms;
+        if !self.android_history.is_empty() {
+            guard.android_history = self.android_history;
+        }
         guard.android_session_active = self.android_session_active;
         guard.android_session_device = self.android_session_device;
         guard.listener_security = self.listener_security;

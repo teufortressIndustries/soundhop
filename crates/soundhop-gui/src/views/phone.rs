@@ -1,7 +1,10 @@
 //! Phone Audio ("Android Bridge") view: guided setup, USB/Wi-Fi phone cards,
 //! 1-click "Go Wireless", plain-language options, and collapsible Advanced tuning.
 
+use std::collections::HashSet;
+
 use eframe::egui::{self, RichText};
+use soundhop_core::state::KnownAndroidDevice;
 
 use crate::backend::{GuiBackend, GuiCommand, GuiSnapshot};
 use crate::theme::Palette;
@@ -55,6 +58,36 @@ impl PhoneViewState {
             }
         }
     }
+}
+
+pub(crate) fn reconnectable_wifi_history(snap: &GuiSnapshot) -> Vec<(&KnownAndroidDevice, String)> {
+    let mut out = Vec::new();
+    let mut seen_targets = HashSet::new();
+    for rec in &snap.android_history {
+        let target = if !rec.last_ip.is_empty() {
+            let port = if rec.last_port == 0 {
+                5555
+            } else {
+                rec.last_port
+            };
+            format!("{}:{port}", rec.last_ip)
+        } else if rec.is_wifi && rec.serial.contains(':') {
+            rec.serial.clone()
+        } else {
+            continue;
+        };
+
+        let already_connected = snap.android_devices.iter().any(|dev| {
+            dev.serial == rec.serial
+                || dev.serial == target
+                || (dev.is_wifi && !rec.last_ip.is_empty() && dev.ip == rec.last_ip)
+        });
+        if already_connected || !seen_targets.insert(target.clone()) {
+            continue;
+        }
+        out.push((rec, target));
+    }
+    out
 }
 
 pub fn render(
@@ -370,6 +403,46 @@ pub fn render(
         }
     }
 
+    let wifi_history = reconnectable_wifi_history(snap);
+    if !wifi_history.is_empty() {
+        ui.add_space(12.0);
+        ui.label(
+            RichText::new("Previously Connected (Wi-Fi)")
+                .color(pal.text_secondary)
+                .size(13.0)
+                .strong(),
+        );
+        ui.add_space(6.0);
+        for (rec, ip_port) in wifi_history {
+            card(ui, pal, None, |ui| {
+                ui.horizontal(|ui| {
+                    ui.vertical(|ui| {
+                        ui.horizontal(|ui| {
+                            ui.label(
+                                RichText::new(rec.display_name())
+                                    .color(pal.text)
+                                    .size(14.5)
+                                    .strong(),
+                            );
+                            pill_badge(ui, "Saved Wi-Fi", pal.accent, pal.accent_soft);
+                        });
+                        ui.label(
+                            RichText::new(format!("Last address: {ip_port}"))
+                                .color(pal.text_muted)
+                                .size(12.0),
+                        );
+                    });
+                    ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                        if primary_button(ui, pal, "Reconnect").clicked() {
+                            backend.send(GuiCommand::AndroidConnectWifi { ip_port });
+                        }
+                    });
+                });
+            });
+            ui.add_space(6.0);
+        }
+    }
+
     ui.add_space(12.0);
 
     // 4. Simple Listening Options
@@ -395,7 +468,14 @@ pub fn render(
                 );
             });
             ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                toggle_switch(ui, pal, &mut state.duplicate);
+                if toggle_switch(ui, pal, &mut state.duplicate).changed() {
+                    backend.send(GuiCommand::SaveConfigPatch {
+                        patch: serde_json::json!({
+                            "android": { "duplicate_audio": state.duplicate }
+                        }),
+                        toast: None,
+                    });
+                }
             });
         });
 
@@ -466,6 +546,7 @@ pub fn render(
                 .spacing([18.0, 10.0])
                 .show(ui, |ui| {
                     ui.label(RichText::new("Capture From").color(pal.text_secondary));
+                    let prev_source = state.source.clone();
                     let source_label = match state.source.as_str() {
                         "mic" => "Phone Microphone",
                         "playback" => "App Playback",
@@ -490,9 +571,18 @@ pub fn render(
                                 "Phone Microphone",
                             );
                         });
+                    if state.source != prev_source {
+                        backend.send(GuiCommand::SaveConfigPatch {
+                            patch: serde_json::json!({
+                                "android": { "default_source": state.source }
+                            }),
+                            toast: None,
+                        });
+                    }
                     ui.end_row();
 
                     ui.label(RichText::new("Audio Format").color(pal.text_secondary));
+                    let prev_codec = state.codec.clone();
                     let codec_label = match state.codec.as_str() {
                         "aac" => "AAC",
                         "flac" => "FLAC (Lossless)",
@@ -519,10 +609,28 @@ pub fn render(
                                 "Uncompressed PCM",
                             );
                         });
+                    if state.codec != prev_codec {
+                        backend.send(GuiCommand::SaveConfigPatch {
+                            patch: serde_json::json!({
+                                "android": { "default_codec": state.codec }
+                            }),
+                            toast: None,
+                        });
+                    }
                     ui.end_row();
 
                     ui.label(RichText::new("Audio Buffer").color(pal.text_secondary));
-                    ui.add(egui::Slider::new(&mut state.buffer_ms, 15..=300).suffix(" ms"));
+                    let buf_slider =
+                        ui.add(egui::Slider::new(&mut state.buffer_ms, 15..=300).suffix(" ms"));
+                    if buf_slider.drag_stopped() || (buf_slider.changed() && !buf_slider.dragged())
+                    {
+                        backend.send(GuiCommand::SaveConfigPatch {
+                            patch: serde_json::json!({
+                                "android": { "buffer_ms": state.buffer_ms }
+                            }),
+                            toast: None,
+                        });
+                    }
                     ui.end_row();
                 });
 
@@ -544,4 +652,99 @@ pub fn render(
             }
         },
     );
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use soundhop_core::android::AdbDevice;
+    use soundhop_core::backend::linux::LinuxAudioBackend;
+    use soundhop_core::config::Config;
+    use soundhop_core::controller::Controller;
+    use soundhop_core::state::State;
+    use soundhop_core::util::{CommandResult, MockRunner};
+    use std::sync::Arc;
+
+    fn test_snapshot(cfg: Config, st: State) -> GuiSnapshot {
+        let runner = Arc::new(MockRunner::new(|args, _| {
+            Ok(CommandResult {
+                args: args.to_vec(),
+                returncode: 0,
+                stdout: String::new(),
+                stderr: String::new(),
+            })
+        }));
+        let backend = Arc::new(LinuxAudioBackend::with_runner(runner));
+        let ctrl = Controller::new(Some(cfg), Some(st), Some(backend), None, None, false);
+        ctrl.set_save_enabled(false);
+        GuiSnapshot::from_controller(&ctrl)
+    }
+
+    #[test]
+    fn test_reconnectable_wifi_history_filters_connected_and_usb_only() {
+        let mut st = State::default();
+        st.known_android_devices.insert(
+            "192.168.1.99:5555".to_string(),
+            KnownAndroidDevice {
+                serial: "192.168.1.99:5555".to_string(),
+                model: "Pixel 8".to_string(),
+                manufacturer: "Google".to_string(),
+                last_ip: "192.168.1.99".to_string(),
+                last_port: 5555,
+                last_seen: 200.0,
+                last_connected: 200.0,
+                is_wifi: true,
+                auto_connect: false,
+            },
+        );
+        st.known_android_devices.insert(
+            "192.168.1.88:5555".to_string(),
+            KnownAndroidDevice {
+                serial: "192.168.1.88:5555".to_string(),
+                model: "Galaxy S24".to_string(),
+                manufacturer: "Samsung".to_string(),
+                last_ip: "192.168.1.88".to_string(),
+                last_port: 5555,
+                last_seen: 100.0,
+                last_connected: 100.0,
+                is_wifi: true,
+                auto_connect: false,
+            },
+        );
+        st.known_android_devices.insert(
+            "USB123".to_string(),
+            KnownAndroidDevice {
+                serial: "USB123".to_string(),
+                model: "USB Only".to_string(),
+                manufacturer: "Acme".to_string(),
+                last_ip: String::new(),
+                last_port: 5555,
+                last_seen: 300.0,
+                last_connected: 300.0,
+                is_wifi: false,
+                auto_connect: false,
+            },
+        );
+
+        let mut snap = test_snapshot(Config::default(), st);
+        snap.android_devices = vec![AdbDevice {
+            serial: "192.168.1.88:5555".to_string(),
+            state: "device".to_string(),
+            model: "Galaxy S24".to_string(),
+            product: "e1q".to_string(),
+            device: "e1q".to_string(),
+            transport_id: "1".to_string(),
+            manufacturer: "Samsung".to_string(),
+            android_version: "14".to_string(),
+            sdk_version: 34,
+            is_wifi: true,
+            ip: "192.168.1.88".to_string(),
+            port: 5555,
+        }];
+
+        let history = reconnectable_wifi_history(&snap);
+        assert_eq!(history.len(), 1);
+        assert_eq!(history[0].0.display_name(), "Google Pixel 8");
+        assert_eq!(history[0].1, "192.168.1.99:5555");
+    }
 }

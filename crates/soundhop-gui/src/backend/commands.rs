@@ -84,6 +84,10 @@ pub enum GuiCommand {
     },
     AndroidStop,
     OpenFirewall,
+    RunDiagnostics {
+        fix: bool,
+    },
+    ExportBugReport,
     SetAutostart {
         enabled: bool,
     },
@@ -206,6 +210,8 @@ impl WorkerState {
             ),
             GuiCommand::AndroidStop => self.handle_android_stop(),
             GuiCommand::OpenFirewall => self.handle_open_firewall(),
+            GuiCommand::RunDiagnostics { fix } => self.handle_run_diagnostics(fix),
+            GuiCommand::ExportBugReport => self.handle_export_bug_report(),
             GuiCommand::SetAutostart { enabled } => self.handle_set_autostart(enabled),
             GuiCommand::CompleteOnboarding {
                 device_name,

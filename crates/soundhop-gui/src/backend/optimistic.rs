@@ -129,6 +129,13 @@ pub(super) fn apply_optimistic_update(snap: &mut GuiSnapshot, cmd: &GuiCommand) 
         GuiCommand::OpenFirewall => {
             snap.busy_message = Some("Opening firewall ports...".to_string());
         }
+        GuiCommand::RunDiagnostics { .. } => {
+            snap.diagnostics_running = true;
+            snap.busy_message = Some("Running diagnostics & fixes...".to_string());
+        }
+        GuiCommand::ExportBugReport => {
+            snap.busy_message = Some("Collecting bug report...".to_string());
+        }
         GuiCommand::SetAutostart { enabled } => {
             snap.autostart_installed = *enabled;
             snap.service_enabled = *enabled;

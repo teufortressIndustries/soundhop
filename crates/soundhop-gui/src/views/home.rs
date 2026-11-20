@@ -47,6 +47,13 @@ impl HomeViewState {
     }
 }
 
+pub(crate) fn should_show_firewall_banner(snap: &GuiSnapshot) -> bool {
+    snap.sharing_enabled
+        && snap.firewall_active
+        && snap.firewall_kind != "none"
+        && snap.firewall_ports_allowed != Some(true)
+}
+
 pub fn render(
     ui: &mut egui::Ui,
     pal: &Palette,
@@ -463,7 +470,7 @@ pub fn render(
             });
         });
 
-        if snap.sharing_enabled && snap.firewall_active && snap.firewall_kind != "none" {
+        if should_show_firewall_banner(snap) {
             ui.add_space(10.0);
             let fw_display = if snap.firewall_kind == "windows-defender" {
                 "Windows Defender Firewall"
@@ -627,5 +634,25 @@ mod tests {
         assert!(!state.multiroom_mode);
         assert_eq!(state.selected_peers.len(), 1);
         assert!(state.selected_peers.contains("p1"));
+    }
+
+    #[test]
+    fn test_firewall_banner_hides_when_ports_allowed() {
+        let mut snap = test_snapshot();
+        snap.sharing_enabled = true;
+        snap.firewall_active = true;
+        snap.firewall_kind = "ufw".to_string();
+        snap.firewall_ports_allowed = None;
+        assert!(should_show_firewall_banner(&snap));
+
+        snap.firewall_ports_allowed = Some(false);
+        assert!(should_show_firewall_banner(&snap));
+
+        snap.firewall_ports_allowed = Some(true);
+        assert!(!should_show_firewall_banner(&snap));
+
+        snap.firewall_ports_allowed = Some(false);
+        snap.sharing_enabled = false;
+        assert!(!should_show_firewall_banner(&snap));
     }
 }

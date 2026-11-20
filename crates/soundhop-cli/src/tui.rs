@@ -1,6 +1,6 @@
 //! Interactive Terminal UI (`soundhop tui`) built with `ratatui` + `crossterm`.
 //! Features:
-//! - Tab 1: Peers & Multi-Room Broadcast (`Space` to toggle peer in multi-room group, `Enter` to connect, `d` to disconnect, `s` to toggle speaker sharing)
+//! - Tab 1: Peers & Multi-Room Broadcast (`Space` to toggle peer in multi-room group, `Enter` to connect, `c`/`i` manual IP connect, `d` to disconnect, `s` to toggle speaker sharing)
 //! - Tab 2: Per-App Mixer & Persistent Routing (`Enter` to toggle remote/local routing, `p` to save persistent rule in `config.toml`)
 //! - Tab 3: Microphone Pass-Through & Android Audio Bridge (`s` send mic, `r` receive mic, `o` stop mic, `a` start/stop Android stream, `w` switch USB Android device to Wi-Fi)
 //! - Bottom Telemetry Bar: Live Stereo Peak/RMS VU gauge + dBFS + Network RTT/Jitter (`ms`)
@@ -25,7 +25,8 @@ use ratatui::{Frame, Terminal};
 use soundhop_core::controller::{ConnectOptions, Controller};
 use soundhop_core::discovery::{discover_once_with_psk, DiscoveryManager, Peer};
 use soundhop_core::util::{
-    install_signal_handlers, is_own_non_loopback_ip, is_private_address, signal_stop_requested,
+    install_signal_handlers, is_own_non_loopback_ip, is_private_address, now_secs,
+    signal_stop_requested, split_host_port,
 };
 
 use crate::ui::lock_or_recover;
@@ -64,6 +65,7 @@ pub struct TuiState {
     pub keep_local: bool,
     pub apps: Vec<serde_json::Value>,
     pub selected_app_idx: usize,
+    pub manual_ip_prompt: Option<String>,
     pub status_message: String,
     pub should_quit: bool,
 }
@@ -106,7 +108,8 @@ impl TuiState {
             keep_local: st.keep_local,
             apps,
             selected_app_idx: 0,
-            status_message: "Press Tab to switch views, Space to select multi-room peers, Enter to apply, q to quit.".to_string(),
+            manual_ip_prompt: None,
+            status_message: "Press Tab to switch views, Space to select multi-room peers, Enter to apply, c/i for manual IP, q to quit.".to_string(),
             should_quit: false,
         }
     }
@@ -145,6 +148,10 @@ impl TuiState {
     }
 
     pub fn handle_key(&mut self, code: KeyCode) {
+        if self.manual_ip_prompt.is_some() {
+            self.handle_manual_ip_key(code);
+            return;
+        }
         match code {
             KeyCode::Char('q') | KeyCode::Esc => {
                 self.should_quit = true;
@@ -281,7 +288,78 @@ impl TuiState {
                     self.peers.len()
                 );
             }
+            KeyCode::Char('c') | KeyCode::Char('i') => {
+                self.manual_ip_prompt = Some(String::new());
+                self.status_message =
+                    "Type IP[:port] and press Enter to connect (Esc to cancel).".to_string();
+            }
             _ => {}
+        }
+    }
+
+    fn handle_manual_ip_key(&mut self, code: KeyCode) {
+        match code {
+            KeyCode::Esc => {
+                self.manual_ip_prompt = None;
+                self.status_message = "Cancelled manual IP connect.".to_string();
+            }
+            KeyCode::Backspace => {
+                if let Some(ref mut buf) = self.manual_ip_prompt {
+                    buf.pop();
+                }
+            }
+            KeyCode::Enter => {
+                let input = self.manual_ip_prompt.take().unwrap_or_default();
+                self.connect_manual_address(&input);
+            }
+            KeyCode::Char(ch) if !ch.is_control() => {
+                if let Some(ref mut buf) = self.manual_ip_prompt {
+                    buf.push(ch);
+                }
+            }
+            _ => {}
+        }
+    }
+
+    fn connect_manual_address(&mut self, raw: &str) {
+        let (host, port) = split_host_port(raw.trim(), 4713);
+        if host.is_empty() {
+            self.status_message =
+                "Enter an IP address or hostname (e.g. 192.168.1.50).".to_string();
+            return;
+        }
+        let peer = Peer {
+            id: format!("manual-{host}-{port}"),
+            name: host.clone(),
+            host: host.clone(),
+            port,
+            version: String::new(),
+            protocol: soundhop_core::constants::PROTOCOL_VERSION,
+            security: "trusted-lan".to_string(),
+            platform: "linux".to_string(),
+            last_seen: now_secs(),
+            source: "manual".to_string(),
+            rtt_ms: None,
+        };
+        match self.controller.connect(
+            &peer,
+            ConnectOptions {
+                keep_local: self.keep_local,
+                by: "tui".to_string(),
+                notify_user: Some(true),
+                ..Default::default()
+            },
+        ) {
+            Ok(_) => {
+                self.controller.remember_peer(&peer);
+                if !self.peers.iter().any(|p| p.id == peer.id) {
+                    self.peers.push(peer);
+                }
+                self.status_message = format!("Connected to {host}:{port}.");
+            }
+            Err(e) => {
+                self.status_message = format!("Connect error: {e}");
+            }
         }
     }
 
@@ -401,6 +479,44 @@ impl TuiState {
                     }
                 }
             }
+            KeyCode::Char('w') => {
+                let devs = self.controller.android_manager.list_devices();
+                if let Some(usb_dev) = devs.iter().find(|d| !d.is_wifi && d.is_ready()) {
+                    if let Some(ip) = self
+                        .controller
+                        .android_manager
+                        .get_device_wifi_ip(&usb_dev.serial)
+                    {
+                        let (_, msg1) = self
+                            .controller
+                            .android_manager
+                            .enable_tcpip(&usb_dev.serial, 5555);
+                        let (ok2, msg2) = self.controller.android_manager.connect_wifi(&ip, 5555);
+                        if ok2 {
+                            self.status_message = format!(
+                                "Switched {} to Wi-Fi ({ip}:5555). You can unplug USB.",
+                                usb_dev.display_name()
+                            );
+                        } else {
+                            self.status_message = format!("Wi-Fi switch failed: {msg1} {msg2}");
+                        }
+                    } else {
+                        self.status_message = format!(
+                            "Could not detect Wi-Fi IP for {}. Make sure it is on the same Wi-Fi.",
+                            usb_dev.display_name()
+                        );
+                    }
+                } else if devs.iter().any(|d| !d.is_wifi) {
+                    self.status_message =
+                        "USB Android device is not authorized yet — tap Allow on your phone."
+                            .to_string();
+                } else if devs.iter().any(|d| d.is_wifi) {
+                    self.status_message =
+                        "Android device is already connected over Wi-Fi.".to_string();
+                } else {
+                    self.status_message = "No USB Android devices connected.".to_string();
+                }
+            }
             _ => {}
         }
     }
@@ -500,12 +616,34 @@ fn draw_peers_tab(frame: &mut Frame<'_>, area: Rect, state: &TuiState) {
             .collect()
     };
 
-    let list = List::new(items).block(
-        Block::default()
-            .borders(Borders::ALL)
-            .title(" Play Audio On (Space: Multi-Room | Enter: Connect | r: Refresh) "),
-    );
-    frame.render_widget(list, cols[0]);
+    let list = List::new(items).block(Block::default().borders(Borders::ALL).title(
+        " Play Audio On (Space: Multi-Room | Enter: Connect | c/i: Connect IP | r: Refresh) ",
+    ));
+    if let Some(ref ip_buf) = state.manual_ip_prompt {
+        let left_chunks = Layout::default()
+            .direction(Direction::Vertical)
+            .constraints([Constraint::Min(3), Constraint::Length(3)])
+            .split(cols[0]);
+        frame.render_widget(list, left_chunks[0]);
+        let prompt = Paragraph::new(Line::from(vec![
+            Span::styled(" > ", Style::default().fg(Color::Yellow)),
+            Span::styled(
+                format!("{ip_buf}_"),
+                Style::default()
+                    .fg(Color::White)
+                    .add_modifier(Modifier::BOLD),
+            ),
+        ]))
+        .block(
+            Block::default()
+                .borders(Borders::ALL)
+                .border_style(Style::default().fg(Color::Yellow))
+                .title(" Connect by IP[:port] (Enter: Connect | Esc: Cancel) "),
+        );
+        frame.render_widget(prompt, left_chunks[1]);
+    } else {
+        frame.render_widget(list, cols[0]);
+    }
 
     let privacy_label = match cfg.sharing.security.as_str() {
         "psk" => "PIN-Paired Only",
@@ -677,7 +815,7 @@ fn draw_mic_android_tab(frame: &mut Frame<'_>, area: Rect, state: &TuiState) {
             if and_active { "Yes" } else { "No" },
             and_dev
         )),
-        Line::from("  Keys: [a] Start / Stop Listening"),
+        Line::from("  Keys: [a] Start / Stop Listening | [w] Switch USB to Wi-Fi"),
     ];
 
     let block = Paragraph::new(text).block(
@@ -954,5 +1092,175 @@ mod tests {
         tui_state.merge_live_peers(Vec::new());
         assert_eq!(tui_state.peers.len(), 1);
         assert_eq!(tui_state.peers[0].id, existing.id);
+    }
+
+    #[test]
+    fn test_tui_manual_ip_connect_prompt_render_cancel_and_submit() {
+        let runner = Arc::new(MockRunner::new(|args, _| {
+            let joined = args.join(" ");
+            let stdout = if joined.contains("load-module") {
+                "42\n".to_string()
+            } else {
+                String::new()
+            };
+            Ok(CommandResult {
+                args: args.to_vec(),
+                returncode: 0,
+                stdout,
+                stderr: String::new(),
+            })
+        }));
+        let backend = Arc::new(LinuxAudioBackend::with_runner(runner));
+        let ctrl = Arc::new(Controller::new(
+            Some(Config::default()),
+            Some(State::default()),
+            Some(backend),
+            None,
+            None,
+            false,
+        ));
+        ctrl.set_save_enabled(false);
+
+        let mut tui_state = TuiState::new(ctrl);
+        let test_backend = TestBackend::new(110, 30);
+        let mut terminal = Terminal::new(test_backend).unwrap();
+
+        // Open prompt with 'c' on Tab 1
+        tui_state.handle_key(KeyCode::Char('c'));
+        assert_eq!(tui_state.manual_ip_prompt.as_deref(), Some(""));
+
+        // Typing 'q' inside the prompt must append to input, NOT quit
+        tui_state.handle_key(KeyCode::Char('q'));
+        assert!(!tui_state.should_quit);
+        assert_eq!(tui_state.manual_ip_prompt.as_deref(), Some("q"));
+
+        // Backspace removes 'q', then Esc cancels
+        tui_state.handle_key(KeyCode::Backspace);
+        assert_eq!(tui_state.manual_ip_prompt.as_deref(), Some(""));
+        tui_state.handle_key(KeyCode::Esc);
+        assert!(tui_state.manual_ip_prompt.is_none());
+        assert!(tui_state.status_message.contains("Cancelled"));
+
+        // Reopen with 'i', type an IP:port, render with TestBackend, and submit with Enter
+        tui_state.handle_key(KeyCode::Char('i'));
+        for ch in "192.168.1.50:4713".chars() {
+            tui_state.handle_key(KeyCode::Char(ch));
+        }
+        assert_eq!(
+            tui_state.manual_ip_prompt.as_deref(),
+            Some("192.168.1.50:4713")
+        );
+
+        terminal.draw(|f| draw_tui(f, &tui_state)).unwrap();
+        let buf_text: String = terminal
+            .backend()
+            .buffer()
+            .content()
+            .iter()
+            .map(|c| c.symbol())
+            .collect();
+        assert!(buf_text.contains("Connect by IP[:port]"));
+        assert!(buf_text.contains("192.168.1.50:4713"));
+
+        tui_state.handle_key(KeyCode::Enter);
+        assert!(tui_state.manual_ip_prompt.is_none());
+        assert!(
+            tui_state.status_message.contains("192.168.1.50")
+                || tui_state.status_message.contains("Connect error"),
+            "unexpected status after manual submit: {}",
+            tui_state.status_message
+        );
+    }
+
+    #[test]
+    fn test_tui_android_wifi_switch_key() {
+        use soundhop_core::android::AndroidManager;
+
+        let dir = tempfile::tempdir().unwrap();
+        let fake_adb = dir.path().join("adb");
+        std::fs::write(&fake_adb, "").unwrap();
+
+        let adb_calls = Arc::new(std::sync::Mutex::new(Vec::<Vec<String>>::new()));
+        let adb_calls_cb = Arc::clone(&adb_calls);
+
+        let adb_runner = Arc::new(MockRunner::new(move |args, _| {
+            adb_calls_cb.lock().unwrap().push(args.to_vec());
+            let joined = args.join(" ");
+            let stdout = if joined.contains("devices -l") {
+                "List of devices attached\nUSB12345               device usb:1-1 product:lynx model:Pixel_7a device:lynx\n"
+                    .to_string()
+            } else if joined.contains("ro.product.manufacturer") {
+                "Google\n".to_string()
+            } else if joined.contains("ro.build.version.release") {
+                "14\n".to_string()
+            } else if joined.contains("ip route") {
+                "192.168.1.0/24 dev wlan0 proto kernel scope link src 192.168.1.99\n".to_string()
+            } else if joined.contains("tcpip 5555") {
+                "restarting in TCP mode port: 5555\n".to_string()
+            } else if joined.contains("connect 192.168.1.99:5555") {
+                "connected to 192.168.1.99:5555\n".to_string()
+            } else {
+                String::new()
+            };
+            Ok(CommandResult {
+                args: args.to_vec(),
+                returncode: 0,
+                stdout,
+                stderr: String::new(),
+            })
+        }));
+
+        let audio_runner = Arc::new(MockRunner::new(|args, _| {
+            Ok(CommandResult {
+                args: args.to_vec(),
+                returncode: 0,
+                stdout: String::new(),
+                stderr: String::new(),
+            })
+        }));
+        let backend = Arc::new(LinuxAudioBackend::with_runner(audio_runner));
+        let mut ctrl = Controller::new(
+            Some(Config::default()),
+            Some(State::default()),
+            Some(backend),
+            None,
+            None,
+            false,
+        );
+        ctrl.android_manager = Arc::new(AndroidManager::with_runner(
+            "",
+            &fake_adb.to_string_lossy(),
+            adb_runner,
+        ));
+        let ctrl = Arc::new(ctrl);
+        ctrl.set_save_enabled(false);
+
+        let mut tui_state = TuiState::new(ctrl);
+        let test_backend = TestBackend::new(100, 30);
+        let mut terminal = Terminal::new(test_backend).unwrap();
+
+        tui_state.handle_key(KeyCode::Char('3'));
+        assert_eq!(tui_state.tab, TuiTab::MicAndAndroid);
+        terminal.draw(|f| draw_tui(f, &tui_state)).unwrap();
+        let buf_text: String = terminal
+            .backend()
+            .buffer()
+            .content()
+            .iter()
+            .map(|c| c.symbol())
+            .collect();
+        assert!(buf_text.contains("[w] Switch USB to Wi-Fi"));
+
+        tui_state.handle_key(KeyCode::Char('w'));
+        assert!(
+            tui_state.status_message.contains("192.168.1.99:5555"),
+            "expected Wi-Fi switch confirmation, got: {}",
+            tui_state.status_message
+        );
+        let calls = adb_calls.lock().unwrap();
+        assert!(calls.iter().any(|c| c.join(" ").contains("tcpip 5555")));
+        assert!(calls
+            .iter()
+            .any(|c| c.join(" ").contains("connect 192.168.1.99:5555")));
     }
 }

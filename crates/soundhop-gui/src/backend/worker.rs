@@ -5,18 +5,20 @@ use std::sync::{Arc, Mutex, RwLock};
 use std::time::{Duration, Instant};
 
 use eframe::egui;
+use soundhop_core::constants::{PROTOCOL_VERSION, VERSION};
 use soundhop_core::controller::Controller;
 use soundhop_core::discovery::{discover_once_with_psk, Peer};
-use soundhop_core::firewall::{detect as detect_firewall, open_ports};
+use soundhop_core::firewall::{detect_for_ports, open_ports};
 use soundhop_core::ipc::{is_running as ipc_is_running, request as ipc_request};
 use soundhop_core::service::{
     install as install_service, status as service_status, uninstall as uninstall_service,
 };
+use soundhop_core::util::{atomic_write, config_path, local_addresses, log_path, state_path};
 
 use crate::{lock_or_recover, write_or_recover};
 
 use super::commands::ipc_checked;
-use super::snapshot::{GuiSnapshot, GuiToast, RefreshUpdate};
+use super::snapshot::{parse_android_history, GuiSnapshot, GuiToast, RefreshUpdate};
 
 pub(super) struct WorkerState {
     pub(super) controller: Arc<Controller>,
@@ -96,13 +98,31 @@ impl WorkerState {
     pub(super) fn refresh_android(&mut self) {
         let tools = self.controller.android_manager.get_tool_status();
         let devices = self.controller.android_manager.list_devices();
+        let history = if self.use_ipc && ipc_is_running(None) {
+            ipc_request(
+                "android_status",
+                serde_json::json!({}),
+                None,
+                Duration::from_millis(800),
+            )
+            .ok()
+            .and_then(|resp| resp.get("history").and_then(|v| v.as_array()).cloned())
+            .map(parse_android_history)
+            .unwrap_or_else(|| parse_android_history(self.controller.android_history()))
+        } else {
+            parse_android_history(self.controller.android_history())
+        };
         let mut guard = write_or_recover(&self.snapshot);
         guard.android_tools = tools;
         guard.android_devices = devices;
+        guard.android_history = history;
     }
 
     pub(super) fn refresh_system(&mut self) {
-        let (fw_kind, fw_active, fw_detail) = if ipc_is_running(None) {
+        let cfg = lock_or_recover(&self.controller.config).clone();
+        let (fw_kind, fw_active, fw_detail, fw_ports_allowed) = if self.use_ipc
+            && ipc_is_running(None)
+        {
             if let Ok(resp) = ipc_request(
                 "firewall_status",
                 serde_json::json!({}),
@@ -121,14 +141,15 @@ impl WorkerState {
                         .and_then(|v| v.as_str())
                         .unwrap_or("")
                         .to_string(),
+                    resp.get("ports_allowed").and_then(|v| v.as_bool()),
                 )
             } else {
-                let fw = detect_firewall();
-                (fw.kind, fw.active, fw.detail)
+                let fw = detect_for_ports(cfg.sharing.port, cfg.discovery.port, cfg.discovery.mdns);
+                (fw.kind, fw.active, fw.detail, fw.ports_allowed)
             }
         } else {
-            let fw = detect_firewall();
-            (fw.kind, fw.active, fw.detail)
+            let fw = detect_for_ports(cfg.sharing.port, cfg.discovery.port, cfg.discovery.mdns);
+            (fw.kind, fw.active, fw.detail, fw.ports_allowed)
         };
 
         let svc = service_status();
@@ -136,6 +157,7 @@ impl WorkerState {
         guard.firewall_kind = fw_kind;
         guard.firewall_active = fw_active;
         guard.firewall_detail = fw_detail;
+        guard.firewall_ports_allowed = fw_ports_allowed;
         guard.service_running = svc.get("active").and_then(|v| v.as_bool()).unwrap_or(false);
         guard.service_enabled = svc
             .get("enabled")
@@ -396,6 +418,244 @@ impl WorkerState {
         self.refresh_system();
     }
 
+    pub(super) fn handle_run_diagnostics(&mut self, fix: bool) {
+        write_or_recover(&self.snapshot).diagnostics_running = true;
+        self.set_busy(Some("Running diagnostics & fixes...".to_string()));
+
+        let cfg = lock_or_recover(&self.controller.config).clone();
+        let backend_ok = self.controller.backend.available();
+        let server_name = self.controller.backend.server_label().unwrap_or_default();
+        let def_sink = self.controller.backend.default_sink().unwrap_or_default();
+        let addrs = local_addresses(false);
+
+        let mut fixed_actions: Vec<String> = Vec::new();
+        let mut fix_errors: Vec<String> = Vec::new();
+
+        if fix {
+            let _sync = lock_or_recover(&self.controller_sync_lock);
+            let rec = self.controller.reconcile();
+            if let Some(arr) = rec.get("actions").and_then(|v| v.as_array()) {
+                for item in arr {
+                    if let Some(s) = item.as_str() {
+                        fixed_actions.push(s.to_string());
+                    }
+                }
+            }
+        }
+
+        let mut fw = detect_for_ports(cfg.sharing.port, cfg.discovery.port, cfg.discovery.mdns);
+        if fix && fw.active && fw.ports_allowed != Some(true) {
+            let fw_ok = if self.use_ipc && ipc_is_running(None) {
+                ipc_request(
+                    "firewall_open",
+                    serde_json::json!({}),
+                    None,
+                    Duration::from_secs(15),
+                )
+                .map(|v| v.get("ok").and_then(|x| x.as_bool()).unwrap_or(false))
+                .unwrap_or(false)
+            } else {
+                open_ports(
+                    cfg.sharing.port,
+                    cfg.discovery.port,
+                    false,
+                    cfg.discovery.mdns,
+                )
+                .ok
+            };
+            if fw_ok {
+                fixed_actions.push(format!("Opened firewall ports on {}", fw.kind));
+            } else {
+                fix_errors.push(format!("Could not open firewall ports on {}", fw.kind));
+            }
+            fw = detect_for_ports(cfg.sharing.port, cfg.discovery.port, cfg.discovery.mdns);
+        }
+
+        let mut svc = service_status();
+        let mut svc_active = svc.get("active").and_then(|v| v.as_bool()).unwrap_or(false);
+        let mut daemon_ipc = self.use_ipc && ipc_is_running(None);
+        if fix && !svc_active && !daemon_ipc {
+            let svc_res = install_service(true, true, true);
+            let started = svc_res
+                .get("started")
+                .and_then(|v| v.as_bool())
+                .unwrap_or(false);
+            if started {
+                fixed_actions.push("Installed and started background service".to_string());
+            } else {
+                fix_errors.push("Could not start background service automatically".to_string());
+            }
+            svc = service_status();
+            svc_active = svc.get("active").and_then(|v| v.as_bool()).unwrap_or(false);
+            daemon_ipc = self.use_ipc && ipc_is_running(None);
+        }
+
+        let tools = self.controller.android_manager.get_tool_status();
+
+        let mut lines = Vec::new();
+        if backend_ok {
+            lines.push(format!(
+                "Audio Backend: OK ({}, output: {})",
+                if server_name.is_empty() {
+                    "available"
+                } else {
+                    server_name.as_str()
+                },
+                if def_sink.is_empty() {
+                    "default"
+                } else {
+                    def_sink.as_str()
+                }
+            ));
+        } else {
+            lines.push(
+                "Audio Backend: Unavailable (check PulseAudio/PipeWire or Windows Audio)"
+                    .to_string(),
+            );
+        }
+
+        if addrs.is_empty() {
+            lines.push("LAN Network: No private LAN IPv4 addresses detected".to_string());
+        } else {
+            lines.push(format!("LAN Network: OK ({})", addrs.join(", ")));
+        }
+
+        let fw_rule_note = match fw.ports_allowed {
+            Some(true) => "ports allowed",
+            Some(false) => "ports may be blocked",
+            None => "rule check unavailable",
+        };
+        lines.push(format!(
+            "Firewall: {} ({}, {})",
+            fw.kind,
+            if fw.active { "active" } else { "inactive" },
+            fw_rule_note
+        ));
+
+        lines.push(format!(
+            "Background Service: {}",
+            if daemon_ipc || svc_active {
+                "Running"
+            } else {
+                "Not running"
+            }
+        ));
+
+        lines.push(format!(
+            "Android Bridge: {}",
+            if tools.ready() {
+                format!("Ready (scrcpy {})", tools.scrcpy_version)
+            } else {
+                "Not installed (optional)".to_string()
+            }
+        ));
+
+        for act in &fixed_actions {
+            lines.push(format!("Fixed: {act}"));
+        }
+        for err in &fix_errors {
+            lines.push(format!("Issue: {err}"));
+        }
+
+        let healthy = backend_ok && !addrs.is_empty() && fix_errors.is_empty();
+        let summary = lines.join("\n");
+
+        {
+            let mut guard = write_or_recover(&self.snapshot);
+            guard.diagnostics_running = false;
+            guard.diagnostics_summary = Some(summary);
+            guard.diagnostics_healthy = Some(healthy);
+            guard.firewall_kind = fw.kind;
+            guard.firewall_active = fw.active;
+            guard.firewall_detail = fw.detail;
+            guard.firewall_ports_allowed = fw.ports_allowed;
+        }
+        self.set_busy(None);
+        if healthy {
+            self.push_toast("Diagnostics complete — system looks healthy.", false);
+        } else {
+            self.push_toast(
+                "Diagnostics complete — review findings in Preferences.",
+                true,
+            );
+        }
+        self.refresh_system();
+        self.refresh_fast(true);
+    }
+
+    pub(super) fn handle_export_bug_report(&mut self) {
+        self.set_busy(Some("Collecting bug report...".to_string()));
+        let cfg = lock_or_recover(&self.controller.config).clone();
+        let st = {
+            let _sync = lock_or_recover(&self.controller_sync_lock);
+            self.controller.status(None)
+        };
+        let fw = detect_for_ports(cfg.sharing.port, cfg.discovery.port, cfg.discovery.mdns);
+        let svc = service_status();
+        let daemon_log = log_path();
+        let recent_logs: Vec<String> = std::fs::read_to_string(&daemon_log)
+            .ok()
+            .map(|content| {
+                let all: Vec<&str> = content.lines().collect();
+                let start = all.len().saturating_sub(50);
+                all[start..].iter().map(|s| (*s).to_string()).collect()
+            })
+            .unwrap_or_default();
+
+        let sanitized_config = serde_json::json!({
+            "device_name": cfg.device.name,
+            "sharing_enabled": cfg.sharing.enabled,
+            "sharing_port": cfg.sharing.port,
+            "sharing_security": cfg.sharing.security,
+            "has_psk_hash": !cfg.sharing.psk_hash.is_empty(),
+            "auto_connect": cfg.connection.auto_connect,
+            "disconnect_on_quit": cfg.connection.disconnect_on_quit,
+            "keep_local_output": cfg.connection.keep_local_output,
+            "latency_ms": cfg.connection.latency_ms,
+            "discovery_mdns": cfg.discovery.mdns,
+            "discovery_udp": cfg.discovery.udp,
+            "discovery_port": cfg.discovery.port,
+            "routing_default_mode": cfg.routing.default_mode,
+        });
+
+        let bundle = serde_json::json!({
+            "version": VERSION,
+            "protocol": PROTOCOL_VERSION,
+            "os": std::env::consts::OS,
+            "arch": std::env::consts::ARCH,
+            "config_path": config_path().to_string_lossy(),
+            "state_path": state_path().to_string_lossy(),
+            "log_path": daemon_log.to_string_lossy(),
+            "config": sanitized_config,
+            "status": st,
+            "firewall": fw,
+            "service": svc,
+            "recent_logs": recent_logs,
+        });
+
+        let pretty = serde_json::to_string_pretty(&bundle).unwrap_or_else(|_| bundle.to_string());
+        let report_path = daemon_log
+            .parent()
+            .map(|p| p.join("soundhop-bug-report.json"))
+            .unwrap_or_else(|| std::env::temp_dir().join("soundhop-bug-report.json"));
+        let saved_path = match atomic_write(&report_path, &pretty) {
+            Ok(()) => Some(report_path.to_string_lossy().into_owned()),
+            Err(_) => None,
+        };
+
+        {
+            let mut guard = write_or_recover(&self.snapshot);
+            guard.bug_report_json = Some(pretty);
+            guard.bug_report_path = saved_path.clone();
+        }
+        self.set_busy(None);
+        if let Some(path) = saved_path {
+            self.push_toast(format!("Bug report exported to {path}"), false);
+        } else {
+            self.push_toast("Bug report collected and ready to copy.", false);
+        }
+    }
+
     pub(super) fn handle_set_autostart(&mut self, enabled: bool) {
         if enabled {
             let svc_res = install_service(true, true, true);
@@ -585,5 +845,161 @@ impl WorkerState {
             Err(e) => self.push_toast(e, true),
         }
         self.refresh_fast(true);
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::backend::GuiCommand;
+    use soundhop_core::backend::linux::LinuxAudioBackend;
+    use soundhop_core::config::Config;
+    use soundhop_core::state::State;
+    use soundhop_core::util::{CommandResult, MockRunner};
+
+    struct TempDirGuard(std::path::PathBuf);
+
+    impl TempDirGuard {
+        fn new(tag: &str) -> Self {
+            let unique = std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map(|d| d.as_nanos())
+                .unwrap_or(0);
+            let dir = std::env::temp_dir().join(format!(
+                "soundhop-gui-{tag}-{}-{unique}",
+                std::process::id()
+            ));
+            std::fs::create_dir_all(&dir).unwrap();
+            Self(dir)
+        }
+
+        fn path(&self) -> &std::path::Path {
+            &self.0
+        }
+    }
+
+    impl Drop for TempDirGuard {
+        fn drop(&mut self) {
+            let _ = std::fs::remove_dir_all(&self.0);
+        }
+    }
+
+    fn make_worker_with_temp_config(tag: &str) -> (TempDirGuard, WorkerState) {
+        let dir = TempDirGuard::new(tag);
+        let cfg_path = dir.path().join("config.toml");
+        let state_path = dir.path().join("state.json");
+        let mut cfg = Config::default();
+        cfg.sharing.psk_hash = "super-secret-hash-should-not-leak".to_string();
+        cfg.save(Some(&cfg_path)).unwrap();
+
+        let runner = Arc::new(MockRunner::new(|args, _| {
+            let joined = args.join(" ");
+            let stdout = if joined.ends_with(" info") {
+                "Server Name: PulseAudio (on PipeWire 1.2.0)\nDefault Sink: alsa_output.mock\n"
+                    .to_string()
+            } else {
+                String::new()
+            };
+            Ok(CommandResult {
+                args: args.to_vec(),
+                returncode: 0,
+                stdout,
+                stderr: String::new(),
+            })
+        }));
+        let backend = Arc::new(LinuxAudioBackend::with_runner(runner));
+        let ctrl = Arc::new(Controller::new(
+            Some(cfg),
+            Some(State::default()),
+            Some(backend),
+            Some(cfg_path),
+            Some(state_path),
+            false,
+        ));
+        let snap = Arc::new(RwLock::new(GuiSnapshot::from_controller(&ctrl)));
+        let worker = WorkerState {
+            controller: ctrl,
+            snapshot: snap,
+            toasts: Arc::new(Mutex::new(Vec::new())),
+            ctx: None,
+            cached_live_peers: Arc::new(Mutex::new(Vec::new())),
+            mutation_seq: Arc::new(AtomicU64::new(0)),
+            active_commands: Arc::new(AtomicUsize::new(0)),
+            onboarding_reopened: Arc::new(AtomicBool::new(false)),
+            controller_sync_lock: Arc::new(Mutex::new(())),
+            use_ipc: false,
+        };
+        (dir, worker)
+    }
+
+    #[test]
+    fn test_phone_and_settings_config_patches_persist_to_disk() {
+        let (dir, mut worker) = make_worker_with_temp_config("patches");
+
+        worker.handle_command(GuiCommand::SaveConfigPatch {
+            patch: serde_json::json!({
+                "android": {
+                    "default_codec": "flac",
+                    "default_source": "mic",
+                    "buffer_ms": 120,
+                    "duplicate_audio": true,
+                },
+                "connection": {
+                    "disconnect_on_quit": false,
+                    "last_peer": "peer-living-room",
+                }
+            }),
+            toast: None,
+        });
+
+        let reloaded = Config::load(Some(&dir.path().join("config.toml"))).unwrap();
+        assert_eq!(reloaded.android.default_codec, "flac");
+        assert_eq!(reloaded.android.default_source, "mic");
+        assert_eq!(reloaded.android.buffer_ms, 120);
+        assert!(reloaded.android.duplicate_audio);
+        assert!(!reloaded.connection.disconnect_on_quit);
+        assert_eq!(reloaded.connection.last_peer, "peer-living-room");
+
+        // Clearing preferred peer persists empty string
+        worker.handle_command(GuiCommand::SaveConfigPatch {
+            patch: serde_json::json!({ "connection": { "last_peer": "" } }),
+            toast: None,
+        });
+        let reloaded2 = Config::load(Some(&dir.path().join("config.toml"))).unwrap();
+        assert_eq!(reloaded2.connection.last_peer, "");
+    }
+
+    #[test]
+    fn test_diagnostics_and_bug_report_commands() {
+        let (_dir, mut worker) = make_worker_with_temp_config("diag");
+
+        worker.handle_command(GuiCommand::RunDiagnostics { fix: false });
+        {
+            let snap = worker.snapshot.read().unwrap();
+            assert!(!snap.diagnostics_running);
+            assert!(snap.diagnostics_summary.is_some());
+            assert!(snap
+                .diagnostics_summary
+                .as_deref()
+                .unwrap()
+                .contains("Audio Backend:"));
+            assert!(snap.diagnostics_healthy.is_some());
+        }
+
+        worker.handle_command(GuiCommand::ExportBugReport);
+        {
+            let snap = worker.snapshot.read().unwrap();
+            let json_str = snap
+                .bug_report_json
+                .as_deref()
+                .expect("bug report JSON populated");
+            assert!(
+                !json_str.contains("super-secret-hash-should-not-leak"),
+                "psk_hash must be redacted from exported bug report"
+            );
+            let parsed: serde_json::Value = serde_json::from_str(json_str).unwrap();
+            assert_eq!(parsed["version"], VERSION);
+            assert_eq!(parsed["config"]["has_psk_hash"], true);
+        }
     }
 }

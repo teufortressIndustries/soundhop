@@ -18,6 +18,7 @@ pub struct SettingsViewState {
     pub latency_ms: u32,
     pub tcp_port: u16,
     pub discovery_port: u16,
+    pub pending_copy_bug_report: bool,
     synced_name: String,
     synced_latency: u32,
     synced_ports: (u16, u16),
@@ -32,6 +33,7 @@ impl Default for SettingsViewState {
             latency_ms: 150,
             tcp_port: 4713,
             discovery_port: 47777,
+            pending_copy_bug_report: false,
             synced_name: String::new(),
             synced_latency: 150,
             synced_ports: (4713, 47777),
@@ -175,6 +177,103 @@ pub fn render(
                 let mut auto = snap.auto_connect;
                 if toggle_switch(ui, pal, &mut auto).changed() {
                     backend.send(GuiCommand::SetAutoConnect { enabled: auto });
+                }
+            });
+        });
+
+        ui.add_space(8.0);
+
+        // Preferred Auto-Connect Peer selector & clear
+        ui.horizontal(|ui| {
+            ui.vertical(|ui| {
+                ui.label(
+                    RichText::new("Preferred auto-connect speaker")
+                        .color(pal.text)
+                        .size(13.5),
+                );
+                ui.label(
+                    RichText::new("Choose which speaker SoundHop reconnects to automatically.")
+                        .color(pal.text_muted)
+                        .size(12.0),
+                );
+            });
+            ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                let current_peer_id = snap.config.connection.last_peer.clone();
+                if !current_peer_id.is_empty() && secondary_button(ui, pal, "Clear").clicked() {
+                    backend.send(GuiCommand::SaveConfigPatch {
+                        patch: serde_json::json!({ "connection": { "last_peer": "" } }),
+                        toast: Some("Cleared preferred auto-connect speaker.".to_string()),
+                    });
+                }
+
+                let selected_label = if current_peer_id.is_empty() {
+                    "None (Most Recent)".to_string()
+                } else {
+                    snap.peers
+                        .iter()
+                        .find(|p| p.id == current_peer_id)
+                        .map(|p| p.name.clone())
+                        .unwrap_or_else(|| current_peer_id.clone())
+                };
+                let mut chosen = current_peer_id.clone();
+                egui::ComboBox::from_id_salt("settings_preferred_peer_combo")
+                    .selected_text(selected_label)
+                    .show_ui(ui, |ui| {
+                        ui.selectable_value(&mut chosen, String::new(), "None (Most Recent)");
+                        for peer in &snap.peers {
+                            let label = if peer.online {
+                                peer.name.clone()
+                            } else {
+                                format!("{} (saved)", peer.name)
+                            };
+                            ui.selectable_value(&mut chosen, peer.id.clone(), label);
+                        }
+                    });
+                if chosen != current_peer_id {
+                    let toast = if chosen.is_empty() {
+                        "Cleared preferred auto-connect speaker.".to_string()
+                    } else {
+                        let name = snap
+                            .peers
+                            .iter()
+                            .find(|p| p.id == chosen)
+                            .map(|p| p.name.as_str())
+                            .unwrap_or(chosen.as_str());
+                        format!("Preferred auto-connect speaker set to {name}.")
+                    };
+                    backend.send(GuiCommand::SaveConfigPatch {
+                        patch: serde_json::json!({ "connection": { "last_peer": chosen } }),
+                        toast: Some(toast),
+                    });
+                }
+            });
+        });
+
+        ui.add_space(10.0);
+
+        // Disconnect on Quit
+        ui.horizontal(|ui| {
+            ui.vertical(|ui| {
+                ui.label(
+                    RichText::new("Disconnect speakers when quitting")
+                        .color(pal.text)
+                        .size(13.5),
+                );
+                ui.label(
+                    RichText::new("Automatically return audio to this device when SoundHop exits.")
+                        .color(pal.text_muted)
+                        .size(12.0),
+                );
+            });
+            ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                let mut disconnect_on_quit = snap.config.connection.disconnect_on_quit;
+                if toggle_switch(ui, pal, &mut disconnect_on_quit).changed() {
+                    backend.send(GuiCommand::SaveConfigPatch {
+                        patch: serde_json::json!({
+                            "connection": { "disconnect_on_quit": disconnect_on_quit }
+                        }),
+                        toast: None,
+                    });
                 }
             });
         });
@@ -675,7 +774,21 @@ pub fn render(
                 .monospace(),
             );
             ui.add_space(6.0);
-            ui.horizontal(|ui| {
+            ui.horizontal_wrapped(|ui| {
+                ui.add_enabled_ui(!snap.diagnostics_running, |ui| {
+                    let diag_label = if snap.diagnostics_running {
+                        "Running Diagnostics..."
+                    } else {
+                        "Run Diagnostics & Fix"
+                    };
+                    if primary_button(ui, pal, diag_label).clicked() {
+                        backend.send(GuiCommand::RunDiagnostics { fix: true });
+                    }
+                });
+                if secondary_button(ui, pal, "Copy / Export Bug Report").clicked() {
+                    state.pending_copy_bug_report = true;
+                    backend.send(GuiCommand::ExportBugReport);
+                }
                 #[cfg(target_os = "windows")]
                 let fw_btn_label = "Allow in Windows Firewall";
                 #[cfg(not(target_os = "windows"))]
@@ -687,6 +800,54 @@ pub fn render(
                     backend.send(GuiCommand::ReopenOnboarding);
                 }
             });
+
+            if state.pending_copy_bug_report {
+                if let Some(ref report_json) = snap.bug_report_json {
+                    ui.ctx().copy_text(report_json.clone());
+                    state.pending_copy_bug_report = false;
+                }
+            }
+
+            if let Some(ref summary) = snap.diagnostics_summary {
+                ui.add_space(8.0);
+                let (bg, border) = if snap.diagnostics_healthy == Some(true) {
+                    (pal.success_soft, pal.success)
+                } else {
+                    (pal.warning_soft, pal.warning)
+                };
+                callout_card(ui, bg, border, |ui| {
+                    ui.label(
+                        RichText::new("Diagnostics Summary")
+                            .color(border)
+                            .size(12.5)
+                            .strong(),
+                    );
+                    ui.add_space(4.0);
+                    ui.label(
+                        RichText::new(summary)
+                            .color(pal.text_secondary)
+                            .size(11.5)
+                            .monospace(),
+                    );
+                });
+            }
+
+            if let Some(ref report_json) = snap.bug_report_json {
+                ui.add_space(6.0);
+                ui.horizontal_wrapped(|ui| {
+                    if secondary_button(ui, pal, "Copy Report JSON").clicked() {
+                        ui.ctx().copy_text(report_json.clone());
+                    }
+                    if let Some(ref path) = snap.bug_report_path {
+                        ui.label(
+                            RichText::new(format!("Saved: {path}"))
+                                .color(pal.text_muted)
+                                .size(11.5)
+                                .monospace(),
+                        );
+                    }
+                });
+            }
         },
     );
 }
