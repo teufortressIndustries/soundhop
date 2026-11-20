@@ -1,24 +1,43 @@
 # Shared libraries / compiled artifacts
 *.so
+*.dll
+*.pdb
+*.lib
+*.exp
+*.ilk
+*.obj
+*.res
 
 # Distribution / packaging
 dist/
 build/
 target/
+packaging/windows/Output/
 *.AppImage
 *.exe
+*.msi
+*.msix
+*.zip
 
 # Local private files
 .private/
 
-# Logs and runtime databases
+# Logs, crash dumps, and runtime databases
 *.log
+*.dmp
 *.sqlite3
+*.sqlite3-wal
+*.sqlite3-shm
 
 # IDE and OS artifacts
 .DS_Store
+Thumbs.db
+ehthumbs.db
+Desktop.ini
+*.lnk
 .idea/
 .vscode/
+.vs/
 *.swp
 *.swo
 *~
