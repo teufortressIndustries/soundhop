@@ -87,17 +87,33 @@ impl Controller {
         if sync_remote && st.is_connected() && !st.connected_host.is_empty() {
             let cur_vol = volume.unwrap_or_else(|| self.backend.get_sink_volume(&sink));
             let cur_mute = mute.unwrap_or_else(|| self.backend.get_sink_mute(&sink));
-            for sess in &st.multiroom_peers {
-                self.backend
-                    .remote_set_volume(&sess.host, sess.port, cur_vol, Some(cur_mute));
-            }
-            if st.multiroom_peers.is_empty() {
-                self.backend.remote_set_volume(
-                    &st.connected_host,
-                    st.connected_port,
-                    cur_vol,
-                    Some(cur_mute),
-                );
+            let sht3_handled = {
+                let guard = lock_or_recover(&self.sht3_outbound);
+                if let Some(ref handle) = *guard {
+                    if handle.is_running() {
+                        let _ = handle.set_volume(cur_vol.min(150) as u8);
+                        let _ = handle.set_mute(cur_mute);
+                        true
+                    } else {
+                        false
+                    }
+                } else {
+                    false
+                }
+            };
+            if !sht3_handled {
+                for sess in &st.multiroom_peers {
+                    self.backend
+                        .remote_set_volume(&sess.host, sess.port, cur_vol, Some(cur_mute));
+                }
+                if st.multiroom_peers.is_empty() {
+                    self.backend.remote_set_volume(
+                        &st.connected_host,
+                        st.connected_port,
+                        cur_vol,
+                        Some(cur_mute),
+                    );
+                }
             }
             let mut guard = lock_or_recover(&self.state);
             guard.last_synced_volume = cur_vol as i32;
@@ -121,14 +137,34 @@ impl Controller {
         if vol as i32 == st.last_synced_volume && mute == st.last_synced_mute {
             return false;
         }
-        if !st.multiroom_peers.is_empty() {
-            for sess in &st.multiroom_peers {
-                self.backend
-                    .remote_set_volume(&sess.host, sess.port, vol, Some(mute));
+        let sht3_handled = {
+            let guard = lock_or_recover(&self.sht3_outbound);
+            if let Some(ref handle) = *guard {
+                if handle.is_running() {
+                    let _ = handle.set_volume(vol.min(150) as u8);
+                    let _ = handle.set_mute(mute);
+                    true
+                } else {
+                    false
+                }
+            } else {
+                false
             }
-        } else {
-            self.backend
-                .remote_set_volume(&st.connected_host, st.connected_port, vol, Some(mute));
+        };
+        if !sht3_handled {
+            if !st.multiroom_peers.is_empty() {
+                for sess in &st.multiroom_peers {
+                    self.backend
+                        .remote_set_volume(&sess.host, sess.port, vol, Some(mute));
+                }
+            } else {
+                self.backend.remote_set_volume(
+                    &st.connected_host,
+                    st.connected_port,
+                    vol,
+                    Some(mute),
+                );
+            }
         }
         let mut guard = lock_or_recover(&self.state);
         guard.last_synced_volume = vol as i32;

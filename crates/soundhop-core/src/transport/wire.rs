@@ -102,7 +102,9 @@ pub struct EncryptedFrame {
 }
 
 impl EncryptedFrame {
-    /// Write the full frame (header + ciphertext + tag) to `w`.
+    /// Write the full frame (header + ciphertext + tag) to `w` in a single atomic write
+    /// so `TCP_NODELAY` sockets never split the 16-byte header and sub-MSS Opus payload
+    /// across separate TCP segments (avoiding Nagle / Delayed-ACK stalls over Wi-Fi).
     pub fn write_to<W: Write>(&self, w: &mut W) -> TransportResult<()> {
         let expected_body = usize::from(self.header.payload_len) + AEAD_TAG_LEN;
         if self.ciphertext_and_tag.len() != expected_body {
@@ -112,24 +114,74 @@ impl EncryptedFrame {
                 expected_body
             )));
         }
-        w.write_all(&self.header.to_bytes())?;
-        w.write_all(&self.ciphertext_and_tag)?;
+        let mut frame_buf = Vec::with_capacity(FRAME_HEADER_LEN + expected_body);
+        frame_buf.extend_from_slice(&self.header.to_bytes());
+        frame_buf.extend_from_slice(&self.ciphertext_and_tag);
+        w.write_all(&frame_buf)?;
         Ok(())
     }
 
     /// Read a framed packet from `r`, enforcing `MAX_PAYLOAD_LEN` prior to allocating.
+    ///
+    /// Timeout-safe: only returns `WouldBlock`/`TimedOut` if **zero** bytes of the frame
+    /// header were read before the timeout. Once the first byte of a frame arrives, it
+    /// completes reading the remaining header and payload bytes so a short socket read
+    /// timeout can never discard a partial header and desynchronize the AEAD stream.
     pub fn read_from<R: Read>(r: &mut R) -> TransportResult<Self> {
         let mut hdr_buf = [0u8; FRAME_HEADER_LEN];
-        r.read_exact(&mut hdr_buf)?;
+        read_frame_bytes(r, &mut hdr_buf, false)?;
         let header = FrameHeader::from_bytes(&hdr_buf)?;
         let body_len = usize::from(header.payload_len) + AEAD_TAG_LEN;
         let mut ciphertext_and_tag = vec![0u8; body_len];
-        r.read_exact(&mut ciphertext_and_tag)?;
+        read_frame_bytes(r, &mut ciphertext_and_tag, true)?;
         Ok(Self {
             header,
             ciphertext_and_tag,
         })
     }
+}
+
+/// Read `buf.len()` bytes from `r`.
+///
+/// If `mid_frame` is `false` and a `WouldBlock`/`TimedOut` occurs when `offset == 0`
+/// (before any byte of the frame has been consumed), returns that timeout error immediately.
+/// Once `offset > 0` (or `mid_frame == true`), retries through transient `WouldBlock`/`TimedOut`
+/// up to ~5 seconds so a frame is never half-consumed and lost.
+fn read_frame_bytes<R: Read>(r: &mut R, buf: &mut [u8], mid_frame: bool) -> TransportResult<()> {
+    let mut offset = 0usize;
+    let mut timeout_retries = 0u32;
+    while offset < buf.len() {
+        match r.read(&mut buf[offset..]) {
+            Ok(0) => {
+                return Err(TransportError::Io(std::io::Error::new(
+                    std::io::ErrorKind::UnexpectedEof,
+                    "early EOF while reading SHT3 frame",
+                )));
+            }
+            Ok(n) => {
+                offset += n;
+                timeout_retries = 0;
+            }
+            Err(ref e) if e.kind() == std::io::ErrorKind::Interrupted => continue,
+            Err(e)
+                if matches!(
+                    e.kind(),
+                    std::io::ErrorKind::WouldBlock | std::io::ErrorKind::TimedOut
+                ) =>
+            {
+                if !mid_frame && offset == 0 {
+                    return Err(TransportError::Io(e));
+                }
+                timeout_retries += 1;
+                if timeout_retries > 250 {
+                    return Err(TransportError::Io(e));
+                }
+                std::thread::sleep(std::time::Duration::from_millis(5));
+            }
+            Err(e) => return Err(TransportError::Io(e)),
+        }
+    }
+    Ok(())
 }
 
 /// Decrypted SHT3 frame returned by server/client connections.
@@ -716,5 +768,76 @@ mod tests {
             dropped_frames: 2,
         };
         assert_eq!(PongPayload::decode(&pong.encode()).unwrap(), pong);
+    }
+
+    struct ChunkyTimeoutReader {
+        data: Vec<u8>,
+        pos: usize,
+        chunk_size: usize,
+        timeout_next: bool,
+    }
+
+    impl Read for ChunkyTimeoutReader {
+        fn read(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
+            if self.pos == 0 && self.timeout_next {
+                self.timeout_next = false;
+                return Err(std::io::Error::new(
+                    std::io::ErrorKind::WouldBlock,
+                    "idle before frame start",
+                ));
+            }
+            if self.pos >= self.data.len() {
+                return Ok(0);
+            }
+            if self.timeout_next {
+                self.timeout_next = false;
+                return Err(std::io::Error::new(
+                    std::io::ErrorKind::TimedOut,
+                    "partial frame timeout",
+                ));
+            }
+            self.timeout_next = true;
+            let n = buf
+                .len()
+                .min(self.chunk_size)
+                .min(self.data.len() - self.pos);
+            buf[..n].copy_from_slice(&self.data[self.pos..self.pos + n]);
+            self.pos += n;
+            Ok(n)
+        }
+    }
+
+    #[test]
+    fn encrypted_frame_read_from_recovers_partial_read_timeouts() {
+        let frame = EncryptedFrame {
+            header: FrameHeader {
+                frame_type: FrameType::AudioOpus,
+                flags: 0,
+                payload_len: 32,
+                seq: 7,
+                timestamp_samples: 960 * 7,
+            },
+            ciphertext_and_tag: vec![0xAB; 32 + AEAD_TAG_LEN],
+        };
+        let mut wire = Vec::new();
+        frame.write_to(&mut wire).unwrap();
+        assert_eq!(wire.len(), FRAME_HEADER_LEN + 32 + AEAD_TAG_LEN);
+
+        // Idle timeout at byte 0 returns WouldBlock immediately so the receiver loop can poll stop flag
+        let mut reader = ChunkyTimeoutReader {
+            data: wire,
+            pos: 0,
+            chunk_size: 5,
+            timeout_next: true,
+        };
+        let idle_err = EncryptedFrame::read_from(&mut reader).unwrap_err();
+        assert!(matches!(
+            idle_err,
+            TransportError::Io(ref e) if e.kind() == std::io::ErrorKind::WouldBlock
+        ));
+
+        // Subsequent read straddles multiple 5-byte chunks with TimedOut between them without losing synchronization
+        let decoded = EncryptedFrame::read_from(&mut reader).unwrap();
+        assert_eq!(decoded, frame);
     }
 }

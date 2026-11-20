@@ -244,14 +244,18 @@ impl OpusCodec {
             return Err(TransportError::Codec("zero Opus frame size".into()));
         }
 
-        let mut encoder =
-            opus2::Encoder::new(params.sample_rate, opus_channels, opus2::Application::Audio)
-                .map_err(|e| TransportError::Codec(format!("Opus encoder init failed: {e}")))?;
+        let mut encoder = opus2::Encoder::new(
+            params.sample_rate,
+            opus_channels,
+            opus2::Application::LowDelay,
+        )
+        .map_err(|e| TransportError::Codec(format!("Opus encoder init failed: {e}")))?;
 
         let target_bps = i32::from(params.bitrate_kbps.clamp(16, 510)) * 1000;
         encoder
             .set_bitrate(opus2::Bitrate::Bits(target_bps))
             .map_err(|e| TransportError::Codec(format!("Opus set_bitrate failed: {e}")))?;
+        let _ = encoder.set_signal(opus2::Signal::Music);
         let _ = encoder.set_vbr(true);
         let _ = encoder.set_inband_fec(false);
 
@@ -427,6 +431,83 @@ mod tests {
             assert!(
                 last_energy > 100_000,
                 "expected non-silent decoded Opus audio for {profile:?}, energy={last_energy}"
+            );
+
+            // Measure actual waveform correlation & SNR (accounting for Opus 312-sample lookahead)
+            let mut codec_snr = OpusCodec::from_profile(profile).unwrap();
+            let total_frames = 60usize;
+            let total_spc = spc * total_frames;
+            let mut in_l = Vec::with_capacity(total_spc);
+            let mut in_r = Vec::with_capacity(total_spc);
+            let mut out_l = Vec::with_capacity(total_spc);
+            let mut out_r = Vec::with_capacity(total_spc);
+
+            for f_idx in 0..total_frames {
+                let mut pcm = Vec::with_capacity(spc * 2);
+                for i in 0..spc {
+                    let s_idx = f_idx * spc + i;
+                    let t = s_idx as f64 / 48_000.0;
+                    // Realistic dynamic stereo signal: bass (110Hz) + vocal mid (660Hz) + treble (3520Hz) with envelope modulation
+                    let env = 0.25 + 0.75 * ((t * 3.0 * std::f64::consts::PI).sin().abs());
+                    let l_val = env
+                        * (8000.0 * (2.0 * std::f64::consts::PI * 110.0 * t).sin()
+                            + 6000.0 * (2.0 * std::f64::consts::PI * 660.0 * t).sin()
+                            + 3000.0 * (2.0 * std::f64::consts::PI * 3520.0 * t).cos());
+                    let r_val = env
+                        * (8000.0 * (2.0 * std::f64::consts::PI * 110.0 * t).sin()
+                            + 5500.0 * (2.0 * std::f64::consts::PI * 880.0 * t).cos()
+                            + 3000.0 * (2.0 * std::f64::consts::PI * 2640.0 * t).sin());
+                    let l_i16 = l_val.clamp(-32000.0, 32000.0) as i16;
+                    let r_i16 = r_val.clamp(-32000.0, 32000.0) as i16;
+                    in_l.push(l_i16);
+                    in_r.push(r_i16);
+                    pcm.push(l_i16);
+                    pcm.push(r_i16);
+                }
+                let mut pkt = Vec::new();
+                codec_snr.encode(&pcm, &mut pkt).unwrap();
+                let mut dec = Vec::new();
+                codec_snr.decode(&pkt, &mut dec).unwrap();
+                for &[l, r] in dec.as_chunks::<2>().0 {
+                    out_l.push(l);
+                    out_r.push(r);
+                }
+            }
+
+            // Find best lag (Opus standard lookahead @ 48kHz is 312 samples = 6.5ms)
+            let mut best_lag = 0usize;
+            let mut best_corr = -1.0f64;
+            let search_start = spc * 5;
+            let search_end = total_spc - spc * 2;
+            for lag in 0..800usize {
+                let mut dot = 0.0f64;
+                let mut e_in = 0.0f64;
+                let mut e_out = 0.0f64;
+                for idx in search_start..search_end {
+                    let a = f64::from(in_l[idx]);
+                    let b = f64::from(out_l[idx + lag]);
+                    dot += a * b;
+                    e_in += a * a;
+                    e_out += b * b;
+                }
+                let corr = dot / (e_in.sqrt() * e_out.sqrt() + 1e-9);
+                if corr > best_corr {
+                    best_corr = corr;
+                    best_lag = lag;
+                }
+            }
+            let mut sig_pow = 0.0f64;
+            let mut err_pow = 0.0f64;
+            for idx in search_start..search_end {
+                let a = f64::from(in_l[idx]);
+                let b = f64::from(out_l[idx + best_lag]);
+                sig_pow += a * a;
+                err_pow += (a - b) * (a - b);
+            }
+            let snr_db = 10.0 * (sig_pow / (err_pow + 1e-9)).log10();
+            assert!(
+                best_corr > 0.90 && snr_db > 8.0,
+                "expected high-fidelity Opus reconstruction for {profile:?}, got corr={best_corr:.4}, snr={snr_db:.2} dB"
             );
 
             // PLC must produce a valid full frame of samples.

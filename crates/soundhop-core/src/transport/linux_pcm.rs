@@ -11,6 +11,7 @@ use crate::transport::pcm::{PcmCapture, PcmPlayback, PCM_CHANNELS, PCM_SAMPLE_RA
 use crate::transport::{TransportError, TransportResult};
 
 const DEFAULT_LATENCY_MS: u32 = 20;
+const DEFAULT_PLAYBACK_LATENCY_MS: u32 = 60;
 
 /// Captures 48 kHz stereo S16LE PCM from a PulseAudio/PipeWire monitor source via `parec`.
 ///
@@ -118,9 +119,9 @@ pub struct LinuxPcmPlayback {
 }
 
 impl LinuxPcmPlayback {
-    /// Spawn `pacat --playback --raw --format=s16le --rate=48000 --channels=2 --latency-msec=20`.
+    /// Spawn `pacat --playback --raw --format=s16le --rate=48000 --channels=2 --latency-msec=60`.
     pub fn spawn() -> TransportResult<Self> {
-        Self::spawn_for_sink(None, DEFAULT_LATENCY_MS)
+        Self::spawn_for_sink(None, DEFAULT_PLAYBACK_LATENCY_MS)
     }
 
     /// Spawn `pacat --playback` targeting an optional PulseAudio/PipeWire sink and latency.
