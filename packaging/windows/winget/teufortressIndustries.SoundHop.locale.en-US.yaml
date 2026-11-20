@@ -1,0 +1,28 @@
+# yaml-language-server: $schema=https://aka.ms/winget-manifest.defaultLocale.1.6.0.schema.json
+PackageIdentifier: teufortressIndustries.SoundHop
+PackageVersion: 2.4.0
+PackageLocale: en-US
+Publisher: SoundHop Contributors
+PublisherUrl: https://github.com/teufortressIndustries/soundhop
+PublisherSupportUrl: https://github.com/teufortressIndustries/soundhop/issues
+PackageName: SoundHop
+PackageUrl: https://github.com/teufortressIndustries/soundhop
+License: MIT
+LicenseUrl: https://github.com/teufortressIndustries/soundhop/blob/main/LICENSE
+ShortDescription: Seamless cross-platform local network audio sharing, multi-room broadcast, and Android bridge
+Description: >-
+  SoundHop lets you stream and share audio between Linux and Windows devices over your
+  local network with zero-configuration LAN discovery, multi-room broadcast, persistent
+  per-app routing, PIN/PSK pairing, an interactive TUI, and a native desktop GUI and tray.
+Moniker: soundhop
+Tags:
+  - audio
+  - lan
+  - streaming
+  - multiroom
+  - wasapi
+  - pipewire
+  - pulseaudio
+ReleaseNotesUrl: https://github.com/teufortressIndustries/soundhop/releases/tag/v2.4.0
+ManifestType: defaultLocale
+ManifestVersion: 1.6.0

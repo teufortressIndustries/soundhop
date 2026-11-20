@@ -12,17 +12,34 @@
     <p>
       SoundHop wraps PipeWire, PulseAudio, and Windows WASAPI in an automatic, self-healing workflow
       with zero-configuration LAN discovery, multi-room broadcast, persistent per-app routing,
-      PIN/PSK pairing, an interactive TUI, and a native desktop system tray.
+      PIN/PSK pairing, an interactive TUI, and a native desktop GUI and system tray.
     </p>
   </description>
   <launchable type="desktop-id">io.github.soundhop.desktop</launchable>
+  <categories>
+    <category>AudioVideo</category>
+    <category>Audio</category>
+    <category>Network</category>
+  </categories>
+  <screenshots>
+    <screenshot type="default">
+      <caption>SoundHop desktop dashboard for LAN audio sharing and multi-room playback</caption>
+      <image>https://raw.githubusercontent.com/teufortressIndustries/soundhop/main/assets/soundhop.png</image>
+    </screenshot>
+  </screenshots>
   <url type="homepage">https://github.com/teufortressIndustries/soundhop</url>
   <url type="bugtracker">https://github.com/teufortressIndustries/soundhop/issues</url>
   <provides>
     <binary>soundhop</binary>
+    <binary>soundhop-gui</binary>
   </provides>
   <content_rating type="oars-1.1"/>
   <releases>
     <release version="2.4.0" date="2026-11-20"/>
+    <release version="2.3.1" date="2026-11-20"/>
+    <release version="2.3.0" date="2026-11-20"/>
+    <release version="2.2.0" date="2026-11-19"/>
+    <release version="2.1.1" date="2026-11-17"/>
+    <release version="2.0.0" date="2026-11-08"/>
   </releases>
 </component>

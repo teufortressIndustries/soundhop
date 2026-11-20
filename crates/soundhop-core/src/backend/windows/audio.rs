@@ -1058,4 +1058,135 @@ mod tests {
         b.reset();
         assert_eq!(b.next_delay(), Duration::from_millis(100));
     }
+
+    #[test]
+    fn test_windows_player_ring_buffer_overflow_preserves_stereo_alignment() {
+        let player = WindowsPlayer::new(48_000, 2);
+
+        // Fill buffer to capacity with recognizable stereo marker pairs: (L=100, R=-100)
+        let mut initial = Vec::with_capacity(MAX_PLAYBACK_BUFFER_SAMPLES * 2);
+        for _ in 0..(MAX_PLAYBACK_BUFFER_SAMPLES / 2) {
+            initial.extend_from_slice(&100i16.to_le_bytes());
+            initial.extend_from_slice(&(-100i16).to_le_bytes());
+        }
+        player.write(&initial);
+        assert_eq!(
+            player.buffer.lock().unwrap().len(),
+            MAX_PLAYBACK_BUFFER_SAMPLES
+        );
+
+        // Push 100 more stereo frames (200 samples) with distinct markers (L=2000, R=-2000)
+        let mut extra = Vec::with_capacity(100 * 4);
+        for _ in 0..100 {
+            extra.extend_from_slice(&2000i16.to_le_bytes());
+            extra.extend_from_slice(&(-2000i16).to_le_bytes());
+        }
+        player.write(&extra);
+
+        let buf = player.buffer.lock().unwrap();
+        assert_eq!(buf.len(), MAX_PLAYBACK_BUFFER_SAMPLES);
+        assert_eq!(
+            buf.len() % 2,
+            0,
+            "stereo channel alignment must be preserved"
+        );
+        // Front should still be an aligned (L, R) pair from the earlier batch
+        assert_eq!(buf[0], 100);
+        assert_eq!(buf[1], -100);
+        // Back should be the newest aligned (L, R) pair
+        assert_eq!(buf[buf.len() - 2], 2000);
+        assert_eq!(buf[buf.len() - 1], -2000);
+    }
+
+    #[test]
+    fn test_windows_player_write_ignores_empty_odd_trailing_byte_and_closed() {
+        let player = WindowsPlayer::new(48_000, 1);
+        player.write(&[]);
+        assert!(player.buffer.lock().unwrap().is_empty());
+
+        // 5 bytes -> 2 complete i16 samples, 1 trailing byte ignored
+        let mut bytes = Vec::new();
+        bytes.extend_from_slice(&1234i16.to_le_bytes());
+        bytes.extend_from_slice(&(-5678i16).to_le_bytes());
+        bytes.push(0xFF);
+        player.write(&bytes);
+        {
+            let buf = player.buffer.lock().unwrap();
+            assert_eq!(buf.len(), 2);
+            assert_eq!(buf[0], 1234);
+            assert_eq!(buf[1], -5678);
+        }
+
+        // After close(), buffer is cleared and subsequent writes are ignored
+        player.close();
+        assert!(player.buffer.lock().unwrap().is_empty());
+        player.write(&bytes);
+        assert!(player.buffer.lock().unwrap().is_empty());
+    }
+
+    #[test]
+    fn test_playback_resampler_underrun_fills_silence_passthrough_and_resampled() {
+        // 1. Passthrough (48k -> 48k) with 2 stereo frames available, requesting 5 frames
+        let mut queue = VecDeque::from(vec![1000i16, -1000, 2000, -2000]);
+        let mut passthrough = PlaybackResampler::new(48_000, 48_000);
+        let mut out = vec![999i16; 5 * 2];
+        passthrough.write_frames(&mut queue, 2, 2, 5, 100, false, |i, s| out[i] = s);
+        assert_eq!(out, vec![1000, -1000, 2000, -2000, 0, 0, 0, 0, 0, 0]);
+        assert!(queue.is_empty());
+
+        // 2. Empty queue underrun in resampled path (44.1k -> 48k) produces pure silence
+        let mut empty_q = VecDeque::new();
+        let mut resampled = PlaybackResampler::new(44_100, 48_000);
+        let mut silent = [777i16; 32 * 2];
+        resampled.write_frames(&mut empty_q, 2, 2, 32, 100, false, |i, s| silent[i] = s);
+        assert!(silent.iter().all(|&s| s == 0));
+
+        // 3. Partial stereo frame (odd single sample left in queue) duplicates L->R, then silence
+        let mut odd_q = VecDeque::from(vec![4200i16]);
+        assert_eq!(pop_frame_pair(&mut odd_q, 2), (4200, 4200));
+        assert_eq!(pop_frame_pair(&mut odd_q, 2), (0, 0));
+    }
+
+    #[test]
+    fn test_mono_to_stereo_and_multichannel_conversion() {
+        // Mono source -> stereo destination (duplicates mono to L and R)
+        let mut mono_q = VecDeque::from(vec![1000i16, -2000, 3000]);
+        let mut r = PlaybackResampler::new(48_000, 48_000);
+        let mut stereo_out = vec![0i16; 3 * 2];
+        r.write_frames(&mut mono_q, 1, 2, 3, 100, false, |i, s| stereo_out[i] = s);
+        assert_eq!(stereo_out, vec![1000, 1000, -2000, -2000, 3000, 3000]);
+
+        // Stereo source -> mono destination (takes L channel)
+        let mut stereo_q = VecDeque::from(vec![1000i16, -1000, 4000, -4000]);
+        let mut mono_out = vec![0i16; 2];
+        r.write_frames(&mut stereo_q, 2, 1, 2, 100, false, |i, s| mono_out[i] = s);
+        assert_eq!(mono_out, vec![1000, 4000]);
+
+        // Stereo source -> 4-channel destination (ch0=L, ch1=R, ch2..=avg without i16 overflow)
+        let mut wide_q = VecDeque::from(vec![30_000i16, 30_000, -30_000, -30_000, 2000, -1000]);
+        let mut quad_out = vec![0i16; 3 * 4];
+        r.write_frames(&mut wide_q, 2, 4, 3, 100, false, |i, s| quad_out[i] = s);
+        assert_eq!(
+            quad_out,
+            vec![
+                30_000, 30_000, 30_000, 30_000, -30_000, -30_000, -30_000, -30_000, 2000, -1000,
+                500, 500,
+            ]
+        );
+
+        // 6-channel source -> stereo pair extraction discards extra surround channels
+        let mut surround_q = VecDeque::from(vec![
+            10i16, 20, 30, 40, 50, 60, // frame 0
+            70, 80, 90, 100, 110, 120, // frame 1
+        ]);
+        assert_eq!(pop_frame_pair(&mut surround_q, 6), (10, 20));
+        assert_eq!(pop_frame_pair(&mut surround_q, 6), (70, 80));
+        assert!(surround_q.is_empty());
+
+        // Gain + mute applied during mono-to-stereo conversion
+        let mut muted_q = VecDeque::from(vec![10_000i16, -10_000]);
+        let mut muted_out = vec![123i16; 2 * 2];
+        r.write_frames(&mut muted_q, 1, 2, 2, 100, true, |i, s| muted_out[i] = s);
+        assert_eq!(muted_out, vec![0, 0, 0, 0]);
+    }
 }

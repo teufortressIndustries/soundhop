@@ -60,6 +60,11 @@ jobs:
       - name: Run unit & integration test suite
         run: cargo test --workspace --locked
 
+      - name: Verify headless CLI build & unit tests (no GUI feature)
+        run: |
+          cargo check -p soundhop-cli --no-default-features --bin soundhop --locked
+          cargo test -p soundhop-cli --no-default-features --lib --locked
+
   build-appimage:
     name: Build AnyLinux AppImage
     needs: [test]
@@ -176,10 +181,52 @@ jobs:
             dist/SoundHop-*-windows-x86_64-portable.zip
           if-no-files-found: error
 
+  build-linux-aarch64:
+    name: Build Linux aarch64 Headless CLI
+    needs: [test]
+    runs-on: ubuntu-24.04-arm
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Cache Cargo registry and target
+        uses: Swatinem/rust-cache@v2
+
+      - name: Build headless CLI binary (aarch64-unknown-linux-gnu)
+        run: cargo build --release -p soundhop-cli --no-default-features --bin soundhop --locked
+
+      - name: Smoke test & package headless tarball
+        run: |
+          VERSION="$(sed -n '/^\[workspace\.package\]/,/^\[/{s/^version = "\([^"]*\)"/\1/p}' Cargo.toml | head -n1)"
+          if [ -z "$VERSION" ]; then
+            echo "Failed to determine workspace version from Cargo.toml" >&2
+            exit 1
+          fi
+          ./target/release/soundhop --version
+          PKG_DIR="soundhop-${VERSION}-linux-aarch64-headless"
+          mkdir -p "dist/${PKG_DIR}"
+          install -Dm755 target/release/soundhop "dist/${PKG_DIR}/soundhop"
+          install -Dm644 README.md "dist/${PKG_DIR}/README.md"
+          install -Dm644 LICENSE "dist/${PKG_DIR}/LICENSE"
+          install -Dm644 CHANGELOG.md "dist/${PKG_DIR}/CHANGELOG.md"
+          tar -C dist -czf "dist/${PKG_DIR}.tar.gz" "${PKG_DIR}"
+          rm -rf "dist/${PKG_DIR}"
+          ls -lh "dist/${PKG_DIR}.tar.gz"
+
+      - name: Upload Linux aarch64 Headless Artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: SoundHop-Linux-aarch64-headless
+          path: dist/soundhop-*-linux-aarch64-headless.tar.gz
+          if-no-files-found: error
+
   release:
     name: Publish GitHub Release
     if: startsWith(github.ref, 'refs/tags/v')
-    needs: [test, build-appimage, build-windows]
+    needs: [test, build-appimage, build-windows, build-linux-aarch64]
     runs-on: ubuntu-22.04
 
     permissions:
@@ -200,10 +247,16 @@ jobs:
           name: SoundHop-Windows-x86_64
           path: dist
 
+      - name: Download Linux aarch64 Headless Artifact
+        uses: actions/download-artifact@v4
+        with:
+          name: SoundHop-Linux-aarch64-headless
+          path: dist
+
       - name: Generate SHA256 Checksums
         run: |
           cd dist
-          sha256sum SoundHop*.AppImage SoundHop*.zsync SoundHop*.exe SoundHop*.zip > SHA256SUMS.txt
+          sha256sum SoundHop*.AppImage SoundHop*.zsync SoundHop*.exe SoundHop*.zip soundhop-*-linux-aarch64-headless.tar.gz > SHA256SUMS.txt
           cat SHA256SUMS.txt
 
       - name: Create GitHub Release
@@ -214,5 +267,6 @@ jobs:
             dist/*.zsync
             dist/*-setup.exe
             dist/*-portable.zip
+            dist/soundhop-*-linux-aarch64-headless.tar.gz
             dist/SHA256SUMS.txt
           generate_release_notes: true

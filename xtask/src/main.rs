@@ -11,6 +11,12 @@ const TARGET_DESKTOP: &str = "packaging/io.github.soundhop.desktop";
 const TARGET_METAINFO: &str = "packaging/io.github.soundhop.metainfo.xml";
 const TARGET_INSTALL_SH: &str = "packaging/install.sh";
 const TARGET_INNO_SETUP: &str = "packaging/windows/soundhop.iss";
+const TARGET_WINGET_VERSION: &str = "packaging/windows/winget/teufortressIndustries.SoundHop.yaml";
+const TARGET_WINGET_INSTALLER: &str =
+    "packaging/windows/winget/teufortressIndustries.SoundHop.installer.yaml";
+const TARGET_WINGET_LOCALE: &str =
+    "packaging/windows/winget/teufortressIndustries.SoundHop.locale.en-US.yaml";
+const TARGET_SCOOP: &str = "packaging/windows/scoop/soundhop.json";
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 struct SemVer {
@@ -436,13 +442,17 @@ type VersionUpdater = fn(&str, &str, &str) -> Result<(String, String), String>;
 
 fn check_versions(root: &Path, expected: SemVer) -> Vec<DriftEntry> {
     let expected_str = expected.to_string();
-    let checks: [(&'static str, VersionExtractor); 6] = [
+    let checks: [(&'static str, VersionExtractor); 10] = [
         (TARGET_PKGBUILD, extract_pkgbuild_version),
         (TARGET_SPEC, extract_spec_version),
         (TARGET_DESKTOP, extract_desktop_version),
         (TARGET_METAINFO, extract_metainfo_version),
         (TARGET_INSTALL_SH, extract_install_sh_version),
         (TARGET_INNO_SETUP, extract_inno_setup_version),
+        (TARGET_WINGET_VERSION, extract_winget_version),
+        (TARGET_WINGET_INSTALLER, extract_winget_version),
+        (TARGET_WINGET_LOCALE, extract_winget_version),
+        (TARGET_SCOOP, extract_scoop_version),
     ];
 
     let mut drifts = Vec::new();
@@ -472,7 +482,7 @@ fn check_versions(root: &Path, expected: SemVer) -> Vec<DriftEntry> {
 
 fn plan_bump(root: &Path, next: SemVer, today: &str) -> Result<Vec<PlannedUpdate>, String> {
     let next_str = next.to_string();
-    let specs: [(&'static str, VersionUpdater); 7] = [
+    let specs: [(&'static str, VersionUpdater); 11] = [
         (TARGET_CARGO_TOML, update_cargo_toml),
         (TARGET_PKGBUILD, update_pkgbuild),
         (TARGET_SPEC, update_spec),
@@ -480,6 +490,10 @@ fn plan_bump(root: &Path, next: SemVer, today: &str) -> Result<Vec<PlannedUpdate
         (TARGET_METAINFO, update_metainfo),
         (TARGET_INSTALL_SH, update_install_sh),
         (TARGET_INNO_SETUP, update_inno_setup),
+        (TARGET_WINGET_VERSION, update_winget_manifest),
+        (TARGET_WINGET_INSTALLER, update_winget_manifest),
+        (TARGET_WINGET_LOCALE, update_winget_manifest),
+        (TARGET_SCOOP, update_scoop_manifest),
     ];
 
     let mut errors = Vec::new();
@@ -866,6 +880,114 @@ fn update_inno_setup(
     Ok((old, out))
 }
 
+fn extract_winget_version(content: &str) -> Result<String, String> {
+    let (old, _) = update_winget_manifest(content, "0.0.0", "")?;
+    Ok(old)
+}
+
+fn update_winget_manifest(
+    content: &str,
+    new_ver: &str,
+    _today: &str,
+) -> Result<(String, String), String> {
+    const PREFIX: &str = "PackageVersion: ";
+
+    let mut old_version: Option<String> = None;
+    for raw_line in content.split_inclusive('\n') {
+        let (line, _) = split_line_ending(raw_line);
+        if let Some(rest) = line.strip_prefix(PREFIX) {
+            let val = rest.trim();
+            if old_version.is_some() {
+                return Err("multiple `PackageVersion:` lines found".to_string());
+            }
+            if val.is_empty() {
+                return Err("empty `PackageVersion:` value".to_string());
+            }
+            old_version = Some(val.to_string());
+        }
+    }
+
+    let old = old_version.ok_or_else(|| "missing `PackageVersion: <version>` line".to_string())?;
+
+    let mut out = String::with_capacity(content.len());
+    for raw_line in content.split_inclusive('\n') {
+        let (line, ending) = split_line_ending(raw_line);
+        if line.starts_with(PREFIX) {
+            out.push_str(PREFIX);
+            out.push_str(new_ver);
+            out.push_str(ending);
+        } else if line.contains("InstallerUrl:") {
+            let replaced = line
+                .replace(&format!("/v{old}/"), &format!("/v{new_ver}/"))
+                .replace(&format!("SoundHop-{old}-"), &format!("SoundHop-{new_ver}-"));
+            out.push_str(&replaced);
+            out.push_str(ending);
+        } else if line.starts_with("ReleaseNotesUrl:") {
+            let replaced = line.replace(&format!("/tag/v{old}"), &format!("/tag/v{new_ver}"));
+            out.push_str(&replaced);
+            out.push_str(ending);
+        } else {
+            out.push_str(raw_line);
+        }
+    }
+
+    Ok((old, out))
+}
+
+fn extract_scoop_version(content: &str) -> Result<String, String> {
+    let (old, _) = update_scoop_manifest(content, "0.0.0", "")?;
+    Ok(old)
+}
+
+fn update_scoop_manifest(
+    content: &str,
+    new_ver: &str,
+    _today: &str,
+) -> Result<(String, String), String> {
+    let mut old_version: Option<String> = None;
+    for raw_line in content.split_inclusive('\n') {
+        let (line, _) = split_line_ending(raw_line);
+        let trimmed = line.trim();
+        if let Some(rest) = trimmed.strip_prefix("\"version\":") {
+            let val_part = rest.trim().trim_end_matches(',');
+            let Some(val) = val_part.strip_prefix('"').and_then(|s| s.strip_suffix('"')) else {
+                return Err("malformed `\"version\": \"<version>\"` entry".to_string());
+            };
+            if old_version.is_some() {
+                return Err("multiple `\"version\":` entries found".to_string());
+            }
+            if val.is_empty() {
+                return Err("empty `\"version\"` entry".to_string());
+            }
+            old_version = Some(val.to_string());
+        }
+    }
+
+    let old =
+        old_version.ok_or_else(|| "missing `\"version\": \"<version>\"` entry".to_string())?;
+
+    let mut out = String::with_capacity(content.len());
+    for raw_line in content.split_inclusive('\n') {
+        let (line, ending) = split_line_ending(raw_line);
+        let trimmed = line.trim();
+        if trimmed.starts_with("\"version\":") {
+            let replaced = line.replacen(&format!("\"{old}\""), &format!("\"{new_ver}\""), 1);
+            out.push_str(&replaced);
+            out.push_str(ending);
+        } else if trimmed.starts_with("\"url\":") && !trimmed.contains("$version") {
+            let replaced = line
+                .replace(&format!("/v{old}/"), &format!("/v{new_ver}/"))
+                .replace(&format!("SoundHop-{old}-"), &format!("SoundHop-{new_ver}-"));
+            out.push_str(&replaced);
+            out.push_str(ending);
+        } else {
+            out.push_str(raw_line);
+        }
+    }
+
+    Ok((old, out))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -883,8 +1005,10 @@ mod tests {
             let root = std::env::temp_dir()
                 .join(format!("soundhop-xtask-test-{}-{id}", std::process::id()));
             let _ = fs::remove_dir_all(&root);
-            fs::create_dir_all(root.join("packaging").join("windows"))
-                .expect("create temp packaging/windows dir");
+            fs::create_dir_all(root.join("packaging").join("windows").join("winget"))
+                .expect("create temp packaging/windows/winget dir");
+            fs::create_dir_all(root.join("packaging").join("windows").join("scoop"))
+                .expect("create temp packaging/windows/scoop dir");
 
             let ws = Self { root };
             ws.write_fixture(version);
@@ -963,6 +1087,60 @@ mod tests {
                      #define MyAppVersion \"{version}\"\n\
                      [Setup]\n\
                      AppVersion={{#MyAppVersion}}\n"
+                ),
+            )
+            .unwrap();
+
+            fs::write(
+                self.root.join(TARGET_WINGET_VERSION),
+                format!(
+                    "PackageIdentifier: teufortressIndustries.SoundHop\n\
+                     PackageVersion: {version}\n\
+                     ManifestType: version\n"
+                ),
+            )
+            .unwrap();
+
+            fs::write(
+                self.root.join(TARGET_WINGET_INSTALLER),
+                format!(
+                    "PackageIdentifier: teufortressIndustries.SoundHop\n\
+                     PackageVersion: {version}\n\
+                     Installers:\n\
+                     \x20 - Architecture: x64\n\
+                     \x20   InstallerUrl: https://github.com/teufortressIndustries/soundhop/releases/download/v{version}/SoundHop-{version}-windows-x86_64-setup.exe\n"
+                ),
+            )
+            .unwrap();
+
+            fs::write(
+                self.root.join(TARGET_WINGET_LOCALE),
+                format!(
+                    "PackageIdentifier: teufortressIndustries.SoundHop\n\
+                     PackageVersion: {version}\n\
+                     ReleaseNotesUrl: https://github.com/teufortressIndustries/soundhop/releases/tag/v{version}\n"
+                ),
+            )
+            .unwrap();
+
+            fs::write(
+                self.root.join(TARGET_SCOOP),
+                format!(
+                    "{{\n\
+                     \x20   \"version\": \"{version}\",\n\
+                     \x20   \"architecture\": {{\n\
+                     \x20       \"64bit\": {{\n\
+                     \x20           \"url\": \"https://github.com/teufortressIndustries/soundhop/releases/download/v{version}/SoundHop-{version}-windows-x86_64-portable.zip\"\n\
+                     \x20       }}\n\
+                     \x20   }},\n\
+                     \x20   \"autoupdate\": {{\n\
+                     \x20       \"architecture\": {{\n\
+                     \x20           \"64bit\": {{\n\
+                     \x20               \"url\": \"https://github.com/teufortressIndustries/soundhop/releases/download/v$version/SoundHop-$version-windows-x86_64-portable.zip\"\n\
+                     \x20           }}\n\
+                     \x20       }}\n\
+                     \x20   }}\n\
+                     }}\n"
                 ),
             )
             .unwrap();
@@ -1125,6 +1303,25 @@ mod tests {
         let inno = fs::read_to_string(ws.root.join(TARGET_INNO_SETUP)).unwrap();
         assert!(inno.contains("#define MyAppVersion \"2.2.0\"\n"));
         assert!(inno.contains("AppVersion={#MyAppVersion}\n"));
+
+        let winget_ver = fs::read_to_string(ws.root.join(TARGET_WINGET_VERSION)).unwrap();
+        assert!(winget_ver.contains("PackageVersion: 2.2.0\n"));
+
+        let winget_inst = fs::read_to_string(ws.root.join(TARGET_WINGET_INSTALLER)).unwrap();
+        assert!(winget_inst.contains("PackageVersion: 2.2.0\n"));
+        assert!(winget_inst.contains("/v2.2.0/SoundHop-2.2.0-windows-x86_64-setup.exe"));
+
+        let winget_loc = fs::read_to_string(ws.root.join(TARGET_WINGET_LOCALE)).unwrap();
+        assert!(winget_loc.contains("PackageVersion: 2.2.0\n"));
+        assert!(winget_loc.contains("/releases/tag/v2.2.0"));
+
+        let scoop = fs::read_to_string(ws.root.join(TARGET_SCOOP)).unwrap();
+        assert!(scoop.contains("\"version\": \"2.2.0\""));
+        assert!(scoop.contains("/v2.2.0/SoundHop-2.2.0-windows-x86_64-portable.zip"));
+        assert!(
+            scoop.contains("/v$version/SoundHop-$version-windows-x86_64-portable.zip"),
+            "Scoop autoupdate template must remain untouched"
+        );
     }
 
     #[test]
@@ -1145,7 +1342,7 @@ mod tests {
 
     #[test]
     fn check_fails_loudly_when_any_single_file_drifts() {
-        let targets: [(&str, &str, &str); 6] = [
+        let targets: [(&str, &str, &str); 10] = [
             (TARGET_PKGBUILD, "pkgver=2.1.2", "pkgver=2.0.0"),
             (
                 TARGET_SPEC,
@@ -1168,6 +1365,26 @@ mod tests {
                 "#define MyAppVersion \"2.1.2\"",
                 "#define MyAppVersion \"2.0.0\"",
             ),
+            (
+                TARGET_WINGET_VERSION,
+                "PackageVersion: 2.1.2",
+                "PackageVersion: 2.0.0",
+            ),
+            (
+                TARGET_WINGET_INSTALLER,
+                "PackageVersion: 2.1.2",
+                "PackageVersion: 2.0.0",
+            ),
+            (
+                TARGET_WINGET_LOCALE,
+                "PackageVersion: 2.1.2",
+                "PackageVersion: 2.0.0",
+            ),
+            (
+                TARGET_SCOOP,
+                "\"version\": \"2.1.2\"",
+                "\"version\": \"2.0.0\"",
+            ),
         ];
 
         for (rel_path, from, to) in targets {
@@ -1186,7 +1403,7 @@ mod tests {
 
     #[test]
     fn bump_is_atomic_and_fails_loudly_when_marker_missing() {
-        let missing_marker_cases: [(&str, &str); 7] = [
+        let missing_marker_cases: [(&str, &str); 11] = [
             (TARGET_CARGO_TOML, "[workspace]\nmembers = []\n"),
             (TARGET_PKGBUILD, "pkgname=soundhop\npkgrel=1\n"),
             (TARGET_SPEC, "Name: soundhop\n"),
@@ -1197,6 +1414,10 @@ mod tests {
             ),
             (TARGET_INSTALL_SH, "#!/usr/bin/env bash\necho hi\n"),
             (TARGET_INNO_SETUP, "[Setup]\nAppName=SoundHop\n"),
+            (TARGET_WINGET_VERSION, "PackageIdentifier: foo\n"),
+            (TARGET_WINGET_INSTALLER, "PackageIdentifier: foo\n"),
+            (TARGET_WINGET_LOCALE, "PackageIdentifier: foo\n"),
+            (TARGET_SCOOP, "{ \"license\": \"MIT\" }\n"),
         ];
 
         for (rel_path, broken_content) in missing_marker_cases {

@@ -4,9 +4,7 @@ runtime-version: '24.08'
 sdk: org.freedesktop.Sdk
 sdk-extensions:
   - org.freedesktop.Sdk.Extension.rust-stable
-command: soundhop
-command-args:
-  - gui
+command: soundhop-gui
 
 build-options:
   append-path: /usr/lib/sdk/rust-stable/bin
@@ -18,9 +16,10 @@ finish-args:
   - --share=network
   # Audio system access (PulseAudio & PipeWire compatibility socket)
   - --socket=pulseaudio
-  # Display servers
+  # Display servers & GPU acceleration
   - --socket=wayland
   - --socket=fallback-x11
+  - --device=dri
   # System tray integration
   - --talk-name=org.kde.StatusNotifierWatcher
   # Desktop notifications
@@ -37,11 +36,12 @@ modules:
       # and pass --offline to cargo build.
       - cargo build --release --workspace --locked
       - install -Dm755 target/release/soundhop ${FLATPAK_DEST}/bin/soundhop
+      - install -Dm755 target/release/soundhop-gui ${FLATPAK_DEST}/bin/soundhop-gui
       - install -Dm644 packaging/io.github.soundhop.desktop ${FLATPAK_DEST}/share/applications/io.github.soundhop.desktop
       - desktop-file-edit --set-icon=io.github.soundhop ${FLATPAK_DEST}/share/applications/io.github.soundhop.desktop
       - install -Dm644 packaging/io.github.soundhop.metainfo.xml ${FLATPAK_DEST}/share/metainfo/io.github.soundhop.metainfo.xml
       - install -Dm644 assets/soundhop.png ${FLATPAK_DEST}/share/icons/hicolor/256x256/apps/io.github.soundhop.png
-      - install -Dm644 assets/soundhop.svg ${FLATPAK_DEST}/share/icons/hicolor/scalable/apps/io.github.soundhop.svg
+      - install -Dm644 assets/soundhop.svg ${FLATPAK_DEST}/share/icons/hicolor/scalable/apps/soundhop.svg
     sources:
       - type: dir
         path: ..
