@@ -13,8 +13,7 @@ use crate::security::soundhop_cookie_path;
 use crate::state::ActivePeerSession;
 use crate::transport::{AudioProfile, OutboundConfig, PcmCapture, DEFAULT_V3_PORT};
 use crate::util::{
-    is_own_non_loopback_ip, is_private_address, lock_or_recover, notify, now_secs, slugify,
-    tcp_probe_rtt,
+    is_own_non_loopback_ip, is_private_address, lock_or_recover, notify, now_secs, tcp_probe_rtt,
 };
 
 use super::{ConnectOptions, Controller, ControllerError};
@@ -215,7 +214,7 @@ impl Controller {
 
         #[cfg(target_os = "linux")]
         {
-            let clean_desc = slugify(description, 48);
+            let clean_desc = crate::util::slugify(description, 48);
             let module_id = self
                 .backend
                 .load_module(

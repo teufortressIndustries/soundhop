@@ -13,6 +13,7 @@ use soundhop_core::util::{config_path, local_addresses, log_path, state_path};
 
 use crate::ui::{error, header, info, lock_or_recover, ok, print_json, safe_print, warning};
 
+#[cfg(any(target_os = "linux", test))]
 fn parse_appimage_mounts(content: &str) -> Vec<String> {
     let mut mounts = Vec::new();
     for line in content.lines() {
