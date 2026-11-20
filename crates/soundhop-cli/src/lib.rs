@@ -8,9 +8,13 @@ pub mod tui;
 pub mod ui;
 
 use std::io::IsTerminal;
+use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
+
+#[cfg(windows)]
+const CREATE_NO_WINDOW: u32 = 0x0800_0000;
 
 use clap::Parser;
 use soundhop_core::constants::VERSION;
@@ -35,7 +39,18 @@ use crate::tui::run_tui;
 use crate::ui::{emit_error, set_no_color};
 
 pub fn run_cli() -> i32 {
-    let cli = Cli::parse();
+    run_cli_parsed(Cli::parse(), false)
+}
+
+/// Entrypoint for the `soundhop-gui` binary (`windows_subsystem = "windows"` on Windows).
+/// Defaults to opening the Control Center (and starting the background tray) when launched
+/// without arguments, while also supporting `tray`, `gui`, `--gui-tab`, `--settings-dialog`,
+/// `--android-wizard`, and `daemon` without ever spawning a console window.
+pub fn run_gui_binary() -> i32 {
+    run_cli_parsed(Cli::parse(), true)
+}
+
+fn run_cli_parsed(cli: Cli, gui_default: bool) -> i32 {
     set_no_color(cli.no_color);
 
     if cli.verbose {
@@ -112,7 +127,10 @@ pub fn run_cli() -> i32 {
         Some(Commands::Android(ref args)) => handle_android(&controller, args, cli.json),
         Some(Commands::Version) => handle_version(cli.json),
         None => {
-            if !cli.json && std::io::stdin().is_terminal() && std::io::stdout().is_terminal() {
+            if gui_default {
+                launch_control_center_with_tray(GuiTab::Home, cli.json)
+            } else if !cli.json && std::io::stdin().is_terminal() && std::io::stdout().is_terminal()
+            {
                 match run_tui(controller) {
                     Ok(code) => code,
                     Err(e) => {
@@ -127,16 +145,41 @@ pub fn run_cli() -> i32 {
     }
 }
 
+/// On Windows, prefer a sibling `soundhop-gui.exe` (GUI subsystem, zero console flash)
+/// when launching the background tray/GUI from `soundhop.exe`.
+fn prefer_sibling_gui_exe(current: &Path) -> PathBuf {
+    #[cfg(windows)]
+    {
+        if let Some(parent) = current.parent() {
+            let gui_exe = parent.join("soundhop-gui.exe");
+            if gui_exe.is_file() {
+                return gui_exe;
+            }
+        }
+    }
+    current.to_path_buf()
+}
+
+fn resolve_gui_executable() -> Option<PathBuf> {
+    let current = std::env::current_exe().ok()?;
+    Some(prefer_sibling_gui_exe(&current))
+}
+
 fn ensure_background_tray_running() {
     if ipc_is_running(None) {
         return;
     }
-    if let Ok(exe) = std::env::current_exe() {
+    if let Some(exe) = resolve_gui_executable() {
         let mut cmd = Command::new(exe);
         cmd.arg("tray")
             .stdin(Stdio::null())
             .stdout(Stdio::null())
             .stderr(Stdio::null());
+        #[cfg(windows)]
+        {
+            use std::os::windows::process::CommandExt;
+            cmd.creation_flags(CREATE_NO_WINDOW);
+        }
         soundhop_core::util::close_fds_pre_exec(&mut cmd);
         if cmd.spawn().is_ok() {
             let deadline = Instant::now() + Duration::from_millis(3000);
@@ -225,5 +268,23 @@ mod tests {
 
         let c5 = Cli::try_parse_from(["soundhop", "--gui-tab", "phone"]).unwrap();
         assert_eq!(c5.gui_tab.as_deref(), Some("phone"));
+    }
+
+    #[test]
+    fn test_prefer_sibling_gui_exe() {
+        let dir = tempfile::tempdir().unwrap();
+        let cli_exe = dir.path().join("soundhop.exe");
+        std::fs::write(&cli_exe, b"").unwrap();
+
+        // Without sibling soundhop-gui.exe, falls back to current exe.
+        assert_eq!(prefer_sibling_gui_exe(&cli_exe), cli_exe);
+
+        // With sibling soundhop-gui.exe, prefers it on Windows.
+        let gui_exe = dir.path().join("soundhop-gui.exe");
+        std::fs::write(&gui_exe, b"").unwrap();
+        #[cfg(windows)]
+        assert_eq!(prefer_sibling_gui_exe(&cli_exe), gui_exe);
+        #[cfg(not(windows))]
+        assert_eq!(prefer_sibling_gui_exe(&cli_exe), cli_exe);
     }
 }

@@ -7,7 +7,7 @@ use soundhop_core::controller::Controller;
 use soundhop_core::firewall::{detect as detect_firewall, open_ports};
 use soundhop_core::ipc::is_running as ipc_is_running;
 use soundhop_core::service::{install as install_service, status as service_status};
-use soundhop_core::util::{config_path, local_addresses, state_path};
+use soundhop_core::util::{config_path, local_addresses, log_path, state_path};
 
 use crate::ui::{error, header, info, lock_or_recover, ok, print_json, safe_print, warning};
 
@@ -107,9 +107,20 @@ pub fn run_doctor(controller: &Arc<Controller>, fix: bool, json_out: bool) -> i3
             .and_then(|v| v.as_bool())
             .unwrap_or(false);
         if started {
+            #[cfg(windows)]
+            fixed_actions.push(
+                "Installed Windows HKCU Run autostart entry and started background tray"
+                    .to_string(),
+            );
+            #[cfg(not(windows))]
             fixed_actions.push("Installed and started user service".to_string());
         } else {
             fix_failed = true;
+            #[cfg(windows)]
+            fix_errors.push(format!(
+                "Failed to install/start Windows startup entry (enabled={enabled}, started={started})"
+            ));
+            #[cfg(not(windows))]
             fix_errors.push(format!(
                 "Failed to install/start user service (enabled={enabled}, started={started})"
             ));
@@ -160,6 +171,7 @@ pub fn run_doctor(controller: &Arc<Controller>, fix: bool, json_out: bool) -> i3
 
     let addrs = local_addresses(false);
     let tools = controller.android_tool_status();
+    let daemon_log_path = log_path();
     let exit_ok = backend_ok && !fix_failed;
 
     let report = serde_json::json!({
@@ -179,6 +191,7 @@ pub fn run_doctor(controller: &Arc<Controller>, fix: bool, json_out: bool) -> i3
         },
         "firewall": fw,
         "service": svc,
+        "log_path": daemon_log_path.to_string_lossy(),
         "appimage_mounts": appimage_mounts,
         "daemon_ipc_running": daemon_ipc,
         "android_tools": tools,
@@ -194,10 +207,26 @@ pub fn run_doctor(controller: &Arc<Controller>, fix: bool, json_out: bool) -> i3
 
     header(&format!("SoundHop v{VERSION} System Diagnostics"));
     if backend_ok {
+        #[cfg(windows)]
+        {
+            if server_name.to_ascii_lowercase().contains("wasapi") {
+                ok(&format!(
+                    "Audio Backend: {server_name} (Default Output: {def_sink})"
+                ));
+            } else {
+                ok(&format!(
+                    "Audio Backend: {server_name} (WASAPI, Default Output: {def_sink})"
+                ));
+            }
+        }
+        #[cfg(not(windows))]
         ok(&format!(
             "Audio Backend: {server_name} (PipeWire: {is_pw}, Default Sink: {def_sink})"
         ));
     } else {
+        #[cfg(windows)]
+        error("Audio Backend: WASAPI unavailable (verify the Windows Audio service is running and an output device is enabled in Sound Settings)");
+        #[cfg(not(windows))]
         error("Audio Backend: unreachable (install pipewire-pulse or pulseaudio-utils)");
     }
 
@@ -208,15 +237,45 @@ pub fn run_doctor(controller: &Arc<Controller>, fix: bool, json_out: bool) -> i3
     }
 
     if fw.active {
+        #[cfg(windows)]
+        info(&format!(
+            "Windows Firewall: {} ({}; run `soundhop firewall open` or `soundhop doctor --fix` to allow LAN audio)",
+            fw.kind, fw.detail
+        ));
+        #[cfg(not(windows))]
         info(&format!("Firewall: {} ({})", fw.kind, fw.detail));
     } else {
+        #[cfg(windows)]
+        ok(&format!("Windows Firewall: {} ({})", fw.kind, fw.detail));
+        #[cfg(not(windows))]
         ok(&format!("Firewall: {} ({})", fw.kind, fw.detail));
     }
 
     if daemon_ipc || svc_active {
         ok("Background Daemon: Running");
     } else {
+        #[cfg(windows)]
+        warning("Background Daemon: Not running (run `soundhop-gui`, `soundhop service install`, or `soundhop setup`)");
+        #[cfg(not(windows))]
         warning("Background Daemon: Not running (run `soundhop daemon` or `soundhop setup`)");
+    }
+
+    #[cfg(windows)]
+    {
+        let autostart_enabled = svc
+            .get("enabled")
+            .and_then(|v| v.as_bool())
+            .unwrap_or(false)
+            || svc
+                .get("tray_autostart")
+                .and_then(|v| v.as_bool())
+                .unwrap_or(false);
+        if autostart_enabled {
+            ok(r"Startup Autostart: Enabled (HKCU\Software\Microsoft\Windows\CurrentVersion\Run)");
+        } else {
+            info("Startup Autostart: Disabled (run `soundhop service install` to register HKCU Run autostart)");
+        }
+        info(&format!("Log File: {}", daemon_log_path.display()));
     }
 
     let scrcpy_ready = tools
@@ -271,6 +330,7 @@ pub fn run_bug_report(controller: &Arc<Controller>, json_out: bool) -> i32 {
         "arch": std::env::consts::ARCH,
         "config_path": config_path().to_string_lossy(),
         "state_path": state_path().to_string_lossy(),
+        "log_path": log_path().to_string_lossy(),
         "status": st,
         "firewall": fw,
         "service": svc,

@@ -24,7 +24,7 @@ use soundhop_core::service::{
     stop_service, sync_appimage_paths_if_installed, uninstall as uninstall_service,
 };
 use soundhop_core::state::PairedPeer;
-use soundhop_core::util::{config_path, is_private_address, split_host_port};
+use soundhop_core::util::{config_path, is_private_address, log_path, split_host_port};
 
 use crate::parser::{
     AutoArgs, Cli, CompletionsArgs, ConfigArgs, ConnectArgs, DiscoverArgs, FirewallArgs, LogsArgs,
@@ -160,12 +160,26 @@ pub fn handle_setup(controller: &Arc<Controller>, args: &SetupArgs, json_out: bo
             .and_then(|v| v.as_bool())
             .unwrap_or(false);
         if started {
+            #[cfg(windows)]
+            ok("Windows Startup (HKCU Run) & Background Tray: Installed and started");
+            #[cfg(not(windows))]
             ok("Background Daemon & Tray Autostart: Installed and started");
         } else if enabled {
+            #[cfg(windows)]
+            warning(
+                "Windows Startup (HKCU Run) & Background Tray: Enabled, but background tray failed to start",
+            );
+            #[cfg(not(windows))]
             warning(
                 "Background Daemon & Tray Autostart: Installed and enabled, but failed to start",
             );
         } else {
+            #[cfg(windows)]
+            emit_error(
+                "Windows Startup (HKCU Run) & Background Tray: Installation failed",
+                false,
+            );
+            #[cfg(not(windows))]
             emit_error(
                 "Background Daemon & Tray Autostart: Installation failed",
                 false,
@@ -1424,13 +1438,27 @@ pub fn handle_service(args: &ServiceArgs, json_out: bool) -> i32 {
         match act.as_str() {
             "install" => {
                 if action_ok {
+                    #[cfg(windows)]
+                    ok("Installed Windows HKCU Run startup entry and started SoundHop background tray.");
+                    #[cfg(not(windows))]
                     ok("Installed, enabled, and started SoundHop user service.");
-                    if let Some(tray_path) = res
-                        .get("tray_autostart")
+                    let entry_path = res
+                        .get("registry_key")
                         .and_then(|v| v.as_str())
                         .filter(|s| !s.is_empty())
-                    {
+                        .or_else(|| {
+                            res.get("tray_autostart")
+                                .and_then(|v| v.as_str())
+                                .filter(|s| !s.is_empty())
+                        });
+                    if let Some(tray_path) = entry_path {
+                        #[cfg(windows)]
+                        info(&format!("Startup entry: {tray_path}"));
+                        #[cfg(not(windows))]
                         info(&format!("Tray autostart: {tray_path}"));
+                    } else {
+                        #[cfg(windows)]
+                        info(r"Startup entry: HKCU\Software\Microsoft\Windows\CurrentVersion\Run\SoundHop");
                     }
                 } else if let Some(err) = res.get("error").and_then(|v| v.as_str()) {
                     emit_error(err, false);
@@ -1443,6 +1471,14 @@ pub fn handle_service(args: &ServiceArgs, json_out: bool) -> i32 {
                         .get("started")
                         .and_then(|v| v.as_bool())
                         .unwrap_or(false);
+                    #[cfg(windows)]
+                    emit_error(
+                        &format!(
+                            "Failed to install/start SoundHop Windows startup entry (enabled={enabled}, started={started})."
+                        ),
+                        false,
+                    );
+                    #[cfg(not(windows))]
                     emit_error(
                         &format!(
                             "Failed to install/start SoundHop user service (enabled={enabled}, started={started})."
@@ -1453,29 +1489,53 @@ pub fn handle_service(args: &ServiceArgs, json_out: bool) -> i32 {
             }
             "uninstall" | "remove" => {
                 if action_ok {
+                    #[cfg(windows)]
+                    ok("Removed SoundHop Windows HKCU Run startup entry and stopped background tray.");
+                    #[cfg(not(windows))]
                     ok("Removed SoundHop user service and autostart entries.");
                 } else {
+                    #[cfg(windows)]
+                    info("SoundHop Windows startup entry was not installed.");
+                    #[cfg(not(windows))]
                     info("SoundHop user service was not installed.");
                 }
             }
             "start" => {
                 if action_ok {
+                    #[cfg(windows)]
+                    ok("Started SoundHop background tray service.");
+                    #[cfg(not(windows))]
                     ok("Started SoundHop user service.");
                 } else {
+                    #[cfg(windows)]
+                    emit_error("Failed to start SoundHop background tray service.", false);
+                    #[cfg(not(windows))]
                     emit_error("Failed to start SoundHop user service.", false);
                 }
             }
             "stop" => {
                 if action_ok {
+                    #[cfg(windows)]
+                    ok("Stopped SoundHop background tray service.");
+                    #[cfg(not(windows))]
                     ok("Stopped SoundHop user service.");
                 } else {
+                    #[cfg(windows)]
+                    emit_error("Failed to stop SoundHop background tray service.", false);
+                    #[cfg(not(windows))]
                     emit_error("Failed to stop SoundHop user service.", false);
                 }
             }
             "restart" => {
                 if action_ok {
+                    #[cfg(windows)]
+                    ok("Restarted SoundHop background tray service.");
+                    #[cfg(not(windows))]
                     ok("Restarted SoundHop user service.");
                 } else {
+                    #[cfg(windows)]
+                    emit_error("Failed to restart SoundHop background tray service.", false);
+                    #[cfg(not(windows))]
                     emit_error("Failed to restart SoundHop user service.", false);
                 }
             }
@@ -1493,22 +1553,51 @@ pub fn handle_service(args: &ServiceArgs, json_out: bool) -> i32 {
                     .get("tray_autostart")
                     .and_then(|v| v.as_bool())
                     .unwrap_or(false);
-                let unit = res.get("unit").and_then(|v| v.as_str()).unwrap_or("");
-                header("SoundHop User Service Status");
-                if active {
-                    ok("Service: active (running)");
-                } else if installed {
-                    warning("Service: inactive (stopped)");
-                } else {
-                    info("Service: not installed");
+                let unit = res
+                    .get("registry_key")
+                    .and_then(|v| v.as_str())
+                    .filter(|s| !s.is_empty())
+                    .or_else(|| res.get("unit").and_then(|v| v.as_str()))
+                    .unwrap_or("");
+                #[cfg(windows)]
+                {
+                    header("SoundHop Windows Startup & Background Service Status");
+                    if active {
+                        ok("Background Tray/Daemon: active (running)");
+                    } else if installed {
+                        warning("Background Tray/Daemon: inactive (stopped)");
+                    } else {
+                        info("Background Tray/Daemon: not running (startup entry not installed)");
+                    }
+                    info(&format!(
+                        "HKCU Run Autostart: {}  Tray autostart: {}",
+                        if enabled { "enabled" } else { "disabled" },
+                        if tray { "yes" } else { "no" }
+                    ));
+                    if !unit.is_empty() {
+                        info(&format!("Startup Entry: {unit}"));
+                    } else if installed || enabled {
+                        info(r"Startup Entry: HKCU\Software\Microsoft\Windows\CurrentVersion\Run\SoundHop");
+                    }
                 }
-                info(&format!(
-                    "Enabled: {}  Tray autostart: {}",
-                    if enabled { "yes" } else { "no" },
-                    if tray { "yes" } else { "no" }
-                ));
-                if !unit.is_empty() {
-                    info(&format!("Unit: {unit}"));
+                #[cfg(not(windows))]
+                {
+                    header("SoundHop User Service Status");
+                    if active {
+                        ok("Service: active (running)");
+                    } else if installed {
+                        warning("Service: inactive (stopped)");
+                    } else {
+                        info("Service: not installed");
+                    }
+                    info(&format!(
+                        "Enabled: {}  Tray autostart: {}",
+                        if enabled { "yes" } else { "no" },
+                        if tray { "yes" } else { "no" }
+                    ));
+                    if !unit.is_empty() {
+                        info(&format!("Unit: {unit}"));
+                    }
                 }
             }
             _ => {}
@@ -1765,7 +1854,22 @@ pub fn handle_config(controller: &Arc<Controller>, args: &ConfigArgs, json_out: 
     }
 }
 
+fn read_log_file_tail(path: &std::path::Path, max_lines: usize) -> Vec<String> {
+    if max_lines == 0 {
+        return Vec::new();
+    }
+    let Ok(content) = std::fs::read_to_string(path) else {
+        return Vec::new();
+    };
+    let all: Vec<&str> = content.lines().collect();
+    let start = all.len().saturating_sub(max_lines);
+    all[start..].iter().map(|s| (*s).to_string()).collect()
+}
+
 pub fn handle_logs(controller: &Arc<Controller>, args: &LogsArgs, json_out: bool) -> i32 {
+    let daemon_log_path = log_path();
+    let daemon_log_str = daemon_log_path.to_string_lossy().into_owned();
+
     if let Some(ipc_res) = try_ipc(
         "logs",
         serde_json::json!({ "lines": args.lines }),
@@ -1773,7 +1877,7 @@ pub fn handle_logs(controller: &Arc<Controller>, args: &LogsArgs, json_out: bool
     ) {
         return match ipc_res {
             Ok(resp) => {
-                let all_lines: Vec<String> = resp
+                let mut all_lines: Vec<String> = resp
                     .get("lines")
                     .and_then(|v| v.as_array())
                     .map(|arr| {
@@ -1782,16 +1886,22 @@ pub fn handle_logs(controller: &Arc<Controller>, args: &LogsArgs, json_out: bool
                             .collect()
                     })
                     .unwrap_or_default();
+                if all_lines.is_empty() {
+                    all_lines = read_log_file_tail(&daemon_log_path, args.lines);
+                }
                 let start = all_lines.len().saturating_sub(args.lines);
                 let tail = &all_lines[start..];
                 if json_out {
                     print_json(&serde_json::json!({
                         "ok": true,
                         "lines": args.lines,
+                        "log_path": daemon_log_str,
                         "logs": tail,
                     }));
                 } else if tail.is_empty() {
-                    info("No recent daemon/session logs recorded.");
+                    info(&format!(
+                        "No recent daemon/session logs recorded (log file: {daemon_log_str})."
+                    ));
                 } else {
                     for line in tail {
                         safe_print(line);
@@ -1806,6 +1916,24 @@ pub fn handle_logs(controller: &Arc<Controller>, args: &LogsArgs, json_out: bool
         };
     }
 
+    let file_lines = read_log_file_tail(&daemon_log_path, args.lines);
+    if !file_lines.is_empty() {
+        if json_out {
+            print_json(&serde_json::json!({
+                "ok": true,
+                "daemon_running": false,
+                "lines": args.lines,
+                "log_path": daemon_log_str,
+                "logs": file_lines,
+            }));
+        } else {
+            for line in &file_lines {
+                safe_print(line);
+            }
+        }
+        return 0;
+    }
+
     let sess = controller.android_session.status();
     let logs = sess
         .get("recent_logs")
@@ -1817,10 +1945,18 @@ pub fn handle_logs(controller: &Arc<Controller>, args: &LogsArgs, json_out: bool
             "ok": true,
             "daemon_running": false,
             "lines": args.lines,
+            "log_path": daemon_log_str,
             "logs": logs,
         }));
     } else if logs.is_empty() {
-        info("SoundHop daemon is not running; no recent session logs available.");
+        #[cfg(windows)]
+        info(&format!(
+            "SoundHop daemon is not running and no log file was found at {daemon_log_str} (default: %LOCALAPPDATA%\\soundhop\\soundhop.log)."
+        ));
+        #[cfg(not(windows))]
+        info(&format!(
+            "SoundHop daemon is not running; no recent session logs available (log file: {daemon_log_str})."
+        ));
     } else {
         for l in logs.iter().rev().take(args.lines).rev() {
             if let Some(s) = l.as_str() {
@@ -2075,5 +2211,20 @@ mod tests {
             true,
         );
         assert_eq!(code, 0);
+    }
+
+    #[test]
+    fn test_read_log_file_tail() {
+        let dir = tempfile::tempdir().unwrap();
+        let file = dir.path().join("soundhop.log");
+        assert!(read_log_file_tail(&file, 10).is_empty());
+
+        std::fs::write(&file, "line1\nline2\nline3\nline4\n").unwrap();
+        assert_eq!(read_log_file_tail(&file, 2), vec!["line3", "line4"]);
+        assert_eq!(
+            read_log_file_tail(&file, 10),
+            vec!["line1", "line2", "line3", "line4"]
+        );
+        assert!(read_log_file_tail(&file, 0).is_empty());
     }
 }

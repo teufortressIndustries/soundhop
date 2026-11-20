@@ -12,6 +12,10 @@ default-run = "soundhop"
 name = "soundhop"
 path = "src/main.rs"
 
+[[bin]]
+name = "soundhop-gui"
+path = "src/bin/soundhop_gui.rs"
+
 [dependencies]
 soundhop-core.workspace = true
 soundhop-gui.workspace = true
@@ -25,6 +29,9 @@ clap.workspace = true
 clap_complete.workspace = true
 ratatui.workspace = true
 crossterm.workspace = true
+
+[target.'cfg(windows)'.build-dependencies]
+winresource = "0.1"
 
 [dev-dependencies]
 tempfile.workspace = true
