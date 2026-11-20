@@ -51,6 +51,9 @@ jobs:
       - name: Check formatting (rustfmt)
         run: cargo fmt --all -- --check
 
+      - name: Verify packaging version consistency
+        run: cargo xtask bump-version --check
+
       - name: Static analysis & linting (clippy)
         run: cargo clippy --workspace --all-targets --locked -- -D warnings
 
@@ -116,7 +119,7 @@ jobs:
           if-no-files-found: error
 
   build-windows:
-    name: Build Windows Executable
+    name: Build Windows Installer & Portable ZIP
     needs: [test]
     runs-on: windows-latest
 
@@ -129,27 +132,42 @@ jobs:
       - name: Cache Cargo registry and target
         uses: Swatinem/rust-cache@v2
 
-      - name: Build Windows Release Executables
+      - name: Verify packaging version consistency
+        run: cargo xtask bump-version --check
+
+      - name: Build & Package Windows Release (Installer + Portable ZIP)
         shell: pwsh
         run: |
-          cargo build --release --workspace --locked
-          New-Item -ItemType Directory -Force -Path dist | Out-Null
-          Copy-Item target/release/soundhop.exe dist/SoundHop.exe
+          .\packaging\windows\build-windows.ps1 -RequireInstaller
 
-      - name: Verify Executable Created
+      - name: Verify Windows Artifacts & Smoke Test
         shell: pwsh
         run: |
-          if (!(Test-Path "dist/SoundHop.exe")) {
-            throw "dist/SoundHop.exe was not created!"
-          }
-          ./dist/SoundHop.exe version
+          $installer = Get-ChildItem -Path dist -Filter "SoundHop-*-windows-x86_64-setup.exe" | Select-Object -First 1
+          $portable = Get-ChildItem -Path dist -Filter "SoundHop-*-windows-x86_64-portable.zip" | Select-Object -First 1
+          if (-not $installer) { throw "Windows installer .exe was not created!" }
+          if (-not $portable) { throw "Windows portable .zip was not created!" }
+          if (-not (Test-Path "dist/SHA256SUMS.txt")) { throw "dist/SHA256SUMS.txt was not created!" }
 
-      - name: Upload Windows Executable Artifact
+          $verifyDir = Join-Path $env:RUNNER_TEMP "soundhop-portable-verify"
+          if (Test-Path $verifyDir) { Remove-Item -Recurse -Force $verifyDir }
+          Expand-Archive -Path $portable.FullName -DestinationPath $verifyDir -Force
+
+          $cli = Get-ChildItem -Path $verifyDir -Recurse -Filter "soundhop.exe" | Select-Object -First 1
+          $gui = Get-ChildItem -Path $verifyDir -Recurse -Filter "soundhop-gui.exe" | Select-Object -First 1
+          if (-not $cli) { throw "soundhop.exe missing from portable zip!" }
+          if (-not $gui) { throw "soundhop-gui.exe missing from portable zip!" }
+
+          & $cli.FullName --version
+          if ($LASTEXITCODE -ne 0) { throw "soundhop.exe --version failed!" }
+
+      - name: Upload Windows Artifacts
         uses: actions/upload-artifact@v4
         with:
-          name: SoundHop-Windows-x86_64.exe
+          name: SoundHop-Windows-x86_64
           path: |
-            dist/SoundHop.exe
+            dist/SoundHop-*-windows-x86_64-setup.exe
+            dist/SoundHop-*-windows-x86_64-portable.zip
           if-no-files-found: error
 
   release:
@@ -170,16 +188,16 @@ jobs:
           name: SoundHop-x86_64.AppImage
           path: dist
 
-      - name: Download Windows Executable Artifact
+      - name: Download Windows Artifacts
         uses: actions/download-artifact@v4
         with:
-          name: SoundHop-Windows-x86_64.exe
+          name: SoundHop-Windows-x86_64
           path: dist
 
       - name: Generate SHA256 Checksums
         run: |
           cd dist
-          sha256sum SoundHop*.AppImage SoundHop*.zsync SoundHop*.exe > SHA256SUMS.txt
+          sha256sum SoundHop*.AppImage SoundHop*.zsync SoundHop*.exe SoundHop*.zip > SHA256SUMS.txt
           cat SHA256SUMS.txt
 
       - name: Create GitHub Release
@@ -188,6 +206,7 @@ jobs:
           files: |
             dist/*.AppImage
             dist/*.zsync
-            dist/SoundHop.exe
+            dist/*-setup.exe
+            dist/*-portable.zip
             dist/SHA256SUMS.txt
           generate_release_notes: true

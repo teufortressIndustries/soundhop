@@ -10,6 +10,7 @@ const TARGET_SPEC: &str = "packaging/soundhop.spec";
 const TARGET_DESKTOP: &str = "packaging/io.github.soundhop.desktop";
 const TARGET_METAINFO: &str = "packaging/io.github.soundhop.metainfo.xml";
 const TARGET_INSTALL_SH: &str = "packaging/install.sh";
+const TARGET_INNO_SETUP: &str = "packaging/windows/soundhop.iss";
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 struct SemVer {
@@ -435,12 +436,13 @@ type VersionUpdater = fn(&str, &str, &str) -> Result<(String, String), String>;
 
 fn check_versions(root: &Path, expected: SemVer) -> Vec<DriftEntry> {
     let expected_str = expected.to_string();
-    let checks: [(&'static str, VersionExtractor); 5] = [
+    let checks: [(&'static str, VersionExtractor); 6] = [
         (TARGET_PKGBUILD, extract_pkgbuild_version),
         (TARGET_SPEC, extract_spec_version),
         (TARGET_DESKTOP, extract_desktop_version),
         (TARGET_METAINFO, extract_metainfo_version),
         (TARGET_INSTALL_SH, extract_install_sh_version),
+        (TARGET_INNO_SETUP, extract_inno_setup_version),
     ];
 
     let mut drifts = Vec::new();
@@ -470,13 +472,14 @@ fn check_versions(root: &Path, expected: SemVer) -> Vec<DriftEntry> {
 
 fn plan_bump(root: &Path, next: SemVer, today: &str) -> Result<Vec<PlannedUpdate>, String> {
     let next_str = next.to_string();
-    let specs: [(&'static str, VersionUpdater); 6] = [
+    let specs: [(&'static str, VersionUpdater); 7] = [
         (TARGET_CARGO_TOML, update_cargo_toml),
         (TARGET_PKGBUILD, update_pkgbuild),
         (TARGET_SPEC, update_spec),
         (TARGET_DESKTOP, update_desktop),
         (TARGET_METAINFO, update_metainfo),
         (TARGET_INSTALL_SH, update_install_sh),
+        (TARGET_INNO_SETUP, update_inno_setup),
     ];
 
     let mut errors = Vec::new();
@@ -817,6 +820,52 @@ fn update_install_sh(
     Ok((old, out))
 }
 
+fn extract_inno_setup_version(content: &str) -> Result<String, String> {
+    let (old, _) = update_inno_setup(content, "0.0.0", "")?;
+    Ok(old)
+}
+
+fn update_inno_setup(
+    content: &str,
+    new_ver: &str,
+    _today: &str,
+) -> Result<(String, String), String> {
+    const PREFIX: &str = "#define MyAppVersion \"";
+    const SUFFIX: &str = "\"";
+
+    let mut old_version: Option<String> = None;
+    let mut out = String::with_capacity(content.len());
+
+    for raw_line in content.split_inclusive('\n') {
+        let (line, ending) = split_line_ending(raw_line);
+
+        if let Some(rest) = line.strip_prefix(PREFIX) {
+            let Some(val) = rest.strip_suffix(SUFFIX) else {
+                return Err(format!(
+                    "malformed `#define MyAppVersion` line (expected `{PREFIX}<version>{SUFFIX}`)"
+                ));
+            };
+            if old_version.is_some() {
+                return Err("multiple `#define MyAppVersion \"...\"` lines found".to_string());
+            }
+            if val.is_empty() {
+                return Err("empty version in `#define MyAppVersion \"\"`".to_string());
+            }
+            old_version = Some(val.to_string());
+            out.push_str(PREFIX);
+            out.push_str(new_ver);
+            out.push_str(SUFFIX);
+            out.push_str(ending);
+        } else {
+            out.push_str(raw_line);
+        }
+    }
+
+    let old = old_version
+        .ok_or_else(|| "missing `#define MyAppVersion \"<version>\"` line".to_string())?;
+    Ok((old, out))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -834,7 +883,8 @@ mod tests {
             let root = std::env::temp_dir()
                 .join(format!("soundhop-xtask-test-{}-{id}", std::process::id()));
             let _ = fs::remove_dir_all(&root);
-            fs::create_dir_all(root.join("packaging")).expect("create temp packaging dir");
+            fs::create_dir_all(root.join("packaging").join("windows"))
+                .expect("create temp packaging/windows dir");
 
             let ws = Self { root };
             ws.write_fixture(version);
@@ -902,6 +952,17 @@ mod tests {
                     "#!/usr/bin/env bash\n\
                      VERSION=\"$(sed -n 's/^version = \"\\([^\"]*\\)\"/\\1/p' \"$REPO_DIR/Cargo.toml\" | head -n1)\"\n\
                      VERSION=\"${{VERSION:-{version}}}\"\n"
+                ),
+            )
+            .unwrap();
+
+            fs::write(
+                self.root.join(TARGET_INNO_SETUP),
+                format!(
+                    "#define MyAppName \"SoundHop\"\n\
+                     #define MyAppVersion \"{version}\"\n\
+                     [Setup]\n\
+                     AppVersion={{#MyAppVersion}}\n"
                 ),
             )
             .unwrap();
@@ -1060,11 +1121,31 @@ mod tests {
             install.contains("sed -n"),
             "sed extraction line in install.sh must remain untouched"
         );
+
+        let inno = fs::read_to_string(ws.root.join(TARGET_INNO_SETUP)).unwrap();
+        assert!(inno.contains("#define MyAppVersion \"2.2.0\"\n"));
+        assert!(inno.contains("AppVersion={#MyAppVersion}\n"));
+    }
+
+    #[test]
+    fn inno_setup_version_update_preserves_crlf_and_rejects_malformed() {
+        let crlf = "#define MyAppName \"SoundHop\"\r\n#define MyAppVersion \"2.2.0\"\r\n";
+        let (old, updated) = update_inno_setup(crlf, "2.3.0", "2026-11-20").unwrap();
+        assert_eq!(old, "2.2.0");
+        assert_eq!(
+            updated,
+            "#define MyAppName \"SoundHop\"\r\n#define MyAppVersion \"2.3.0\"\r\n"
+        );
+
+        let dup = "#define MyAppVersion \"2.2.0\"\n#define MyAppVersion \"2.2.0\"\n";
+        assert!(update_inno_setup("#define MyAppVersion \"\"\n", "2.3.0", "").is_err());
+        assert!(update_inno_setup("#define MyAppVersion \"2.2.0\n", "2.3.0", "").is_err());
+        assert!(update_inno_setup(dup, "2.3.0", "").is_err());
     }
 
     #[test]
     fn check_fails_loudly_when_any_single_file_drifts() {
-        let targets: [(&str, &str, &str); 5] = [
+        let targets: [(&str, &str, &str); 6] = [
             (TARGET_PKGBUILD, "pkgver=2.1.2", "pkgver=2.0.0"),
             (
                 TARGET_SPEC,
@@ -1081,6 +1162,11 @@ mod tests {
                 TARGET_INSTALL_SH,
                 "VERSION=\"${VERSION:-2.1.2}\"",
                 "VERSION=\"${VERSION:-2.0.0}\"",
+            ),
+            (
+                TARGET_INNO_SETUP,
+                "#define MyAppVersion \"2.1.2\"",
+                "#define MyAppVersion \"2.0.0\"",
             ),
         ];
 
@@ -1100,7 +1186,7 @@ mod tests {
 
     #[test]
     fn bump_is_atomic_and_fails_loudly_when_marker_missing() {
-        let missing_marker_cases: [(&str, &str); 6] = [
+        let missing_marker_cases: [(&str, &str); 7] = [
             (TARGET_CARGO_TOML, "[workspace]\nmembers = []\n"),
             (TARGET_PKGBUILD, "pkgname=soundhop\npkgrel=1\n"),
             (TARGET_SPEC, "Name: soundhop\n"),
@@ -1110,6 +1196,7 @@ mod tests {
                 "<component><releases></releases></component>\n",
             ),
             (TARGET_INSTALL_SH, "#!/usr/bin/env bash\necho hi\n"),
+            (TARGET_INNO_SETUP, "[Setup]\nAppName=SoundHop\n"),
         ];
 
         for (rel_path, broken_content) in missing_marker_cases {

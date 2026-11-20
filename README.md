@@ -4,7 +4,7 @@
 
 # <img width="48" height="48" alt="com github SoundHop" src="https://github.com/teufortressIndustries/soundhop/blob/main/assets/soundhop.png?raw=true" /> SoundHop
 
-[**Download Latest AppImage (Releases)**](https://github.com/teufortressIndustries/soundhop/releases) • [**Quickstart**](#quickstart) • [**Control Center & Tray**](#control-center-gui--system-tray) • [**Interactive TUI**](#interactive-terminal-ui-tui) • [**CLI Commands**](#cli-command-reference) • [**Requirements**](#requirements) • [**Building from Source**](#building-from-source) • [**How It Works**](#how-it-works-under-the-hood)
+[**Download Latest Release**](https://github.com/teufortressIndustries/soundhop/releases) • [**Quickstart**](#quickstart) • [**Windows Installation & Usage**](#windows-installation--usage) • [**Control Center & Tray**](#control-center-gui--system-tray) • [**Interactive TUI**](#interactive-terminal-ui-tui) • [**CLI Commands**](#cli-command-reference) • [**Requirements**](#requirements) • [**Building from Source**](#building-from-source) • [**How It Works**](#how-it-works-under-the-hood)
 
 ---
 
@@ -25,11 +25,13 @@ PulseAudio and PipeWire already implement native TCP network streaming modules (
 The primary and recommended way to use SoundHop is through the **Control Center GUI** and **native desktop system tray**, which run seamlessly on KDE Plasma, GNOME, and other Linux desktop environments (as well as Windows 10/11).
 
 ### 1. Launch SoundHop
-Download and run the standalone **[SoundHop AnyLinux AppImage](https://github.com/teufortressIndustries/soundhop/releases)** (no installation, host libraries, or FUSE required — works on glibc, musl, and non-FHS distros) or run:
+- **Linux**: Download and run the standalone **[SoundHop AnyLinux AppImage](https://github.com/teufortressIndustries/soundhop/releases)** (no installation, host libraries, or FUSE required — works on glibc, musl, and non-FHS distros) or run `soundhop gui`.
+- **Windows 10/11**: Download the **[Windows Installer (`SoundHop-<version>-windows-x86_64-setup.exe`)](https://github.com/teufortressIndustries/soundhop/releases)** or the **[Portable ZIP (`SoundHop-<version>-windows-x86_64-portable.zip`)](https://github.com/teufortressIndustries/soundhop/releases)** and launch **SoundHop** (`soundhop-gui.exe`). See [Windows Installation & Usage](#windows-installation--usage) for details.
+
 ```bash
 soundhop gui
 ```
-*(Or launch **SoundHop** directly from your desktop application launcher. On first run, a guided 3-step onboarding wizard helps you set your device name, speaker sharing role, firewall rules, and login autostart. Running `soundhop gui` automatically ensures the background system tray & daemon are running.)*
+*(Or launch **SoundHop** directly from your desktop application launcher / Start Menu. On first run, a guided 3-step onboarding wizard helps you set your device name, speaker sharing role, firewall rules, and login autostart. Running `soundhop gui` or `soundhop-gui.exe` automatically ensures the background system tray & daemon are running.)*
 
 ### 2. Receiver (e.g. your PC or sound system with good speakers)
 Open **Play & Share** in the Control Center (or click the SoundHop tray icon) and enable **Share this device's speakers** (or **Share My Speakers** in the tray).
@@ -39,6 +41,30 @@ In **Play & Share**, click **Play Here** next to your target speaker (e.g. `pbjj
 Active playback streams (Spotify, Firefox, mpv, games) immediately switch over to the remote speakers.
 
 To stop streaming and restore audio back to local speakers or headphones at any time, click **Disconnect** in the Control Center or select **This Device (Local Speakers)** in the tray menu.
+
+---
+
+## Windows Installation & Usage
+
+SoundHop provides first-class native Windows 10/11 (x86_64) packages on the [GitHub Releases](https://github.com/teufortressIndustries/soundhop/releases) page, alongside `SHA256SUMS.txt` for verification:
+
+### Installation Options
+- **Windows Installer (`SoundHop-<version>-windows-x86_64-setup.exe`)** *(Recommended)*:
+  - Installs **per-user by default** (`%LOCALAPPDATA%\Programs\SoundHop`) with no administrator UAC prompt required; you can also choose an **all-users** install (`C:\Program Files\SoundHop`) in the setup dialog.
+  - Creates a **SoundHop** Start Menu shortcut (`soundhop-gui.exe`), plus optional tasks for a **Desktop shortcut**, **Start SoundHop when Windows starts**, and **Add CLI (`soundhop.exe`) to user PATH**.
+  - Gracefully closes any running SoundHop instance before upgrading or uninstalling, and cleanly removes the PATH entry, `HKCU Run` autostart entry, and (when uninstalled elevated) Windows Defender Firewall rules.
+- **Portable ZIP (`SoundHop-<version>-windows-x86_64-portable.zip`)**:
+  - Extract anywhere and run `soundhop-gui.exe` (or `soundhop.exe` from PowerShell/Terminal) with no installer or registry changes required.
+
+### Dual Windows Binaries (`soundhop-gui.exe` vs `soundhop.exe`)
+Windows packages include two executables so desktop and terminal workflows both behave natively:
+- **`soundhop-gui.exe`**: Built with the Windows GUI subsystem (`windows_subsystem = "windows"`). Launches the Control Center GUI and system tray (`soundhop-gui.exe tray`) with **zero console window flash**, PerMonitorV2 High-DPI scaling, and native Win32 icons.
+- **`soundhop.exe`**: Standard console subsystem binary for the CLI and interactive TUI (`soundhop tui`, `soundhop status`, `soundhop connect`, `soundhop doctor`, etc.).
+
+### Windows Platform Notes
+- **WASAPI Loopback & Playback**: On Windows, SoundHop uses native WASAPI (`cpal`) loopback capture to stream your system's default audio output over TCP (`48 kHz`, stereo `s16le`, with automatic resampling and device hotplug recovery when unplugging headphones or switching outputs). Because WASAPI loopback captures the active output device as a whole, per-application stream routing and microphone pass-through remain Linux-only (PipeWire/PulseAudio).
+- **Windows Defender Firewall (UAC Prompt)**: To receive audio from other devices on your LAN, Windows Defender Firewall must allow inbound TCP `4713` (audio), UDP `47777` (LAN discovery), and UDP `5353` (mDNS). Clicking **Allow in Firewall** in the Control Center or running `soundhop firewall open` automatically triggers a Windows **UAC elevation prompt** to add scoped `private,domain` firewall rules cleanly.
+- **Login Autostart (`HKCU Run`)**: Enabling **Start SoundHop when I log in** in Preferences, running `soundhop service install`, or selecting the installer's startup option registers `"<install-dir>\soundhop-gui.exe" tray` under `HKCU\Software\Microsoft\Windows\CurrentVersion\Run\SoundHop`. Disabling it in Preferences, running `soundhop service uninstall`, or uninstalling SoundHop removes the registry entry cleanly.
 
 ---
 
@@ -271,27 +297,35 @@ cd soundhop
 ### 2. Build release binaries with Cargo
 ```bash
 cargo build --release --workspace
-# Binary is emitted to target/release/soundhop
+# Linux:   target/release/soundhop (and target/release/soundhop-gui)
+# Windows: target\release\soundhop.exe (CLI/TUI) and target\release\soundhop-gui.exe (GUI/tray)
 ```
 
-### 3. Run formatting, lints, and tests
+### 3. Run formatting, lints, version check, and tests
 ```bash
 cargo fmt --all -- --check
+cargo xtask bump-version --check
 cargo clippy --workspace --all-targets -- -D warnings
 cargo test --workspace
 ```
 
-### 4. Build AnyLinux AppImage locally
+### 4. Build AnyLinux AppImage locally (Linux)
 ```bash
 ./packaging/build-appimage.sh
 ```
 On non-Arch hosts this automatically builds inside an Arch Linux container using [pkgforge's AnyLinux AppImages](https://pkgforge-dev.github.io/Anylinux-AppImages/) (`quick-sharun` + `uruntime`/DwarFS, no FUSE required at runtime). The finished binary will be placed at `dist/SoundHop-X.Y.Z-universal-x86_64.AppImage`.
 
+### 5. Build Windows Installer & Portable ZIP locally (Windows)
+```powershell
+.\packaging\windows\build-windows.ps1
+```
+This builds both `soundhop.exe` and `soundhop-gui.exe`, smoke-tests `soundhop.exe --version`, creates `dist\SoundHop-X.Y.Z-windows-x86_64-portable.zip`, invokes Inno Setup 6 (`iscc`) if installed to create `dist\SoundHop-X.Y.Z-windows-x86_64-setup.exe`, and generates `dist\SHA256SUMS.txt`. Pass `-RequireInstaller` to fail if Inno Setup 6 is not installed, or `-SkipBuild` to package already-built binaries.
+
 ---
 
 ## Configuration & Tuning
 
-Configuration is stored in `~/.config/soundhop/config.toml` (and can be edited directly, in the Control Center **Preferences**, or via `soundhop config set <key> <val>`):
+Configuration is stored in `~/.config/soundhop/config.toml` on Linux (`%APPDATA%\soundhop\config.toml` on Windows) and can be edited directly, in the Control Center **Preferences**, or via `soundhop config set <key> <val>`:
 
 ```toml
 [device]
