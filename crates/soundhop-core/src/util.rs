@@ -367,7 +367,7 @@ pub fn home_dir() -> PathBuf {
         if let Some(h) = env::var_os("HOME").filter(|v| !v.is_empty()) {
             return PathBuf::from(h);
         }
-        return env::temp_dir();
+        env::temp_dir()
     }
     #[cfg(not(windows))]
     {
@@ -437,7 +437,7 @@ pub fn runtime_dir() -> PathBuf {
                 .join("run");
         }
         let user = env::var("USERNAME").unwrap_or_else(|_| "user".to_string());
-        return env::temp_dir().join(format!("{APP_SLUG}-{user}"));
+        env::temp_dir().join(format!("{APP_SLUG}-{user}"))
     }
     #[cfg(not(windows))]
     {
@@ -1054,8 +1054,20 @@ pub fn is_private_address(value: &str) -> bool {
 pub fn is_virtual_bridge_interface(name: &str) -> bool {
     let lower = name.trim().to_ascii_lowercase();
     for prefix in [
-        "docker", "br-", "veth", "virbr", "podman", "cni", "flannel", "cali", "lxcbr", "vboxnet",
-        "vmnet", "tunl", "sit", "vethernet",
+        "docker",
+        "br-",
+        "veth",
+        "virbr",
+        "podman",
+        "cni",
+        "flannel",
+        "cali",
+        "lxcbr",
+        "vboxnet",
+        "vmnet",
+        "tunl",
+        "sit",
+        "vethernet",
     ] {
         if lower.starts_with(prefix) {
             return true;
@@ -1603,9 +1615,7 @@ mod tests {
     fn test_windows_virtual_adapter_filtering() {
         assert!(is_virtual_bridge_interface("vEthernet (WSL)"));
         assert!(is_virtual_bridge_interface("vEthernet (Default Switch)"));
-        assert!(is_virtual_bridge_interface(
-            "VMware Network Adapter VMnet8"
-        ));
+        assert!(is_virtual_bridge_interface("VMware Network Adapter VMnet8"));
         assert!(is_virtual_bridge_interface("VirtualBox Host-Only Network"));
         assert!(is_virtual_bridge_interface("Npcap Loopback Adapter"));
         assert!(is_virtual_bridge_interface(

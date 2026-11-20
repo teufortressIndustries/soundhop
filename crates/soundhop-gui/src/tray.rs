@@ -1774,24 +1774,34 @@ mod tests {
 
         // Idle
         cfg.sharing.enabled = false;
-        let idle = TrayMenuSnapshot::from_parts(Vec::new(), Vec::new(), st.clone(), cfg.clone(), false);
+        let idle =
+            TrayMenuSnapshot::from_parts(Vec::new(), Vec::new(), st.clone(), cfg.clone(), false);
         assert_eq!(format_tray_tooltip(&idle), "SoundHop — Idle");
 
         // Sharing speakers
         cfg.sharing.enabled = true;
-        let sharing = TrayMenuSnapshot::from_parts(Vec::new(), Vec::new(), st.clone(), cfg.clone(), false);
+        let sharing =
+            TrayMenuSnapshot::from_parts(Vec::new(), Vec::new(), st.clone(), cfg.clone(), false);
         assert_eq!(format_tray_tooltip(&sharing), "SoundHop — Sharing speakers");
 
         // Receiving phone audio
-        let phone = TrayMenuSnapshot::from_parts(Vec::new(), Vec::new(), st.clone(), cfg.clone(), true);
-        assert_eq!(format_tray_tooltip(&phone), "SoundHop — Receiving phone audio");
+        let phone =
+            TrayMenuSnapshot::from_parts(Vec::new(), Vec::new(), st.clone(), cfg.clone(), true);
+        assert_eq!(
+            format_tray_tooltip(&phone),
+            "SoundHop — Receiving phone audio"
+        );
 
         // Streaming to a single peer
         st.connected_peer = "peer-1".to_string();
         st.connected_name = "Living Room".to_string();
         st.connected_sink = "sink-1".to_string();
-        let streaming = TrayMenuSnapshot::from_parts(Vec::new(), Vec::new(), st.clone(), cfg.clone(), false);
-        assert_eq!(format_tray_tooltip(&streaming), "SoundHop — Streaming to Living Room");
+        let streaming =
+            TrayMenuSnapshot::from_parts(Vec::new(), Vec::new(), st.clone(), cfg.clone(), false);
+        assert_eq!(
+            format_tray_tooltip(&streaming),
+            "SoundHop — Streaming to Living Room"
+        );
 
         // Long peer name is truncated safely within Windows szTip limits
         st.connected_name = "A".repeat(160);

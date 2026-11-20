@@ -1458,7 +1458,9 @@ pub fn handle_service(args: &ServiceArgs, json_out: bool) -> i32 {
                         info(&format!("Tray autostart: {tray_path}"));
                     } else {
                         #[cfg(windows)]
-                        info(r"Startup entry: HKCU\Software\Microsoft\Windows\CurrentVersion\Run\SoundHop");
+                        info(
+                            r"Startup entry: HKCU\Software\Microsoft\Windows\CurrentVersion\Run\SoundHop",
+                        );
                     }
                 } else if let Some(err) = res.get("error").and_then(|v| v.as_str()) {
                     emit_error(err, false);
@@ -1577,7 +1579,9 @@ pub fn handle_service(args: &ServiceArgs, json_out: bool) -> i32 {
                     if !unit.is_empty() {
                         info(&format!("Startup Entry: {unit}"));
                     } else if installed || enabled {
-                        info(r"Startup Entry: HKCU\Software\Microsoft\Windows\CurrentVersion\Run\SoundHop");
+                        info(
+                            r"Startup Entry: HKCU\Software\Microsoft\Windows\CurrentVersion\Run\SoundHop",
+                        );
                     }
                 }
                 #[cfg(not(windows))]

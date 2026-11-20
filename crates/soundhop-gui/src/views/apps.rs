@@ -9,9 +9,9 @@ use crate::backend::{GuiBackend, GuiSnapshot};
 use crate::theme::Palette;
 #[cfg(target_os = "windows")]
 use crate::widgets::callout_card;
+use crate::widgets::{card, pill_badge, section_header};
 #[cfg(not(target_os = "windows"))]
 use crate::widgets::{secondary_button, segmented_control};
-use crate::widgets::{card, pill_badge, section_header};
 
 #[derive(Default)]
 pub struct AppsViewState {

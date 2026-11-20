@@ -6,10 +6,10 @@ use std::path::{Path, PathBuf};
 use std::time::Duration;
 
 use crate::constants::{APP_NAME, APP_SLUG, VERSION};
-#[cfg(not(windows))]
-use crate::util::{ensure_dir, home_dir, ProcessRunner, SystemRunner};
 #[cfg(windows)]
 use crate::util::home_dir;
+#[cfg(not(windows))]
+use crate::util::{ensure_dir, home_dir, ProcessRunner, SystemRunner};
 
 pub const UNIT_NAME: &str = "soundhop.service";
 pub const AUTOSTART_NAME: &str = "soundhop-tray.desktop";
@@ -426,12 +426,7 @@ pub fn stop_service() -> bool {
                     .ok()
                     .and_then(|s| s.trim().parse::<u64>().ok())
             });
-        let _ = crate::ipc::request(
-            "stop",
-            serde_json::json!({}),
-            None,
-            Duration::from_secs(2),
-        );
+        let _ = crate::ipc::request("stop", serde_json::json!({}), None, Duration::from_secs(2));
         for attempt in 0..30 {
             if !crate::ipc::is_reachable(None) {
                 return true;

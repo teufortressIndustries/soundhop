@@ -18,9 +18,8 @@ fn embed_windows_resources() {
         return;
     }
 
-    let manifest_dir = PathBuf::from(
-        std::env::var("CARGO_MANIFEST_DIR").expect("CARGO_MANIFEST_DIR must be set"),
-    );
+    let manifest_dir =
+        PathBuf::from(std::env::var("CARGO_MANIFEST_DIR").expect("CARGO_MANIFEST_DIR must be set"));
     let repo_root = manifest_dir
         .parent()
         .and_then(|p| p.parent())
@@ -47,11 +46,7 @@ fn embed_windows_resources() {
     let packed_version = pack_version_u64(&pkg_version);
 
     let mut res = winresource::WindowsResource::new();
-    res.set_icon(
-        icon_path
-            .to_str()
-            .expect("icon path must be valid UTF-8"),
-    );
+    res.set_icon(icon_path.to_str().expect("icon path must be valid UTF-8"));
     res.set_manifest_file(
         manifest_path
             .to_str()

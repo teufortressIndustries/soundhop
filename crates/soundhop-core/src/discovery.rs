@@ -463,7 +463,10 @@ fn parse_mdns_service_info(info: &ServiceInfo, own_id: &str) -> Option<Peer> {
         .get_property_val_str("name")
         .unwrap_or("SoundHop Peer")
         .to_string();
-    let ver = info.get_property_val_str("ver").unwrap_or(VERSION).to_string();
+    let ver = info
+        .get_property_val_str("ver")
+        .unwrap_or(VERSION)
+        .to_string();
     let sec = info
         .get_property_val_str("security")
         .unwrap_or("trusted-lan")

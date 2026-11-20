@@ -1096,7 +1096,9 @@ fn cvolume_to_pct(vols: &[u32]) -> u32 {
 }
 
 /// Parse the body of `PA_COMMAND_SET_SINK_VOLUME` after command & tag have been read.
-pub fn parse_set_sink_volume(r: &mut TagStructReader<'_>) -> io::Result<(u32, Option<String>, u32)> {
+pub fn parse_set_sink_volume(
+    r: &mut TagStructReader<'_>,
+) -> io::Result<(u32, Option<String>, u32)> {
     let sink_index = r.read_u32()?;
     let sink_name = r.read_string()?;
     let (_channels, vols) = r.read_cvolume()?;

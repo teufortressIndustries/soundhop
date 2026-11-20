@@ -67,8 +67,7 @@ pub fn apply_gain_i16(sample: i16, volume_pct: u32, muted: bool) -> i16 {
 #[inline]
 fn lerp_i16(a: i16, b: i16, t: f64) -> i16 {
     let v = f64::from(a) + (f64::from(b) - f64::from(a)) * t;
-    v.round()
-        .clamp(f64::from(i16::MIN), f64::from(i16::MAX)) as i16
+    v.round().clamp(f64::from(i16::MIN), f64::from(i16::MAX)) as i16
 }
 
 /// Persistent-phase linear resampler for push-based stereo frame streams (capture path).
@@ -321,8 +320,7 @@ impl WindowsPlayer {
     }
 
     pub fn set_volume(&self, volume_pct: u32) {
-        self.volume_pct
-            .store(volume_pct.min(150), Ordering::SeqCst);
+        self.volume_pct.store(volume_pct.min(150), Ordering::SeqCst);
     }
 
     pub fn set_mute(&self, muted: bool) {
@@ -378,12 +376,7 @@ impl WindowsPlayer {
             .lock()
             .unwrap_or_else(|e| e.into_inner())
             .clear();
-        if let Some(h) = self
-            .worker
-            .lock()
-            .unwrap_or_else(|e| e.into_inner())
-            .take()
-        {
+        if let Some(h) = self.worker.lock().unwrap_or_else(|e| e.into_inner()).take() {
             let _ = h.join();
         }
     }
@@ -661,12 +654,7 @@ impl WindowsLoopbackRecorder {
 
     pub fn stop(&self) {
         self.stop_flag.store(true, Ordering::SeqCst);
-        if let Some(h) = self
-            .handle
-            .lock()
-            .unwrap_or_else(|e| e.into_inner())
-            .take()
-        {
+        if let Some(h) = self.handle.lock().unwrap_or_else(|e| e.into_inner()).take() {
             let _ = h.join();
         }
     }
@@ -696,9 +684,9 @@ fn open_loopback_stream(
         );
     };
     let active_name = device.name().ok();
-    let default_cfg = device.default_output_config().map_err(|e| {
-        format!("Failed to read default output config for WASAPI loopback: {e}")
-    })?;
+    let default_cfg = device
+        .default_output_config()
+        .map_err(|e| format!("Failed to read default output config for WASAPI loopback: {e}"))?;
 
     let format = default_cfg.sample_format();
     let config: StreamConfig = default_cfg.into();
@@ -868,10 +856,10 @@ fn run_loopback_worker(
         }
         drop(stream);
 
-        if !stop_flag.load(Ordering::SeqCst) {
-            if sleep_interruptible(backoff.next_delay(), &stop_flag) {
-                break;
-            }
+        if !stop_flag.load(Ordering::SeqCst)
+            && sleep_interruptible(backoff.next_delay(), &stop_flag)
+        {
+            break;
         }
     }
 }
@@ -907,7 +895,9 @@ mod tests {
 
     fn decode_s16le_stereo(bytes: &[u8]) -> Vec<(i16, i16)> {
         bytes
-            .chunks_exact(4)
+            .as_chunks::<4>()
+            .0
+            .iter()
             .map(|c| {
                 (
                     i16::from_le_bytes([c[0], c[1]]),
@@ -1005,7 +995,7 @@ mod tests {
             resampler.write_frames(&mut queue, 2, 2, 400, 100, false, |i, s| {
                 block[i] = s;
             });
-            for pair in block.chunks_exact(2) {
+            for pair in block.as_chunks::<2>().0 {
                 out.push((pair[0], pair[1]));
             }
         }

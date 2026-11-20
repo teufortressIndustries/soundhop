@@ -603,8 +603,7 @@ impl AudioBackend for WindowsAudioBackend {
 
         let mod_id = self.next_module_id.fetch_add(1, Ordering::SeqCst);
         let stop_flag = Arc::new(AtomicBool::new(false));
-        let (tx, writer_handle) =
-            spawn_tunnel_writer(stream, data_channel, Arc::clone(&stop_flag));
+        let (tx, writer_handle) = spawn_tunnel_writer(stream, data_channel, Arc::clone(&stop_flag));
         let tx_for_rec = tx.clone();
         let stop_for_rec = Arc::clone(&stop_flag);
         let recorder = match WindowsLoopbackRecorder::try_new(move |pcm_chunk| {
@@ -704,11 +703,7 @@ impl AudioBackend for WindowsAudioBackend {
                 .iter()
                 .filter_map(|name| {
                     senders.get_mut(name).and_then(|sess| {
-                        let target = sess
-                            .tx
-                            .lock()
-                            .unwrap_or_else(|e| e.into_inner())
-                            .clone();
+                        let target = sess.tx.lock().unwrap_or_else(|e| e.into_inner()).clone();
                         if target.is_some() {
                             if let Some(rec) = sess.recorder.take() {
                                 slave_recorders_to_stop.push(rec);
