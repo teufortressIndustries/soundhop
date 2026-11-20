@@ -1305,7 +1305,12 @@ mod tests {
 
         let dir = tempfile::tempdir().unwrap();
         let fake_adb = dir.path().join("adb");
-        std::fs::write(&fake_adb, "").unwrap();
+        std::fs::write(&fake_adb, b"#!/bin/sh\n").unwrap();
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            std::fs::set_permissions(&fake_adb, std::fs::Permissions::from_mode(0o755)).unwrap();
+        }
 
         let adb_calls = Arc::new(std::sync::Mutex::new(Vec::<Vec<String>>::new()));
         let adb_calls_cb = Arc::clone(&adb_calls);
