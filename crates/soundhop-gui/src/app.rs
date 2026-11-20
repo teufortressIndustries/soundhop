@@ -10,7 +10,10 @@ use soundhop_core::controller::Controller;
 use crate::backend::{GuiBackend, GuiCommand};
 use crate::theme::{apply_theme, Palette, ThemeMode};
 use crate::views::{apps, home, onboarding, phone, settings};
-use crate::widgets::{callout_card, compact_button, nav_tab_button, pill_badge};
+use crate::widgets::{
+    callout_card, compact_button, danger_button, nav_tab_button, pill_badge, primary_button,
+};
+use soundhop_core::pairing::PendingPairRequest;
 
 const EMBEDDED_LOGO_PNG: &[u8] = include_bytes!("../../../assets/soundhop.png");
 
@@ -187,7 +190,11 @@ impl eframe::App for ControlCenterApp {
         }
         let pal = self.cached_palette;
 
-        let repaint_ms = if snap.audio_active || snap.connected || snap.busy_message.is_some() {
+        let repaint_ms = if snap.audio_active
+            || snap.connected
+            || snap.busy_message.is_some()
+            || !snap.pending_pair_requests.is_empty()
+        {
             66
         } else {
             400
@@ -394,7 +401,117 @@ impl eframe::App for ControlCenterApp {
                         }
                     });
             });
+
+        if let Some(req) = snap.pending_pair_requests.first() {
+            render_pair_request_modal(
+                ctx,
+                &pal,
+                req,
+                snap.pending_pair_requests.len(),
+                &self.backend,
+            );
+        }
     }
+}
+
+fn render_pair_request_modal(
+    ctx: &egui::Context,
+    pal: &Palette,
+    req: &PendingPairRequest,
+    total_pending: usize,
+    backend: &GuiBackend,
+) {
+    let screen_rect = ctx.screen_rect();
+    egui::Area::new(egui::Id::new("pair_request_modal_backdrop"))
+        .order(egui::Order::Middle)
+        .fixed_pos(screen_rect.min)
+        .show(ctx, |ui| {
+            let (rect, _) = ui.allocate_exact_size(screen_rect.size(), egui::Sense::click());
+            ui.painter()
+                .rect_filled(rect, 0.0, egui::Color32::from_black_alpha(145));
+        });
+
+    egui::Window::new("Incoming Pair Request")
+        .id(egui::Id::new("incoming_pair_request_modal"))
+        .order(egui::Order::Foreground)
+        .anchor(egui::Align2::CENTER_CENTER, egui::vec2(0.0, 0.0))
+        .collapsible(false)
+        .resizable(false)
+        .default_width(440.0)
+        .max_width(440.0)
+        .frame(
+            egui::Frame::new()
+                .fill(pal.card)
+                .stroke(Stroke::new(1.5_f32, pal.accent))
+                .corner_radius(CornerRadius::same(12))
+                .inner_margin(Margin::same(18)),
+        )
+        .show(ctx, |ui| {
+            ui.label(
+                RichText::new(format!(
+                    "{} wants to pair — Verification Code: {}",
+                    req.display_name, req.sas_code
+                ))
+                .color(pal.text)
+                .size(14.5)
+                .strong(),
+            );
+            ui.add_space(10.0);
+            callout_card(ui, pal.accent_soft, pal.accent, |ui| {
+                ui.vertical_centered(|ui| {
+                    ui.label(
+                        RichText::new("Verification Code")
+                            .color(pal.text_secondary)
+                            .size(11.5),
+                    );
+                    ui.label(
+                        RichText::new(&req.sas_code)
+                            .color(pal.accent)
+                            .size(22.0)
+                            .strong()
+                            .monospace(),
+                    );
+                });
+            });
+            ui.add_space(8.0);
+            ui.label(
+                RichText::new(format!(
+                    "From: {} • Fingerprint: {}",
+                    req.remote_addr, req.fingerprint
+                ))
+                .color(pal.text_muted)
+                .size(11.5)
+                .monospace(),
+            );
+            if total_pending > 1 {
+                ui.add_space(4.0);
+                ui.label(
+                    RichText::new(format!(
+                        "+ {} more pending pair request{}",
+                        total_pending - 1,
+                        if total_pending - 1 == 1 { "" } else { "s" }
+                    ))
+                    .color(pal.text_secondary)
+                    .size(11.5),
+                );
+            }
+            ui.add_space(14.0);
+            ui.horizontal(|ui| {
+                ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                    if primary_button(ui, pal, "Approve").clicked() {
+                        backend.send(GuiCommand::ApprovePairRequest {
+                            request_id: req.request_id.clone(),
+                        });
+                    }
+                    ui.add_space(6.0);
+                    if danger_button(ui, pal, "Deny").clicked() {
+                        backend.send(GuiCommand::DenyPairRequest {
+                            request_id: req.request_id.clone(),
+                        });
+                    }
+                });
+            });
+        });
 }
 
 fn render_banner(

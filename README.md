@@ -83,7 +83,8 @@ The Control Center is organized into four sidebar views:
 - **Play & Share**: View your active output & master volume/mute bar, connect to one or multiple LAN speakers (**Multiple speakers** multi-room mode with optional local playback), connect manually by IP/hostname, toggle **Share this device's speakers** (with one-click **Allow in Firewall** detection), and switch network microphone pass-through.
 - **Apps**: Switch between **Send all apps** and **Only picked apps** default routing, toggle individual playing apps between remote and local output on the fly, and save permanent rules with **Always Remember**.
 - **Phone Audio**: Stream audio from Android devices over USB or Wi-Fi using official `scrcpy` (installed on-demand in one click, SHA-256 verified), switch USB devices to wireless ADB, connect by manual Wi-Fi IP, optionally keep audio playing on phone speakers, or expose the phone as a virtual PC microphone (`SoundHop_Android_Mic`).
-- **Preferences**: Switch between **Dark**, **Light**, and **System** themes, rename your device, toggle **Auto-connect** and **Start SoundHop when I log in**, manage **Privacy & Pairing** (**Home Wi-Fi**, **PIN-Paired Devices Only**, or **System Audio Cookie**) with a built-in pairing code generator, and expand **Advanced Audio, Network & Diagnostics** for buffer latency presets (`50 ms` / `150 ms` / `300 ms`), ports, live RTT/jitter/dBFS telemetry, and replaying the welcome tour.
+- **Preferences**: Switch between **Dark**, **Light**, and **System** themes, rename your device, toggle **Auto-connect** and **Start SoundHop when I log in**, choose your **Audio Quality & Latency** SHT3 profile (`Opus Balanced`, `Opus Low-Latency 10 ms`, `Opus Low-Bandwidth 64 kbps`, or `Encrypted Lossless PCM`), manage **Privacy & Pairing** (**Home Wi-Fi**, **Paired Devices Only**, or **System Audio Cookie**) with a live enforcement banner and one-click **Trusted Devices** revocation, and expand **Advanced Audio, Network & Diagnostics** for buffer latency presets, ports, live RTT/jitter/dBFS telemetry, and bug report export.
+- **Interactive Pair Request Modal**: Incoming Pairing v2 requests pop up a verification modal with a 6-digit SAS verification code and one-click **Approve** / **Deny** buttons (also surfaced in the system tray tooltip/menu and TUI).
 
 | Phone Audio (`scrcpy` Android Bridge) | Preferences & Privacy Pairing |
 | :---: | :---: |
@@ -153,16 +154,16 @@ Audio falls straight back to your local speakers or headphones without missing a
 
 ---
 
-## What's New in v2.x (Pure Rust Rewrite & v2.1 Control Center)
+## What's New in v2.4 (Encrypted SHT3 Opus Transport, Pairing v2 & Headless ARM64)
 
 SoundHop v2.x is a ground-up rewrite in pure Rust (`soundhop-core`, `soundhop-gui`, `soundhop-cli`), eliminating Python & Qt runtime overhead while introducing:
 
-1. **Unified Control Center GUI (`soundhop gui`) & Onboarding (v2.1)**: Modern `egui` Control Center with 4 sidebar tabs (**Play & Share**, **Apps**, **Phone Audio**, **Preferences**), Dark/Light/System themes, guided 3-step first-run onboarding, upgraded tray integration, and automatic cross-version AppImage upgrade handoff & autostart/systemd path syncing.
-2. **Interactive Terminal UI (`soundhop tui`)**: Live `ratatui` dashboard with Multi-Room peer toggles, App Mixer & persistent rules, Phone & Mic controls, and real-time audio dBFS + network RTT/jitter telemetry.
-3. **Multi-Room / Simultaneous Broadcast Audio (`soundhop connect PeerA PeerB --combine --keep-local`)**: Stream audio to multiple LAN speakers at once (plus optionally keep your local speakers playing in sync) via `module-combine-sink` on Linux and multi-peer TCP fan-out on Windows.
-4. **Persistent Per-App Routing Rules (`soundhop route Spotify --save`)**: Save `always_remote` and `always_local` application rules (plus `all` vs `selective` default mode) in `config.toml` (`[routing]`).
-5. **Hardened PIN / Pre-Shared Key (PSK) Pairing & HMAC-SHA256 Auth (`soundhop pair`)**: 60,000-iteration PBKDF2-HMAC-SHA256 key derivation, 12-character pairing codes (or 6+ char custom codes), constant-time HMAC-SHA256 signed UDP discovery beacons, `0o600` 256-byte PulseAudio cookie & IPC socket permissions, and SHA-256 verified `scrcpy` tool downloads.
-6. **Real-Time Audio Telemetry & AnyLinux Portability**: Live Peak/RMS/dBFS audio metering, rolling RTT & jitter tracking, and universal AnyLinux AppImages (`quick-sharun` + `uruntime`/DwarFS) running across glibc, musl, non-FHS, and non-FUSE Linux environments.
+1. **Encrypted SoundHop Transport v3 (`SHT3`) with Selectable Opus & Lossless PCM Profiles (v2.4)**: End-to-end **ChaCha20-Poly1305** authenticated encryption on TCP port `4714` with pure-Rust **Opus** encoding (`opus-balanced` 20 ms / 128 kbps default, `opus-low-latency` 10 ms, `opus-low-bandwidth` 64 kbps) and `pcm-lossless` (48 kHz stereo S16LE), configurable from **Preferences** or `config.toml` (`[audio] profile`).
+2. **Pairing v2 Interactive Device Trust (v2.4)**: Per-device **Ed25519** identity keys and **X25519** ephemeral key exchange on TCP port `4715` with 6-digit SAS verification modals across GUI, System Tray, TUI (`[a]` Approve / `[d]` Deny), and CLI (`soundhop pair request/pending/approve/deny/revoke/list/code`), plus 120-second one-time headless codes for Raspberry Pi / SSH receivers and live session revocation.
+3. **Headless & ARM64 (`aarch64`) Linux Builds (v2.4)**: Compile `soundhop-cli` with `--no-default-features` (no GTK/X11/GL dependencies) or download the prebuilt `soundhop-*-linux-aarch64-headless.tar.gz` release tarball for Raspberry Pi and headless Linux audio receivers.
+4. **Unified Control Center GUI (`soundhop gui`) & Onboarding**: Modern `egui` Control Center with 4 sidebar tabs (**Play & Share**, **Apps**, **Phone Audio**, **Preferences**), Dark/Light/System themes, guided 3-step first-run onboarding, upgraded tray integration, and automatic cross-version AppImage upgrade handoff.
+5. **Interactive Terminal UI (`soundhop tui`)**: Live `ratatui` dashboard with Multi-Room peer toggles, App Mixer & persistent rules, Phone & Mic controls, incoming pair-request approval popups, and real-time audio dBFS + network RTT/jitter telemetry.
+6. **Multi-Room Broadcast & Persistent Per-App Routing**: Stream audio to multiple LAN speakers at once (`soundhop connect PeerA PeerB --combine --keep-local`) and persist `always_remote` / `always_local` rules in `config.toml` (`[routing]`).
 
 ---
 
@@ -214,9 +215,14 @@ soundhop connect PeerA PeerB --combine --keep-local
 soundhop connect 192.168.1.50:4713 --latency 100 --remember
 soundhop disconnect             # Drop remote tunnel / multi-room group and restore local sound
 soundhop share <on|off|status>  # Enable or disable receiving audio from other devices
-soundhop pair generate          # Generate a random 12-character pairing code
-soundhop pair <peer> --pin CODE # Pair with a peer using a shared PIN/passphrase (6+ chars)
-soundhop pair status            # Show pairing & security mode status (`clear` to reset)
+soundhop pair request <host> [--port 4715] [--code CODE]  # Interactive Pairing v2 request (or headless code)
+soundhop pair pending           # List incoming Pairing v2 requests awaiting approval
+soundhop pair approve <id|sas>  # Approve a pending Pairing v2 request
+soundhop pair deny <id|sas>     # Deny a pending Pairing v2 request
+soundhop pair list              # List trusted paired devices & fingerprints
+soundhop pair revoke <dev_id>   # Revoke a trusted device (terminates active sessions)
+soundhop pair code              # Generate a 120s one-time code for headless / Raspberry Pi pairing
+soundhop pair status            # Show pairing & security mode status (`clear` / `generate` for legacy PIN)
 ```
 
 ### Stream Routing, Mic Pass-Through & Volume Sync
@@ -299,6 +305,9 @@ cd soundhop
 cargo build --release --workspace
 # Linux:   target/release/soundhop (and target/release/soundhop-gui)
 # Windows: target\release\soundhop.exe (CLI/TUI) and target\release\soundhop-gui.exe (GUI/tray)
+
+# Headless Linux / Raspberry Pi (aarch64) without GTK/X11/GL dependencies:
+cargo build --release -p soundhop-cli --no-default-features
 ```
 
 ### 3. Run formatting, lints, version check, and tests
@@ -333,8 +342,13 @@ name = "Fedora-Desktop"         # Display name broadcasted to other devices
 
 [sharing]
 enabled = true                  # Whether this device accepts incoming audio
-port = 4713                     # TCP audio port
-security = "trusted-lan"        # "trusted-lan" (Home Wi-Fi), "psk" (PIN-Paired), "cookie", or "open"
+port = 4713                     # Legacy PulseAudio/WASAPI TCP audio port
+v3_port = 4714                  # Encrypted SoundHop Transport v3 (SHT3) TCP port
+pair_port = 4715                # Pairing v2 interactive handshake TCP port
+security = "trusted-lan"        # "trusted-lan" (Home Wi-Fi), "psk" (Paired Only), "cookie", or "open"
+
+[audio]
+profile = "opus-balanced"       # "opus-balanced", "opus-low-latency", "opus-low-bandwidth", or "pcm-lossless"
 
 [connection]
 auto_connect = true             # Automatically reconnect to preferred peer when online
@@ -397,11 +411,15 @@ notifications = true            # Desktop connection notifications
   - **Multi-Room / Broadcast Audio**: `soundhop connect PeerA PeerB --combine --keep-local`.
   - **Persistent Per-App Routing Rules**: `[routing]` in `config.toml` & `soundhop route --save`.
   - **PIN / PSK Pairing & Telemetry**: Pre-Shared Key pairing with HMAC-SHA256 beacons (`soundhop pair`) plus live Peak/RMS/dBFS and RTT/jitter telemetry.
-- [x] **v2.1 (Current)**:
+- [x] **v2.1 – v2.3**:
   - **Unified Control Center GUI (`soundhop gui`)**: Modern `egui` desktop app with Play & Share, Apps, Phone Audio, and Preferences views, Dark/Light/System themes, and guided 3-step first-run onboarding.
   - **Upgraded System Tray (`soundhop tray`)**: Color-coded status badges, live peer RTT readouts, Multi-Room submenu, and direct Control Center tab launchers.
-  - **Seamless AppImage Upgrade Handoff**: Automatic cross-version daemon/tray/GUI replacement, auto-synced `systemd` unit & XDG autostart AppImage paths with GUI toast feedback, and safe `doctor --fix` mount cleanup.
-  - **Security Hardening**: 60,000-iteration PBKDF2-HMAC-SHA256 pairing KDF, `0o600` PulseAudio cookie & IPC sockets, SHA-256 verified `scrcpy` downloads, and hardened Windows WASAPI/`cpal` backend.
+  - **First-Class Windows 10/11 Support**: Native Inno Setup installer, portable ZIP, Win32 dual-binary subsystem (`soundhop-gui.exe` + `soundhop.exe`), `wgpu` DX12 renderer, Windows Firewall UAC elevation, and WASAPI hotplug recovery.
+  - **Seamless AppImage Upgrade Handoff**: Automatic cross-version daemon/tray/GUI replacement, auto-synced `systemd` unit & XDG autostart AppImage paths with GUI toast feedback, and `cargo xtask bump-version` drift checking.
+- [x] **v2.4 (Current)**:
+  - **SoundHop Transport v3 (`SHT3`)**: End-to-end ChaCha20-Poly1305 encrypted TCP audio transport with pure-Rust Opus (`opus-balanced`, `opus-low-latency`, `opus-low-bandwidth`) and `pcm-lossless` profiles.
+  - **Pairing v2 Interactive Device Trust**: Per-device Ed25519/X25519 pairing with 6-digit SAS verification modals across GUI, Tray, TUI, and CLI, 120-second one-time headless codes, and live session revocation.
+  - **Headless & ARM64 (`aarch64`) Linux Support**: `--no-default-features` headless CLI/daemon builds and prebuilt `linux-aarch64-headless` release tarballs.
 
 ---
 

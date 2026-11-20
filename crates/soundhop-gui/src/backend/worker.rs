@@ -18,7 +18,10 @@ use soundhop_core::util::{atomic_write, config_path, local_addresses, log_path, 
 use crate::{lock_or_recover, write_or_recover};
 
 use super::commands::ipc_checked;
-use super::snapshot::{parse_android_history, GuiSnapshot, GuiToast, RefreshUpdate};
+use super::snapshot::{
+    parse_android_history, parse_pending_pair_requests_json, parse_trusted_peers_json, GuiSnapshot,
+    GuiToast, RefreshUpdate,
+};
 
 pub(super) struct WorkerState {
     pub(super) controller: Arc<Controller>,
@@ -202,9 +205,37 @@ impl WorkerState {
             None
         };
 
+        let trusted_peers_val = if daemon_up {
+            ipc_request(
+                "pair_list",
+                serde_json::json!({}),
+                None,
+                Duration::from_millis(500),
+            )
+            .ok()
+            .and_then(|v| v.get("trusted_peers").and_then(|a| a.as_array()).cloned())
+            .map(|arr| parse_trusted_peers_json(&arr))
+        } else {
+            None
+        };
+
+        let pending_pair_val = if daemon_up {
+            ipc_request(
+                "pair_pending",
+                serde_json::json!({}),
+                None,
+                Duration::from_millis(500),
+            )
+            .ok()
+            .and_then(|v| v.get("requests").and_then(|a| a.as_array()).cloned())
+            .map(|arr| parse_pending_pair_requests_json(&arr))
+        } else {
+            None
+        };
+
         let live_peers = lock_or_recover(&self.cached_live_peers).clone();
 
-        let (cfg, st, local_telem, status_json, apps_json) = {
+        let (cfg, st, local_telem, status_json, apps_json, trusted_peers, pending_pair_requests) = {
             let _sync_guard = if allow_during_command {
                 Some(lock_or_recover(&self.controller_sync_lock))
             } else {
@@ -227,7 +258,19 @@ impl WorkerState {
             let status_json =
                 status_val.unwrap_or_else(|| self.controller.status(Some(&live_peers)));
             let apps_json = apps_val.unwrap_or_else(|| self.controller.list_apps());
-            (cfg, st, local_telem, status_json, apps_json)
+            let trusted_peers =
+                trusted_peers_val.unwrap_or_else(|| self.controller.trusted_peers());
+            let pending_pair_requests =
+                pending_pair_val.unwrap_or_else(|| self.controller.pending_pair_requests());
+            (
+                cfg,
+                st,
+                local_telem,
+                status_json,
+                apps_json,
+                trusted_peers,
+                pending_pair_requests,
+            )
         };
 
         let update = RefreshUpdate::from_status(
@@ -238,6 +281,8 @@ impl WorkerState {
             &status_json,
             apps_json,
             &live_peers,
+            trusted_peers,
+            pending_pair_requests,
         );
 
         if !allow_during_command
@@ -962,11 +1007,16 @@ mod tests {
 
         // Clearing preferred peer persists empty string
         worker.handle_command(GuiCommand::SaveConfigPatch {
-            patch: serde_json::json!({ "connection": { "last_peer": "" } }),
+            patch: serde_json::json!({ "connection": { "last_peer": "" }, "audio": { "profile": "pcm-lossless" } }),
             toast: None,
         });
         let reloaded2 = Config::load(Some(&dir.path().join("config.toml"))).unwrap();
         assert_eq!(reloaded2.connection.last_peer, "");
+        assert_eq!(reloaded2.audio.profile, "pcm-lossless");
+        assert_eq!(
+            worker.snapshot.read().unwrap().audio_profile,
+            "pcm-lossless"
+        );
     }
 
     #[test]

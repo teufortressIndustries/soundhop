@@ -97,6 +97,7 @@ pub(super) fn apply_optimistic_update(snap: &mut GuiSnapshot, cmd: &GuiCommand) 
         }
         GuiCommand::SaveConfigPatch { patch, .. } => {
             let _ = snap.config.apply_patch(patch);
+            snap.audio_profile = snap.config.audio.profile.clone();
         }
         GuiCommand::ApplyPairingPin { pin } => {
             if pin.trim().len() >= 6 {
@@ -106,6 +107,25 @@ pub(super) fn apply_optimistic_update(snap: &mut GuiSnapshot, cmd: &GuiCommand) 
         GuiCommand::ClearPairing => {
             snap.config.sharing.psk_hash.clear();
             snap.config.sharing.security = "trusted-lan".to_string();
+        }
+        GuiCommand::SendPairRequest { host, .. } => {
+            if !host.trim().is_empty() {
+                snap.busy_message = Some(format!("Sending pair request to {}...", host.trim()));
+            }
+        }
+        GuiCommand::ApprovePairRequest { request_id }
+        | GuiCommand::DenyPairRequest { request_id } => {
+            snap.pending_pair_requests
+                .retain(|r| r.request_id != *request_id && r.sas_code != *request_id);
+        }
+        GuiCommand::RevokeTrustedPeer { device_id } => {
+            snap.trusted_peers.retain(|p| p.device_id != *device_id);
+            for peer in &mut snap.peers {
+                if peer.id == *device_id {
+                    peer.paired = false;
+                }
+            }
+            snap.paired_peer_count = snap.trusted_peers.len();
         }
         GuiCommand::AndroidInstallTools => {
             snap.android_installing = true;
@@ -205,10 +225,11 @@ mod tests {
         assert_eq!(gui_backend.read().config.routing.default_mode, "selective");
 
         gui_backend.send(GuiCommand::SaveConfigPatch {
-            patch: serde_json::json!({ "ui": { "theme": "light" } }),
+            patch: serde_json::json!({ "ui": { "theme": "light" }, "audio": { "profile": "opus-low-latency" } }),
             toast: None,
         });
         assert_eq!(gui_backend.read().config.ui.theme, "light");
+        assert_eq!(gui_backend.read().audio_profile, "opus-low-latency");
 
         gui_backend.send(GuiCommand::RefreshPeers);
         assert!(gui_backend.read().refreshing_peers);

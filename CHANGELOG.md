@@ -7,7 +7,15 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [2.4.0] - 2026-11-20
+
 ### Added
+- **SoundHop Transport v3 (`SHT3`)**: Authenticated ChaCha20-Poly1305 encrypted TCP audio transport (`sharing.v3_port`, default `4714`) with pure-Rust Opus (`opus-balanced`, `opus-low-latency`, `opus-low-bandwidth`) and `pcm-lossless` profiles (`audio.profile`), PCM bridges, and live session revocation.
+- **Pairing v2 Interactive Device Trust**: Per-device Ed25519 identity keys, X25519 key agreement, and interactive TCP pairing listener (`sharing.pair_port`, default `4715`) with 6-digit SAS verification, 120-second headless one-time codes, and daemon IPC (`pair_request`, `pair_pending`, `pair_approve`, `pair_deny`, `pair_revoke`, `pair_list`, `pair_code`).
+- **Pairing v2 & Audio Profile UX**:
+  - Control Center GUI: incoming pair-request approval modal with SAS verification code, `PeerTrustState` badges (`Trusted` / `Pairing Required` / `Open LAN`) with one-click **Pair** action, **Trusted Devices** management with one-click **Revoke**, live security enforcement banner, and **Audio Quality & Latency** profile selector.
+  - System Tray: pending pair request indicators in tray tooltip and quick Approve/Deny menu actions.
+  - CLI & TUI: `soundhop pair request/pending/approve/deny/revoke/list/code` subcommands and TUI popup approval modal (`[a]` Approve / `[d]` Deny).
 - Optional `gui` feature flag on `soundhop-cli` (`--no-default-features`) for headless Linux / Raspberry Pi (`aarch64`) builds without GTK/X11/GL dependencies.
 - Linux `aarch64` headless CLI tarball (`soundhop-*-linux-aarch64-headless.tar.gz`) CI build and release attachment.
 - Winget (`packaging/windows/winget/`) and Scoop (`packaging/windows/scoop/soundhop.json`) Windows package manifest templates synced via `cargo xtask bump-version`.
@@ -19,6 +27,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ### Changed
 - Decomposed `controller`, `soundhop-gui/src/backend`, and `soundhop-cli/src/core_cmds` into focused submodules.
 - Updated `PKGBUILD`, `soundhop.spec`, `io.github.soundhop.metainfo.xml`, and `io.github.soundhop.yaml` to ship `soundhop-gui`, use modern `.metainfo.xml` paths, add AppStream categories/screenshots, and enable `--device=dri` in Flatpak.
+- Refreshed `README.md` for v2.4.0 (Pairing v2, SHT3 Opus + ChaCha20-Poly1305 profiles, and headless ARM64 builds).
 
 ## [2.3.1] - 2026-11-20
 
@@ -74,7 +83,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - PIN/PSK HMAC pairing and trusted-LAN security modes.
 - Interactive terminal UI (TUI), native system tray, and live telemetry.
 
-[Unreleased]: https://github.com/teufortressIndustries/soundhop/compare/v2.3.1...HEAD
+[Unreleased]: https://github.com/teufortressIndustries/soundhop/compare/v2.4.0...HEAD
+[2.4.0]: https://github.com/teufortressIndustries/soundhop/compare/v2.3.1...v2.4.0
 [2.3.1]: https://github.com/teufortressIndustries/soundhop/compare/v2.3.0...v2.3.1
 [2.3.0]: https://github.com/teufortressIndustries/soundhop/compare/v2.2.0...v2.3.0
 [2.2.0]: https://github.com/teufortressIndustries/soundhop/compare/v2.1.2...v2.2.0

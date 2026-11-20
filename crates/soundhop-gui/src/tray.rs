@@ -19,6 +19,7 @@ use soundhop_core::ipc::{
     find_soundhop_process_with_arg, is_running as ipc_is_running, ping as ipc_ping,
     request as ipc_request,
 };
+use soundhop_core::pairing::PendingPairRequest;
 use soundhop_core::service::sync_appimage_paths_if_installed;
 use soundhop_core::util::{
     is_own_non_loopback_ip, is_private_address, now_secs, replace_stale_instance, InstanceLockInfo,
@@ -226,7 +227,15 @@ pub fn build_tray_menu(controller: &Controller, peers: &[Peer]) -> Menu {
     let cfg = lock_or_recover(&controller.config).clone();
     let streams = controller.list_apps();
     let and_running = controller.android_session.is_active();
-    let snap = TrayMenuSnapshot::from_parts(peers.to_vec(), streams, st, cfg, and_running);
+    let pending_pair_requests = controller.pending_pair_requests();
+    let snap = TrayMenuSnapshot::from_parts(
+        peers.to_vec(),
+        streams,
+        st,
+        cfg,
+        and_running,
+        pending_pair_requests,
+    );
     build_tray_menu_from_snapshot(&snap)
 }
 
@@ -247,6 +256,7 @@ struct TrayMenuSnapshot {
     mic_direction: String,
     routed_apps_lower: HashSet<String>,
     android_active: bool,
+    pending_pair_requests: Vec<PendingPairRequest>,
     badge: TrayBadgeState,
     signature: String,
 }
@@ -258,6 +268,7 @@ impl TrayMenuSnapshot {
         st: soundhop_core::state::State,
         cfg: soundhop_core::config::Config,
         android_active: bool,
+        pending_pair_requests: Vec<PendingPairRequest>,
     ) -> Self {
         let connected = st.is_connected();
         let multiroom = st.is_multiroom();
@@ -291,6 +302,7 @@ impl TrayMenuSnapshot {
             mic_active,
             &st.mic_direction,
             android_active,
+            &pending_pair_requests,
         );
         Self {
             peers,
@@ -308,6 +320,7 @@ impl TrayMenuSnapshot {
             mic_direction: st.mic_direction,
             routed_apps_lower,
             android_active,
+            pending_pair_requests,
             badge,
             signature,
         }
@@ -316,6 +329,48 @@ impl TrayMenuSnapshot {
 
 fn build_tray_menu_from_snapshot(snap: &TrayMenuSnapshot) -> Menu {
     let menu = Menu::new();
+
+    if !snap.pending_pair_requests.is_empty() {
+        let count = snap.pending_pair_requests.len();
+        let title = if count == 1 {
+            format!(
+                "Pair Request: {} (Code: {})",
+                snap.pending_pair_requests[0].display_name, snap.pending_pair_requests[0].sas_code
+            )
+        } else {
+            format!("Pending Pair Requests ({count})")
+        };
+        let pair_sub = Submenu::new(title, true);
+        for req in &snap.pending_pair_requests {
+            let info_item = MenuItem::with_id(
+                MenuId::new(format!("noop_pair:{}", req.request_id)),
+                format!("{} — Code: {}", req.display_name, req.sas_code),
+                false,
+                None,
+            );
+            let _ = pair_sub.append(&info_item);
+            let approve_item = MenuItem::with_id(
+                MenuId::new(format!("pair_approve:{}", req.request_id)),
+                format!("Approve {}", req.display_name),
+                true,
+                None,
+            );
+            let _ = pair_sub.append(&approve_item);
+            let deny_item = MenuItem::with_id(
+                MenuId::new(format!("pair_deny:{}", req.request_id)),
+                format!("Deny {}", req.display_name),
+                true,
+                None,
+            );
+            let _ = pair_sub.append(&deny_item);
+            let _ = pair_sub.append(&PredefinedMenuItem::separator());
+        }
+        let review_item =
+            MenuItem::with_id(MenuId::new("open_gui"), "Review in SoundHop...", true, None);
+        let _ = pair_sub.append(&review_item);
+        let _ = menu.append(&pair_sub);
+        let _ = menu.append(&PredefinedMenuItem::separator());
+    }
 
     let open_item = MenuItem::with_id(MenuId::new("open_gui"), "Open SoundHop", true, None);
     let _ = menu.append(&open_item);
@@ -556,7 +611,17 @@ fn build_tray_menu_from_snapshot(snap: &TrayMenuSnapshot) -> Menu {
 }
 
 fn format_tray_tooltip(snap: &TrayMenuSnapshot) -> String {
-    let raw = if snap.multiroom && !snap.multiroom_peer_ids.is_empty() {
+    let raw = if !snap.pending_pair_requests.is_empty() {
+        let count = snap.pending_pair_requests.len();
+        if count == 1 {
+            format!(
+                "SoundHop — Pair request from {} (Code: {})",
+                snap.pending_pair_requests[0].display_name, snap.pending_pair_requests[0].sas_code
+            )
+        } else {
+            format!("SoundHop — {count} pending pair requests")
+        }
+    } else if snap.multiroom && !snap.multiroom_peer_ids.is_empty() {
         if !snap.connected_name.is_empty() {
             format!("SoundHop — Streaming to {}", snap.connected_name)
         } else {
@@ -640,6 +705,20 @@ fn collect_tray_snapshot(daemon: &Daemon) -> TrayMenuSnapshot {
         )
         .ok()
         .and_then(|v| v.get("apps").and_then(|a| a.as_array()).cloned())
+        .unwrap_or_default();
+        let pending_pair_requests: Vec<PendingPairRequest> = ipc_request(
+            "pair_pending",
+            serde_json::json!({}),
+            None,
+            Duration::from_millis(400),
+        )
+        .ok()
+        .and_then(|v| v.get("requests").and_then(|a| a.as_array()).cloned())
+        .map(|arr| {
+            arr.into_iter()
+                .filter_map(|item| serde_json::from_value::<PendingPairRequest>(item).ok())
+                .collect()
+        })
         .unwrap_or_default();
 
         if let Some(st_json) = status_json {
@@ -748,6 +827,7 @@ fn collect_tray_snapshot(daemon: &Daemon) -> TrayMenuSnapshot {
                 mic_active,
                 &mic_direction,
                 android_active,
+                &pending_pair_requests,
             );
             return TrayMenuSnapshot {
                 peers,
@@ -765,6 +845,7 @@ fn collect_tray_snapshot(daemon: &Daemon) -> TrayMenuSnapshot {
                 mic_direction,
                 routed_apps_lower,
                 android_active,
+                pending_pair_requests,
                 badge,
                 signature,
             };
@@ -776,7 +857,8 @@ fn collect_tray_snapshot(daemon: &Daemon) -> TrayMenuSnapshot {
     let cfg = lock_or_recover(&ctrl.config).clone();
     let streams = ctrl.list_apps();
     let and_running = ctrl.android_session.is_active();
-    TrayMenuSnapshot::from_parts(peers, streams, st, cfg, and_running)
+    let pending_pair_requests = ctrl.pending_pair_requests();
+    TrayMenuSnapshot::from_parts(peers, streams, st, cfg, and_running, pending_pair_requests)
 }
 
 fn handle_menu_action(id_str: &str, daemon: &Daemon, running: &AtomicBool) {
@@ -797,6 +879,32 @@ fn handle_menu_action(id_str: &str, daemon: &Daemon, running: &AtomicBool) {
     }
     if id_str == "open_android_wizard" {
         spawn_self_args(&["--gui-tab", "phone"]);
+        return;
+    }
+    if let Some(req_id) = id_str.strip_prefix("pair_approve:") {
+        if external {
+            let _ = ipc_request(
+                "pair_approve",
+                serde_json::json!({ "request_id": req_id }),
+                None,
+                Duration::from_secs(5),
+            );
+        } else {
+            let _ = ctrl.approve_pair_request(req_id);
+        }
+        return;
+    }
+    if let Some(req_id) = id_str.strip_prefix("pair_deny:") {
+        if external {
+            let _ = ipc_request(
+                "pair_deny",
+                serde_json::json!({ "request_id": req_id }),
+                None,
+                Duration::from_secs(5),
+            );
+        } else {
+            let _ = ctrl.deny_pair_request(req_id);
+        }
         return;
     }
     if id_str == "android_stop" {
@@ -1232,6 +1340,7 @@ fn compute_menu_signature(
     mic_active: bool,
     mic_direction: &str,
     android_active: bool,
+    pending_pair_requests: &[PendingPairRequest],
 ) -> String {
     let peer_sig: Vec<String> = peers
         .iter()
@@ -1252,8 +1361,12 @@ fn compute_menu_signature(
         .collect();
     let mut sorted_multi: Vec<&str> = multiroom_peer_ids.iter().map(String::as_str).collect();
     sorted_multi.sort_unstable();
+    let pair_sig: Vec<String> = pending_pair_requests
+        .iter()
+        .map(|r| format!("{}:{}", r.request_id, r.sas_code))
+        .collect();
     format!(
-        "peers={}|apps={}|conn={}|cname={}|multi={}|share={}|auto={}|keep={}|mic_on={}|mic={}|and={}",
+        "peers={}|apps={}|conn={}|cname={}|multi={}|share={}|auto={}|keep={}|mic_on={}|mic={}|and={}|pair={}",
         peer_sig.join(","),
         app_sig.join(","),
         connected_peer,
@@ -1265,6 +1378,7 @@ fn compute_menu_signature(
         mic_active,
         mic_direction,
         android_active,
+        pair_sig.join(","),
     )
 }
 
@@ -1532,6 +1646,7 @@ pub fn run_tray(verbose: bool) -> Result<i32, String> {
         initial_st,
         initial_cfg,
         ctrl.android_session.is_active(),
+        ctrl.pending_pair_requests(),
     );
     let initial_icon = build_tray_icon(initial_snap.badge);
     let initial_menu = build_tray_menu_from_snapshot(&initial_snap);
@@ -1677,8 +1792,20 @@ mod tests {
 
     #[test]
     fn test_compute_menu_signature_tracks_apps_and_android() {
-        let s1 =
-            compute_menu_signature(&[], &[], "", "", &[], false, false, false, false, "", false);
+        let s1 = compute_menu_signature(
+            &[],
+            &[],
+            "",
+            "",
+            &[],
+            false,
+            false,
+            false,
+            false,
+            "",
+            false,
+            &[],
+        );
         let s2 = compute_menu_signature(
             &[],
             &[serde_json::json!({
@@ -1696,9 +1823,22 @@ mod tests {
             false,
             "",
             false,
+            &[],
         );
-        let s3 =
-            compute_menu_signature(&[], &[], "", "", &[], false, false, false, false, "", true);
+        let s3 = compute_menu_signature(
+            &[],
+            &[],
+            "",
+            "",
+            &[],
+            false,
+            false,
+            false,
+            false,
+            "",
+            true,
+            &[],
+        );
         assert_ne!(s1, s2);
         assert_ne!(s1, s3);
     }
@@ -1717,6 +1857,7 @@ mod tests {
             false,
             "send",
             false,
+            &[],
         );
         // Same count of multiroom peers, different peer IDs
         let diff_multi = compute_menu_signature(
@@ -1731,6 +1872,7 @@ mod tests {
             false,
             "send",
             false,
+            &[],
         );
         assert_ne!(base, diff_multi);
 
@@ -1747,6 +1889,7 @@ mod tests {
             true,
             "send",
             false,
+            &[],
         );
         assert_ne!(base, diff_mic);
 
@@ -1763,6 +1906,7 @@ mod tests {
             false,
             "send",
             false,
+            &[],
         );
         assert_ne!(base, diff_name);
     }
@@ -1774,30 +1918,79 @@ mod tests {
 
         // Idle
         cfg.sharing.enabled = false;
-        let idle =
-            TrayMenuSnapshot::from_parts(Vec::new(), Vec::new(), st.clone(), cfg.clone(), false);
+        let idle = TrayMenuSnapshot::from_parts(
+            Vec::new(),
+            Vec::new(),
+            st.clone(),
+            cfg.clone(),
+            false,
+            Vec::new(),
+        );
         assert_eq!(format_tray_tooltip(&idle), "SoundHop — Idle");
 
         // Sharing speakers
         cfg.sharing.enabled = true;
-        let sharing =
-            TrayMenuSnapshot::from_parts(Vec::new(), Vec::new(), st.clone(), cfg.clone(), false);
+        let sharing = TrayMenuSnapshot::from_parts(
+            Vec::new(),
+            Vec::new(),
+            st.clone(),
+            cfg.clone(),
+            false,
+            Vec::new(),
+        );
         assert_eq!(format_tray_tooltip(&sharing), "SoundHop — Sharing speakers");
 
         // Receiving phone audio
-        let phone =
-            TrayMenuSnapshot::from_parts(Vec::new(), Vec::new(), st.clone(), cfg.clone(), true);
+        let phone = TrayMenuSnapshot::from_parts(
+            Vec::new(),
+            Vec::new(),
+            st.clone(),
+            cfg.clone(),
+            true,
+            Vec::new(),
+        );
         assert_eq!(
             format_tray_tooltip(&phone),
             "SoundHop — Receiving phone audio"
+        );
+
+        // Pending pair request takes priority in tooltip
+        let pending = vec![PendingPairRequest {
+            request_id: "req-1".to_string(),
+            device_id: "dev-1".to_string(),
+            display_name: "Studio Laptop".to_string(),
+            platform: "linux".to_string(),
+            remote_addr: "192.168.1.42:51234".to_string(),
+            fingerprint: "aa:bb:cc:dd".to_string(),
+            sas_code: "482-913".to_string(),
+            created_at: 100.0,
+            expires_at: 160.0,
+        }];
+        let pair_snap = TrayMenuSnapshot::from_parts(
+            Vec::new(),
+            Vec::new(),
+            st.clone(),
+            cfg.clone(),
+            false,
+            pending,
+        );
+        assert_eq!(
+            format_tray_tooltip(&pair_snap),
+            "SoundHop — Pair request from Studio Laptop (Code: 482-913)"
         );
 
         // Streaming to a single peer
         st.connected_peer = "peer-1".to_string();
         st.connected_name = "Living Room".to_string();
         st.connected_sink = "sink-1".to_string();
-        let streaming =
-            TrayMenuSnapshot::from_parts(Vec::new(), Vec::new(), st.clone(), cfg.clone(), false);
+        let streaming = TrayMenuSnapshot::from_parts(
+            Vec::new(),
+            Vec::new(),
+            st.clone(),
+            cfg.clone(),
+            false,
+            Vec::new(),
+        );
         assert_eq!(
             format_tray_tooltip(&streaming),
             "SoundHop — Streaming to Living Room"
@@ -1811,6 +2004,7 @@ mod tests {
             st,
             cfg,
             false,
+            Vec::new(),
         ));
         assert!(long_tip.chars().count() <= 120);
         assert!(long_tip.ends_with("..."));

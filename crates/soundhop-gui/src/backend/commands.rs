@@ -63,6 +63,20 @@ pub enum GuiCommand {
         pin: String,
     },
     ClearPairing,
+    SendPairRequest {
+        host: String,
+        port: Option<u16>,
+        code: Option<String>,
+    },
+    ApprovePairRequest {
+        request_id: String,
+    },
+    DenyPairRequest {
+        request_id: String,
+    },
+    RevokeTrustedPeer {
+        device_id: String,
+    },
     AndroidInstallTools,
     AndroidSwitchWifi {
         serial: String,
@@ -185,6 +199,16 @@ impl WorkerState {
             }
             GuiCommand::ApplyPairingPin { pin } => self.handle_apply_pairing_pin(pin),
             GuiCommand::ClearPairing => self.handle_clear_pairing(),
+            GuiCommand::SendPairRequest { host, port, code } => {
+                self.handle_send_pair_request(host, port, code)
+            }
+            GuiCommand::ApprovePairRequest { request_id } => {
+                self.handle_approve_pair_request(request_id)
+            }
+            GuiCommand::DenyPairRequest { request_id } => self.handle_deny_pair_request(request_id),
+            GuiCommand::RevokeTrustedPeer { device_id } => {
+                self.handle_revoke_trusted_peer(device_id)
+            }
             GuiCommand::AndroidInstallTools => self.handle_android_install_tools(),
             GuiCommand::AndroidSwitchWifi { serial } => self.handle_android_switch_wifi(serial),
             GuiCommand::AndroidConnectWifi { ip_port } => self.handle_android_connect_wifi(ip_port),
@@ -591,5 +615,98 @@ impl WorkerState {
             Ok(())
         };
         self.finish_with_toast(res, "Pairing cleared. Switched back to Home Wi-Fi mode.");
+    }
+
+    fn handle_send_pair_request(&mut self, host: String, port: Option<u16>, code: Option<String>) {
+        let trimmed = host.trim().to_string();
+        if trimmed.is_empty() {
+            self.set_busy(None);
+            self.push_toast("Target device address is required to pair.", true);
+            return;
+        }
+        self.set_busy(Some(format!("Sending pair request to {trimmed}...")));
+        let res = if self.use_ipc && ipc_is_running(None) {
+            let mut payload = serde_json::json!({ "host": trimmed });
+            if let Some(p) = port {
+                payload["port"] = serde_json::json!(p);
+            }
+            if let Some(ref c) = code {
+                if !c.trim().is_empty() {
+                    payload["code"] = serde_json::json!(c.trim());
+                }
+            }
+            ipc_checked(
+                "pair_request",
+                payload,
+                Duration::from_secs(65),
+                "Pair request failed",
+            )
+            .map(|_| ())
+        } else {
+            let _sync = lock_or_recover(&self.controller_sync_lock);
+            self.controller
+                .pair_request(&trimmed, port, code.as_deref())
+                .map(|_| ())
+                .map_err(|e| e.to_string())
+        };
+        self.set_busy(None);
+        self.finish_with_toast(res, format!("Paired with {trimmed}!"));
+    }
+
+    fn handle_approve_pair_request(&mut self, request_id: String) {
+        let res = if self.use_ipc && ipc_is_running(None) {
+            ipc_checked(
+                "pair_approve",
+                serde_json::json!({ "request_id": request_id }),
+                Duration::from_secs(5),
+                "Failed to approve pair request",
+            )
+            .map(|_| ())
+        } else {
+            let _sync = lock_or_recover(&self.controller_sync_lock);
+            self.controller
+                .approve_pair_request(&request_id)
+                .map(|_| ())
+                .map_err(|e| e.to_string())
+        };
+        self.finish_with_toast(res, "Device pairing approved.");
+    }
+
+    fn handle_deny_pair_request(&mut self, request_id: String) {
+        let res = if self.use_ipc && ipc_is_running(None) {
+            ipc_checked(
+                "pair_deny",
+                serde_json::json!({ "request_id": request_id }),
+                Duration::from_secs(5),
+                "Failed to deny pair request",
+            )
+            .map(|_| ())
+        } else {
+            let _sync = lock_or_recover(&self.controller_sync_lock);
+            self.controller
+                .deny_pair_request(&request_id)
+                .map(|_| ())
+                .map_err(|e| e.to_string())
+        };
+        self.finish_with_toast(res, "Device pairing request denied.");
+    }
+
+    fn handle_revoke_trusted_peer(&mut self, device_id: String) {
+        let res = if self.use_ipc && ipc_is_running(None) {
+            ipc_checked(
+                "pair_revoke",
+                serde_json::json!({ "device_id": device_id }),
+                Duration::from_secs(5),
+                "Failed to revoke trusted device",
+            )
+            .map(|_| ())
+        } else {
+            let _sync = lock_or_recover(&self.controller_sync_lock);
+            self.controller
+                .revoke_trusted_peer(&device_id)
+                .map(|_| ())
+                .map_err(|e| e.to_string())
+        };
+        self.finish_with_toast(res, "Trusted device revoked.");
     }
 }

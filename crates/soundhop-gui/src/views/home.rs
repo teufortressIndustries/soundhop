@@ -5,7 +5,7 @@ use std::collections::HashSet;
 
 use eframe::egui::{self, RichText};
 
-use crate::backend::{GuiBackend, GuiCommand, GuiSnapshot};
+use crate::backend::{GuiBackend, GuiCommand, GuiSnapshot, PeerView};
 use crate::theme::Palette;
 #[cfg(not(target_os = "windows"))]
 use crate::widgets::segmented_control;
@@ -13,6 +13,23 @@ use crate::widgets::{
     audio_wave_indicator, callout_card, card, danger_button, pill_badge, primary_button,
     secondary_button, section_header, toggle_switch,
 };
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum PeerTrustState {
+    Trusted,
+    PairingRequired,
+    OpenLan,
+}
+
+pub(crate) fn peer_trust_state(peer: &PeerView) -> PeerTrustState {
+    if peer.paired {
+        PeerTrustState::Trusted
+    } else if matches!(peer.security.as_str(), "psk" | "paired" | "pin" | "cookie") {
+        PeerTrustState::PairingRequired
+    } else {
+        PeerTrustState::OpenLan
+    }
+}
 
 #[derive(Default)]
 pub struct HomeViewState {
@@ -296,10 +313,27 @@ pub fn render(
                                 pal.text_secondary,
                                 pal.card_elevated,
                             );
-                            if peer.paired {
-                                pill_badge(ui, "Paired", pal.success, pal.success_soft);
-                            } else if matches!(peer.security.as_str(), "psk" | "paired" | "pin") {
-                                pill_badge(ui, "Pairing Required", pal.warning, pal.warning_soft);
+                            let trust_state = peer_trust_state(peer);
+                            match trust_state {
+                                PeerTrustState::Trusted => {
+                                    pill_badge(ui, "Trusted", pal.success, pal.success_soft);
+                                }
+                                PeerTrustState::PairingRequired => {
+                                    pill_badge(
+                                        ui,
+                                        "Pairing Required",
+                                        pal.warning,
+                                        pal.warning_soft,
+                                    );
+                                }
+                                PeerTrustState::OpenLan => {
+                                    pill_badge(
+                                        ui,
+                                        "Open LAN",
+                                        pal.text_secondary,
+                                        pal.card_elevated,
+                                    );
+                                }
                             }
                             if is_conn {
                                 pill_badge(ui, "Connected", pal.success, pal.success_soft);
@@ -323,23 +357,59 @@ pub fn render(
                         if !state.multiroom_mode {
                             let is_connecting_this =
                                 snap.pending_peer_id.as_deref() == Some(peer.id.as_str());
+                            let trust_state = peer_trust_state(peer);
                             if is_conn {
                                 if danger_button(ui, pal, "Disconnect").clicked() {
                                     backend.send(GuiCommand::Disconnect);
                                 }
                             } else {
-                                ui.add_enabled_ui(!is_connecting_this, |ui| {
-                                    let btn_label = if is_connecting_this {
-                                        "Connecting..."
-                                    } else {
-                                        "Play Here"
-                                    };
-                                    if primary_button(ui, pal, btn_label).clicked() {
-                                        backend.send(GuiCommand::ConnectPeer {
-                                            peer_id: peer.id.clone(),
+                                match trust_state {
+                                    PeerTrustState::Trusted => {
+                                        ui.add_enabled_ui(!is_connecting_this, |ui| {
+                                            let btn_label = if is_connecting_this {
+                                                "Connecting..."
+                                            } else {
+                                                "Play Here"
+                                            };
+                                            if primary_button(ui, pal, btn_label).clicked() {
+                                                backend.send(GuiCommand::ConnectPeer {
+                                                    peer_id: peer.id.clone(),
+                                                });
+                                            }
                                         });
                                     }
-                                });
+                                    PeerTrustState::PairingRequired => {
+                                        if primary_button(ui, pal, "Pair").clicked() {
+                                            backend.send(GuiCommand::SendPairRequest {
+                                                host: peer.host.clone(),
+                                                port: None,
+                                                code: None,
+                                            });
+                                        }
+                                    }
+                                    PeerTrustState::OpenLan => {
+                                        ui.add_enabled_ui(!is_connecting_this, |ui| {
+                                            let btn_label = if is_connecting_this {
+                                                "Connecting..."
+                                            } else {
+                                                "Play Here"
+                                            };
+                                            if primary_button(ui, pal, btn_label).clicked() {
+                                                backend.send(GuiCommand::ConnectPeer {
+                                                    peer_id: peer.id.clone(),
+                                                });
+                                            }
+                                        });
+                                        ui.add_space(6.0);
+                                        if secondary_button(ui, pal, "Pair").clicked() {
+                                            backend.send(GuiCommand::SendPairRequest {
+                                                host: peer.host.clone(),
+                                                port: None,
+                                                code: None,
+                                            });
+                                        }
+                                    }
+                                }
                             }
                         }
                     });
@@ -654,5 +724,20 @@ mod tests {
         snap.firewall_ports_allowed = Some(false);
         snap.sharing_enabled = false;
         assert!(!should_show_firewall_banner(&snap));
+    }
+
+    #[test]
+    fn test_peer_trust_state_classification() {
+        let mut p = peer("p1");
+        p.security = "trusted-lan".to_string();
+        p.paired = false;
+        assert_eq!(peer_trust_state(&p), PeerTrustState::OpenLan);
+
+        p.security = "psk".to_string();
+        p.paired = false;
+        assert_eq!(peer_trust_state(&p), PeerTrustState::PairingRequired);
+
+        p.paired = true;
+        assert_eq!(peer_trust_state(&p), PeerTrustState::Trusted);
     }
 }

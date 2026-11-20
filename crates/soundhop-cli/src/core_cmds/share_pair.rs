@@ -8,7 +8,7 @@ use soundhop_core::security::generate_pairing_pin;
 use soundhop_core::state::PairedPeer;
 
 use super::try_ipc;
-use crate::parser::{PairArgs, ShareAction, ShareArgs};
+use crate::parser::{PairAction, PairArgs, ShareAction, ShareArgs};
 use crate::ui::{emit_error, header, info, lock_or_recover, ok, print_json};
 
 pub fn handle_share(controller: &Arc<Controller>, args: &ShareArgs, json_out: bool) -> i32 {
@@ -141,6 +141,10 @@ fn pair_status_json(controller: &Controller) -> serde_json::Value {
 }
 
 pub fn handle_pair(controller: &Arc<Controller>, args: &PairArgs, json_out: bool) -> i32 {
+    if let Some(ref action) = args.action {
+        return handle_pair_v2(controller, action, json_out);
+    }
+
     let target = args.target.as_deref().unwrap_or("status").trim();
     if target.eq_ignore_ascii_case("generate") {
         let pin = generate_pairing_pin();
@@ -254,6 +258,267 @@ pub fn handle_pair(controller: &Arc<Controller>, args: &PairArgs, json_out: bool
     }
 }
 
+fn handle_pair_v2(controller: &Arc<Controller>, action: &PairAction, json_out: bool) -> i32 {
+    match action {
+        PairAction::Request { host, port, code } => {
+            let mut payload = serde_json::json!({ "host": host });
+            if let Some(p) = port {
+                payload["port"] = serde_json::json!(p);
+            }
+            if let Some(c) = code {
+                payload["code"] = serde_json::json!(c);
+            }
+            let res =
+                if let Some(ipc_res) = try_ipc("pair_request", payload, Duration::from_secs(65)) {
+                    ipc_res
+                } else {
+                    controller
+                        .pair_request(host, *port, code.as_deref())
+                        .map_err(|e| e.to_string())
+                };
+            match res {
+                Ok(val) => {
+                    if json_out {
+                        print_json(&val);
+                    } else {
+                        let name = val
+                            .get("peer")
+                            .and_then(|p| p.get("display_name"))
+                            .and_then(|v| v.as_str())
+                            .unwrap_or(host);
+                        let fp = val
+                            .get("peer")
+                            .and_then(|p| p.get("fingerprint"))
+                            .and_then(|v| v.as_str())
+                            .unwrap_or("");
+                        let sas = val.get("sas_code").and_then(|v| v.as_str()).unwrap_or("");
+                        ok(&format!(
+                            "Paired with '{name}' (code: {sas}, fingerprint: {fp})."
+                        ));
+                    }
+                    0
+                }
+                Err(e) => {
+                    emit_error(&e, json_out);
+                    1
+                }
+            }
+        }
+        PairAction::Pending => {
+            let res = if let Some(ipc_res) = try_ipc(
+                "pair_pending",
+                serde_json::json!({}),
+                Duration::from_secs(3),
+            ) {
+                ipc_res
+            } else {
+                let reqs = controller.pending_pair_requests();
+                Ok(serde_json::json!({ "ok": true, "requests": reqs }))
+            };
+            match res {
+                Ok(val) => {
+                    if json_out {
+                        print_json(&val);
+                    } else {
+                        let reqs = val
+                            .get("requests")
+                            .and_then(|v| v.as_array())
+                            .cloned()
+                            .unwrap_or_default();
+                        header("Pending Pair Requests");
+                        if reqs.is_empty() {
+                            info("No pending pair requests.");
+                        } else {
+                            for r in &reqs {
+                                let id = r.get("request_id").and_then(|v| v.as_str()).unwrap_or("");
+                                let name = r
+                                    .get("display_name")
+                                    .and_then(|v| v.as_str())
+                                    .unwrap_or("Unknown");
+                                let sas = r.get("sas_code").and_then(|v| v.as_str()).unwrap_or("");
+                                let addr =
+                                    r.get("remote_addr").and_then(|v| v.as_str()).unwrap_or("");
+                                info(&format!(
+                                    "  {id}  {name} ({addr}) — Verification Code: {sas}"
+                                ));
+                            }
+                        }
+                    }
+                    0
+                }
+                Err(e) => {
+                    emit_error(&e, json_out);
+                    1
+                }
+            }
+        }
+        PairAction::Approve { id } => {
+            let res = if let Some(ipc_res) = try_ipc(
+                "pair_approve",
+                serde_json::json!({ "request_id": id }),
+                Duration::from_secs(5),
+            ) {
+                ipc_res
+            } else {
+                controller
+                    .approve_pair_request(id)
+                    .map_err(|e| e.to_string())
+            };
+            match res {
+                Ok(val) => {
+                    if json_out {
+                        print_json(&val);
+                    } else {
+                        ok(&format!("Approved pair request '{id}'."));
+                    }
+                    0
+                }
+                Err(e) => {
+                    emit_error(&e, json_out);
+                    1
+                }
+            }
+        }
+        PairAction::Deny { id } => {
+            let res = if let Some(ipc_res) = try_ipc(
+                "pair_deny",
+                serde_json::json!({ "request_id": id }),
+                Duration::from_secs(5),
+            ) {
+                ipc_res
+            } else {
+                controller.deny_pair_request(id).map_err(|e| e.to_string())
+            };
+            match res {
+                Ok(val) => {
+                    if json_out {
+                        print_json(&val);
+                    } else {
+                        ok(&format!("Denied pair request '{id}'."));
+                    }
+                    0
+                }
+                Err(e) => {
+                    emit_error(&e, json_out);
+                    1
+                }
+            }
+        }
+        PairAction::Revoke { device_id } => {
+            let res = if let Some(ipc_res) = try_ipc(
+                "pair_revoke",
+                serde_json::json!({ "device_id": device_id }),
+                Duration::from_secs(5),
+            ) {
+                ipc_res
+            } else {
+                controller
+                    .revoke_trusted_peer(device_id)
+                    .map_err(|e| e.to_string())
+            };
+            match res {
+                Ok(val) => {
+                    if json_out {
+                        print_json(&val);
+                    } else {
+                        let revoked = val
+                            .get("revoked")
+                            .and_then(|v| v.as_bool())
+                            .unwrap_or(false);
+                        if revoked {
+                            ok(&format!("Revoked trusted device '{device_id}'."));
+                        } else {
+                            info(&format!("No trusted device found with ID '{device_id}'."));
+                        }
+                    }
+                    0
+                }
+                Err(e) => {
+                    emit_error(&e, json_out);
+                    1
+                }
+            }
+        }
+        PairAction::List => {
+            let res = if let Some(ipc_res) =
+                try_ipc("pair_list", serde_json::json!({}), Duration::from_secs(3))
+            {
+                ipc_res
+            } else {
+                let peers: Vec<serde_json::Value> = controller
+                    .trusted_peers()
+                    .iter()
+                    .map(|p| p.to_public_json())
+                    .collect();
+                Ok(serde_json::json!({ "ok": true, "trusted_peers": peers }))
+            };
+            match res {
+                Ok(val) => {
+                    if json_out {
+                        print_json(&val);
+                    } else {
+                        let peers = val
+                            .get("trusted_peers")
+                            .and_then(|v| v.as_array())
+                            .cloned()
+                            .unwrap_or_default();
+                        header("Trusted Devices");
+                        if peers.is_empty() {
+                            info("No trusted devices paired.");
+                        } else {
+                            for p in &peers {
+                                let name = p
+                                    .get("display_name")
+                                    .and_then(|v| v.as_str())
+                                    .unwrap_or("Unknown");
+                                let id = p.get("device_id").and_then(|v| v.as_str()).unwrap_or("");
+                                let fp =
+                                    p.get("fingerprint").and_then(|v| v.as_str()).unwrap_or("");
+                                info(&format!("  {name}  (id: {id}, fingerprint: {fp})"));
+                            }
+                        }
+                    }
+                    0
+                }
+                Err(e) => {
+                    emit_error(&e, json_out);
+                    1
+                }
+            }
+        }
+        PairAction::Code => {
+            let res = if let Some(ipc_res) =
+                try_ipc("pair_code", serde_json::json!({}), Duration::from_secs(3))
+            {
+                ipc_res
+            } else {
+                Ok(controller.generate_headless_pair_code())
+            };
+            match res {
+                Ok(val) => {
+                    if json_out {
+                        print_json(&val);
+                    } else {
+                        let code = val.get("code").and_then(|v| v.as_str()).unwrap_or("");
+                        let ttl = val.get("ttl_secs").and_then(|v| v.as_u64()).unwrap_or(120);
+                        ok(&format!(
+                            "One-time headless pairing code: {code} (valid for {ttl}s)"
+                        ));
+                        info(&format!(
+                            "On the remote device, run: soundhop pair request <this-host> --code {code}"
+                        ));
+                    }
+                    0
+                }
+                Err(e) => {
+                    emit_error(&e, json_out);
+                    1
+                }
+            }
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -307,11 +572,95 @@ mod tests {
         let code = handle_pair(
             &ctrl,
             &PairArgs {
+                action: None,
                 target: Some("status".to_string()),
                 pin: None,
             },
             true,
         );
         assert_eq!(code, 0);
+    }
+
+    #[test]
+    fn test_pair_v2_cli_subcommands_parse_and_execute() {
+        use crate::parser::{Cli, Commands};
+        use clap::Parser;
+
+        let parsed = Cli::try_parse_from([
+            "soundhop",
+            "pair",
+            "request",
+            "192.168.1.50",
+            "--port",
+            "4725",
+            "--code",
+            "123456",
+        ])
+        .expect("parse pair request");
+        match parsed.command {
+            Some(Commands::Pair(pa)) => match pa.action {
+                Some(PairAction::Request { host, port, code }) => {
+                    assert_eq!(host, "192.168.1.50");
+                    assert_eq!(port, Some(4725));
+                    assert_eq!(code.as_deref(), Some("123456"));
+                }
+                other => panic!("unexpected pair action: {other:?}"),
+            },
+            other => panic!("unexpected command: {other:?}"),
+        }
+
+        for argv in [
+            vec!["soundhop", "pair", "pending"],
+            vec!["soundhop", "pair", "approve", "req-1"],
+            vec!["soundhop", "pair", "deny", "req-1"],
+            vec!["soundhop", "pair", "revoke", "dev-1"],
+            vec!["soundhop", "pair", "list"],
+            vec!["soundhop", "pair", "code"],
+            vec!["soundhop", "pair", "status"],
+            vec!["soundhop", "pair", "my-pc", "--pin", "ABCDEF123456"],
+        ] {
+            assert!(
+                Cli::try_parse_from(argv.clone()).is_ok(),
+                "failed to parse {argv:?}"
+            );
+        }
+
+        let ctrl = test_controller();
+        assert_eq!(
+            handle_pair(
+                &ctrl,
+                &PairArgs {
+                    action: Some(PairAction::Code),
+                    target: None,
+                    pin: None,
+                },
+                true,
+            ),
+            0
+        );
+        assert_eq!(
+            handle_pair(
+                &ctrl,
+                &PairArgs {
+                    action: Some(PairAction::List),
+                    target: None,
+                    pin: None,
+                },
+                true,
+            ),
+            0
+        );
+        assert_eq!(
+            handle_pair(
+                &ctrl,
+                &PairArgs {
+                    action: Some(PairAction::Pending),
+                    target: None,
+                    pin: None,
+                },
+                true,
+            ),
+            0
+        );
     }
 }

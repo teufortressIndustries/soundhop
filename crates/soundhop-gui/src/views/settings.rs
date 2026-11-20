@@ -340,8 +340,71 @@ pub fn render(
 
     ui.add_space(12.0);
 
-    // 2. Privacy & Pairing
+    // 2. Audio Quality & Latency (SHT3 Transport Profile)
     card(ui, pal, None, |ui| {
+        ui.label(
+            RichText::new("Audio Quality & Latency")
+                .color(pal.text)
+                .size(15.0)
+                .strong(),
+        );
+        ui.label(
+            RichText::new(
+                "Choose the SoundHop Transport v3 (SHT3) codec and latency profile for encrypted streaming.",
+            )
+            .color(pal.text_muted)
+            .size(12.0),
+        );
+        ui.add_space(10.0);
+
+        let active_profile = if snap.audio_profile.is_empty() {
+            snap.config.audio.profile.as_str()
+        } else {
+            snap.audio_profile.as_str()
+        };
+
+        for (profile_key, title, desc) in [
+            (
+                "opus-balanced",
+                "Opus Balanced (Default)",
+                "48 kHz stereo Opus (20 ms frames, 128 kbps VBR) • Best all-around quality and Wi-Fi resilience.",
+            ),
+            (
+                "opus-low-latency",
+                "Opus Low-Latency (10 ms)",
+                "48 kHz stereo Opus (10 ms frames, 128 kbps VBR) • Ideal for videos, calls, and gaming.",
+            ),
+            (
+                "opus-low-bandwidth",
+                "Opus Low-Bandwidth (64 kbps)",
+                "48 kHz stereo Opus (20 ms frames, 64 kbps VBR) • Smooth playback on congested Wi-Fi.",
+            ),
+            (
+                "pcm-lossless",
+                "Encrypted Lossless PCM",
+                "48 kHz stereo uncompressed S16LE over ChaCha20-Poly1305 • Zero-loss studio audio.",
+            ),
+        ] {
+            let selected = active_profile == profile_key;
+            if selectable_card(ui, pal, ("audio_profile", profile_key), selected, title, desc)
+                .clicked()
+                && !selected
+            {
+                backend.send(GuiCommand::SaveConfigPatch {
+                    patch: serde_json::json!({ "audio": { "profile": profile_key } }),
+                    toast: Some(format!("Audio profile set to {title}.")),
+                });
+            }
+            ui.add_space(6.0);
+        }
+    });
+
+    ui.add_space(12.0);
+
+    // 3. Privacy & Pairing
+    card(ui, pal, None, |ui| {
+        let trusted_count = snap.trusted_peers.len();
+        let effective_paired_count = trusted_count.max(snap.paired_peer_count);
         ui.horizontal(|ui| {
             ui.vertical(|ui| {
                 ui.label(
@@ -364,12 +427,12 @@ pub fn render(
                 } else {
                     match snap.listener_security.as_str() {
                         "cookie" | "psk" | "paired" | "pin" => {
-                            if !snap.config.sharing.psk_hash.is_empty()
-                                && snap.paired_peer_count > 0
+                            if effective_paired_count > 0
+                                || !snap.config.sharing.psk_hash.is_empty()
                             {
                                 pill_badge(
                                     ui,
-                                    "Enforcing: PIN Paired",
+                                    "Enforcing: Paired Only",
                                     pal.success,
                                     pal.success_soft,
                                 );
@@ -384,8 +447,10 @@ pub fn render(
                             pill_badge(ui, "Enforcing: Open", pal.warning, pal.warning_soft);
                         }
                         _ => {
-                            if !snap.config.sharing.psk_hash.is_empty() {
-                                pill_badge(ui, "PIN Paired", pal.success, pal.success_soft);
+                            if effective_paired_count > 0
+                                || !snap.config.sharing.psk_hash.is_empty()
+                            {
+                                pill_badge(ui, "Paired Devices", pal.success, pal.success_soft);
                             } else {
                                 pill_badge(ui, "Home Wi-Fi", pal.accent, pal.accent_soft);
                             }
@@ -395,73 +460,145 @@ pub fn render(
             });
         });
 
-        ui.add_space(6.0);
-        let live_enforcement_line = if !snap.sharing_enabled && snap.listener_security.is_empty() {
-            format!(
-                "Listener inactive (speaker sharing is off) • {} paired device{}",
-                snap.paired_peer_count,
-                if snap.paired_peer_count == 1 { "" } else { "s" }
-            )
-        } else if snap.listener_security.is_empty() {
-            format!(
-                "Configured: {} (listener not running) • {} paired device{}",
-                security_friendly_label(&snap.config.sharing.security),
-                snap.paired_peer_count,
-                if snap.paired_peer_count == 1 { "" } else { "s" }
-            )
-        } else {
-            let enforced_label = match snap.listener_security.as_str() {
-                "cookie" => {
-                    if matches!(
-                        snap.config.sharing.security.as_str(),
-                        "psk" | "paired" | "pin"
-                    ) {
-                        "PIN-Paired Devices Only (cookie auth)"
-                    } else {
-                        "System Audio Cookie"
-                    }
-                }
-                "psk" | "paired" | "pin" => "PIN-Paired Devices Only",
-                "open" => "Open (No Check)",
-                "trusted-lan" => "Home Wi-Fi (Automatic)",
-                other => other,
-            };
-            format!(
-                "Live enforcement: {} • {} paired device{}",
-                enforced_label,
-                snap.paired_peer_count,
-                if snap.paired_peer_count == 1 { "" } else { "s" }
-            )
-        };
-        ui.label(
-            RichText::new(live_enforcement_line)
-                .color(pal.text_secondary)
-                .size(12.0),
-        );
-
+        ui.add_space(8.0);
         let psk_mode_selected = matches!(
             snap.config.sharing.security.as_str(),
             "psk" | "paired" | "pin"
         );
+        let legacy_pa_status = if psk_mode_selected {
+            "Legacy PA-TCP off"
+        } else if snap.sharing_enabled {
+            "Legacy PA-TCP active"
+        } else {
+            "Legacy PA-TCP off"
+        };
+        let trusted_label = format!(
+            "{} trusted device{}",
+            trusted_count,
+            if trusted_count == 1 { "" } else { "s" }
+        );
+        let live_enforcement_line = if !snap.sharing_enabled && snap.listener_security.is_empty() {
+            format!("Listener inactive (sharing off) • {trusted_label} • {legacy_pa_status}")
+        } else if psk_mode_selected {
+            format!("Enforcing: Paired Devices Only • {trusted_label} • {legacy_pa_status}")
+        } else if snap.listener_security.is_empty() {
+            format!(
+                "Configured: {} • {trusted_label} • {legacy_pa_status}",
+                security_friendly_label(&snap.config.sharing.security)
+            )
+        } else {
+            let enforced_label = match snap.listener_security.as_str() {
+                "cookie" => "System Audio Cookie",
+                "psk" | "paired" | "pin" => "Paired Devices Only",
+                "open" => "Open (No Check)",
+                "trusted-lan" => "Home Wi-Fi (Automatic)",
+                other => other,
+            };
+            format!("Enforcing: {enforced_label} • {trusted_label} • {legacy_pa_status}")
+        };
+        callout_card(
+            ui,
+            if psk_mode_selected {
+                pal.success_soft
+            } else {
+                pal.card_elevated
+            },
+            if psk_mode_selected {
+                pal.success
+            } else {
+                pal.border
+            },
+            |ui| {
+                ui.label(
+                    RichText::new(live_enforcement_line)
+                        .color(if psk_mode_selected {
+                            pal.success
+                        } else {
+                            pal.text_secondary
+                        })
+                        .size(12.0)
+                        .strong(),
+                );
+            },
+        );
+
         if psk_mode_selected
-            && (snap.paired_peer_count == 0 || snap.config.sharing.psk_hash.is_empty())
+            && effective_paired_count == 0
+            && snap.config.sharing.psk_hash.is_empty()
         {
             ui.add_space(8.0);
             callout_card(ui, pal.warning_soft, pal.warning, |ui| {
                 ui.label(
-                    RichText::new("No active pairing code or paired devices")
+                    RichText::new("No trusted devices paired yet")
                         .color(pal.warning)
                         .size(12.5)
                         .strong(),
                 );
                 ui.label(
                     RichText::new(
-                        "\"PIN-Paired Devices Only\" is selected, but no devices are paired yet. Create or enter a shared pairing code below so your devices can connect.",
+                        "\"Paired Devices Only\" is selected, but no devices are trusted yet. Click Pair on a nearby speaker in Play & Share, or enter a shared code below.",
                     )
                     .color(pal.text_secondary)
                     .size(11.5),
                 );
             });
+        }
+
+        ui.add_space(10.0);
+        ui.separator();
+        ui.add_space(8.0);
+
+        // Trusted Devices (Pairing v2)
+        ui.horizontal(|ui| {
+            ui.label(
+                RichText::new("Trusted Devices")
+                    .color(pal.text)
+                    .size(13.5)
+                    .strong(),
+            );
+            pill_badge(ui, &format!("{trusted_count}"), pal.accent, pal.accent_soft);
+        });
+        ui.add_space(4.0);
+        if snap.trusted_peers.is_empty() {
+            ui.label(
+                RichText::new(
+                    "No trusted devices yet. Click Pair on a device in Play & Share or run 'soundhop pair request <host>'.",
+                )
+                .color(pal.text_muted)
+                .size(12.0),
+            );
+        } else {
+            for tp in &snap.trusted_peers {
+                callout_card(ui, pal.card_elevated, pal.border_subtle, |ui| {
+                    ui.horizontal(|ui| {
+                        ui.vertical(|ui| {
+                            ui.label(
+                                RichText::new(&tp.display_name)
+                                    .color(pal.text)
+                                    .size(13.0)
+                                    .strong(),
+                            );
+                            ui.label(
+                                RichText::new(format!(
+                                    "Fingerprint: {} • ID: {}",
+                                    tp.fingerprint, tp.device_id
+                                ))
+                                .color(pal.text_muted)
+                                .size(11.0)
+                                .monospace(),
+                            );
+                        });
+                        ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                            if danger_button(ui, pal, "Revoke").clicked() {
+                                backend.send(GuiCommand::RevokeTrustedPeer {
+                                    device_id: tp.device_id.clone(),
+                                });
+                            }
+                        });
+                    });
+                });
+                ui.add_space(4.0);
+            }
         }
 
         ui.add_space(10.0);

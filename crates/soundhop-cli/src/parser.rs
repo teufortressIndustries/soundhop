@@ -205,12 +205,51 @@ pub enum ShareAction {
 
 #[derive(Debug, Args)]
 pub struct PairArgs {
-    /// Peer name, ID, or IP, or "status" / "clear" / "generate"
+    #[command(subcommand)]
+    pub action: Option<PairAction>,
+
+    /// Peer name, ID, or IP, or "status" / "clear" / "generate" (legacy PIN/PSK mode)
     pub target: Option<String>,
 
     /// 12-character alphanumeric pairing code or passphrase to derive shared PSK & PulseAudio cookie
     #[arg(long)]
     pub pin: Option<String>,
+}
+
+#[derive(Debug, Subcommand)]
+pub enum PairAction {
+    /// Initiate an interactive Pairing v2 request to a remote SoundHop device
+    Request {
+        /// Target host IP, hostname, or discovered peer name/ID
+        host: String,
+        /// Pairing TCP port (default: 4715)
+        #[arg(short, long)]
+        port: Option<u16>,
+        /// Optional one-time headless pairing code from the remote device
+        #[arg(long)]
+        code: Option<String>,
+    },
+    /// List incoming Pairing v2 requests awaiting approval
+    Pending,
+    /// Approve a pending incoming Pairing v2 request by request ID or SAS verification code
+    Approve {
+        /// Request ID or 6-digit verification code (SAS)
+        id: String,
+    },
+    /// Deny a pending incoming Pairing v2 request by request ID or SAS verification code
+    Deny {
+        /// Request ID or 6-digit verification code (SAS)
+        id: String,
+    },
+    /// Revoke a previously trusted peer by device ID
+    Revoke {
+        /// Trusted peer device ID to revoke
+        device_id: String,
+    },
+    /// List all trusted Pairing v2 devices
+    List,
+    /// Generate a 120-second one-time pairing code for headless / Raspberry Pi devices
+    Code,
 }
 
 #[derive(Debug, Args)]

@@ -7,6 +7,7 @@ use soundhop_core::android::{AdbDevice, ToolStatus};
 use soundhop_core::config::Config;
 use soundhop_core::controller::Controller;
 use soundhop_core::discovery::Peer;
+use soundhop_core::pairing::{PendingPairRequest, TrustedPeer};
 use soundhop_core::state::{ActivePeerSession, KnownAndroidDevice, State};
 use soundhop_core::telemetry::TelemetrySnapshot;
 use soundhop_core::util::{is_own_non_loopback_ip, is_private_address};
@@ -118,6 +119,9 @@ pub struct GuiSnapshot {
     pub show_onboarding: bool,
     pub listener_security: String,
     pub paired_peer_count: usize,
+    pub trusted_peers: Vec<TrustedPeer>,
+    pub pending_pair_requests: Vec<PendingPairRequest>,
+    pub audio_profile: String,
     pub hydrated: bool,
 }
 
@@ -125,12 +129,21 @@ impl GuiSnapshot {
     pub fn from_controller(controller: &Controller) -> Self {
         let cfg = lock_or_recover(&controller.config).clone();
         let st = lock_or_recover(&controller.state).clone();
+        let trusted_peers = redact_trusted_peers(controller.trusted_peers());
+        let pending_pair_requests = controller.pending_pair_requests();
+        let mut paired_ids: HashSet<String> = st.paired_peers.keys().cloned().collect();
+        for tp in &trusted_peers {
+            paired_ids.insert(tp.device_id.clone());
+        }
 
         Self {
             daemon_connected: false,
             show_onboarding: !cfg.ui.onboarding_completed && st.known_peers.is_empty(),
             listener_security: st.listener_security.clone(),
-            paired_peer_count: st.paired_peers.len(),
+            paired_peer_count: paired_ids.len(),
+            trusted_peers,
+            pending_pair_requests,
+            audio_profile: cfg.audio.profile.clone(),
             config: cfg.clone(),
             connected: st.is_connected(),
             multiroom: st.is_multiroom(),
@@ -238,6 +251,68 @@ impl GuiSnapshot {
     }
 }
 
+pub(super) fn redact_trusted_peers(peers: Vec<TrustedPeer>) -> Vec<TrustedPeer> {
+    peers
+        .into_iter()
+        .map(|mut p| {
+            p.pairwise_secret = [0u8; 32];
+            p
+        })
+        .collect()
+}
+
+pub(super) fn parse_trusted_peers_json(values: &[serde_json::Value]) -> Vec<TrustedPeer> {
+    values
+        .iter()
+        .filter_map(|v| {
+            let device_id = v.get("device_id")?.as_str()?.trim().to_string();
+            if device_id.is_empty() || device_id == "lan-group" {
+                return None;
+            }
+            let display_name = v
+                .get("display_name")
+                .and_then(|x| x.as_str())
+                .unwrap_or(&device_id)
+                .to_string();
+            let mut ed25519_pub = [0u8; 32];
+            if let Some(hex_str) = v.get("ed25519_pub_hex").and_then(|x| x.as_str()) {
+                if hex_str.len() == 64 {
+                    for (i, chunk) in hex_str.as_bytes().as_chunks::<2>().0.iter().enumerate() {
+                        if let Ok(s) = std::str::from_utf8(chunk) {
+                            if let Ok(b) = u8::from_str_radix(s, 16) {
+                                ed25519_pub[i] = b;
+                            }
+                        }
+                    }
+                }
+            }
+            let fingerprint = v
+                .get("fingerprint")
+                .and_then(|x| x.as_str())
+                .unwrap_or("")
+                .to_string();
+            let paired_at = v.get("paired_at").and_then(|x| x.as_f64()).unwrap_or(0.0);
+            Some(TrustedPeer {
+                device_id,
+                display_name,
+                ed25519_pub,
+                pairwise_secret: [0u8; 32],
+                fingerprint,
+                paired_at,
+            })
+        })
+        .collect()
+}
+
+pub(super) fn parse_pending_pair_requests_json(
+    values: &[serde_json::Value],
+) -> Vec<PendingPairRequest> {
+    values
+        .iter()
+        .filter_map(|v| serde_json::from_value::<PendingPairRequest>(v.clone()).ok())
+        .collect()
+}
+
 pub(super) fn parse_android_history(values: Vec<serde_json::Value>) -> Vec<KnownAndroidDevice> {
     values
         .into_iter()
@@ -297,9 +372,13 @@ pub(super) struct RefreshUpdate {
     android_session_device: String,
     listener_security: String,
     paired_peer_count: usize,
+    trusted_peers: Vec<TrustedPeer>,
+    pending_pair_requests: Vec<PendingPairRequest>,
+    audio_profile: String,
 }
 
 impl RefreshUpdate {
+    #[allow(clippy::too_many_arguments)]
     pub(super) fn from_status(
         daemon_up: bool,
         cfg: Config,
@@ -308,6 +387,8 @@ impl RefreshUpdate {
         status_json: &serde_json::Value,
         apps_json: Vec<serde_json::Value>,
         live_peers: &[Peer],
+        trusted_peers: Vec<TrustedPeer>,
+        pending_pair_requests: Vec<PendingPairRequest>,
     ) -> Self {
         // Parse connection block
         let conn = status_json.get("connection").filter(|c| !c.is_null());
@@ -439,7 +520,7 @@ impl RefreshUpdate {
         };
 
         // Peers (merge live + remembered)
-        let paired_ids: HashSet<String> =
+        let mut paired_ids: HashSet<String> =
             if let Some(arr) = status_json.get("paired_peers").and_then(|v| v.as_array()) {
                 arr.iter()
                     .filter_map(|item| item.get("peer_id").and_then(|v| v.as_str()))
@@ -449,6 +530,19 @@ impl RefreshUpdate {
             } else {
                 st.paired_peers.keys().cloned().collect()
             };
+        let trusted_peers = redact_trusted_peers(trusted_peers);
+        for tp in &trusted_peers {
+            if !tp.device_id.is_empty() {
+                paired_ids.insert(tp.device_id.clone());
+            }
+        }
+        let audio_profile = status_json
+            .get("audio")
+            .and_then(|a| a.get("profile"))
+            .and_then(|v| v.as_str())
+            .filter(|s| !s.is_empty())
+            .map(String::from)
+            .unwrap_or_else(|| cfg.audio.profile.clone());
         let mut peer_views = Vec::new();
         let mut seen_ids = HashSet::new();
         for p in live_peers {
@@ -569,6 +663,9 @@ impl RefreshUpdate {
             android_session_device,
             listener_security,
             paired_peer_count: paired_ids.len(),
+            trusted_peers,
+            pending_pair_requests,
+            audio_profile,
         }
     }
 
@@ -609,6 +706,9 @@ impl RefreshUpdate {
         guard.android_session_device = self.android_session_device;
         guard.listener_security = self.listener_security;
         guard.paired_peer_count = self.paired_peer_count;
+        guard.trusted_peers = self.trusted_peers;
+        guard.pending_pair_requests = self.pending_pair_requests;
+        guard.audio_profile = self.audio_profile;
     }
 }
 
@@ -701,6 +801,8 @@ mod tests {
             &status_json,
             Vec::new(),
             &live_peers,
+            Vec::new(),
+            Vec::new(),
         );
 
         assert_eq!(update.listener_security, "cookie");

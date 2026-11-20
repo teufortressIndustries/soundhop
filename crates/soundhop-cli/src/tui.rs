@@ -17,13 +17,14 @@ use crossterm::terminal::{
     disable_raw_mode, enable_raw_mode, EnterAlternateScreen, LeaveAlternateScreen,
 };
 use ratatui::backend::CrosstermBackend;
-use ratatui::layout::{Constraint, Direction, Layout, Rect};
+use ratatui::layout::{Alignment, Constraint, Direction, Layout, Rect};
 use ratatui::style::{Color, Modifier, Style};
 use ratatui::text::{Line, Span};
-use ratatui::widgets::{Block, Borders, Gauge, List, ListItem, Paragraph, Tabs};
+use ratatui::widgets::{Block, Borders, Clear, Gauge, List, ListItem, Paragraph, Tabs};
 use ratatui::{Frame, Terminal};
 use soundhop_core::controller::{ConnectOptions, Controller};
 use soundhop_core::discovery::{discover_once_with_psk, DiscoveryManager, Peer};
+use soundhop_core::pairing::PendingPairRequest;
 use soundhop_core::util::{
     install_signal_handlers, is_own_non_loopback_ip, is_private_address, now_secs,
     signal_stop_requested, split_host_port,
@@ -66,6 +67,7 @@ pub struct TuiState {
     pub apps: Vec<serde_json::Value>,
     pub selected_app_idx: usize,
     pub manual_ip_prompt: Option<String>,
+    pub pending_pair_requests: Vec<PendingPairRequest>,
     pub status_message: String,
     pub should_quit: bool,
 }
@@ -99,6 +101,7 @@ impl TuiState {
             })
             .collect();
         let apps = controller.list_apps();
+        let pending_pair_requests = controller.pending_pair_requests();
         Self {
             controller,
             tab: TuiTab::PeersAndMultiRoom,
@@ -109,6 +112,7 @@ impl TuiState {
             apps,
             selected_app_idx: 0,
             manual_ip_prompt: None,
+            pending_pair_requests,
             status_message: "Press Tab to switch views, Space to select multi-room peers, Enter to apply, c/i for manual IP, q to quit.".to_string(),
             should_quit: false,
         }
@@ -139,6 +143,7 @@ impl TuiState {
     pub fn refresh_data(&mut self) {
         let _ = self.controller.status(Some(&self.peers));
         self.apps = self.controller.list_apps();
+        self.pending_pair_requests = self.controller.pending_pair_requests();
         if self.selected_peer_idx >= self.peers.len() && !self.peers.is_empty() {
             self.selected_peer_idx = self.peers.len() - 1;
         }
@@ -151,6 +156,41 @@ impl TuiState {
         if self.manual_ip_prompt.is_some() {
             self.handle_manual_ip_key(code);
             return;
+        }
+        if !self.pending_pair_requests.is_empty() {
+            match code {
+                KeyCode::Char('a') | KeyCode::Char('A') => {
+                    let req = self.pending_pair_requests.remove(0);
+                    match self.controller.approve_pair_request(&req.request_id) {
+                        Ok(_) => {
+                            self.status_message =
+                                format!("Approved pairing request from {}.", req.display_name);
+                        }
+                        Err(e) => {
+                            self.status_message = format!(
+                                "Approved pairing request from {} ({e}).",
+                                req.display_name
+                            );
+                        }
+                    }
+                    return;
+                }
+                KeyCode::Char('d') | KeyCode::Char('D') => {
+                    let req = self.pending_pair_requests.remove(0);
+                    match self.controller.deny_pair_request(&req.request_id) {
+                        Ok(_) => {
+                            self.status_message =
+                                format!("Denied pairing request from {}.", req.display_name);
+                        }
+                        Err(e) => {
+                            self.status_message =
+                                format!("Denied pairing request from {} ({e}).", req.display_name);
+                        }
+                    }
+                    return;
+                }
+                _ => {}
+            }
         }
         match code {
             KeyCode::Char('q') | KeyCode::Esc => {
@@ -541,6 +581,93 @@ pub fn draw_tui(frame: &mut Frame<'_>, state: &TuiState) {
     }
     draw_telemetry_bar(frame, chunks[2], state);
     draw_footer_bar(frame, chunks[3], state);
+
+    if let Some(req) = state.pending_pair_requests.first() {
+        draw_pair_request_modal(frame, frame.area(), req, state.pending_pair_requests.len());
+    }
+}
+
+fn centered_rect(percent_x: u16, height: u16, area: Rect) -> Rect {
+    let vertical = Layout::default()
+        .direction(Direction::Vertical)
+        .constraints([
+            Constraint::Fill(1),
+            Constraint::Length(height.min(area.height)),
+            Constraint::Fill(1),
+        ])
+        .split(area);
+    Layout::default()
+        .direction(Direction::Horizontal)
+        .constraints([
+            Constraint::Percentage((100 - percent_x) / 2),
+            Constraint::Percentage(percent_x),
+            Constraint::Percentage((100 - percent_x) / 2),
+        ])
+        .split(vertical[1])[1]
+}
+
+fn draw_pair_request_modal(
+    frame: &mut Frame<'_>,
+    area: Rect,
+    req: &PendingPairRequest,
+    total_pending: usize,
+) {
+    let popup_area = centered_rect(70, 9, area);
+    frame.render_widget(Clear, popup_area);
+
+    let mut lines = vec![
+        Line::from(Span::styled(
+            format!("{} wants to pair", req.display_name),
+            Style::default()
+                .fg(Color::White)
+                .add_modifier(Modifier::BOLD),
+        )),
+        Line::from(""),
+        Line::from(vec![
+            Span::styled("Verification Code: ", Style::default().fg(Color::Gray)),
+            Span::styled(
+                &req.sas_code,
+                Style::default()
+                    .fg(Color::Yellow)
+                    .add_modifier(Modifier::BOLD),
+            ),
+        ]),
+        Line::from(Span::styled(
+            format!(
+                "From: {}  •  Fingerprint: {}",
+                req.remote_addr, req.fingerprint
+            ),
+            Style::default().fg(Color::DarkGray),
+        )),
+        Line::from(""),
+        Line::from(vec![
+            Span::styled(
+                "[a] Approve",
+                Style::default()
+                    .fg(Color::Green)
+                    .add_modifier(Modifier::BOLD),
+            ),
+            Span::raw("     "),
+            Span::styled(
+                "[d] Deny",
+                Style::default().fg(Color::Red).add_modifier(Modifier::BOLD),
+            ),
+        ]),
+    ];
+    if total_pending > 1 {
+        lines.push(Line::from(Span::styled(
+            format!("(+{} more pending)", total_pending - 1),
+            Style::default().fg(Color::Cyan),
+        )));
+    }
+
+    let modal = Paragraph::new(lines).alignment(Alignment::Center).block(
+        Block::default()
+            .borders(Borders::ALL)
+            .border_style(Style::default().fg(Color::Yellow))
+            .title(" Incoming Pair Request "),
+    );
+    frame.render_widget(modal, popup_area);
 }
 
 fn draw_top_bar(frame: &mut Frame<'_>, area: Rect, state: &TuiState) {
@@ -1262,5 +1389,84 @@ mod tests {
         assert!(calls
             .iter()
             .any(|c| c.join(" ").contains("connect 192.168.1.99:5555")));
+    }
+
+    #[test]
+    fn test_tui_pending_pair_request_modal_render_approve_and_deny() {
+        let runner = Arc::new(MockRunner::new(|args, _| {
+            Ok(CommandResult {
+                args: args.to_vec(),
+                returncode: 0,
+                stdout: String::new(),
+                stderr: String::new(),
+            })
+        }));
+        let backend = Arc::new(LinuxAudioBackend::with_runner(runner));
+        let ctrl = Arc::new(Controller::new(
+            Some(Config::default()),
+            Some(State::default()),
+            Some(backend),
+            None,
+            None,
+            false,
+        ));
+        ctrl.set_save_enabled(false);
+
+        let mut tui_state = TuiState::new(ctrl);
+        tui_state.pending_pair_requests = vec![
+            PendingPairRequest {
+                request_id: "req-approve".to_string(),
+                device_id: "dev-1".to_string(),
+                display_name: "Living Room Laptop".to_string(),
+                platform: "linux".to_string(),
+                remote_addr: "192.168.1.42:54321".to_string(),
+                fingerprint: "11:22:33:44".to_string(),
+                sas_code: "482-913".to_string(),
+                created_at: 100.0,
+                expires_at: 160.0,
+            },
+            PendingPairRequest {
+                request_id: "req-deny".to_string(),
+                device_id: "dev-2".to_string(),
+                display_name: "Guest Phone".to_string(),
+                platform: "android".to_string(),
+                remote_addr: "192.168.1.43:54322".to_string(),
+                fingerprint: "55:66:77:88".to_string(),
+                sas_code: "901-234".to_string(),
+                created_at: 101.0,
+                expires_at: 161.0,
+            },
+        ];
+
+        let test_backend = TestBackend::new(100, 30);
+        let mut terminal = Terminal::new(test_backend).unwrap();
+        terminal.draw(|f| draw_tui(f, &tui_state)).unwrap();
+
+        let buf_text: String = terminal
+            .backend()
+            .buffer()
+            .content()
+            .iter()
+            .map(|c| c.symbol())
+            .collect();
+        assert!(buf_text.contains("Incoming Pair Request"));
+        assert!(buf_text.contains("Living Room Laptop wants to pair"));
+        assert!(buf_text.contains("482-913"));
+        assert!(buf_text.contains("[a] Approve"));
+        assert!(buf_text.contains("[d] Deny"));
+
+        // Press 'a' to approve the first request
+        tui_state.handle_key(KeyCode::Char('a'));
+        assert_eq!(tui_state.pending_pair_requests.len(), 1);
+        assert!(tui_state
+            .status_message
+            .contains("Approved pairing request from Living Room Laptop"));
+
+        // Press 'd' to deny the second request
+        tui_state.handle_key(KeyCode::Char('d'));
+        assert!(tui_state.pending_pair_requests.is_empty());
+        assert!(tui_state
+            .status_message
+            .contains("Denied pairing request from Guest Phone"));
     }
 }
