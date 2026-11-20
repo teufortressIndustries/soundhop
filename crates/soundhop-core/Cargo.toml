@@ -7,6 +7,10 @@ authors.workspace = true
 repository.workspace = true
 description = "Core library for SoundHop local network audio sharing, discovery, multi-room, and Android bridge"
 
+[features]
+default = ["opus"]
+opus = ["dep:opus2"]
+
 [dependencies]
 serde.workspace = true
 serde_json.workspace = true
@@ -18,6 +22,12 @@ ipnet.workspace = true
 mdns-sd.workspace = true
 hmac.workspace = true
 sha2.workspace = true
+hkdf.workspace = true
+ed25519-dalek.workspace = true
+x25519-dalek.workspace = true
+chacha20poly1305.workspace = true
+zeroize.workspace = true
+opus2 = { workspace = true, optional = true }
 hex.workspace = true
 rand.workspace = true
 ureq.workspace = true
