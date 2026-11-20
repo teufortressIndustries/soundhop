@@ -203,9 +203,11 @@ impl Controller {
         &self,
         sink_name: &str,
         description: &str,
+        frame_ms: u8,
     ) -> Result<(Box<dyn PcmCapture>, u32), ControllerError> {
         #[cfg(test)]
         if let Some(factory) = lock_or_recover(&self.capture_factory_override).clone() {
+            let _ = frame_ms;
             let capture = factory().map_err(|e| {
                 ControllerError::Message(format!("Could not start SHT3 audio capture: {e}"))
             })?;
@@ -230,7 +232,10 @@ impl Controller {
                     ))
                 })?;
             let monitor = format!("{sink_name}.monitor");
-            match crate::transport::LinuxPcmCapture::spawn(&monitor) {
+            match crate::transport::LinuxPcmCapture::spawn_with_latency(
+                &monitor,
+                u32::from(frame_ms),
+            ) {
                 Ok(cap) => Ok((Box::new(cap) as Box<dyn PcmCapture>, module_id)),
                 Err(e) => {
                     let _ = self.backend.unload_module(module_id, true);
@@ -243,7 +248,7 @@ impl Controller {
 
         #[cfg(target_os = "windows")]
         {
-            let _ = (sink_name, description);
+            let _ = (sink_name, description, frame_ms);
             let cap = crate::transport::WindowsPcmCapture::start().map_err(|e| {
                 ControllerError::Message(format!("Could not start Windows loopback capture: {e}"))
             })?;
@@ -252,7 +257,7 @@ impl Controller {
 
         #[cfg(not(any(target_os = "linux", target_os = "windows")))]
         {
-            let _ = (sink_name, description);
+            let _ = (sink_name, description, frame_ms);
             Err(ControllerError::Message(
                 "SHT3 outbound audio capture is not supported on this platform".to_string(),
             ))
@@ -317,7 +322,7 @@ impl Controller {
         .with_jitter_ms(jitter_ms);
 
         let (capture, module_id) =
-            self.create_outbound_capture(&sink_name, &peer.display_name())?;
+            self.create_outbound_capture(&sink_name, &peer.display_name(), profile.frame_ms())?;
         let handle = match self.sht3_manager.start_outbound(outbound_cfg, capture) {
             Ok(h) => h,
             Err(e) => {

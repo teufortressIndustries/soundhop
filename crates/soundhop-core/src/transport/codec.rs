@@ -524,11 +524,16 @@ mod tests {
                 "expected high-fidelity Opus reconstruction (R) for {profile:?}, got snr={snr_r_db:.2} dB"
             );
 
-            // PLC must produce a valid full frame of samples.
+            // PLC must produce a valid full frame of non-silent extrapolated samples.
             let mut plc_out = Vec::new();
             let plc_samples = codec.decode_plc(&mut plc_out).unwrap();
             assert_eq!(plc_samples, spc * 2);
             assert_eq!(plc_out.len(), spc * 2);
+            let plc_energy: i64 = plc_out.iter().map(|&s| i64::from(s).abs()).sum();
+            assert!(
+                plc_energy > 100_000,
+                "expected non-silent Opus PLC output for {profile:?}, energy={plc_energy}"
+            );
         }
     }
 }
