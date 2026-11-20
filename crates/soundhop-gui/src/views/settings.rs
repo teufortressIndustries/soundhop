@@ -211,17 +211,21 @@ pub fn render(
         // Start at Login
         ui.horizontal(|ui| {
             ui.vertical(|ui| {
-                ui.label(
-                    RichText::new("Start SoundHop when I log in")
-                        .color(pal.text)
-                        .size(13.5),
+                #[cfg(target_os = "windows")]
+                let (autostart_title, autostart_sub) = (
+                    "Start with Windows",
+                    "Starts quietly in the Windows notification area so your speakers are always ready.",
                 );
+                #[cfg(not(target_os = "windows"))]
+                let (autostart_title, autostart_sub) = (
+                    "Start SoundHop when I log in",
+                    "Keeps your system tray and speaker discovery ready in the background.",
+                );
+                ui.label(RichText::new(autostart_title).color(pal.text).size(13.5));
                 ui.label(
-                    RichText::new(
-                        "Keeps your system tray and speaker discovery ready in the background.",
-                    )
-                    .color(pal.text_muted)
-                    .size(12.0),
+                    RichText::new(autostart_sub)
+                        .color(pal.text_muted)
+                        .size(12.0),
                 );
             });
             ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
@@ -283,6 +287,11 @@ pub fn render(
                 "Uses your computer's built-in PulseAudio/PipeWire network cookie.",
             ),
         ] {
+            // PulseAudio/PipeWire cookie mode is Linux-only; only show on Windows if already active.
+            #[cfg(target_os = "windows")]
+            if mode_key == "cookie" && snap.config.sharing.security != "cookie" {
+                continue;
+            }
             let selected = snap.config.sharing.security == mode_key;
             if selectable_card(ui, pal, ("privacy_mode", mode_key), selected, title, desc).clicked()
                 && !selected
@@ -413,6 +422,7 @@ pub fn render(
             ui.add_space(8.0);
 
             // Behavior toggles
+            #[cfg(not(target_os = "windows"))]
             for (title, val, key) in [
                 (
                     "Switch default system output on connect",
@@ -423,11 +433,6 @@ pub fn render(
                     "Move currently playing apps on connect",
                     snap.config.connection.move_streams,
                     "move_streams",
-                ),
-                (
-                    "Keep local speakers active by default in Multi-Room",
-                    snap.config.connection.keep_local_output,
-                    "keep_local_output",
                 ),
             ] {
                 ui.horizontal(|ui| {
@@ -442,6 +447,33 @@ pub fn render(
                         }
                     });
                 });
+            }
+            ui.horizontal(|ui| {
+                ui.label(
+                    RichText::new("Keep local speakers active by default in Multi-Room")
+                        .color(pal.text_secondary)
+                        .size(12.5),
+                );
+                ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                    let mut b = snap.config.connection.keep_local_output;
+                    if toggle_switch(ui, pal, &mut b).changed() {
+                        backend.send(GuiCommand::SaveConfigPatch {
+                            patch: serde_json::json!({ "connection": { "keep_local_output": b } }),
+                            toast: None,
+                        });
+                    }
+                });
+            });
+            #[cfg(target_os = "windows")]
+            {
+                ui.add_space(4.0);
+                ui.label(
+                    RichText::new(
+                        "Audio capture uses Windows WASAPI loopback without changing your default playback device.",
+                    )
+                    .color(pal.text_muted)
+                    .size(11.5),
+                );
             }
 
             ui.add_space(10.0);
@@ -523,6 +555,11 @@ pub fn render(
                 .jitter_ms
                 .map(|j| format!("{j:.1} ms"))
                 .unwrap_or_else(|| "--".to_string());
+            let fw_display = if snap.firewall_kind == "windows-defender" {
+                "Windows Defender Firewall"
+            } else {
+                snap.firewall_kind.as_str()
+            };
             ui.label(
                 RichText::new(format!(
                     "Daemon: {} • Firewall: {} • RTT: {} • Jitter: {} • Audio: {:.1} dBFS",
@@ -531,7 +568,7 @@ pub fn render(
                     } else {
                         "Standalone"
                     },
-                    snap.firewall_kind,
+                    fw_display,
                     rtt_str,
                     jit_str,
                     snap.audio_dbfs,
@@ -542,7 +579,11 @@ pub fn render(
             );
             ui.add_space(6.0);
             ui.horizontal(|ui| {
-                if secondary_button(ui, pal, "Open Firewall Ports").clicked() {
+                #[cfg(target_os = "windows")]
+                let fw_btn_label = "Allow in Windows Firewall";
+                #[cfg(not(target_os = "windows"))]
+                let fw_btn_label = "Open Firewall Ports";
+                if secondary_button(ui, pal, fw_btn_label).clicked() {
                     backend.send(GuiCommand::OpenFirewall);
                 }
                 if secondary_button(ui, pal, "Replay Welcome Tour").clicked() {

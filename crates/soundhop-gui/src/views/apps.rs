@@ -3,9 +3,15 @@
 
 use eframe::egui::{self, RichText};
 
-use crate::backend::{GuiBackend, GuiCommand, GuiSnapshot};
+#[cfg(not(target_os = "windows"))]
+use crate::backend::GuiCommand;
+use crate::backend::{GuiBackend, GuiSnapshot};
 use crate::theme::Palette;
-use crate::widgets::{card, pill_badge, secondary_button, section_header, segmented_control};
+#[cfg(target_os = "windows")]
+use crate::widgets::callout_card;
+#[cfg(not(target_os = "windows"))]
+use crate::widgets::{secondary_button, segmented_control};
+use crate::widgets::{card, pill_badge, section_header};
 
 #[derive(Default)]
 pub struct AppsViewState {
@@ -13,6 +19,71 @@ pub struct AppsViewState {
     pub custom_target_remote: bool,
 }
 
+#[cfg(target_os = "windows")]
+pub fn render(
+    ui: &mut egui::Ui,
+    pal: &Palette,
+    _snap: &GuiSnapshot,
+    _state: &mut AppsViewState,
+    _backend: &GuiBackend,
+) {
+    section_header(
+        ui,
+        pal,
+        "Per-App Audio Routing",
+        Some("How SoundHop captures and streams audio on Windows."),
+    );
+    ui.add_space(10.0);
+
+    card(ui, pal, None, |ui| {
+        ui.horizontal(|ui| {
+            ui.label(
+                RichText::new("System-wide WASAPI loopback")
+                    .color(pal.text)
+                    .size(15.0)
+                    .strong(),
+            );
+            pill_badge(ui, "Windows", pal.accent, pal.accent_soft);
+        });
+        ui.add_space(6.0);
+        ui.label(
+            RichText::new(
+                "On Windows, SoundHop captures all system audio using WASAPI loopback so music, videos, and games stream together to your selected speakers.",
+            )
+            .color(pal.text_secondary)
+            .size(13.0),
+        );
+        ui.add_space(8.0);
+        ui.label(
+            RichText::new(
+                "Per-app stream routing (sending individual apps to different speakers) requires PulseAudio or PipeWire and is currently available on Linux.",
+            )
+            .color(pal.text_muted)
+            .size(12.5),
+        );
+    });
+
+    ui.add_space(12.0);
+
+    callout_card(ui, pal.accent_soft, pal.accent, |ui| {
+        ui.label(
+            RichText::new("Tip: Adjust app levels in Windows Volume Mixer")
+                .color(pal.text)
+                .size(13.5)
+                .strong(),
+        );
+        ui.add_space(4.0);
+        ui.label(
+            RichText::new(
+                "Open Windows Settings → System → Sound → Volume mixer to mute or balance individual apps while streaming.",
+            )
+            .color(pal.text_secondary)
+            .size(12.0),
+        );
+    });
+}
+
+#[cfg(not(target_os = "windows"))]
 pub fn render(
     ui: &mut egui::Ui,
     pal: &Palette,

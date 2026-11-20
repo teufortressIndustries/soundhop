@@ -400,6 +400,39 @@ pub fn render(
         });
 
         ui.add_space(10.0);
+        #[cfg(target_os = "windows")]
+        {
+            state.as_mic = false;
+            let row_resp = ui.horizontal(|ui| {
+                ui.vertical(|ui| {
+                    ui.horizontal(|ui| {
+                        ui.label(
+                            RichText::new("Use phone as a PC microphone")
+                                .color(pal.text_muted)
+                                .size(13.5),
+                        );
+                        pill_badge(ui, "Linux only", pal.text_muted, pal.card_elevated);
+                    });
+                    ui.label(
+                        RichText::new(
+                            "Virtual microphone routing requires PulseAudio/PipeWire on Linux.",
+                        )
+                        .color(pal.text_muted)
+                        .size(12.0),
+                    );
+                });
+                ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                    ui.add_enabled_ui(false, |ui| {
+                        let mut disabled_val = false;
+                        toggle_switch(ui, pal, &mut disabled_val);
+                    });
+                });
+            });
+            row_resp.response.on_hover_text(
+                "Creating a virtual PC microphone is supported on Linux (PulseAudio/PipeWire). On Windows, phone audio plays through your speakers.",
+            );
+        }
+        #[cfg(not(target_os = "windows"))]
         ui.horizontal(|ui| {
             ui.vertical(|ui| {
                 ui.label(

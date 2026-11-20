@@ -438,12 +438,11 @@ fn build_tray_menu_from_snapshot(snap: &TrayMenuSnapshot) -> Menu {
     // Apps submenu (plain labels, no & mnemonics)
     let app_sub = Submenu::new("Apps", true);
     if snap.streams.is_empty() {
-        let empty = MenuItem::with_id(
-            MenuId::new("noop_apps"),
-            "No apps playing right now",
-            false,
-            None,
-        );
+        #[cfg(target_os = "windows")]
+        let empty_label = "System-wide audio (WASAPI)";
+        #[cfg(not(target_os = "windows"))]
+        let empty_label = "No apps playing right now";
+        let empty = MenuItem::with_id(MenuId::new("noop_apps"), empty_label, false, None);
         let _ = app_sub.append(&empty);
     } else {
         for stream in &snap.streams {
@@ -502,29 +501,33 @@ fn build_tray_menu_from_snapshot(snap: &TrayMenuSnapshot) -> Menu {
     let _ = vol_sub.append(&mute_item);
     let _ = menu.append(&vol_sub);
 
-    // Microphone submenu
-    let mic_sub = Submenu::new("Microphone", true);
-    let mic_send = CheckMenuItem::with_id(
-        MenuId::new("mic_send_toggle"),
-        "Send My Microphone",
-        snap.connected || snap.mic_active,
-        snap.mic_active && snap.mic_direction == "send",
-        None,
-    );
-    let mic_recv = CheckMenuItem::with_id(
-        MenuId::new("mic_recv_toggle"),
-        "Hear Peer Microphone",
-        snap.connected || snap.mic_active,
-        snap.mic_active && snap.mic_direction == "receive",
-        None,
-    );
-    let _ = mic_sub.append(&mic_send);
-    let _ = mic_sub.append(&mic_recv);
-    if snap.mic_active {
-        let mic_off = MenuItem::with_id(MenuId::new("mic_stop"), "Turn Off Microphone", true, None);
-        let _ = mic_sub.append(&mic_off);
+    // Microphone submenu (Linux PulseAudio/PipeWire pass-through only)
+    #[cfg(not(target_os = "windows"))]
+    {
+        let mic_sub = Submenu::new("Microphone", true);
+        let mic_send = CheckMenuItem::with_id(
+            MenuId::new("mic_send_toggle"),
+            "Send My Microphone",
+            snap.connected || snap.mic_active,
+            snap.mic_active && snap.mic_direction == "send",
+            None,
+        );
+        let mic_recv = CheckMenuItem::with_id(
+            MenuId::new("mic_recv_toggle"),
+            "Hear Peer Microphone",
+            snap.connected || snap.mic_active,
+            snap.mic_active && snap.mic_direction == "receive",
+            None,
+        );
+        let _ = mic_sub.append(&mic_send);
+        let _ = mic_sub.append(&mic_recv);
+        if snap.mic_active {
+            let mic_off =
+                MenuItem::with_id(MenuId::new("mic_stop"), "Turn Off Microphone", true, None);
+            let _ = mic_sub.append(&mic_off);
+        }
+        let _ = menu.append(&mic_sub);
     }
-    let _ = menu.append(&mic_sub);
 
     // Phone Audio action
     let and_wiz = MenuItem::with_id(
@@ -552,10 +555,64 @@ fn build_tray_menu_from_snapshot(snap: &TrayMenuSnapshot) -> Menu {
     menu
 }
 
+fn format_tray_tooltip(snap: &TrayMenuSnapshot) -> String {
+    let raw = if snap.multiroom && !snap.multiroom_peer_ids.is_empty() {
+        if !snap.connected_name.is_empty() {
+            format!("SoundHop — Streaming to {}", snap.connected_name)
+        } else {
+            format!(
+                "SoundHop — Streaming to {} speakers",
+                snap.multiroom_peer_ids.len()
+            )
+        }
+    } else if snap.connected {
+        if !snap.connected_name.is_empty() {
+            format!("SoundHop — Streaming to {}", snap.connected_name)
+        } else {
+            "SoundHop — Streaming".to_string()
+        }
+    } else if snap.android_active {
+        "SoundHop — Receiving phone audio".to_string()
+    } else if snap.sharing_enabled {
+        "SoundHop — Sharing speakers".to_string()
+    } else {
+        "SoundHop — Idle".to_string()
+    };
+
+    // Windows NOTIFYICONDATAW.szTip supports up to 127 UTF-16 code units.
+    const MAX_TOOLTIP_CHARS: usize = 120;
+    if raw.chars().count() <= MAX_TOOLTIP_CHARS {
+        raw
+    } else {
+        let truncated: String = raw.chars().take(MAX_TOOLTIP_CHARS - 3).collect();
+        format!("{truncated}...")
+    }
+}
+
+fn resolve_gui_executable_from(current_exe: &std::path::Path) -> std::path::PathBuf {
+    #[cfg(target_os = "windows")]
+    {
+        if let Some(dir) = current_exe.parent() {
+            let gui_exe = dir.join("soundhop-gui.exe");
+            if gui_exe.is_file() {
+                return gui_exe;
+            }
+        }
+    }
+    current_exe.to_path_buf()
+}
+
 fn spawn_self_args(args: &[&str]) {
-    if let Ok(exe) = std::env::current_exe() {
+    if let Ok(current_exe) = std::env::current_exe() {
+        let exe = resolve_gui_executable_from(&current_exe);
         let mut cmd = Command::new(exe);
         cmd.args(args);
+        #[cfg(target_os = "windows")]
+        {
+            use std::os::windows::process::CommandExt;
+            const CREATE_NO_WINDOW: u32 = 0x0800_0000;
+            cmd.creation_flags(CREATE_NO_WINDOW);
+        }
         soundhop_core::util::close_fds_pre_exec(&mut cmd);
         if let Ok(mut child) = cmd.spawn() {
             std::thread::spawn(move || {
@@ -1245,31 +1302,166 @@ fn pump_platform_events() -> bool {
     true
 }
 
+#[cfg(target_os = "windows")]
+mod win32_session {
+    use std::sync::atomic::{AtomicBool, Ordering};
+
+    use windows_sys::Win32::Foundation::{HWND, LPARAM, LRESULT, WPARAM};
+    use windows_sys::Win32::System::LibraryLoader::GetModuleHandleW;
+    use windows_sys::Win32::UI::WindowsAndMessaging::{
+        CreateWindowExW, DefWindowProcW, DestroyWindow, PostQuitMessage, RegisterClassW,
+        UnregisterClassW, WM_CLOSE, WM_ENDSESSION, WM_QUERYENDSESSION, WNDCLASSW, WS_OVERLAPPED,
+    };
+
+    static SHUTDOWN_REQUESTED: AtomicBool = AtomicBool::new(false);
+
+    pub fn shutdown_requested() -> bool {
+        SHUTDOWN_REQUESTED.load(Ordering::Acquire)
+    }
+
+    pub fn reset_shutdown_flag() {
+        SHUTDOWN_REQUESTED.store(false, Ordering::Release);
+    }
+
+    unsafe extern "system" fn wnd_proc(
+        hwnd: HWND,
+        msg: u32,
+        wparam: WPARAM,
+        lparam: LPARAM,
+    ) -> LRESULT {
+        match msg {
+            WM_QUERYENDSESSION => {
+                // Return TRUE (1) so Windows logoff/shutdown proceeds without blocking.
+                1
+            }
+            WM_ENDSESSION => {
+                if wparam != 0 {
+                    SHUTDOWN_REQUESTED.store(true, Ordering::SeqCst);
+                    PostQuitMessage(0);
+                }
+                0
+            }
+            WM_CLOSE => {
+                SHUTDOWN_REQUESTED.store(true, Ordering::SeqCst);
+                PostQuitMessage(0);
+                0
+            }
+            _ => DefWindowProcW(hwnd, msg, wparam, lparam),
+        }
+    }
+
+    /// Hidden top-level Win32 window so this tray thread receives broadcast
+    /// `WM_QUERYENDSESSION`, `WM_ENDSESSION`, and `WM_CLOSE` notifications.
+    pub struct SessionShutdownWindow {
+        hwnd: HWND,
+        class_name: Vec<u16>,
+    }
+
+    impl SessionShutdownWindow {
+        pub fn create() -> Option<Self> {
+            reset_shutdown_flag();
+            let class_name: Vec<u16> = "SoundHopTraySessionWnd\0".encode_utf16().collect();
+            let title: Vec<u16> = "SoundHop\0".encode_utf16().collect();
+            // SAFETY: Valid null-terminated UTF-16 class/title buffers and valid `wnd_proc`.
+            unsafe {
+                let hinstance = GetModuleHandleW(std::ptr::null());
+                let wc = WNDCLASSW {
+                    lpfnWndProc: Some(wnd_proc),
+                    hInstance: hinstance,
+                    lpszClassName: class_name.as_ptr(),
+                    ..std::mem::zeroed()
+                };
+                let _ = RegisterClassW(&wc);
+                let hwnd = CreateWindowExW(
+                    0,
+                    class_name.as_ptr(),
+                    title.as_ptr(),
+                    WS_OVERLAPPED,
+                    0,
+                    0,
+                    0,
+                    0,
+                    std::ptr::null_mut(),
+                    std::ptr::null_mut(),
+                    hinstance,
+                    std::ptr::null(),
+                );
+                if hwnd.is_null() {
+                    return None;
+                }
+                Some(Self { hwnd, class_name })
+            }
+        }
+    }
+
+    impl Drop for SessionShutdownWindow {
+        fn drop(&mut self) {
+            // SAFETY: `self.hwnd` was created on this thread via `CreateWindowExW`.
+            unsafe {
+                if !self.hwnd.is_null() {
+                    DestroyWindow(self.hwnd);
+                }
+                let hinstance = GetModuleHandleW(std::ptr::null());
+                UnregisterClassW(self.class_name.as_ptr(), hinstance);
+            }
+        }
+    }
+}
+
 /// Pump pending native OS UI events without blocking.
 ///
 /// Returns `false` if the platform event loop signaled a quit request
-/// (`WM_QUIT`), or `true` to keep running.
+/// (`WM_QUIT`, `WM_CLOSE`, `WM_ENDSESSION`), or `true` to keep running.
 #[cfg(target_os = "windows")]
 fn pump_platform_events() -> bool {
     use windows_sys::Win32::UI::WindowsAndMessaging::{
-        DispatchMessageW, PeekMessageW, TranslateMessage, MSG, PM_REMOVE, WM_QUIT,
+        DispatchMessageW, PeekMessageW, TranslateMessage, MSG, PM_REMOVE, WM_CLOSE, WM_ENDSESSION,
+        WM_QUERYENDSESSION, WM_QUIT,
     };
+
+    if win32_session::shutdown_requested() {
+        return false;
+    }
 
     // SAFETY: `MSG` is a plain-old-data C struct populated by `PeekMessageW`.
     let mut msg: MSG = unsafe { std::mem::zeroed() };
     // SAFETY: Passing a null HWND pumps all queued messages for the current thread
     // (required on Windows for `tray-icon` and `muda` menu callbacks).
     while unsafe { PeekMessageW(&mut msg, std::ptr::null_mut(), 0, 0, PM_REMOVE) } != 0 {
-        if msg.message == WM_QUIT {
+        match msg.message {
+            WM_QUIT | WM_CLOSE => {
+                return false;
+            }
+            WM_QUERYENDSESSION => {
+                // SAFETY: `msg` was just populated by `PeekMessageW`.
+                unsafe {
+                    TranslateMessage(&msg);
+                    DispatchMessageW(&msg);
+                }
+            }
+            WM_ENDSESSION => {
+                // SAFETY: `msg` was just populated by `PeekMessageW`.
+                unsafe {
+                    TranslateMessage(&msg);
+                    DispatchMessageW(&msg);
+                }
+                if msg.wParam != 0 {
+                    return false;
+                }
+            }
+            _ => {
+                // SAFETY: `msg` was just populated by `PeekMessageW`.
+                unsafe {
+                    TranslateMessage(&msg);
+                    DispatchMessageW(&msg);
+                }
+            }
+        }
+        if win32_session::shutdown_requested() {
             return false;
         }
-        // SAFETY: `msg` was just populated by `PeekMessageW`.
-        unsafe {
-            TranslateMessage(&msg);
-            DispatchMessageW(&msg);
-        }
     }
-    true
+    !win32_session::shutdown_requested()
 }
 
 /// Pump pending native OS UI events without blocking.
@@ -1323,6 +1515,9 @@ pub fn run_tray(verbose: bool) -> Result<i32, String> {
         gtk::init().map_err(|e| format!("Failed to initialize GTK for system tray: {e}"))?;
     }
 
+    #[cfg(target_os = "windows")]
+    let _session_window = win32_session::SessionShutdownWindow::create();
+
     let daemon = Daemon::new(None, None, !verbose, None);
     if daemon.start().is_err() {
         daemon.start_discovery_only();
@@ -1331,7 +1526,6 @@ pub fn run_tray(verbose: bool) -> Result<i32, String> {
     let ctrl = Arc::clone(&daemon.controller);
     let initial_st = lock_or_recover(&ctrl.state).clone();
     let initial_cfg = lock_or_recover(&ctrl.config).clone();
-    let dev_name = initial_cfg.device.name.clone();
     let initial_snap = TrayMenuSnapshot::from_parts(
         Vec::new(),
         Vec::new(),
@@ -1341,8 +1535,9 @@ pub fn run_tray(verbose: bool) -> Result<i32, String> {
     );
     let initial_icon = build_tray_icon(initial_snap.badge);
     let initial_menu = build_tray_menu_from_snapshot(&initial_snap);
+    let mut last_tooltip = format_tray_tooltip(&initial_snap);
     let tray_icon = TrayIconBuilder::new()
-        .with_tooltip(format!("SoundHop — {dev_name}"))
+        .with_tooltip(&last_tooltip)
         .with_icon(initial_icon)
         .with_menu(Box::new(initial_menu))
         .build()
@@ -1425,6 +1620,11 @@ pub fn run_tray(verbose: bool) -> Result<i32, String> {
             if snap.badge != last_badge {
                 let _ = tray_icon.set_icon(Some(build_tray_icon(snap.badge)));
                 last_badge = snap.badge;
+            }
+            let next_tooltip = format_tray_tooltip(&snap);
+            if next_tooltip != last_tooltip {
+                let _ = tray_icon.set_tooltip(Some(&next_tooltip));
+                last_tooltip = next_tooltip;
             }
             if snap.signature != last_sig {
                 tray_icon.set_menu(Some(Box::new(build_tray_menu_from_snapshot(&snap))));
@@ -1565,5 +1765,66 @@ mod tests {
             false,
         );
         assert_ne!(base, diff_name);
+    }
+
+    #[test]
+    fn test_format_tray_tooltip_reflects_live_state() {
+        let mut st = soundhop_core::state::State::default();
+        let mut cfg = soundhop_core::config::Config::default();
+
+        // Idle
+        cfg.sharing.enabled = false;
+        let idle = TrayMenuSnapshot::from_parts(Vec::new(), Vec::new(), st.clone(), cfg.clone(), false);
+        assert_eq!(format_tray_tooltip(&idle), "SoundHop — Idle");
+
+        // Sharing speakers
+        cfg.sharing.enabled = true;
+        let sharing = TrayMenuSnapshot::from_parts(Vec::new(), Vec::new(), st.clone(), cfg.clone(), false);
+        assert_eq!(format_tray_tooltip(&sharing), "SoundHop — Sharing speakers");
+
+        // Receiving phone audio
+        let phone = TrayMenuSnapshot::from_parts(Vec::new(), Vec::new(), st.clone(), cfg.clone(), true);
+        assert_eq!(format_tray_tooltip(&phone), "SoundHop — Receiving phone audio");
+
+        // Streaming to a single peer
+        st.connected_peer = "peer-1".to_string();
+        st.connected_name = "Living Room".to_string();
+        st.connected_sink = "sink-1".to_string();
+        let streaming = TrayMenuSnapshot::from_parts(Vec::new(), Vec::new(), st.clone(), cfg.clone(), false);
+        assert_eq!(format_tray_tooltip(&streaming), "SoundHop — Streaming to Living Room");
+
+        // Long peer name is truncated safely within Windows szTip limits
+        st.connected_name = "A".repeat(160);
+        let long_tip = format_tray_tooltip(&TrayMenuSnapshot::from_parts(
+            Vec::new(),
+            Vec::new(),
+            st,
+            cfg,
+            false,
+        ));
+        assert!(long_tip.chars().count() <= 120);
+        assert!(long_tip.ends_with("..."));
+    }
+
+    #[test]
+    fn test_resolve_gui_executable_prefers_sibling_gui_on_windows() {
+        let dir = std::env::temp_dir().join(format!("soundhop-tray-test-{}", std::process::id()));
+        let _ = std::fs::create_dir_all(&dir);
+        let cli_exe = dir.join("soundhop.exe");
+        let gui_exe = dir.join("soundhop-gui.exe");
+        let _ = std::fs::write(&cli_exe, b"");
+
+        // Without sibling soundhop-gui.exe -> falls back to current_exe
+        let _ = std::fs::remove_file(&gui_exe);
+        assert_eq!(resolve_gui_executable_from(&cli_exe), cli_exe);
+
+        // With sibling soundhop-gui.exe -> prefers soundhop-gui.exe on Windows
+        let _ = std::fs::write(&gui_exe, b"");
+        #[cfg(target_os = "windows")]
+        assert_eq!(resolve_gui_executable_from(&cli_exe), gui_exe);
+        #[cfg(not(target_os = "windows"))]
+        assert_eq!(resolve_gui_executable_from(&cli_exe), cli_exe);
+
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }

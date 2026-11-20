@@ -7,9 +7,11 @@ use eframe::egui::{self, RichText};
 
 use crate::backend::{GuiBackend, GuiCommand, GuiSnapshot};
 use crate::theme::Palette;
+#[cfg(not(target_os = "windows"))]
+use crate::widgets::segmented_control;
 use crate::widgets::{
     audio_wave_indicator, callout_card, card, danger_button, pill_badge, primary_button,
-    secondary_button, section_header, segmented_control, toggle_switch,
+    secondary_button, section_header, toggle_switch,
 };
 
 #[derive(Default)]
@@ -461,13 +463,17 @@ pub fn render(
 
         if snap.sharing_enabled && snap.firewall_active && snap.firewall_kind != "none" {
             ui.add_space(10.0);
+            let fw_display = if snap.firewall_kind == "windows-defender" {
+                "Windows Defender Firewall"
+            } else {
+                snap.firewall_kind.as_str()
+            };
             callout_card(ui, pal.warning_soft, pal.warning, |ui| {
                 ui.horizontal(|ui| {
                     ui.vertical(|ui| {
                         ui.label(
                             RichText::new(format!(
-                                "Your firewall ({}) may block incoming audio",
-                                snap.firewall_kind
+                                "{fw_display} may block incoming audio"
                             ))
                             .color(pal.warning)
                             .size(12.5)
@@ -491,7 +497,8 @@ pub fn render(
         }
     });
 
-    // 4. Quick Microphone Card (only prominent when connected or active)
+    // 4. Quick Microphone Card (Linux PulseAudio/PipeWire pass-through only)
+    #[cfg(not(target_os = "windows"))]
     if snap.connected || snap.mic_enabled {
         ui.add_space(14.0);
         card(ui, pal, None, |ui| {

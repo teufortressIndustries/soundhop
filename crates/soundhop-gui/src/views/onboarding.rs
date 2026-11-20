@@ -237,18 +237,26 @@ pub fn render(
 
                                 ui.horizontal(|ui| {
                                     ui.vertical(|ui| {
+                                        #[cfg(target_os = "windows")]
+                                        let (autostart_title, autostart_sub) = (
+                                            "Start with Windows",
+                                            "Launch quietly in the Windows taskbar notification area when you sign in.",
+                                        );
+                                        #[cfg(not(target_os = "windows"))]
+                                        let (autostart_title, autostart_sub) = (
+                                            "Keep SoundHop running in the background",
+                                            "Start quietly in the system tray at login so your speakers are always ready.",
+                                        );
                                         ui.label(
-                                            RichText::new("Keep SoundHop running in the background")
+                                            RichText::new(autostart_title)
                                                 .color(pal.text)
                                                 .size(14.0)
                                                 .strong(),
                                         );
                                         ui.label(
-                                            RichText::new(
-                                                "Start quietly in the system tray at login so your speakers are always ready.",
-                                            )
-                                            .color(pal.text_muted)
-                                            .size(12.0),
+                                            RichText::new(autostart_sub)
+                                                .color(pal.text_muted)
+                                                .size(12.0),
                                         );
                                     });
                                     ui.with_layout(
@@ -266,23 +274,31 @@ pub fn render(
                                     ui.add_space(14.0);
                                     ui.separator();
                                     ui.add_space(10.0);
+                                    let fw_heading = if snap.firewall_kind == "windows-defender" {
+                                        "Allow SoundHop through Windows Defender Firewall"
+                                            .to_string()
+                                    } else {
+                                        format!(
+                                            "Allow SoundHop through {} firewall",
+                                            snap.firewall_kind
+                                        )
+                                    };
+                                    #[cfg(target_os = "windows")]
+                                    let fw_sub = "Adds a Private network rule in Windows Defender Firewall so nearby devices can reach your speakers.";
+                                    #[cfg(not(target_os = "windows"))]
+                                    let fw_sub = "Needed so other devices can reach your speakers.";
                                     ui.horizontal(|ui| {
                                         ui.vertical(|ui| {
                                             ui.label(
-                                                RichText::new(format!(
-                                                    "Allow SoundHop through {} firewall",
-                                                    snap.firewall_kind
-                                                ))
-                                                .color(pal.text)
-                                                .size(14.0)
-                                                .strong(),
+                                                RichText::new(fw_heading)
+                                                    .color(pal.text)
+                                                    .size(14.0)
+                                                    .strong(),
                                             );
                                             ui.label(
-                                                RichText::new(
-                                                    "Needed so other devices can reach your speakers.",
-                                                )
-                                                .color(pal.text_muted)
-                                                .size(12.0),
+                                                RichText::new(fw_sub)
+                                                    .color(pal.text_muted)
+                                                    .size(12.0),
                                             );
                                         });
                                         ui.with_layout(
