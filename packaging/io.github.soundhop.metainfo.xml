@@ -4,7 +4,9 @@
   <metadata_license>CC0-1.0</metadata_license>
   <project_license>MIT</project_license>
   <name>SoundHop</name>
-  <developer_name>SoundHop Contributors</developer_name>
+  <developer id="io.github.soundhop">
+    <name>SoundHop Contributors</name>
+  </developer>
   <summary>Stream and share audio between local Linux and Windows machines seamlessly</summary>
   <description>
     <p>
@@ -21,6 +23,6 @@
   </provides>
   <content_rating type="oars-1.1"/>
   <releases>
-    <release version="2.3.0" date="2026-11-20"/>
+    <release version="2.3.1" date="2026-11-20"/>
   </releases>
 </component>

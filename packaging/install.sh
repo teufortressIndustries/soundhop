@@ -16,7 +16,7 @@ RED='\033[0;31m'
 NC='\033[0m'
 
 VERSION="$(sed -n 's/^version = "\([^"]*\)"/\1/p' "$REPO_DIR/Cargo.toml" | head -n1)"
-VERSION="${VERSION:-2.3.0}"
+VERSION="${VERSION:-2.3.1}"
 
 echo -e "${BOLD}${CYAN}=== SoundHop v${VERSION} Installer ===${NC}"
 echo "Building and installing native Rust binaries..."

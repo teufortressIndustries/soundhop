@@ -97,7 +97,21 @@ export CARGO_TARGET_DIR
     cargo build --release --workspace --locked
 )
 
-VERSION="${VERSION:-$(grep -oP '^version\s*=\s*"\K[^"]+' "$REPO_DIR/Cargo.toml" | head -n1)}"
+VERSION="${VERSION:-$(awk '
+    /^\[workspace\.package\]/ { in_sec=1; next }
+    /^\[/ { in_sec=0 }
+    in_sec && /^version[[:space:]]*=/ {
+        sub(/^[^"]*"/, "")
+        sub(/".*$/, "")
+        print
+        exit
+    }
+' "$REPO_DIR/Cargo.toml")}"
+if [[ -z "$VERSION" || "${VERSION,,}" == "unknown" ]]; then
+    echo "Error: Could not determine a valid VERSION (got '${VERSION:-}')."
+    exit 1
+fi
+export VERSION
 UPDATE_REPO="${UPDATE_REPO:-teufortressIndustries/soundhop}"
 ARCH="$(uname -m)"
 
@@ -109,9 +123,14 @@ if grep -q '^X-AppImage-Version=' /usr/share/applications/io.github.soundhop.des
 else
     echo "X-AppImage-Version=$VERSION" | $SUDO tee -a /usr/share/applications/io.github.soundhop.desktop >/dev/null
 fi
+if grep -q '^X-AppImage-UpdateURL=' /usr/share/applications/io.github.soundhop.desktop; then
+    $SUDO sed -i "s|^X-AppImage-UpdateURL=.*|X-AppImage-UpdateURL=https://github.com/$UPDATE_REPO|" /usr/share/applications/io.github.soundhop.desktop
+else
+    echo "X-AppImage-UpdateURL=https://github.com/$UPDATE_REPO" | $SUDO tee -a /usr/share/applications/io.github.soundhop.desktop >/dev/null
+fi
 
 if [ -f "$REPO_DIR/packaging/io.github.soundhop.metainfo.xml" ]; then
-    $SUDO install -Dm644 "$REPO_DIR/packaging/io.github.soundhop.metainfo.xml" /usr/share/metainfo/io.github.soundhop.appdata.xml
+    $SUDO install -Dm644 "$REPO_DIR/packaging/io.github.soundhop.metainfo.xml" /usr/share/metainfo/io.github.soundhop.metainfo.xml
 fi
 
 $SUDO install -Dm644 "$REPO_DIR/assets/soundhop.svg" /usr/share/icons/hicolor/scalable/apps/soundhop.svg
@@ -134,7 +153,7 @@ export OUTPATH="$OUTPUT_DIR"
 export OUTNAME="SoundHop-$VERSION-universal-$ARCH.AppImage"
 export DESKTOP="/usr/share/applications/io.github.soundhop.desktop"
 export ICON="$ICON_PATH"
-export UPINFO="gh-releases-zsync|${UPDATE_REPO%/*}|${UPDATE_REPO#*/}|latest|SoundHop-*$ARCH.AppImage.zsync"
+export UPINFO="gh-releases-zsync|${UPDATE_REPO%/*}|${UPDATE_REPO#*/}|latest|SoundHop-*-universal-${ARCH}.AppImage.zsync"
 export DEPLOY_GTK=1
 export USE_HOST_DRIVERS="${USE_HOST_DRIVERS:-1}"
 EXTRA_GL_LIBS=()
@@ -181,6 +200,18 @@ fi
 EOF
 chmod +x "$APP_DIR/bin/soundhop-dispatch.hook"
 
+# Ship AppStream metainfo and hicolor icons inside AppDir for AppManager / desktop integration
+if [ -f "$REPO_DIR/packaging/io.github.soundhop.metainfo.xml" ]; then
+    install -Dm644 "$REPO_DIR/packaging/io.github.soundhop.metainfo.xml" "$APP_DIR/usr/share/metainfo/io.github.soundhop.metainfo.xml"
+    install -Dm644 "$REPO_DIR/packaging/io.github.soundhop.metainfo.xml" "$APP_DIR/share/metainfo/io.github.soundhop.metainfo.xml"
+fi
+install -Dm644 "$REPO_DIR/assets/soundhop.svg" "$APP_DIR/usr/share/icons/hicolor/scalable/apps/soundhop.svg"
+install -Dm644 "$REPO_DIR/assets/soundhop.svg" "$APP_DIR/share/icons/hicolor/scalable/apps/soundhop.svg"
+if [ -f "$REPO_DIR/assets/soundhop.png" ]; then
+    install -Dm644 "$REPO_DIR/assets/soundhop.png" "$APP_DIR/usr/share/icons/hicolor/256x256/apps/soundhop.png"
+    install -Dm644 "$REPO_DIR/assets/soundhop.png" "$APP_DIR/share/icons/hicolor/256x256/apps/soundhop.png"
+fi
+
 echo "5. Generating AnyLinux AppImage (uruntime + DwarFS, version: $VERSION)..."
 "$QUICK_SHARUN" --make-appimage
 
@@ -189,10 +220,17 @@ if [ -f "$OUTPUT_FILE" ]; then
         if [ -f "$REPO_DIR/$OUTNAME.zsync" ]; then
             mv -f "$REPO_DIR/$OUTNAME.zsync" "$OUTPUT_FILE.zsync"
         elif command -v zsyncmake >/dev/null 2>&1; then
-            (cd "$OUTPUT_DIR" && zsyncmake "$OUTNAME")
+            (cd "$OUTPUT_DIR" && zsyncmake -u "$OUTNAME" -o "$OUTNAME.zsync" "$OUTNAME")
         fi
     fi
     chmod +x "$OUTPUT_FILE"
+    if [[ "${SKIP_VERIFY:-0}" != "1" ]]; then
+        if [[ ! -f "$SCRIPT_DIR/verify-appimage.sh" ]]; then
+            echo "Error: Verification script not found: $SCRIPT_DIR/verify-appimage.sh"
+            exit 1
+        fi
+        UPDATE_REPO="$UPDATE_REPO" bash "$SCRIPT_DIR/verify-appimage.sh" "$OUTPUT_FILE" "$VERSION"
+    fi
     trap - ERR INT TERM
     echo "✓ Successfully built: dist/$OUTNAME"
 else

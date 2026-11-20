@@ -98,7 +98,7 @@ jobs:
       - name: Build AnyLinux AppImage
         run: |
           mkdir -p build/appimage-container dist
-          chmod +x packaging/container-build.sh
+          chmod +x packaging/container-build.sh packaging/verify-appimage.sh
           ./packaging/container-build.sh
 
       - name: Verify AppImage Execution
@@ -108,6 +108,12 @@ jobs:
           ./dist/*.AppImage doctor || true
           ./dist/*.AppImage --appimage-extract-and-run version
           ./build/appimage-container/quick-sharun.sh --simple-test ./dist/*.AppImage version
+
+      - name: Verify AppImage Metadata & Updates
+        run: |
+          for appimage in dist/*.AppImage; do
+            ./packaging/verify-appimage.sh "$appimage"
+          done
 
       - name: Upload AppImage Artifact
         uses: actions/upload-artifact@v4
