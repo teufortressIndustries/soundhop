@@ -267,6 +267,11 @@ fn beacon_signing_input(pkt: &BeaconPacket) -> String {
     )
 }
 
+/// Returns the normalized platform identifier for this host (`"windows"`, `"linux"`, `"macos"`, ...).
+pub fn current_platform() -> &'static str {
+    std::env::consts::OS
+}
+
 #[allow(clippy::too_many_arguments)]
 pub fn make_beacon_with_reply_port(
     device_id: &str,
@@ -278,7 +283,7 @@ pub fn make_beacon_with_reply_port(
     ts_us: Option<u64>,
     reply_port: Option<u16>,
 ) -> Vec<u8> {
-    let platform = if cfg!(windows) { "windows" } else { "linux" };
+    let platform = current_platform();
     let ts = ts_us.unwrap_or_else(|| (now_secs() * 1_000_000.0) as u64);
     let mut pkt = BeaconPacket {
         magic: MAGIC.to_string(),
@@ -369,6 +374,44 @@ pub fn parse_beacon(
     (Some(pkt), Some(peer))
 }
 
+#[cfg(windows)]
+fn suppress_udp_connreset(sock: &Socket) {
+    use std::os::windows::io::AsRawSocket;
+    use windows_sys::Win32::Networking::WinSock::{SIO_UDP_CONNRESET, SOCKET};
+
+    // WSAIoctl is gated behind Win32_System_IO in windows-sys, so link ws2_32 directly.
+    #[link(name = "ws2_32")]
+    extern "system" {
+        fn WSAIoctl(
+            s: SOCKET,
+            dw_io_control_code: u32,
+            lpv_in_buffer: *const core::ffi::c_void,
+            cb_in_buffer: u32,
+            lpv_out_buffer: *mut core::ffi::c_void,
+            cb_out_buffer: u32,
+            lpcb_bytes_returned: *mut u32,
+            lp_overlapped: *mut core::ffi::c_void,
+            lp_completion_routine: *const core::ffi::c_void,
+        ) -> i32;
+    }
+
+    let enable: u32 = 0; // FALSE: suppress WSAECONNRESET (10054) on ICMP Port Unreachable
+    let mut bytes_returned: u32 = 0;
+    unsafe {
+        let _ = WSAIoctl(
+            sock.as_raw_socket() as SOCKET,
+            SIO_UDP_CONNRESET,
+            (&enable as *const u32).cast(),
+            std::mem::size_of_val(&enable) as u32,
+            std::ptr::null_mut(),
+            0,
+            &mut bytes_returned,
+            std::ptr::null_mut(),
+            std::ptr::null(),
+        );
+    }
+}
+
 fn bind_udp_reusable(port: u16) -> std::io::Result<UdpSocket> {
     let sock = Socket::new(Domain::IPV4, Type::DGRAM, Some(Protocol::UDP))?;
     let _ = sock.set_reuse_address(true);
@@ -386,11 +429,72 @@ fn bind_udp_reusable(port: u16) -> std::io::Result<UdpSocket> {
             );
         }
     }
+    #[cfg(windows)]
+    suppress_udp_connreset(&sock);
     let _ = sock.set_broadcast(true);
     let addr = SocketAddr::new(IpAddr::V4(Ipv4Addr::UNSPECIFIED), port);
     sock.bind(&addr.into())?;
     sock.set_read_timeout(Some(Duration::from_millis(250)))?;
     Ok(sock.into())
+}
+
+fn build_mdns_txt_properties<'a>(
+    device_id: &'a str,
+    name: &'a str,
+    security: &'a str,
+    platform: &'a str,
+) -> [(&'static str, &'a str); 6] {
+    [
+        ("id", device_id),
+        ("name", name),
+        ("ver", VERSION),
+        ("proto", "2"),
+        ("security", security),
+        ("platform", platform),
+    ]
+}
+
+fn parse_mdns_service_info(info: &ServiceInfo, own_id: &str) -> Option<Peer> {
+    let id = info.get_property_val_str("id").unwrap_or("").to_string();
+    if id.is_empty() || id == own_id {
+        return None;
+    }
+    let name = info
+        .get_property_val_str("name")
+        .unwrap_or("SoundHop Peer")
+        .to_string();
+    let ver = info.get_property_val_str("ver").unwrap_or(VERSION).to_string();
+    let sec = info
+        .get_property_val_str("security")
+        .unwrap_or("trusted-lan")
+        .to_string();
+    let proto = info
+        .get_property_val_str("proto")
+        .and_then(|p| p.parse::<u32>().ok())
+        .unwrap_or(PROTOCOL_VERSION);
+    let platform = info
+        .get_property_val_str("platform")
+        .map(str::trim)
+        .filter(|p| !p.is_empty())
+        .unwrap_or("unknown")
+        .to_string();
+    let host = select_best_peer_ip(info.get_addresses())?;
+    if !is_private_address(&host) {
+        return None;
+    }
+    Some(Peer {
+        id,
+        name,
+        host,
+        port: info.get_port(),
+        version: ver,
+        protocol: proto,
+        security: sec,
+        platform,
+        last_seen: now_secs(),
+        source: "mdns".to_string(),
+        rtt_ms: None,
+    })
 }
 
 pub struct DiscoveryManager {
@@ -582,13 +686,12 @@ impl DiscoveryManager {
                         let host_fqdn = format!("{instance_name}.local.");
                         let addrs = local_addresses(false);
                         let ip_str = addrs.first().map(|s| s.as_str()).unwrap_or("");
-                        let props = [
-                            ("id", self.device_id.as_str()),
-                            ("name", self.name.as_str()),
-                            ("ver", VERSION),
-                            ("proto", "2"),
-                            ("security", self.security.as_str()),
-                        ];
+                        let props = build_mdns_txt_properties(
+                            &self.device_id,
+                            &self.name,
+                            &self.security,
+                            current_platform(),
+                        );
                         if let Ok(info) = ServiceInfo::new(
                             MDNS_SERVICE_TYPE,
                             &instance_name,
@@ -612,47 +715,9 @@ impl DiscoveryManager {
                                     if let Ok(ServiceEvent::ServiceResolved(info)) =
                                         receiver.recv_timeout(Duration::from_millis(250))
                                     {
-                                        let id = info
-                                            .get_property_val_str("id")
-                                            .unwrap_or("")
-                                            .to_string();
-                                        if id.is_empty() || id == own_id {
-                                            continue;
-                                        }
-                                        let name = info
-                                            .get_property_val_str("name")
-                                            .unwrap_or("SoundHop Peer")
-                                            .to_string();
-                                        let ver = info
-                                            .get_property_val_str("ver")
-                                            .unwrap_or(VERSION)
-                                            .to_string();
-                                        let sec = info
-                                            .get_property_val_str("security")
-                                            .unwrap_or("trusted-lan")
-                                            .to_string();
-                                        let proto = info
-                                            .get_property_val_str("proto")
-                                            .and_then(|p| p.parse::<u32>().ok())
-                                            .unwrap_or(PROTOCOL_VERSION);
-                                        if let Some(host) =
-                                            select_best_peer_ip(info.get_addresses())
+                                        if let Some(peer) = parse_mdns_service_info(&info, &own_id)
                                         {
-                                            if is_private_address(&host) {
-                                                store.update(Peer {
-                                                    id,
-                                                    name,
-                                                    host,
-                                                    port: info.get_port(),
-                                                    version: ver,
-                                                    protocol: proto,
-                                                    security: sec,
-                                                    platform: "linux".to_string(),
-                                                    last_seen: now_secs(),
-                                                    source: "mdns".to_string(),
-                                                    rtt_ms: None,
-                                                });
-                                            }
+                                            store.update(peer);
                                         }
                                     }
                                 }
@@ -889,5 +954,70 @@ mod tests {
         let stored = store.get("peer-1").unwrap();
         assert_eq!(stored.host, "192.168.1.20");
         assert_eq!(stored.port, 4713);
+    }
+
+    #[test]
+    fn test_mdns_platform_property_propagation() {
+        for platform in ["windows", "linux", "macos"] {
+            let props = build_mdns_txt_properties("peer-42", "Desk Rig", "trusted-lan", platform);
+            assert!(props.contains(&("platform", platform)));
+
+            let info = ServiceInfo::new(
+                MDNS_SERVICE_TYPE,
+                "desk-rig-peer42",
+                "desk-rig-peer42.local.",
+                "10.254.254.42",
+                4713,
+                &props[..],
+            )
+            .unwrap();
+
+            let peer = parse_mdns_service_info(&info, "own-device-id").unwrap();
+            assert_eq!(peer.id, "peer-42");
+            assert_eq!(peer.name, "Desk Rig");
+            assert_eq!(peer.port, 4713);
+            assert_eq!(peer.platform, platform);
+            assert_eq!(peer.source, "mdns");
+        }
+
+        // Legacy mDNS record without platform property falls back cleanly
+        let legacy_props = [
+            ("id", "peer-legacy"),
+            ("name", "Legacy Box"),
+            ("ver", VERSION),
+            ("proto", "2"),
+            ("security", "trusted-lan"),
+        ];
+        let legacy_info = ServiceInfo::new(
+            MDNS_SERVICE_TYPE,
+            "legacy-box",
+            "legacy-box.local.",
+            "10.254.254.43",
+            4713,
+            &legacy_props[..],
+        )
+        .unwrap();
+        let legacy_peer = parse_mdns_service_info(&legacy_info, "own-device-id").unwrap();
+        assert_eq!(legacy_peer.platform, "unknown");
+
+        // Own device ID is filtered out
+        assert!(parse_mdns_service_info(&legacy_info, "peer-legacy").is_none());
+    }
+
+    #[test]
+    fn test_beacon_and_mdns_use_current_platform() {
+        let raw = make_beacon("dev-os", "Host", 4713, "trusted-lan", "offer", None, None);
+        let (pkt, peer) = parse_beacon(&raw, "10.254.254.44", "udp", None);
+        assert_eq!(pkt.unwrap().platform, current_platform());
+        assert_eq!(peer.unwrap().platform, current_platform());
+
+        let props = build_mdns_txt_properties("dev-os", "Host", "trusted-lan", current_platform());
+        assert!(props.contains(&("platform", current_platform())));
+    }
+
+    #[test]
+    fn test_bind_udp_reusable_ephemeral_socket() {
+        let sock = bind_udp_reusable(0).expect("ephemeral UDP bind should succeed");
+        assert!(sock.local_addr().unwrap().port() > 0);
     }
 }

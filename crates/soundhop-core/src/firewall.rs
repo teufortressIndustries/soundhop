@@ -55,9 +55,397 @@ pub fn is_admin() -> bool {
     {
         unsafe { libc::geteuid() == 0 }
     }
-    #[cfg(not(unix))]
+    #[cfg(windows)]
+    {
+        use std::mem::size_of;
+        use windows_sys::Win32::Foundation::{CloseHandle, HANDLE};
+        use windows_sys::Win32::Security::{
+            GetTokenInformation, TokenElevation, TOKEN_ELEVATION, TOKEN_QUERY,
+        };
+        use windows_sys::Win32::System::Threading::{GetCurrentProcess, OpenProcessToken};
+
+        unsafe {
+            let mut token: HANDLE = std::ptr::null_mut();
+            if OpenProcessToken(GetCurrentProcess(), TOKEN_QUERY, &mut token) == 0 {
+                return false;
+            }
+            let mut elevation = TOKEN_ELEVATION { TokenIsElevated: 0 };
+            let mut return_len: u32 = 0;
+            let ok = GetTokenInformation(
+                token,
+                TokenElevation,
+                (&mut elevation as *mut TOKEN_ELEVATION).cast(),
+                size_of::<TOKEN_ELEVATION>() as u32,
+                &mut return_len,
+            );
+            let _ = CloseHandle(token);
+            ok != 0 && elevation.TokenIsElevated != 0
+        }
+    }
+    #[cfg(not(any(unix, windows)))]
     {
         false
+    }
+}
+
+fn parse_windows_firewall_state(stdout: &str) -> bool {
+    for line in stdout.lines() {
+        let mut parts = line.split_whitespace();
+        if let (Some(key), Some(val)) = (parts.next(), parts.next()) {
+            if key.eq_ignore_ascii_case("state") && val.eq_ignore_ascii_case("on") {
+                return true;
+            }
+        }
+    }
+    false
+}
+
+fn windows_audio_rule_name(audio_port: u16) -> String {
+    format!("SoundHop Audio ({audio_port}/tcp)")
+}
+
+fn windows_discovery_rule_name(discovery_port: u16) -> String {
+    format!("SoundHop Discovery ({discovery_port}/udp)")
+}
+
+fn windows_mdns_rule_name() -> String {
+    format!("SoundHop mDNS ({MDNS_PORT}/udp)")
+}
+
+fn windows_delete_rule_cmd(name: &str) -> Vec<String> {
+    vec![
+        "netsh".into(),
+        "advfirewall".into(),
+        "firewall".into(),
+        "delete".into(),
+        "rule".into(),
+        format!("name={name}"),
+    ]
+}
+
+#[cfg_attr(not(windows), allow(dead_code))]
+fn windows_show_rule_cmd(name: &str) -> Vec<String> {
+    vec![
+        "netsh".into(),
+        "advfirewall".into(),
+        "firewall".into(),
+        "show".into(),
+        "rule".into(),
+        format!("name={name}"),
+    ]
+}
+
+fn windows_add_rule_cmd(name: &str, protocol: &str, port: u16) -> Vec<String> {
+    vec![
+        "netsh".into(),
+        "advfirewall".into(),
+        "firewall".into(),
+        "add".into(),
+        "rule".into(),
+        format!("name={name}"),
+        "dir=in".into(),
+        "action=allow".into(),
+        format!("protocol={protocol}"),
+        format!("localport={port}"),
+        "profile=private,domain".into(),
+    ]
+}
+
+fn build_windows_open_commands(
+    audio_port: u16,
+    discovery_port: u16,
+    include_mdns: bool,
+) -> Vec<Vec<String>> {
+    let audio_name = windows_audio_rule_name(audio_port);
+    let discovery_name = windows_discovery_rule_name(discovery_port);
+    let mut cmds = vec![
+        windows_delete_rule_cmd(&audio_name),
+        windows_add_rule_cmd(&audio_name, "TCP", audio_port),
+        windows_delete_rule_cmd(&discovery_name),
+        windows_add_rule_cmd(&discovery_name, "UDP", discovery_port),
+    ];
+    if include_mdns {
+        let mdns_name = windows_mdns_rule_name();
+        cmds.push(windows_delete_rule_cmd(&mdns_name));
+        cmds.push(windows_add_rule_cmd(&mdns_name, "UDP", MDNS_PORT));
+    }
+    cmds
+}
+
+fn build_windows_close_commands(audio_port: u16, discovery_port: u16) -> Vec<Vec<String>> {
+    vec![
+        windows_delete_rule_cmd(&windows_audio_rule_name(audio_port)),
+        windows_delete_rule_cmd(&windows_discovery_rule_name(discovery_port)),
+        windows_delete_rule_cmd(&windows_mdns_rule_name()),
+    ]
+}
+
+#[cfg_attr(not(windows), allow(dead_code))]
+fn is_netsh_delete_rule(cmd: &[String]) -> bool {
+    cmd.first()
+        .map(|s| s.eq_ignore_ascii_case("netsh"))
+        .unwrap_or(false)
+        && cmd.iter().any(|a| a.eq_ignore_ascii_case("delete"))
+        && cmd.iter().any(|a| a.eq_ignore_ascii_case("rule"))
+}
+
+#[cfg_attr(not(windows), allow(dead_code))]
+fn extract_netsh_rule_name(cmd: &[String]) -> Option<&str> {
+    cmd.iter().find_map(|arg| {
+        let (k, v) = arg.split_once('=')?;
+        if k.eq_ignore_ascii_case("name") && !v.is_empty() {
+            Some(v)
+        } else {
+            None
+        }
+    })
+}
+
+#[cfg_attr(not(windows), allow(dead_code))]
+fn is_netsh_no_matching_rules(output: &str) -> bool {
+    let lower = output.to_lowercase();
+    lower.contains("no rules match")
+        || lower.contains("no rule matches")
+        || lower.contains("not found")
+}
+
+#[cfg_attr(not(windows), allow(dead_code))]
+fn needs_cmd_quoting(s: &str) -> bool {
+    s.is_empty()
+        || s.chars().any(|c| {
+            c.is_whitespace() || matches!(c, '"' | '&' | '|' | '<' | '>' | '^' | '(' | ')')
+        })
+}
+
+#[cfg_attr(not(windows), allow(dead_code))]
+fn format_netsh_arg_for_cmd(arg: &str) -> String {
+    if let Some((key, val)) = arg.split_once('=') {
+        if !key.is_empty() && !needs_cmd_quoting(key) && needs_cmd_quoting(val) {
+            let escaped = val.replace('"', "\\\"");
+            return format!("{key}=\"{escaped}\"");
+        }
+    }
+    if needs_cmd_quoting(arg) {
+        let escaped = arg.replace('"', "\\\"");
+        format!("\"{escaped}\"")
+    } else {
+        arg.to_string()
+    }
+}
+
+#[cfg_attr(not(windows), allow(dead_code))]
+fn format_command_for_cmd(cmd: &[String]) -> String {
+    cmd.iter()
+        .map(|a| format_netsh_arg_for_cmd(a))
+        .collect::<Vec<_>>()
+        .join(" ")
+}
+
+#[cfg_attr(not(windows), allow(dead_code))]
+fn build_windows_elevated_cmd_params(commands: &[Vec<String>], is_close: bool) -> String {
+    if is_close {
+        let mut steps = Vec::new();
+        for cmd in commands {
+            if let Some(name) = extract_netsh_rule_name(cmd) {
+                let show_cmd = format_command_for_cmd(&windows_show_rule_cmd(name));
+                let del_cmd = format_command_for_cmd(cmd);
+                steps.push(format!(
+                    "{show_cmd} >nul 2>&1 && ({del_cmd} >nul 2>&1 || exit /b 1)"
+                ));
+            } else {
+                steps.push(format!("{} >nul 2>&1", format_command_for_cmd(cmd)));
+            }
+        }
+        if steps.is_empty() {
+            return "/C \"exit /b 0\"".to_string();
+        }
+        format!("/C \"{} & exit /b 0\"", steps.join(" & "))
+    } else {
+        let mut groups = Vec::new();
+        let mut i = 0;
+        while i < commands.len() {
+            if is_netsh_delete_rule(&commands[i])
+                && i + 1 < commands.len()
+                && !is_netsh_delete_rule(&commands[i + 1])
+            {
+                let del_cmd = format_command_for_cmd(&commands[i]);
+                let add_cmd = format_command_for_cmd(&commands[i + 1]);
+                groups.push(format!("({del_cmd} >nul 2>&1 & {add_cmd})"));
+                i += 2;
+            } else if is_netsh_delete_rule(&commands[i]) {
+                let del_cmd = format_command_for_cmd(&commands[i]);
+                groups.push(format!("({del_cmd} >nul 2>&1 & ver >nul)"));
+                i += 1;
+            } else {
+                groups.push(format!("({})", format_command_for_cmd(&commands[i])));
+                i += 1;
+            }
+        }
+        if groups.is_empty() {
+            return "/C \"exit /b 0\"".to_string();
+        }
+        format!("/C \"{}\"", groups.join(" && "))
+    }
+}
+
+#[cfg(windows)]
+fn to_wide_null(s: &str) -> Vec<u16> {
+    use std::os::windows::ffi::OsStrExt;
+    std::ffi::OsStr::new(s)
+        .encode_wide()
+        .chain(std::iter::once(0))
+        .collect()
+}
+
+#[cfg(windows)]
+fn run_elevated_windows_cmd(params: &str, timeout: Duration) -> Result<u32, String> {
+    use std::mem::{size_of, zeroed};
+    use windows_sys::Win32::Foundation::{
+        CloseHandle, GetLastError, ERROR_CANCELLED, WAIT_OBJECT_0, WAIT_TIMEOUT,
+    };
+    use windows_sys::Win32::System::Threading::{GetExitCodeProcess, WaitForSingleObject};
+    use windows_sys::Win32::UI::Shell::{
+        ShellExecuteExW, SEE_MASK_NOCLOSEPROCESS, SHELLEXECUTEINFOW,
+    };
+    use windows_sys::Win32::UI::WindowsAndMessaging::SW_HIDE;
+
+    let verb = to_wide_null("runas");
+    let file = to_wide_null("cmd.exe");
+    let parameters = to_wide_null(params);
+
+    unsafe {
+        let mut sei: SHELLEXECUTEINFOW = zeroed();
+        sei.cbSize = size_of::<SHELLEXECUTEINFOW>() as u32;
+        sei.fMask = SEE_MASK_NOCLOSEPROCESS;
+        sei.lpVerb = verb.as_ptr();
+        sei.lpFile = file.as_ptr();
+        sei.lpParameters = parameters.as_ptr();
+        sei.nShow = SW_HIDE;
+
+        if ShellExecuteExW(&mut sei) == 0 {
+            let err = GetLastError();
+            if err == ERROR_CANCELLED {
+                return Err("UAC elevation was cancelled by the user".to_string());
+            }
+            return Err(format!(
+                "Failed to launch elevated firewall helper (Win32 error {err})"
+            ));
+        }
+
+        if sei.hProcess.is_null() {
+            return Err("Elevated firewall helper did not return a process handle".to_string());
+        }
+
+        let wait_ms = timeout.as_millis().min(u32::MAX as u128) as u32;
+        let wait_res = WaitForSingleObject(sei.hProcess, wait_ms);
+        let outcome = if wait_res == WAIT_OBJECT_0 {
+            let mut exit_code: u32 = 1;
+            if GetExitCodeProcess(sei.hProcess, &mut exit_code) != 0 {
+                Ok(exit_code)
+            } else {
+                let err = GetLastError();
+                Err(format!(
+                    "Failed to read elevated firewall helper exit code (Win32 error {err})"
+                ))
+            }
+        } else if wait_res == WAIT_TIMEOUT {
+            Err(format!(
+                "Elevated firewall helper timed out after {:.0}s",
+                timeout.as_secs_f64()
+            ))
+        } else {
+            let err = GetLastError();
+            Err(format!(
+                "Waiting for elevated firewall helper failed (Win32 error {err})"
+            ))
+        };
+
+        let _ = CloseHandle(sei.hProcess);
+        outcome
+    }
+}
+
+#[cfg(windows)]
+fn execute_windows_firewall_commands(
+    result: &mut FirewallResult,
+    interactive: bool,
+    is_close: bool,
+) {
+    if result.commands.is_empty() {
+        return;
+    }
+
+    if is_admin() {
+        result.ran = true;
+        // SystemRunner sets CREATE_NO_WINDOW (0x0800_0000) on Windows so netsh never flashes a console.
+        for cmd in &result.commands {
+            let is_del = is_netsh_delete_rule(cmd);
+            match SystemRunner.run(cmd, None, Duration::from_secs(15)) {
+                Ok(res) if res.ok() => {}
+                Ok(res) => {
+                    if is_del && !is_close {
+                        // Pre-add cleanup delete may report "No rules match" on first run.
+                        continue;
+                    }
+                    if is_del && is_close {
+                        let out = res.combined_output();
+                        if is_netsh_no_matching_rules(&out) {
+                            continue;
+                        }
+                        if let Some(name) = extract_netsh_rule_name(cmd) {
+                            let show = windows_show_rule_cmd(name);
+                            if let Ok(show_res) =
+                                SystemRunner.run(&show, None, Duration::from_secs(10))
+                            {
+                                if !show_res.ok() {
+                                    // Rule does not exist (localized Windows output).
+                                    continue;
+                                }
+                            }
+                        }
+                    }
+                    result.ok = false;
+                    result.errors.push(res.combined_output());
+                }
+                Err(err) => {
+                    result.ok = false;
+                    result.errors.push(err.to_string());
+                }
+            }
+        }
+        return;
+    }
+
+    if !interactive {
+        result.ran = false;
+        result.ok = false;
+        result.errors.push(
+            "Administrator privileges are required to modify Windows Defender Firewall in non-interactive mode."
+                .to_string(),
+        );
+        result.note =
+            "Run interactively to approve the Windows UAC prompt, or run as Administrator."
+                .to_string();
+        return;
+    }
+
+    result.ran = true;
+    let params = build_windows_elevated_cmd_params(&result.commands, is_close);
+    match run_elevated_windows_cmd(&params, Duration::from_secs(60)) {
+        Ok(0) => {
+            result.ok = true;
+            result.note = "Windows Defender Firewall rules updated via UAC elevation.".to_string();
+        }
+        Ok(code) => {
+            result.ok = false;
+            result.errors.push(format!(
+                "Elevated Windows Firewall helper exited with code {code}"
+            ));
+        }
+        Err(err) => {
+            result.ok = false;
+            result.errors.push(err);
+        }
     }
 }
 
@@ -106,8 +494,7 @@ fn detect_with_runner_and_ufw_conf(
             ];
             if let Ok(res) = runner.run(&args, None, Duration::from_secs(5)) {
                 if res.ok() {
-                    let lower = res.stdout.to_lowercase();
-                    let active = lower.contains("state") && lower.contains("on");
+                    let active = parse_windows_firewall_state(&res.stdout);
                     return FirewallState {
                         kind: "windows-defender".to_string(),
                         active,
@@ -264,7 +651,15 @@ fn sudo_prefix(interactive: bool) -> Vec<String> {
     }
 }
 
-fn execute_firewall_commands(result: &mut FirewallResult, interactive: bool) {
+fn execute_firewall_commands(result: &mut FirewallResult, interactive: bool, is_close: bool) {
+    #[cfg(windows)]
+    if result.firewall.kind == "windows-defender" {
+        execute_windows_firewall_commands(result, interactive, is_close);
+        return;
+    }
+    #[cfg(not(windows))]
+    let _ = is_close;
+
     result.ran = true;
     for cmd in &result.commands {
         let is_interactive_sudo = interactive
@@ -390,44 +785,11 @@ fn open_ports_with_mode(
             result.commands.push(reload);
         }
         "windows-defender" => {
-            result.commands.push(vec![
-                "netsh".into(),
-                "advfirewall".into(),
-                "firewall".into(),
-                "add".into(),
-                "rule".into(),
-                format!("name=SoundHop Audio ({audio_port}/tcp)"),
-                "dir=in".into(),
-                "action=allow".into(),
-                "protocol=TCP".into(),
-                format!("localport={audio_port}"),
-            ]);
-            result.commands.push(vec![
-                "netsh".into(),
-                "advfirewall".into(),
-                "firewall".into(),
-                "add".into(),
-                "rule".into(),
-                format!("name=SoundHop Discovery ({discovery_port}/udp)"),
-                "dir=in".into(),
-                "action=allow".into(),
-                "protocol=UDP".into(),
-                format!("localport={discovery_port}"),
-            ]);
-            if include_mdns {
-                result.commands.push(vec![
-                    "netsh".into(),
-                    "advfirewall".into(),
-                    "firewall".into(),
-                    "add".into(),
-                    "rule".into(),
-                    format!("name=SoundHop mDNS ({MDNS_PORT}/udp)"),
-                    "dir=in".into(),
-                    "action=allow".into(),
-                    "protocol=UDP".into(),
-                    format!("localport={MDNS_PORT}"),
-                ]);
-            }
+            result.commands.extend(build_windows_open_commands(
+                audio_port,
+                discovery_port,
+                include_mdns,
+            ));
         }
         _ => {
             result.note = format!(
@@ -441,7 +803,7 @@ fn open_ports_with_mode(
         return result;
     }
 
-    execute_firewall_commands(&mut result, interactive);
+    execute_firewall_commands(&mut result, interactive, false);
     result
 }
 
@@ -502,22 +864,9 @@ pub fn close_ports(audio_port: u16, discovery_port: u16, dry_run: bool) -> Firew
             result.commands.push(reload);
         }
         "windows-defender" => {
-            result.commands.push(vec![
-                "netsh".into(),
-                "advfirewall".into(),
-                "firewall".into(),
-                "delete".into(),
-                "rule".into(),
-                format!("name=SoundHop Audio ({audio_port}/tcp)"),
-            ]);
-            result.commands.push(vec![
-                "netsh".into(),
-                "advfirewall".into(),
-                "firewall".into(),
-                "delete".into(),
-                "rule".into(),
-                format!("name=SoundHop Discovery ({discovery_port}/udp)"),
-            ]);
+            result
+                .commands
+                .extend(build_windows_close_commands(audio_port, discovery_port));
         }
         _ => {
             result.note =
@@ -529,7 +878,7 @@ pub fn close_ports(audio_port: u16, discovery_port: u16, dry_run: bool) -> Firew
     if dry_run {
         return result;
     }
-    execute_firewall_commands(&mut result, true);
+    execute_firewall_commands(&mut result, true, true);
     result
 }
 
@@ -662,5 +1011,129 @@ mod tests {
         let st = detect_with_runner(&runner);
         assert_eq!(st.kind, "windows-defender");
         assert!(st.active);
+    }
+
+    #[test]
+    fn test_parse_windows_firewall_state() {
+        let all_on = "\
+Domain Profile Settings:
+----------------------------------------------------------------------
+State                                 ON
+
+Private Profile Settings:
+----------------------------------------------------------------------
+State                                 ON
+
+Public Profile Settings:
+----------------------------------------------------------------------
+State                                 ON
+Ok.
+";
+        assert!(parse_windows_firewall_state(all_on));
+
+        let all_off = "\
+Domain Profile Settings:
+----------------------------------------------------------------------
+State                                 OFF
+Connection                            Block
+Private Profile Settings:
+----------------------------------------------------------------------
+State                                 OFF
+Public Profile Settings:
+----------------------------------------------------------------------
+State                                 OFF
+Ok.
+";
+        assert!(!parse_windows_firewall_state(all_off));
+
+        let mixed = "\
+Domain Profile Settings:
+State                                 OFF
+Private Profile Settings:
+State                                 ON
+";
+        assert!(parse_windows_firewall_state(mixed));
+    }
+
+    #[test]
+    fn test_build_windows_open_commands_idempotent_and_scoped() {
+        let cmds_no_mdns = build_windows_open_commands(4713, 47777, false);
+        assert_eq!(cmds_no_mdns.len(), 4);
+        assert!(is_netsh_delete_rule(&cmds_no_mdns[0]));
+        assert_eq!(
+            extract_netsh_rule_name(&cmds_no_mdns[0]),
+            Some("SoundHop Audio (4713/tcp)")
+        );
+        assert!(!is_netsh_delete_rule(&cmds_no_mdns[1]));
+        assert!(cmds_no_mdns[1].contains(&"profile=private,domain".to_string()));
+        assert!(cmds_no_mdns[1].contains(&"protocol=TCP".to_string()));
+        assert!(cmds_no_mdns[1].contains(&"localport=4713".to_string()));
+
+        assert!(is_netsh_delete_rule(&cmds_no_mdns[2]));
+        assert_eq!(
+            extract_netsh_rule_name(&cmds_no_mdns[2]),
+            Some("SoundHop Discovery (47777/udp)")
+        );
+        assert!(cmds_no_mdns[3].contains(&"profile=private,domain".to_string()));
+        assert!(cmds_no_mdns[3].contains(&"protocol=UDP".to_string()));
+        assert!(cmds_no_mdns[3].contains(&"localport=47777".to_string()));
+
+        let cmds_with_mdns = build_windows_open_commands(4713, 47777, true);
+        assert_eq!(cmds_with_mdns.len(), 6);
+        assert!(is_netsh_delete_rule(&cmds_with_mdns[4]));
+        assert_eq!(
+            extract_netsh_rule_name(&cmds_with_mdns[4]),
+            Some("SoundHop mDNS (5353/udp)")
+        );
+        assert!(cmds_with_mdns[5].contains(&"profile=private,domain".to_string()));
+        assert!(cmds_with_mdns[5].contains(&"protocol=UDP".to_string()));
+        assert!(cmds_with_mdns[5].contains(&format!("localport={MDNS_PORT}")));
+    }
+
+    #[test]
+    fn test_build_windows_close_commands_includes_mdns() {
+        let cmds = build_windows_close_commands(4713, 47777);
+        assert_eq!(cmds.len(), 3);
+        assert!(cmds.iter().all(|c| is_netsh_delete_rule(c)));
+        let names: Vec<Option<&str>> = cmds.iter().map(|c| extract_netsh_rule_name(c)).collect();
+        assert_eq!(
+            names,
+            vec![
+                Some("SoundHop Audio (4713/tcp)"),
+                Some("SoundHop Discovery (47777/udp)"),
+                Some("SoundHop mDNS (5353/udp)"),
+            ]
+        );
+    }
+
+    #[test]
+    fn test_build_windows_elevated_cmd_params_open_and_close() {
+        let open_cmds = build_windows_open_commands(4713, 47777, true);
+        let open_params = build_windows_elevated_cmd_params(&open_cmds, false);
+        assert!(open_params.starts_with("/C \""));
+        assert!(open_params.ends_with('"'));
+        assert!(open_params.contains("name=\"SoundHop Audio (4713/tcp)\""));
+        assert!(open_params.contains("name=\"SoundHop Discovery (47777/udp)\""));
+        assert!(open_params.contains("name=\"SoundHop mDNS (5353/udp)\""));
+        assert!(open_params.contains("profile=private,domain"));
+        assert!(open_params.contains(" >nul 2>&1 & netsh advfirewall firewall add rule "));
+        assert!(open_params.contains(") && ("));
+
+        let close_cmds = build_windows_close_commands(4713, 47777);
+        let close_params = build_windows_elevated_cmd_params(&close_cmds, true);
+        assert!(close_params.starts_with("/C \""));
+        assert!(close_params.ends_with("& exit /b 0\""));
+        assert!(close_params.contains("show rule name=\"SoundHop mDNS (5353/udp)\""));
+        assert!(close_params.contains("delete rule name=\"SoundHop mDNS (5353/udp)\""));
+    }
+
+    #[test]
+    fn test_is_netsh_no_matching_rules() {
+        assert!(is_netsh_no_matching_rules(
+            "No rules match the specified criteria.\r\n"
+        ));
+        assert!(!is_netsh_no_matching_rules(
+            "The requested operation requires elevation (Run as administrator)."
+        ));
     }
 }
