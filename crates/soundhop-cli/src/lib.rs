@@ -8,19 +8,26 @@ pub mod tui;
 pub mod ui;
 
 use std::io::IsTerminal;
+#[cfg(feature = "gui")]
 use std::path::{Path, PathBuf};
+#[cfg(feature = "gui")]
 use std::process::{Command, Stdio};
 use std::sync::Arc;
+#[cfg(feature = "gui")]
 use std::time::{Duration, Instant};
 
-#[cfg(windows)]
+#[cfg(all(windows, feature = "gui"))]
 const CREATE_NO_WINDOW: u32 = 0x0800_0000;
 
 use clap::Parser;
+#[cfg(feature = "gui")]
 use soundhop_core::constants::VERSION;
 use soundhop_core::controller::Controller;
+#[cfg(feature = "gui")]
 use soundhop_core::ipc::{is_running as ipc_is_running, ping as ipc_ping};
+#[cfg(feature = "gui")]
 use soundhop_core::service::sync_appimage_paths_if_installed;
+#[cfg(feature = "gui")]
 use soundhop_gui::{
     run_standalone_android_wizard, run_standalone_control_center_with_toast,
     run_standalone_settings, run_tray, GuiTab,
@@ -37,6 +44,15 @@ use crate::doctor::{run_bug_report, run_doctor};
 use crate::parser::{Cli, Commands};
 use crate::tui::run_tui;
 use crate::ui::{emit_error, set_no_color};
+
+#[cfg(not(feature = "gui"))]
+pub(crate) const GUI_DISABLED_MSG: &str = "This build of SoundHop was compiled without the `gui` feature (headless mode). Use the CLI or `soundhop tui`, or rebuild with `--features gui`.";
+
+#[cfg(not(feature = "gui"))]
+fn emit_gui_disabled(json_out: bool) -> i32 {
+    emit_error(GUI_DISABLED_MSG, json_out);
+    1
+}
 
 pub fn run_cli() -> i32 {
     run_cli_parsed(Cli::parse(), false)
@@ -60,28 +76,46 @@ fn run_cli_parsed(cli: Cli, gui_default: bool) -> i32 {
     }
 
     if let Some(ref tab_name) = cli.gui_tab {
-        let tab = GuiTab::from_arg(tab_name);
-        return launch_control_center_with_tray(tab, cli.json);
+        #[cfg(feature = "gui")]
+        {
+            let tab = GuiTab::from_arg(tab_name);
+            return launch_control_center_with_tray(tab, cli.json);
+        }
+        #[cfg(not(feature = "gui"))]
+        {
+            let _ = tab_name;
+            return emit_gui_disabled(cli.json);
+        }
     }
 
     if cli.settings_dialog {
-        return match run_standalone_settings() {
-            Ok(code) => code,
-            Err(e) => {
-                emit_error(&e, cli.json);
-                1
-            }
-        };
+        #[cfg(feature = "gui")]
+        {
+            return match run_standalone_settings() {
+                Ok(code) => code,
+                Err(e) => {
+                    emit_error(&e, cli.json);
+                    1
+                }
+            };
+        }
+        #[cfg(not(feature = "gui"))]
+        return emit_gui_disabled(cli.json);
     }
 
     if cli.android_wizard {
-        return match run_standalone_android_wizard() {
-            Ok(code) => code,
-            Err(e) => {
-                emit_error(&e, cli.json);
-                1
-            }
-        };
+        #[cfg(feature = "gui")]
+        {
+            return match run_standalone_android_wizard() {
+                Ok(code) => code,
+                Err(e) => {
+                    emit_error(&e, cli.json);
+                    1
+                }
+            };
+        }
+        #[cfg(not(feature = "gui"))]
+        return emit_gui_disabled(cli.json);
     }
 
     let controller = Arc::new(Controller::new(None, None, None, None, None, !cli.json));
@@ -113,14 +147,32 @@ fn run_cli_parsed(cli: Cli, gui_default: bool) -> i32 {
         Some(Commands::Firewall(ref args)) => handle_firewall(&controller, args, cli.json),
         Some(Commands::Config(ref args)) => handle_config(&controller, args, cli.json),
         Some(Commands::Doctor(ref args)) => run_doctor(&controller, args.fix, cli.json),
-        Some(Commands::Gui) => launch_control_center_with_tray(GuiTab::Home, cli.json),
-        Some(Commands::Tray) => match run_tray(cli.verbose) {
-            Ok(code) => code,
-            Err(e) => {
-                emit_error(&e, cli.json);
-                1
+        Some(Commands::Gui) => {
+            #[cfg(feature = "gui")]
+            {
+                launch_control_center_with_tray(GuiTab::Home, cli.json)
             }
-        },
+            #[cfg(not(feature = "gui"))]
+            {
+                emit_gui_disabled(cli.json)
+            }
+        }
+        Some(Commands::Tray) => {
+            #[cfg(feature = "gui")]
+            {
+                match run_tray(cli.verbose) {
+                    Ok(code) => code,
+                    Err(e) => {
+                        emit_error(&e, cli.json);
+                        1
+                    }
+                }
+            }
+            #[cfg(not(feature = "gui"))]
+            {
+                emit_gui_disabled(cli.json)
+            }
+        }
         Some(Commands::Logs(ref args)) => handle_logs(&controller, args, cli.json),
         Some(Commands::BugReport) => run_bug_report(&controller, cli.json),
         Some(Commands::Completions(ref args)) => handle_completions(args),
@@ -128,7 +180,14 @@ fn run_cli_parsed(cli: Cli, gui_default: bool) -> i32 {
         Some(Commands::Version) => handle_version(cli.json),
         None => {
             if gui_default {
-                launch_control_center_with_tray(GuiTab::Home, cli.json)
+                #[cfg(feature = "gui")]
+                {
+                    launch_control_center_with_tray(GuiTab::Home, cli.json)
+                }
+                #[cfg(not(feature = "gui"))]
+                {
+                    emit_gui_disabled(cli.json)
+                }
             } else if !cli.json && std::io::stdin().is_terminal() && std::io::stdout().is_terminal()
             {
                 match run_tui(controller) {
@@ -147,6 +206,7 @@ fn run_cli_parsed(cli: Cli, gui_default: bool) -> i32 {
 
 /// On Windows, prefer a sibling `soundhop-gui.exe` (GUI subsystem, zero console flash)
 /// when launching the background tray/GUI from `soundhop.exe`.
+#[cfg(feature = "gui")]
 fn prefer_sibling_gui_exe(current: &Path) -> PathBuf {
     #[cfg(windows)]
     {
@@ -160,11 +220,13 @@ fn prefer_sibling_gui_exe(current: &Path) -> PathBuf {
     current.to_path_buf()
 }
 
+#[cfg(feature = "gui")]
 fn resolve_gui_executable() -> Option<PathBuf> {
     let current = std::env::current_exe().ok()?;
     Some(prefer_sibling_gui_exe(&current))
 }
 
+#[cfg(feature = "gui")]
 fn ensure_background_tray_running() {
     if ipc_is_running(None) {
         return;
@@ -193,6 +255,7 @@ fn ensure_background_tray_running() {
     }
 }
 
+#[cfg(feature = "gui")]
 fn launch_control_center_with_tray(tab: GuiTab, json_out: bool) -> i32 {
     let old_instance_running = ipc_ping(None).is_some_and(|p| p.version != VERSION)
         || soundhop_core::util::read_instance_lock_info("tray")
@@ -270,6 +333,7 @@ mod tests {
         assert_eq!(c5.gui_tab.as_deref(), Some("phone"));
     }
 
+    #[cfg(feature = "gui")]
     #[test]
     fn test_prefer_sibling_gui_exe() {
         let dir = tempfile::tempdir().unwrap();
@@ -286,5 +350,22 @@ mod tests {
         assert_eq!(prefer_sibling_gui_exe(&cli_exe), gui_exe);
         #[cfg(not(windows))]
         assert_eq!(prefer_sibling_gui_exe(&cli_exe), cli_exe);
+    }
+
+    #[cfg(not(feature = "gui"))]
+    #[test]
+    fn test_headless_gui_commands_return_error() {
+        for argv in [
+            vec!["soundhop", "--json", "gui"],
+            vec!["soundhop", "--json", "tray"],
+            vec!["soundhop", "--json", "--gui-tab", "phone"],
+            vec!["soundhop", "--json", "--settings-dialog"],
+            vec!["soundhop", "--json", "--android-wizard"],
+        ] {
+            let cli = Cli::try_parse_from(argv).unwrap();
+            assert_eq!(run_cli_parsed(cli, false), 1);
+        }
+        let default_gui = Cli::try_parse_from(["soundhop", "--json"]).unwrap();
+        assert_eq!(run_cli_parsed(default_gui, true), 1);
     }
 }

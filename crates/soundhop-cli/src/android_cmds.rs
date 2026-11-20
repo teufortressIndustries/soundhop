@@ -6,6 +6,7 @@ use std::time::Duration;
 
 use soundhop_core::controller::Controller;
 use soundhop_core::util::{install_signal_handlers, signal_stop_requested};
+#[cfg(feature = "gui")]
 use soundhop_gui::open_android_wizard;
 
 use crate::core_cmds::try_ipc;
@@ -52,18 +53,28 @@ fn validate_android_codec(s: &str) -> Result<String, String> {
 pub fn handle_android(controller: &Arc<Controller>, args: &AndroidArgs, json_out: bool) -> i32 {
     let action = args.action.trim().to_lowercase();
     match action.as_str() {
-        "wizard" | "gui" => match open_android_wizard(Arc::clone(controller)) {
-            Ok(()) => {
-                if json_out {
-                    print_json(&serde_json::json!({ "ok": true }));
+        "wizard" | "gui" => {
+            #[cfg(feature = "gui")]
+            {
+                match open_android_wizard(Arc::clone(controller)) {
+                    Ok(()) => {
+                        if json_out {
+                            print_json(&serde_json::json!({ "ok": true }));
+                        }
+                        0
+                    }
+                    Err(e) => {
+                        emit_error(&e, json_out);
+                        1
+                    }
                 }
-                0
             }
-            Err(e) => {
-                emit_error(&e, json_out);
+            #[cfg(not(feature = "gui"))]
+            {
+                emit_error(crate::GUI_DISABLED_MSG, json_out);
                 1
             }
-        },
+        }
         "install" => {
             if !json_out {
                 info("Downloading and installing managed scrcpy + adb...");
@@ -506,6 +517,40 @@ mod tests {
         let args = AndroidArgs {
             action: "start".to_string(),
             target: Some("emulator-5554".to_string()),
+            source: "output".to_string(),
+            codec: "opus".to_string(),
+            bitrate: "128K".to_string(),
+            buffer: 50,
+            as_mic: false,
+            foreground: false,
+        };
+        assert_eq!(handle_android(&ctrl, &args, true), 1);
+    }
+
+    #[cfg(not(feature = "gui"))]
+    #[test]
+    fn test_android_wizard_disabled_without_gui_feature() {
+        let runner = Arc::new(MockRunner::new(|args, _| {
+            Ok(CommandResult {
+                args: args.to_vec(),
+                returncode: 0,
+                stdout: String::new(),
+                stderr: String::new(),
+            })
+        }));
+        let backend = Arc::new(LinuxAudioBackend::with_runner(runner));
+        let ctrl = Arc::new(Controller::new(
+            Some(Config::default()),
+            Some(State::default()),
+            Some(backend),
+            None,
+            None,
+            false,
+        ));
+        ctrl.set_save_enabled(false);
+        let args = AndroidArgs {
+            action: "wizard".to_string(),
+            target: None,
             source: "output".to_string(),
             codec: "opus".to_string(),
             bitrate: "128K".to_string(),
