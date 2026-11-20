@@ -9,8 +9,8 @@ use std::time::Duration;
 use crate::backend::Listener;
 use crate::config::{is_paired_security_mode, Config};
 use crate::pairing::{
-    identity_key_path, initiate_pair_request, DeviceIdentity, PairingManager, PendingPairRequest,
-    TrustStore, TrustedPeer, DEFAULT_PAIR_PORT, PENDING_REQUEST_TTL_SECS,
+    identity_key_path, initiate_pair_request_with_manager, DeviceIdentity, PairingManager,
+    PendingPairRequest, TrustStore, TrustedPeer, DEFAULT_PAIR_PORT, PENDING_REQUEST_TTL_SECS,
 };
 use crate::security::{
     derive_key_hex, derive_pa_cookie, generate_pairing_pin, soundhop_cookie_path, write_pa_cookie,
@@ -438,13 +438,15 @@ impl Controller {
         };
         let port = pair_port.filter(|&p| p > 0).unwrap_or(default_port);
         let identity = self.device_identity()?;
-        let outcome = initiate_pair_request(
+        let mgr = self.pairing_manager();
+        let outcome = initiate_pair_request_with_manager(
             trimmed_host,
             port,
             &identity,
             &display_name,
             code,
             Duration::from_secs(PENDING_REQUEST_TTL_SECS),
+            Some(&mgr),
             None,
         )
         .map_err(|e| ControllerError::Message(e.to_string()))?;

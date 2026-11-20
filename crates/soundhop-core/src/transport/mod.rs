@@ -335,7 +335,12 @@ impl OutboundSessionHandle {
                 let n = match capture.read_frame(&mut pcm_buf) {
                     Ok(0) => {
                         // Clean EOF: ensure at least one telemetry ping was exchanged if none yet.
-                        if last_ping_at.is_none() {
+                        let has_pong = telemetry_c
+                            .lock()
+                            .unwrap_or_else(|e| e.into_inner())
+                            .pongs_received
+                            > 0;
+                        if !has_pong {
                             let _ = exchange_ping(&mut conn, &telemetry_c, start_instant);
                         }
                         let _ = conn.send_close();
@@ -375,13 +380,20 @@ impl OutboundSessionHandle {
                 }
 
                 let should_ping = match last_ping_at {
-                    None => true,
+                    None => false,
                     Some(prev) => prev.elapsed() >= ping_interval,
                 };
-                if should_ping {
-                    if !exchange_ping(&mut conn, &telemetry_c, start_instant) {
-                        break 'stream;
-                    }
+                if last_ping_at.is_none() {
+                    last_ping_at = Some(Instant::now());
+                } else if should_ping {
+                    let now_us = start_instant
+                        .elapsed()
+                        .as_micros()
+                        .min(u128::from(u64::MAX)) as u64;
+                    let _ = conn.send_ping(&PingPayload {
+                        client_time_us: now_us,
+                    });
+                    let _ = poll_outbound_reply_nonblocking(&mut conn, &telemetry_c, start_instant);
                     last_ping_at = Some(Instant::now());
                 }
             }
@@ -491,6 +503,17 @@ fn exchange_ping(
         return false;
     }
     poll_outbound_reply(conn, telemetry, start_instant, true)
+}
+
+fn poll_outbound_reply_nonblocking(
+    conn: &mut Sht3ClientConnection,
+    telemetry: &Arc<Mutex<StreamTelemetry>>,
+    start_instant: Instant,
+) -> bool {
+    let _ = conn.set_read_timeout(Some(Duration::from_millis(2)));
+    let ok = poll_outbound_reply(conn, telemetry, start_instant, true);
+    let _ = conn.set_read_timeout(Some(DEFAULT_OUTBOUND_IO_TIMEOUT));
+    ok
 }
 
 /// Read reply frame(s) from the server after sending a `Ping` or `Control` message.
@@ -808,7 +831,6 @@ fn spawn_inbound_peer(
             ..JitterConfig::default()
         });
         let mut decoded_pcm = Vec::with_capacity(codec.interleaved_samples_per_frame());
-        let mut play_buf = Vec::with_capacity(codec.interleaved_samples_per_frame());
         let mut clean_close = false;
 
         while !peer_stop_c.load(Ordering::Acquire) && !manager_stop_c.load(Ordering::Acquire) {
@@ -829,10 +851,18 @@ fn spawn_inbound_peer(
                             }
                             jb.push(decoded_pcm.clone());
                             if jb.is_primed() {
-                                play_buf.clear();
-                                if jb.pop_with_codec(&mut *codec, &mut play_buf).is_ok()
-                                    && playback.write_frame(&play_buf).is_err()
-                                {
+                                let mut write_failed = false;
+                                while jb.stats().buffered_frames > 0 {
+                                    if let PopOutcome::Frame(frame) = jb.pop() {
+                                        if playback.write_frame(&frame).is_err() {
+                                            write_failed = true;
+                                            break;
+                                        }
+                                    } else {
+                                        break;
+                                    }
+                                }
+                                if write_failed {
                                     break;
                                 }
                             }

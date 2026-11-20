@@ -612,12 +612,36 @@ fn draw_pair_request_modal(
     req: &PendingPairRequest,
     total_pending: usize,
 ) {
-    let popup_area = centered_rect(70, 9, area);
+    let popup_area = centered_rect(72, 10, area);
     frame.render_widget(Clear, popup_area);
+
+    let title = if req.outgoing {
+        " Verify Pairing Code "
+    } else {
+        " Incoming Pair Request "
+    };
+    let headline = if req.outgoing {
+        format!(
+            "Pairing with {} — confirm code matches on both devices",
+            req.display_name
+        )
+    } else {
+        format!("{} wants to pair", req.display_name)
+    };
+    let approve_lbl = if req.outgoing {
+        "[a] Codes Match — Confirm"
+    } else {
+        "[a] Approve"
+    };
+    let deny_lbl = if req.outgoing {
+        "[d] Cancel (Mismatch)"
+    } else {
+        "[d] Deny"
+    };
 
     let mut lines = vec![
         Line::from(Span::styled(
-            format!("{} wants to pair", req.display_name),
+            headline,
             Style::default()
                 .fg(Color::White)
                 .add_modifier(Modifier::BOLD),
@@ -642,14 +666,14 @@ fn draw_pair_request_modal(
         Line::from(""),
         Line::from(vec![
             Span::styled(
-                "[a] Approve",
+                approve_lbl,
                 Style::default()
                     .fg(Color::Green)
                     .add_modifier(Modifier::BOLD),
             ),
             Span::raw("     "),
             Span::styled(
-                "[d] Deny",
+                deny_lbl,
                 Style::default().fg(Color::Red).add_modifier(Modifier::BOLD),
             ),
         ]),
@@ -665,7 +689,7 @@ fn draw_pair_request_modal(
         Block::default()
             .borders(Borders::ALL)
             .border_style(Style::default().fg(Color::Yellow))
-            .title(" Incoming Pair Request "),
+            .title(title),
     );
     frame.render_widget(modal, popup_area);
 }
@@ -1429,6 +1453,7 @@ mod tests {
                 sas_code: "482-913".to_string(),
                 created_at: 100.0,
                 expires_at: 160.0,
+                outgoing: false,
             },
             PendingPairRequest {
                 request_id: "req-deny".to_string(),
@@ -1440,6 +1465,7 @@ mod tests {
                 sas_code: "901-234".to_string(),
                 created_at: 101.0,
                 expires_at: 161.0,
+                outgoing: true,
             },
         ];
 

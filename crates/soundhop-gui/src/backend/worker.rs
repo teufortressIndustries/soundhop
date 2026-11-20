@@ -72,7 +72,7 @@ impl WorkerState {
     }
 
     pub(super) fn refresh_peers(&mut self) {
-        if ipc_is_running(None) {
+        if self.use_ipc && ipc_is_running(None) {
             if let Ok(resp) = ipc_request(
                 "peers",
                 serde_json::json!({}),
@@ -844,7 +844,7 @@ impl WorkerState {
     }
 
     pub(super) fn apply_config_patch(&mut self, patch: serde_json::Value, toast: Option<String>) {
-        let res = if ipc_is_running(None) {
+        let res = if self.use_ipc && ipc_is_running(None) {
             ipc_checked(
                 "config_patch",
                 serde_json::json!({ "patch": patch }),

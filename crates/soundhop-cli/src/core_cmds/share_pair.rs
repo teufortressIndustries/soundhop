@@ -268,6 +268,57 @@ fn handle_pair_v2(controller: &Arc<Controller>, action: &PairAction, json_out: b
             if let Some(c) = code {
                 payload["code"] = serde_json::json!(c);
             }
+            let has_code = code.as_deref().is_some_and(|c| !c.trim().is_empty());
+            if !has_code && !json_out {
+                // Poll briefly on a side thread to print the 6-digit SAS verification code
+                // immediately while waiting for mutual confirmation.
+                let ctrl_poll = Arc::clone(controller);
+                std::thread::spawn(move || {
+                    for _ in 0..40 {
+                        std::thread::sleep(Duration::from_millis(50));
+                        let reqs: Vec<serde_json::Value> = if let Some(Ok(val)) = try_ipc(
+                            "pair_pending",
+                            serde_json::json!({}),
+                            Duration::from_millis(800),
+                        ) {
+                            val.get("requests")
+                                .and_then(|v| v.as_array())
+                                .cloned()
+                                .unwrap_or_default()
+                        } else {
+                            ctrl_poll
+                                .pending_pair_requests()
+                                .into_iter()
+                                .filter_map(|r| serde_json::to_value(r).ok())
+                                .collect()
+                        };
+                        if let Some(out_req) = reqs
+                            .iter()
+                            .find(|r| r.get("outgoing").and_then(|b| b.as_bool()) == Some(true))
+                        {
+                            let sas = out_req
+                                .get("sas_code")
+                                .and_then(|v| v.as_str())
+                                .unwrap_or("");
+                            let peer_name = out_req
+                                .get("display_name")
+                                .and_then(|v| v.as_str())
+                                .unwrap_or("remote device");
+                            let fp = out_req
+                                .get("fingerprint")
+                                .and_then(|v| v.as_str())
+                                .unwrap_or("");
+                            info(&format!(
+                                "Verification Code for '{peer_name}': {sas}  (Fingerprint: {fp})"
+                            ));
+                            info(&format!(
+                                "Confirm both screens show {sas}, then run `soundhop pair approve {sas}` (or confirm in GUI/TUI) on both devices."
+                            ));
+                            break;
+                        }
+                    }
+                });
+            }
             let res =
                 if let Some(ipc_res) = try_ipc("pair_request", payload, Duration::from_secs(65)) {
                     ipc_res

@@ -431,14 +431,52 @@ fn render_pair_request_modal(
                 .rect_filled(rect, 0.0, egui::Color32::from_black_alpha(145));
         });
 
-    egui::Window::new("Incoming Pair Request")
+    let window_title = if req.outgoing {
+        "Verify Pairing Code"
+    } else {
+        "Incoming Pair Request"
+    };
+    let headline = if req.outgoing {
+        format!(
+            "Pairing with {} — Verification Code: {}",
+            req.display_name, req.sas_code
+        )
+    } else {
+        format!(
+            "{} wants to pair — Verification Code: {}",
+            req.display_name, req.sas_code
+        )
+    };
+    let verify_hint = if req.outgoing {
+        format!(
+            "Check that {} displays this exact same 6-digit code. Both devices must confirm matching codes to prevent Man-in-the-Middle attacks.",
+            req.display_name
+        )
+    } else {
+        format!(
+            "Check that {} displays this exact same 6-digit code before approving. If the codes do not match, deny immediately.",
+            req.display_name
+        )
+    };
+    let approve_label = if req.outgoing {
+        "Codes Match — Confirm"
+    } else {
+        "Codes Match — Approve"
+    };
+    let deny_label = if req.outgoing {
+        "Cancel (Codes Don't Match)"
+    } else {
+        "Deny"
+    };
+
+    egui::Window::new(window_title)
         .id(egui::Id::new("incoming_pair_request_modal"))
         .order(egui::Order::Foreground)
         .anchor(egui::Align2::CENTER_CENTER, egui::vec2(0.0, 0.0))
         .collapsible(false)
         .resizable(false)
-        .default_width(440.0)
-        .max_width(440.0)
+        .default_width(450.0)
+        .max_width(450.0)
         .frame(
             egui::Frame::new()
                 .fill(pal.card)
@@ -447,20 +485,18 @@ fn render_pair_request_modal(
                 .inner_margin(Margin::same(18)),
         )
         .show(ctx, |ui| {
+            ui.label(RichText::new(headline).color(pal.text).size(14.5).strong());
+            ui.add_space(6.0);
             ui.label(
-                RichText::new(format!(
-                    "{} wants to pair — Verification Code: {}",
-                    req.display_name, req.sas_code
-                ))
-                .color(pal.text)
-                .size(14.5)
-                .strong(),
+                RichText::new(verify_hint)
+                    .color(pal.text_secondary)
+                    .size(12.0),
             );
             ui.add_space(10.0);
             callout_card(ui, pal.accent_soft, pal.accent, |ui| {
                 ui.vertical_centered(|ui| {
                     ui.label(
-                        RichText::new("Verification Code")
+                        RichText::new("Verification Code (must match on both screens)")
                             .color(pal.text_secondary)
                             .size(11.5),
                     );
@@ -476,7 +512,7 @@ fn render_pair_request_modal(
             ui.add_space(8.0);
             ui.label(
                 RichText::new(format!(
-                    "From: {} • Fingerprint: {}",
+                    "Peer: {} • Fingerprint: {}",
                     req.remote_addr, req.fingerprint
                 ))
                 .color(pal.text_muted)
@@ -498,13 +534,13 @@ fn render_pair_request_modal(
             ui.add_space(14.0);
             ui.horizontal(|ui| {
                 ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                    if primary_button(ui, pal, "Approve").clicked() {
+                    if primary_button(ui, pal, approve_label).clicked() {
                         backend.send(GuiCommand::ApprovePairRequest {
                             request_id: req.request_id.clone(),
                         });
                     }
                     ui.add_space(6.0);
-                    if danger_button(ui, pal, "Deny").clicked() {
+                    if danger_button(ui, pal, deny_label).clicked() {
                         backend.send(GuiCommand::DenyPairRequest {
                             request_id: req.request_id.clone(),
                         });

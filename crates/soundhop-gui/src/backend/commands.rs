@@ -624,36 +624,189 @@ impl WorkerState {
             self.push_toast("Target device address is required to pair.", true);
             return;
         }
-        self.set_busy(Some(format!("Sending pair request to {trimmed}...")));
-        let res = if self.use_ipc && ipc_is_running(None) {
-            let mut payload = serde_json::json!({ "host": trimmed });
-            if let Some(p) = port {
-                payload["port"] = serde_json::json!(p);
-            }
-            if let Some(ref c) = code {
-                if !c.trim().is_empty() {
-                    payload["code"] = serde_json::json!(c.trim());
+        let has_headless_code = code.as_deref().is_some_and(|c| !c.trim().is_empty());
+        if has_headless_code {
+            self.set_busy(Some(format!("Sending pair request to {trimmed}...")));
+            let res = if self.use_ipc && ipc_is_running(None) {
+                let mut payload = serde_json::json!({ "host": trimmed });
+                if let Some(p) = port {
+                    payload["port"] = serde_json::json!(p);
+                }
+                if let Some(ref c) = code {
+                    if !c.trim().is_empty() {
+                        payload["code"] = serde_json::json!(c.trim());
+                    }
+                }
+                ipc_checked(
+                    "pair_request",
+                    payload,
+                    Duration::from_secs(65),
+                    "Pair request failed",
+                )
+                .map(|_| ())
+            } else {
+                let _sync = lock_or_recover(&self.controller_sync_lock);
+                self.controller
+                    .pair_request(&trimmed, port, code.as_deref())
+                    .map(|_| ())
+                    .map_err(|e| e.to_string())
+            };
+            self.set_busy(None);
+            self.finish_with_toast(res, format!("Paired with {trimmed}!"));
+            return;
+        }
+
+        // Interactive Pairing v2: run on a background thread so `cmd_handle` remains free
+        // to process the user's mutual SAS confirmation (`ApprovePairRequest` / `DenyPairRequest`)
+        // while the Verification Code modal is shown on both devices.
+        self.set_busy(Some(format!(
+            "Connecting to {trimmed} for verification code..."
+        )));
+        let use_ipc = self.use_ipc;
+        let controller = std::sync::Arc::clone(&self.controller);
+        let snapshot = std::sync::Arc::clone(&self.snapshot);
+        let toasts = std::sync::Arc::clone(&self.toasts);
+        let ctx = self.ctx.clone();
+
+        // Quick helper thread to surface the outgoing 6-digit SAS code modal within ~80ms
+        let snap_poll = std::sync::Arc::clone(&self.snapshot);
+        let ctrl_poll = std::sync::Arc::clone(&self.controller);
+        let ctx_poll = self.ctx.clone();
+        std::thread::spawn(move || {
+            for delay_ms in [60_u64, 150, 350] {
+                std::thread::sleep(Duration::from_millis(delay_ms));
+                let pending = if use_ipc && ipc_is_running(None) {
+                    ipc_request(
+                        "pair_pending",
+                        serde_json::json!({}),
+                        None,
+                        Duration::from_millis(800),
+                    )
+                    .ok()
+                    .and_then(|v| v.get("requests").and_then(|a| a.as_array()).cloned())
+                    .map(|arr| super::snapshot::parse_pending_pair_requests_json(&arr))
+                    .unwrap_or_else(|| ctrl_poll.pending_pair_requests())
+                } else {
+                    ctrl_poll.pending_pair_requests()
+                };
+                if !pending.is_empty() {
+                    let mut guard = write_or_recover(&snap_poll);
+                    guard.pending_pair_requests = pending;
+                    guard.busy_message = None;
+                    drop(guard);
+                    if let Some(ref c) = ctx_poll {
+                        c.request_repaint();
+                    }
+                    break;
                 }
             }
-            ipc_checked(
-                "pair_request",
-                payload,
-                Duration::from_secs(65),
-                "Pair request failed",
-            )
-            .map(|_| ())
-        } else {
-            let _sync = lock_or_recover(&self.controller_sync_lock);
-            self.controller
-                .pair_request(&trimmed, port, code.as_deref())
-                .map(|_| ())
-                .map_err(|e| e.to_string())
-        };
-        self.set_busy(None);
-        self.finish_with_toast(res, format!("Paired with {trimmed}!"));
+        });
+
+        std::thread::spawn(move || {
+            let res = if use_ipc && ipc_is_running(None) {
+                let mut payload = serde_json::json!({ "host": trimmed });
+                if let Some(p) = port {
+                    payload["port"] = serde_json::json!(p);
+                }
+                ipc_checked(
+                    "pair_request",
+                    payload,
+                    Duration::from_secs(65),
+                    "Pair request failed",
+                )
+            } else {
+                controller
+                    .pair_request(&trimmed, port, None)
+                    .map_err(|e| e.to_string())
+            };
+
+            let (toast_msg, is_err) = match res {
+                Ok(val) => {
+                    let peer_name = val
+                        .get("peer")
+                        .and_then(|p| p.get("display_name"))
+                        .and_then(|v| v.as_str())
+                        .unwrap_or(&trimmed);
+                    let sas = val.get("sas_code").and_then(|v| v.as_str()).unwrap_or("");
+                    if sas.is_empty() {
+                        (format!("Paired with {peer_name}!"), false)
+                    } else {
+                        (
+                            format!("Paired with {peer_name} (code {sas} verified)!"),
+                            false,
+                        )
+                    }
+                }
+                Err(e) => (e, true),
+            };
+
+            let trusted = if use_ipc && ipc_is_running(None) {
+                ipc_request(
+                    "pair_list",
+                    serde_json::json!({}),
+                    None,
+                    Duration::from_millis(800),
+                )
+                .ok()
+                .and_then(|v| v.get("trusted_peers").and_then(|a| a.as_array()).cloned())
+                .map(|arr| super::snapshot::parse_trusted_peers_json(&arr))
+                .unwrap_or_else(|| controller.trusted_peers())
+            } else {
+                controller.trusted_peers()
+            };
+            let pending = if use_ipc && ipc_is_running(None) {
+                ipc_request(
+                    "pair_pending",
+                    serde_json::json!({}),
+                    None,
+                    Duration::from_millis(800),
+                )
+                .ok()
+                .and_then(|v| v.get("requests").and_then(|a| a.as_array()).cloned())
+                .map(|arr| super::snapshot::parse_pending_pair_requests_json(&arr))
+                .unwrap_or_else(|| controller.pending_pair_requests())
+            } else {
+                controller.pending_pair_requests()
+            };
+
+            {
+                let mut guard = write_or_recover(&snapshot);
+                guard.busy_message = None;
+                guard.paired_peer_count = trusted.len();
+                let trusted_ids: std::collections::HashSet<String> =
+                    trusted.iter().map(|t| t.device_id.clone()).collect();
+                for peer in &mut guard.peers {
+                    if trusted_ids.contains(&peer.id) {
+                        peer.paired = true;
+                    }
+                }
+                guard.trusted_peers = trusted;
+                guard.pending_pair_requests = pending;
+            }
+            {
+                let mut t_guard = lock_or_recover(&toasts);
+                t_guard.push(super::snapshot::GuiToast {
+                    message: toast_msg,
+                    is_error: is_err,
+                    created_at: std::time::Instant::now(),
+                });
+                if t_guard.len() > 3 {
+                    let drain = t_guard.len() - 3;
+                    t_guard.drain(0..drain);
+                }
+            }
+            if let Some(ref c) = ctx {
+                c.request_repaint();
+            }
+        });
     }
 
     fn handle_approve_pair_request(&mut self, request_id: String) {
+        let is_outgoing = self
+            .controller
+            .pending_pair_requests()
+            .iter()
+            .any(|r| r.request_id == request_id && r.outgoing);
         let res = if self.use_ipc && ipc_is_running(None) {
             ipc_checked(
                 "pair_approve",
@@ -661,15 +814,36 @@ impl WorkerState {
                 Duration::from_secs(5),
                 "Failed to approve pair request",
             )
-            .map(|_| ())
+            .map(|v| {
+                let outgoing_ipc = v
+                    .get("request")
+                    .and_then(|r| r.get("outgoing"))
+                    .and_then(|b| b.as_bool())
+                    .unwrap_or(is_outgoing);
+                outgoing_ipc
+            })
         } else {
             let _sync = lock_or_recover(&self.controller_sync_lock);
             self.controller
                 .approve_pair_request(&request_id)
-                .map(|_| ())
+                .map(|_| is_outgoing)
                 .map_err(|e| e.to_string())
         };
-        self.finish_with_toast(res, "Device pairing approved.");
+        match res {
+            Ok(true) => {
+                self.push_toast(
+                    "Code confirmed on this device — make sure it is also approved on the other device.",
+                    false,
+                );
+                self.refresh_fast(true);
+            }
+            Ok(false) => {
+                self.finish_with_toast(Ok(()), "Device pairing approved.");
+            }
+            Err(e) => {
+                self.finish_with_toast(Err::<(), _>(e), "Device pairing approved.");
+            }
+        }
     }
 
     fn handle_deny_pair_request(&mut self, request_id: String) {

@@ -189,6 +189,11 @@ impl Sht3ClientConnection {
         Ok(())
     }
 
+    pub fn set_read_timeout(&self, dur: Option<Duration>) -> TransportResult<()> {
+        self.stream.set_read_timeout(dur)?;
+        Ok(())
+    }
+
     pub fn recv_frame(&mut self) -> TransportResult<DecryptedFrame> {
         let encrypted = EncryptedFrame::read_from(&mut self.stream)?;
         let payload = self.session.open_frame(&encrypted)?;

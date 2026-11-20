@@ -717,7 +717,11 @@ fn x25519_dh(secret: X25519StaticSecret, peer_pub: &[u8; 32]) -> PairingResult<[
 // PendingPairRequest, HeadlessOneTimeCode & PairingManager
 // ---------------------------------------------------------------------------
 
-/// An incoming pair request awaiting user approval or denial.
+/// A pending pair request awaiting user confirmation/approval or denial.
+///
+/// - When `outgoing == false`, this is an **incoming** request on the responder PC.
+/// - When `outgoing == true`, this is an **outgoing** request on the initiator PC
+///   awaiting mutual 6-digit SAS verification before Step 4 (`PairAckMsg`) is sent.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 pub struct PendingPairRequest {
     pub request_id: String,
@@ -729,6 +733,8 @@ pub struct PendingPairRequest {
     pub sas_code: String,
     pub created_at: f64,
     pub expires_at: f64,
+    #[serde(default)]
+    pub outgoing: bool,
 }
 
 /// Generated headless one-time pairing code (valid for 120s).
@@ -763,7 +769,7 @@ type OnPairedCallback = Arc<dyn Fn(TrustedPeer) + Send + Sync>;
 pub struct PairingManager {
     trust_store: Arc<TrustStore>,
     pending: Mutex<HashMap<String, PendingEntry>>,
-    rate_limit: Mutex<HashMap<IpAddr, Instant>>,
+    rate_limit: Mutex<HashMap<IpAddr, Vec<Instant>>>,
     headless_code: Mutex<Option<ActiveHeadlessCode>>,
     on_paired: Mutex<Option<OnPairedCallback>>,
     pending_ttl: Duration,
@@ -878,15 +884,14 @@ impl PairingManager {
     fn check_rate_limit(&self, ip: IpAddr) -> PairingResult<()> {
         let now = Instant::now();
         let mut guard = lock_or_recover(&self.rate_limit);
-        guard.retain(|_, ts| now.duration_since(*ts) < self.rate_limit_window);
-        if let Some(last) = guard.get(&ip) {
-            if now.duration_since(*last) < self.rate_limit_window {
-                return Err(PairingError::RateLimited(format!(
-                    "too many pair requests from {ip}"
-                )));
-            }
+        let timestamps = guard.entry(ip).or_default();
+        timestamps.retain(|ts| now.duration_since(*ts) < self.rate_limit_window);
+        if timestamps.len() >= 5 {
+            return Err(PairingError::RateLimited(format!(
+                "too many pair requests from {ip}"
+            )));
         }
-        guard.insert(ip, now);
+        timestamps.push(now);
         Ok(())
     }
 
@@ -1204,6 +1209,7 @@ fn handle_responder_connection(
             sas_code: sas_code.clone(),
             created_at: now,
             expires_at: now + manager.pending_ttl.as_secs_f64(),
+            outgoing: false,
         };
         match manager.register_pending(pending_info) {
             Ok(rx) => Some(rx),
@@ -1340,6 +1346,33 @@ pub fn initiate_pair_request(
     timeout: Duration,
     on_sas: Option<SasCallback>,
 ) -> PairingResult<PairRequestOutcome> {
+    initiate_pair_request_with_manager(
+        host,
+        pair_port,
+        identity,
+        display_name,
+        headless_code,
+        timeout,
+        None,
+        on_sas,
+    )
+}
+
+/// Perform the 4-step Pairing v2 handshake as the initiator against `host:pair_port`,
+/// optionally registering an outgoing [`PendingPairRequest`] in `initiator_manager` so
+/// **both** devices display the 6-digit SAS code and **both** users must confirm matching
+/// codes before Step 4 (`PairAckMsg`) completes (defeating active MITM auto-accept attacks).
+#[allow(clippy::too_many_arguments)]
+pub fn initiate_pair_request_with_manager(
+    host: &str,
+    pair_port: u16,
+    identity: &DeviceIdentity,
+    display_name: &str,
+    headless_code: Option<&str>,
+    timeout: Duration,
+    initiator_manager: Option<&Arc<PairingManager>>,
+    on_sas: Option<SasCallback>,
+) -> PairingResult<PairRequestOutcome> {
     let addr = format!("{host}:{pair_port}");
     let mut stream = TcpStream::connect_timeout(
         &addr.parse::<SocketAddr>().or_else(|_| {
@@ -1471,13 +1504,121 @@ pub fn initiate_pair_request(
         cb(&sas_code);
     }
 
-    // Step 3 & 4: Wait for PairCommitMsg (Accept or Reject)
-    let commit: PairCommitMsg = read_frame(&mut stream)?;
-    let commit_mac_hex = match commit {
-        PairCommitMsg::Accept { commit_mac_hex } => commit_mac_hex,
-        PairCommitMsg::Reject { reason } => {
-            shared_dh.zeroize();
-            return Err(PairingError::Rejected(reason));
+    let has_headless_code = headless_code.is_some_and(|c| !c.trim().is_empty());
+
+    // Step 3: Wait for PairCommitMsg (and mutual local SAS confirmation when managed)
+    let commit_mac_hex = if !has_headless_code {
+        if let Some(mgr) = initiator_manager {
+            let now = now_secs();
+            let pending_info = PendingPairRequest {
+                request_id: request_id.clone(),
+                device_id: resp_device_id.clone(),
+                display_name: resp_display_name.clone(),
+                platform: resp_platform.clone(),
+                remote_addr: addr.clone(),
+                fingerprint: compute_fingerprint(&resp_ed_pub),
+                sas_code: sas_code.clone(),
+                created_at: now,
+                expires_at: now + timeout.as_secs_f64(),
+                outgoing: true,
+            };
+            let decision_rx = mgr.register_pending(pending_info)?;
+            let mut reader_stream = stream.try_clone()?;
+            let (commit_tx, commit_rx) = mpsc::channel::<PairingResult<PairCommitMsg>>();
+            thread::spawn(move || {
+                let res = read_frame::<_, PairCommitMsg>(&mut reader_stream);
+                let _ = commit_tx.send(res);
+            });
+
+            let deadline = Instant::now() + timeout;
+            let mut local_approved = false;
+            let mut remote_accept_mac: Option<String> = None;
+
+            loop {
+                if !local_approved {
+                    match decision_rx.try_recv() {
+                        Ok(PairDecision::Approve) => {
+                            local_approved = true;
+                        }
+                        Ok(PairDecision::Deny) => {
+                            shared_dh.zeroize();
+                            let _ = stream.shutdown(std::net::Shutdown::Both);
+                            return Err(PairingError::Rejected(
+                                "Pair request cancelled — verification code rejected on this device"
+                                    .into(),
+                            ));
+                        }
+                        Err(mpsc::TryRecvError::Empty) => {}
+                        Err(mpsc::TryRecvError::Disconnected) => {
+                            shared_dh.zeroize();
+                            let _ = stream.shutdown(std::net::Shutdown::Both);
+                            return Err(PairingError::Rejected(
+                                "Pair request cancelled on this device".into(),
+                            ));
+                        }
+                    }
+                }
+
+                if remote_accept_mac.is_none() {
+                    match commit_rx.try_recv() {
+                        Ok(Ok(PairCommitMsg::Accept { commit_mac_hex })) => {
+                            remote_accept_mac = Some(commit_mac_hex);
+                        }
+                        Ok(Ok(PairCommitMsg::Reject { reason })) => {
+                            mgr.remove_pending(&request_id);
+                            shared_dh.zeroize();
+                            let _ = stream.shutdown(std::net::Shutdown::Both);
+                            return Err(PairingError::Rejected(reason));
+                        }
+                        Ok(Err(err)) => {
+                            mgr.remove_pending(&request_id);
+                            shared_dh.zeroize();
+                            return Err(err);
+                        }
+                        Err(mpsc::TryRecvError::Empty) => {}
+                        Err(mpsc::TryRecvError::Disconnected) => {
+                            mgr.remove_pending(&request_id);
+                            shared_dh.zeroize();
+                            return Err(PairingError::Wire(
+                                "responder closed pairing connection".into(),
+                            ));
+                        }
+                    }
+                }
+
+                if local_approved {
+                    if let Some(mac) = remote_accept_mac {
+                        break mac;
+                    }
+                }
+
+                if Instant::now() >= deadline {
+                    mgr.remove_pending(&request_id);
+                    shared_dh.zeroize();
+                    let _ = stream.shutdown(std::net::Shutdown::Both);
+                    return Err(PairingError::Timeout);
+                }
+
+                thread::sleep(Duration::from_millis(20));
+            }
+        } else {
+            let commit: PairCommitMsg = read_frame(&mut stream)?;
+            match commit {
+                PairCommitMsg::Accept { commit_mac_hex } => commit_mac_hex,
+                PairCommitMsg::Reject { reason } => {
+                    shared_dh.zeroize();
+                    return Err(PairingError::Rejected(reason));
+                }
+            }
+        }
+    } else {
+        let commit: PairCommitMsg = read_frame(&mut stream)?;
+        match commit {
+            PairCommitMsg::Accept { commit_mac_hex } => commit_mac_hex,
+            PairCommitMsg::Reject { reason } => {
+                shared_dh.zeroize();
+                return Err(PairingError::Rejected(reason));
+            }
         }
     };
 
@@ -1737,6 +1878,112 @@ mod tests {
             None,
         );
         assert!(matches!(replay_res, Err(PairingError::Rejected(_))));
+
+        server.stop();
+    }
+
+    #[test]
+    fn test_mutual_sas_verification_requires_both_devices_and_blocks_mitm() {
+        let resp_id = DeviceIdentity::generate("resp-mutual");
+        let init_id = DeviceIdentity::generate("init-mutual");
+        let resp_trust = Arc::new(TrustStore::new());
+        let resp_manager = Arc::new(PairingManager::new(Arc::clone(&resp_trust)));
+        let init_trust = Arc::new(TrustStore::new());
+        let init_manager = Arc::new(PairingManager::new(Arc::clone(&init_trust)));
+
+        let server = PairingServer::start(
+            SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), 0),
+            resp_id.clone(),
+            "Studio PC".to_string(),
+            Arc::clone(&resp_manager),
+        )
+        .unwrap();
+        let port = server.local_addr().port();
+
+        // 1. Both devices show identical SAS code; if responder approves first (or MITM auto-accepts),
+        // initiator does NOT complete Step 4 until initiator user ALSO confirms!
+        let init_mgr_clone = Arc::clone(&init_manager);
+        let init_id_clone = init_id.clone();
+        let handle = thread::spawn(move || {
+            initiate_pair_request_with_manager(
+                "127.0.0.1",
+                port,
+                &init_id_clone,
+                "My Laptop",
+                None,
+                Duration::from_secs(10),
+                Some(&init_mgr_clone),
+                None,
+            )
+        });
+
+        let (init_pending, resp_pending) = loop {
+            let i_list = init_manager.pending_requests();
+            let r_list = resp_manager.pending_requests();
+            if !i_list.is_empty() && !r_list.is_empty() {
+                break (i_list, r_list);
+            }
+            thread::sleep(Duration::from_millis(10));
+        };
+        assert_eq!(init_pending.len(), 1);
+        assert!(init_pending[0].outgoing);
+        assert_eq!(init_pending[0].display_name, "Studio PC");
+        assert_eq!(resp_pending.len(), 1);
+        assert!(!resp_pending[0].outgoing);
+        assert_eq!(resp_pending[0].display_name, "My Laptop");
+        assert_eq!(init_pending[0].sas_code, resp_pending[0].sas_code);
+
+        // Responder approves first, but initiator user sees a MITM mismatch and clicks Cancel/Deny:
+        resp_manager.approve(&resp_pending[0].request_id).unwrap();
+        thread::sleep(Duration::from_millis(40));
+        // Responder must NOT have trusted the initiator yet because initiator hasn't confirmed Step 4!
+        assert!(resp_trust.lookup_peer_key("init-mutual").is_none());
+
+        init_manager.deny(&init_pending[0].request_id).unwrap();
+        let cancelled = handle.join().unwrap();
+        assert!(matches!(cancelled, Err(PairingError::Rejected(_))));
+        assert!(resp_trust.lookup_peer_key("init-mutual").is_none());
+        assert!(init_trust.lookup_peer_key("resp-mutual").is_none());
+
+        // 2. Now both sides confirm matching SAS codes -> pairing succeeds on both ends
+        let init_mgr_clone2 = Arc::clone(&init_manager);
+        let init_id_clone2 = init_id.clone();
+        let handle2 = thread::spawn(move || {
+            initiate_pair_request_with_manager(
+                "127.0.0.1",
+                port,
+                &init_id_clone2,
+                "My Laptop",
+                None,
+                Duration::from_secs(10),
+                Some(&init_mgr_clone2),
+                None,
+            )
+        });
+
+        let (init_p2, resp_p2) = loop {
+            let i_list = init_manager.pending_requests();
+            let r_list = resp_manager.pending_requests();
+            if !i_list.is_empty() && !r_list.is_empty() {
+                break (i_list, r_list);
+            }
+            thread::sleep(Duration::from_millis(10));
+        };
+        assert_eq!(init_p2[0].sas_code, resp_p2[0].sas_code);
+
+        // Initiator confirms first, then responder approves
+        init_manager.approve(&init_p2[0].request_id).unwrap();
+        resp_manager.approve(&resp_p2[0].request_id).unwrap();
+
+        let outcome = handle2.join().unwrap().unwrap();
+        assert_eq!(outcome.peer.device_id, "resp-mutual");
+        let resp_key = loop {
+            if let Some(k) = resp_trust.lookup_peer_key("init-mutual") {
+                break k;
+            }
+            thread::sleep(Duration::from_millis(10));
+        };
+        assert_eq!(resp_key, outcome.peer.pairwise_secret);
 
         server.stop();
     }

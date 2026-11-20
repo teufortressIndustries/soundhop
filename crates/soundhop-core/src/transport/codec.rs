@@ -253,7 +253,7 @@ impl OpusCodec {
             .set_bitrate(opus2::Bitrate::Bits(target_bps))
             .map_err(|e| TransportError::Codec(format!("Opus set_bitrate failed: {e}")))?;
         let _ = encoder.set_vbr(true);
-        let _ = encoder.set_inband_fec(true);
+        let _ = encoder.set_inband_fec(false);
 
         let decoder = opus2::Decoder::new(params.sample_rate, opus_channels)
             .map_err(|e| TransportError::Codec(format!("Opus decoder init failed: {e}")))?;

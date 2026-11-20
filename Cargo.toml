@@ -62,6 +62,12 @@ cpal = "0.15"
 [profile.dev]
 debug = 1
 
+[profile.dev.package.mousiki]
+opt-level = 3
+
+[profile.dev.package.opus2]
+opt-level = 3
+
 [profile.release]
 opt-level = 3
 lto = true

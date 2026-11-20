@@ -2,7 +2,6 @@
 //! Dark/Light/System theme selector, and collapsible Advanced diagnostics.
 
 use eframe::egui::{self, RichText};
-use soundhop_core::security::generate_pairing_pin;
 
 use crate::backend::{security_friendly_label, GuiBackend, GuiCommand, GuiSnapshot};
 use crate::theme::{Palette, ThemeMode};
@@ -636,66 +635,6 @@ pub fn render(
             }
             ui.add_space(6.0);
         }
-
-        ui.add_space(8.0);
-        ui.separator();
-        ui.add_space(8.0);
-
-        ui.label(
-            RichText::new("Pair Devices with a Code")
-                .color(pal.text)
-                .size(13.5)
-                .strong(),
-        );
-        ui.label(
-            RichText::new(
-                "Generate a code here and type the exact same code on your other device, or enter a code from another device.",
-            )
-            .color(pal.text_muted)
-            .size(12.0),
-        );
-        ui.add_space(6.0);
-
-        ui.horizontal(|ui| {
-            if secondary_button(ui, pal, "Create Pairing Code").clicked() {
-                state.generated_code = generate_pairing_pin();
-                state.pairing_code_input = state.generated_code.clone();
-            }
-            if !state.generated_code.is_empty() {
-                ui.add_space(6.0);
-                ui.label(
-                    RichText::new(&state.generated_code)
-                        .color(pal.accent)
-                        .size(15.5)
-                        .strong()
-                        .monospace(),
-                );
-                if secondary_button(ui, pal, "Copy").clicked() {
-                    ui.ctx().copy_text(state.generated_code.clone());
-                }
-            }
-        });
-
-        ui.add_space(8.0);
-        ui.horizontal(|ui| {
-            ui.add(
-                egui::TextEdit::singleline(&mut state.pairing_code_input)
-                    .hint_text("Enter shared code (6+ chars)")
-                    .desired_width(210.0),
-            );
-            if primary_button(ui, pal, "Pair Devices").clicked() {
-                backend.send(GuiCommand::ApplyPairingPin {
-                    pin: state.pairing_code_input.clone(),
-                });
-            }
-            if !snap.config.sharing.psk_hash.is_empty()
-                && danger_button(ui, pal, "Reset Pairing").clicked()
-            {
-                state.generated_code.clear();
-                state.pairing_code_input.clear();
-                backend.send(GuiCommand::ClearPairing);
-            }
-        });
     });
 
     ui.add_space(10.0);

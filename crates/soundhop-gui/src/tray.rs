@@ -1965,6 +1965,7 @@ mod tests {
             sas_code: "482-913".to_string(),
             created_at: 100.0,
             expires_at: 160.0,
+            outgoing: false,
         }];
         let pair_snap = TrayMenuSnapshot::from_parts(
             Vec::new(),
