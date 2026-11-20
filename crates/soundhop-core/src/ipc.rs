@@ -301,7 +301,117 @@ pub fn is_soundhop_process(pid: u64) -> bool {
             })
             .unwrap_or(false)
     }
-    #[cfg(not(unix))]
+    #[cfg(windows)]
+    {
+        use windows_sys::Win32::Foundation::{CloseHandle, HANDLE};
+        use windows_sys::Win32::System::Threading::{
+            OpenProcess, QueryFullProcessImageNameW, PROCESS_QUERY_LIMITED_INFORMATION,
+        };
+
+        let Ok(pid32) = u32::try_from(pid) else {
+            return false;
+        };
+        unsafe {
+            let handle: HANDLE = OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, 0, pid32);
+            if handle.is_null() {
+                return false;
+            }
+            let mut buf = [0u16; 1024];
+            let mut len = buf.len() as u32;
+            let ok = QueryFullProcessImageNameW(handle, 0, buf.as_mut_ptr(), &mut len);
+            CloseHandle(handle);
+            if ok == 0 || len == 0 {
+                return false;
+            }
+            let image_path = String::from_utf16_lossy(&buf[..len as usize]);
+            let file_name = Path::new(&image_path)
+                .file_name()
+                .and_then(|n| n.to_str())
+                .unwrap_or(&image_path);
+            file_name.to_ascii_lowercase().contains("soundhop")
+        }
+    }
+    #[cfg(all(not(unix), not(windows)))]
+    {
+        let _ = pid;
+        false
+    }
+}
+
+/// Returns `true` if a process with `pid` is currently running.
+pub fn is_process_alive(pid: u64) -> bool {
+    if pid <= 1 {
+        return false;
+    }
+    #[cfg(unix)]
+    {
+        let Ok(pid_t) = libc::pid_t::try_from(pid) else {
+            return false;
+        };
+        unsafe { libc::kill(pid_t, 0) == 0 }
+    }
+    #[cfg(windows)]
+    {
+        use windows_sys::Win32::Foundation::{CloseHandle, HANDLE, STILL_ACTIVE};
+        use windows_sys::Win32::System::Threading::{
+            GetExitCodeProcess, OpenProcess, PROCESS_QUERY_LIMITED_INFORMATION,
+        };
+
+        let Ok(pid32) = u32::try_from(pid) else {
+            return false;
+        };
+        unsafe {
+            let handle: HANDLE = OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, 0, pid32);
+            if handle.is_null() {
+                return false;
+            }
+            let mut exit_code: u32 = 0;
+            let ok = GetExitCodeProcess(handle, &mut exit_code);
+            CloseHandle(handle);
+            ok != 0 && exit_code == STILL_ACTIVE as u32
+        }
+    }
+    #[cfg(all(not(unix), not(windows)))]
+    {
+        let _ = pid;
+        false
+    }
+}
+
+/// Sends a termination signal to a verified SoundHop process (`SIGTERM` on Unix,
+/// `TerminateProcess` on Windows). Never terminates non-SoundHop PIDs or self.
+pub fn terminate_process(pid: u64) -> bool {
+    if !is_soundhop_process(pid) {
+        return false;
+    }
+    #[cfg(unix)]
+    {
+        let Ok(pid_t) = libc::pid_t::try_from(pid) else {
+            return false;
+        };
+        unsafe { libc::kill(pid_t, libc::SIGTERM) == 0 }
+    }
+    #[cfg(windows)]
+    {
+        use windows_sys::Win32::Foundation::{CloseHandle, HANDLE};
+        use windows_sys::Win32::System::Threading::{
+            OpenProcess, TerminateProcess, PROCESS_TERMINATE,
+        };
+
+        let Ok(pid32) = u32::try_from(pid) else {
+            return false;
+        };
+        unsafe {
+            let handle: HANDLE = OpenProcess(PROCESS_TERMINATE, 0, pid32);
+            if handle.is_null() {
+                return false;
+            }
+            let ok = TerminateProcess(handle, 1);
+            CloseHandle(handle);
+            ok != 0
+        }
+    }
+    #[cfg(all(not(unix), not(windows)))]
     {
         let _ = pid;
         false
@@ -471,5 +581,17 @@ mod tests {
         assert!(!is_running(Some(&sock)));
 
         server.stop();
+    }
+
+    #[test]
+    fn test_process_inspection_self_and_invalid() {
+        let self_pid = u64::from(std::process::id());
+        assert!(is_process_alive(self_pid));
+        // is_soundhop_process must always reject self and invalid PIDs.
+        assert!(!is_soundhop_process(self_pid));
+        assert!(!is_soundhop_process(0));
+        assert!(!is_soundhop_process(1));
+        assert!(!is_process_alive(0));
+        assert!(!terminate_process(self_pid));
     }
 }

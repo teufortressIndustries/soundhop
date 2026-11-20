@@ -73,6 +73,7 @@ impl Daemon {
         if is_reachable(self.ipc_path.as_deref()) {
             return Err("SoundHop daemon is already running".to_string());
         }
+        crate::util::init_daemon_log();
         self.stop_flag.store(false, Ordering::SeqCst);
         let _ = self.controller.reconcile();
         self.setup_sharing();
@@ -122,31 +123,41 @@ impl Daemon {
         if info.version == VERSION {
             return;
         }
+        crate::util::append_log_line(
+            "INFO",
+            &format!(
+                "Replacing stale daemon v{} (pid={:?}) with v{VERSION}",
+                info.version, info.pid
+            ),
+        );
         let _ = ipc_request(
             "stop",
             serde_json::json!({}),
             self.ipc_path.as_deref(),
             Duration::from_secs(1),
         );
-        #[cfg(unix)]
         let tracked_pid = info.pid.filter(|&pid| crate::ipc::is_soundhop_process(pid));
         #[cfg(unix)]
         if let Some(pid) = tracked_pid {
-            unsafe {
-                libc::kill(pid as libc::pid_t, libc::SIGTERM);
-            }
+            let _ = crate::ipc::terminate_process(pid);
         }
-        for _ in 0..30 {
+        for attempt in 0..30 {
             let ipc_down = !is_reachable(self.ipc_path.as_deref());
-            #[cfg(unix)]
             let proc_exited = tracked_pid
-                .map(|pid| unsafe { libc::kill(pid as libc::pid_t, 0) != 0 })
+                .map(|pid| !crate::ipc::is_process_alive(pid))
                 .unwrap_or(true);
-            #[cfg(not(unix))]
-            let proc_exited = true;
             if ipc_down && proc_exited {
                 break;
             }
+            // On Windows, give graceful IPC stop 1.5s before falling back to TerminateProcess.
+            #[cfg(windows)]
+            if attempt == 15 {
+                if let Some(pid) = tracked_pid {
+                    let _ = crate::ipc::terminate_process(pid);
+                }
+            }
+            #[cfg(not(windows))]
+            let _ = attempt;
             thread::sleep(Duration::from_millis(100));
         }
         if !is_reachable(self.ipc_path.as_deref()) {
@@ -216,6 +227,7 @@ impl Daemon {
             let _ = self.controller.android_session.stop();
         }
         let _ = fs::remove_file(pid_path());
+        crate::util::append_log_line("INFO", "SoundHop daemon stopped");
     }
 
     fn setup_sharing(&self) {
@@ -227,10 +239,9 @@ impl Daemon {
         match self.controller.start_listener(Some(false)) {
             Ok(_) => self.advertising.store(true, Ordering::SeqCst),
             Err(e) => {
-                self.warnings
-                    .lock()
-                    .unwrap()
-                    .push(format!("Could not start the audio listener: {e}"));
+                let msg = format!("Could not start the audio listener: {e}");
+                crate::util::append_log_line("WARN", &msg);
+                self.warnings.lock().unwrap().push(msg);
             }
         }
     }

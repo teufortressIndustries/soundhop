@@ -359,13 +359,26 @@ pub fn is_executable(path: &Path) -> bool {
 // ---------------------------------------------------------------------------
 
 pub fn home_dir() -> PathBuf {
-    if let Some(h) = env::var_os("HOME").filter(|v| !v.is_empty()) {
-        return PathBuf::from(h);
+    #[cfg(windows)]
+    {
+        if let Some(up) = env::var_os("USERPROFILE").filter(|v| !v.is_empty()) {
+            return PathBuf::from(up);
+        }
+        if let Some(h) = env::var_os("HOME").filter(|v| !v.is_empty()) {
+            return PathBuf::from(h);
+        }
+        return env::temp_dir();
     }
-    if let Some(up) = env::var_os("USERPROFILE").filter(|v| !v.is_empty()) {
-        return PathBuf::from(up);
+    #[cfg(not(windows))]
+    {
+        if let Some(h) = env::var_os("HOME").filter(|v| !v.is_empty()) {
+            return PathBuf::from(h);
+        }
+        if let Some(up) = env::var_os("USERPROFILE").filter(|v| !v.is_empty()) {
+            return PathBuf::from(up);
+        }
+        env::temp_dir()
     }
-    env::temp_dir()
 }
 
 pub fn config_dir() -> PathBuf {
@@ -411,11 +424,36 @@ pub fn runtime_dir() -> PathBuf {
     if let Some(base) = env::var_os("XDG_RUNTIME_DIR").filter(|v| !v.is_empty()) {
         return PathBuf::from(base).join(APP_SLUG);
     }
-    #[cfg(unix)]
-    let uid = unsafe { libc::getuid() }.to_string();
-    #[cfg(not(unix))]
-    let uid = env::var("USERNAME").unwrap_or_else(|_| "user".to_string());
-    env::temp_dir().join(format!("{APP_SLUG}-{uid}"))
+    #[cfg(windows)]
+    {
+        if let Some(local) = env::var_os("LOCALAPPDATA").filter(|v| !v.is_empty()) {
+            return PathBuf::from(local).join(APP_SLUG).join("run");
+        }
+        if let Some(up) = env::var_os("USERPROFILE").filter(|v| !v.is_empty()) {
+            return PathBuf::from(up)
+                .join("AppData")
+                .join("Local")
+                .join(APP_SLUG)
+                .join("run");
+        }
+        let user = env::var("USERNAME").unwrap_or_else(|_| "user".to_string());
+        return env::temp_dir().join(format!("{APP_SLUG}-{user}"));
+    }
+    #[cfg(not(windows))]
+    {
+        #[cfg(unix)]
+        let uid = unsafe { libc::getuid() }.to_string();
+        #[cfg(not(unix))]
+        let uid = env::var("USERNAME").unwrap_or_else(|_| "user".to_string());
+        env::temp_dir().join(format!("{APP_SLUG}-{uid}"))
+    }
+}
+
+#[cfg(windows)]
+fn is_windows_reparse_point_or_symlink(meta: &fs::Metadata) -> bool {
+    use std::os::windows::fs::MetadataExt;
+    const FILE_ATTRIBUTE_REPARSE_POINT: u32 = 0x0000_0400;
+    meta.file_type().is_symlink() || (meta.file_attributes() & FILE_ATTRIBUTE_REPARSE_POINT) != 0
 }
 
 pub fn ensure_dir(path: &Path) -> std::io::Result<PathBuf> {
@@ -426,6 +464,17 @@ pub fn ensure_dir(path: &Path) -> std::io::Result<PathBuf> {
                 return Err(std::io::Error::new(
                     std::io::ErrorKind::PermissionDenied,
                     "Refusing symlinked directory",
+                ));
+            }
+        }
+    }
+    #[cfg(windows)]
+    {
+        if let Ok(pre_meta) = fs::symlink_metadata(path) {
+            if is_windows_reparse_point_or_symlink(&pre_meta) {
+                return Err(std::io::Error::new(
+                    std::io::ErrorKind::PermissionDenied,
+                    "Refusing symlinked or reparse-point directory",
                 ));
             }
         }
@@ -449,6 +498,16 @@ pub fn ensure_dir(path: &Path) -> std::io::Result<PathBuf> {
             ));
         }
         let _ = fs::set_permissions(path, fs::Permissions::from_mode(0o700));
+    }
+    #[cfg(windows)]
+    {
+        let meta = fs::symlink_metadata(path)?;
+        if is_windows_reparse_point_or_symlink(&meta) {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::PermissionDenied,
+                "Refusing symlinked or reparse-point directory",
+            ));
+        }
     }
     Ok(path.to_path_buf())
 }
@@ -475,6 +534,66 @@ pub fn lock_path() -> PathBuf {
 
 pub fn pid_path() -> PathBuf {
     runtime_dir().join("daemon.pid")
+}
+
+/// Maximum log file size before rotating `soundhop.log` -> `soundhop.log.old` (2 MiB).
+pub const MAX_LOG_FILE_BYTES: u64 = 2 * 1024 * 1024;
+
+static LOG_FILE_LOCK: OnceLock<Mutex<()>> = OnceLock::new();
+
+/// Rotate `path` to `<path>.old` (or truncate on rename failure) if its size
+/// meets or exceeds `max_bytes`.
+pub fn rotate_log_if_needed(path: &Path, max_bytes: u64) {
+    let Ok(meta) = fs::metadata(path) else {
+        return;
+    };
+    if meta.len() < max_bytes {
+        return;
+    }
+    let backup = path.with_extension("log.old");
+    let _ = fs::remove_file(&backup);
+    if fs::rename(path, &backup).is_err() {
+        let _ = fs::write(path, "");
+    }
+}
+
+/// Append a single timestamped log line to `path` with size-bounded rotation.
+pub fn append_log_line_to(path: &Path, level: &str, message: &str, max_bytes: u64) {
+    let lock = LOG_FILE_LOCK.get_or_init(|| Mutex::new(()));
+    let _guard = lock.lock().unwrap_or_else(|e| e.into_inner());
+    if let Some(parent) = path.parent() {
+        if ensure_dir(parent).is_err() {
+            return;
+        }
+    }
+    rotate_log_if_needed(path, max_bytes);
+    let ts = now_secs() as u64;
+    let clean_msg = message.replace(['\r', '\n'], " ");
+    let line = format!("[{ts}] [{level}] {clean_msg}\n");
+    if let Ok(mut file) = OpenOptions::new().create(true).append(true).open(path) {
+        let _ = file.write_all(line.as_bytes());
+    }
+}
+
+/// Append a timestamped diagnostic line to `log_path()`.
+pub fn append_log_line(level: &str, message: &str) {
+    append_log_line_to(&log_path(), level, message, MAX_LOG_FILE_BYTES);
+}
+
+/// Initialize the daemon log file at `log_path()`, rotating if oversized and
+/// writing a startup marker.
+pub fn init_daemon_log() {
+    let path = log_path();
+    append_log_line_to(
+        &path,
+        "INFO",
+        &format!(
+            "SoundHop daemon v{VERSION} (pid={}) starting (runtime_dir={})",
+            std::process::id(),
+            runtime_dir().display()
+        ),
+        MAX_LOG_FILE_BYTES,
+    );
 }
 
 /// Marks non-standard file descriptors (>= 3) as `FD_CLOEXEC` on Unix before executing
@@ -633,10 +752,7 @@ pub fn replace_stale_instance(
         return None;
     }
 
-    #[cfg(unix)]
-    unsafe {
-        libc::kill(pid as libc::pid_t, libc::SIGTERM);
-    }
+    let _ = crate::ipc::terminate_process(pid);
 
     for _ in 0..60 {
         if let Some(lock) = try_acquire_instance_lock(name) {
@@ -939,9 +1055,22 @@ pub fn is_virtual_bridge_interface(name: &str) -> bool {
     let lower = name.trim().to_ascii_lowercase();
     for prefix in [
         "docker", "br-", "veth", "virbr", "podman", "cni", "flannel", "cali", "lxcbr", "vboxnet",
-        "vmnet", "tunl", "sit",
+        "vmnet", "tunl", "sit", "vethernet",
     ] {
         if lower.starts_with(prefix) {
+            return true;
+        }
+    }
+    for token in [
+        "vethernet",
+        "wsl",
+        "vmware",
+        "virtualbox",
+        "npcap",
+        "hyper-v",
+        "loopback",
+    ] {
+        if lower.contains(token) {
             return true;
         }
     }
@@ -1196,7 +1325,56 @@ pub fn notify(title: &str, body: &str, urgency: &str) {
     }
     #[cfg(windows)]
     {
-        let _ = (title, body, urgency);
+        use std::os::windows::process::CommandExt;
+        const CREATE_NO_WINDOW: u32 = 0x08000000;
+        let _ = urgency;
+
+        // Pass title & body via environment variables so arbitrary characters
+        // (quotes, `$`, backticks, newlines) cannot break PowerShell quoting.
+        let ps_script = r#"
+$t = [System.Security.SecurityElement]::Escape($env:SOUNDHOP_NOTIFY_TITLE)
+$b = [System.Security.SecurityElement]::Escape($env:SOUNDHOP_NOTIFY_BODY)
+try {
+    [Windows.UI.Notifications.ToastNotificationManager, Windows.UI.Notifications, ContentType = WindowsRuntime] | Out-Null
+    [Windows.Data.Xml.Dom.XmlDocument, Windows.Data.Xml.Dom.XmlDocument, ContentType = WindowsRuntime] | Out-Null
+    $xml = New-Object Windows.Data.Xml.Dom.XmlDocument
+    $xml.LoadXml("<toast><visual><binding template='ToastText02'><text id='1'>$t</text><text id='2'>$b</text></binding></visual></toast>")
+    $toast = [Windows.UI.Notifications.ToastNotification]::new($xml)
+    [Windows.UI.Notifications.ToastNotificationManager]::CreateToastNotifier('SoundHop').Show($toast)
+} catch {
+    try {
+        Add-Type -AssemblyName System.Windows.Forms
+        $n = New-Object System.Windows.Forms.NotifyIcon
+        $n.Icon = [System.Drawing.SystemIcons]::Information
+        $n.Visible = $true
+        $n.ShowBalloonTip(4000, $env:SOUNDHOP_NOTIFY_TITLE, $env:SOUNDHOP_NOTIFY_BODY, [System.Windows.Forms.ToolTipIcon]::Info)
+        Start-Sleep -Milliseconds 4200
+        $n.Dispose()
+    } catch {}
+}
+"#;
+        let mut cmd = Command::new("powershell.exe");
+        cmd.args([
+            "-NoProfile",
+            "-NonInteractive",
+            "-WindowStyle",
+            "Hidden",
+            "-ExecutionPolicy",
+            "Bypass",
+            "-Command",
+            ps_script,
+        ])
+        .env("SOUNDHOP_NOTIFY_TITLE", title)
+        .env("SOUNDHOP_NOTIFY_BODY", body)
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .creation_flags(CREATE_NO_WINDOW);
+        if let Ok(mut child) = cmd.spawn() {
+            std::thread::spawn(move || {
+                let _ = child.wait();
+            });
+        }
     }
 }
 
@@ -1205,6 +1383,25 @@ static SIGNAL_STOP_FLAG: std::sync::atomic::AtomicBool = std::sync::atomic::Atom
 #[cfg(unix)]
 extern "C" fn handle_posix_signal(_sig: libc::c_int) {
     SIGNAL_STOP_FLAG.store(true, std::sync::atomic::Ordering::SeqCst);
+}
+
+#[cfg(windows)]
+static WINDOWS_CTRL_HANDLER_INSTALLED: std::sync::atomic::AtomicBool =
+    std::sync::atomic::AtomicBool::new(false);
+
+#[cfg(windows)]
+unsafe extern "system" fn handle_windows_console_ctrl(ctrl_type: u32) -> i32 {
+    use windows_sys::Win32::System::Console::{
+        CTRL_BREAK_EVENT, CTRL_CLOSE_EVENT, CTRL_C_EVENT, CTRL_LOGOFF_EVENT, CTRL_SHUTDOWN_EVENT,
+    };
+    match ctrl_type {
+        CTRL_C_EVENT | CTRL_BREAK_EVENT | CTRL_CLOSE_EVENT | CTRL_LOGOFF_EVENT
+        | CTRL_SHUTDOWN_EVENT => {
+            SIGNAL_STOP_FLAG.store(true, std::sync::atomic::Ordering::SeqCst);
+            1
+        }
+        _ => 0,
+    }
 }
 
 pub fn install_signal_handlers() {
@@ -1219,6 +1416,17 @@ pub fn install_signal_handlers() {
             libc::SIGTERM,
             handle_posix_signal as *const () as libc::sighandler_t,
         );
+    }
+    #[cfg(windows)]
+    {
+        if !WINDOWS_CTRL_HANDLER_INSTALLED.swap(true, std::sync::atomic::Ordering::SeqCst) {
+            unsafe {
+                windows_sys::Win32::System::Console::SetConsoleCtrlHandler(
+                    Some(handle_windows_console_ctrl),
+                    1,
+                );
+            }
+        }
     }
 }
 
@@ -1389,5 +1597,67 @@ mod tests {
             .spawn()
             .expect_err("spawning a nonexistent binary must return Err(NotFound)");
         assert_eq!(err.kind(), std::io::ErrorKind::NotFound);
+    }
+
+    #[test]
+    fn test_windows_virtual_adapter_filtering() {
+        assert!(is_virtual_bridge_interface("vEthernet (WSL)"));
+        assert!(is_virtual_bridge_interface("vEthernet (Default Switch)"));
+        assert!(is_virtual_bridge_interface(
+            "VMware Network Adapter VMnet8"
+        ));
+        assert!(is_virtual_bridge_interface("VirtualBox Host-Only Network"));
+        assert!(is_virtual_bridge_interface("Npcap Loopback Adapter"));
+        assert!(is_virtual_bridge_interface(
+            "Hyper-V Virtual Ethernet Adapter"
+        ));
+        assert!(is_virtual_bridge_interface("Loopback Pseudo-Interface 1"));
+        assert!(!is_virtual_bridge_interface("Ethernet"));
+        assert!(!is_virtual_bridge_interface("Wi-Fi"));
+        assert!(!is_virtual_bridge_interface("Ethernet 2"));
+    }
+
+    #[test]
+    fn test_daemon_log_append_and_rotation() {
+        let dir = tempfile::tempdir().unwrap();
+        let log_file = dir.path().join("soundhop.log");
+        append_log_line_to(&log_file, "INFO", "first line", 64);
+        let content1 = fs::read_to_string(&log_file).unwrap();
+        assert!(content1.contains("[INFO] first line"));
+
+        // Exceed small rotation threshold (64 bytes) and ensure rotation creates `.log.old`.
+        append_log_line_to(
+            &log_file,
+            "WARN",
+            "a much longer second line that pushes the log over the 64 byte limit",
+            64,
+        );
+        append_log_line_to(&log_file, "INFO", "after rotation", 64);
+        let content2 = fs::read_to_string(&log_file).unwrap();
+        assert!(content2.contains("after rotation"));
+        assert!(log_file.with_extension("log.old").exists());
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn test_windows_runtime_dir_prefers_localappdata() {
+        if env::var_os("XDG_RUNTIME_DIR").is_none() && env::var_os("LOCALAPPDATA").is_some() {
+            let rt = runtime_dir();
+            assert!(
+                rt.ends_with(Path::new(APP_SLUG).join("run")),
+                "Expected runtime_dir() to end with {APP_SLUG}\\run, got {}",
+                rt.display()
+            );
+        }
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn test_windows_install_signal_handlers() {
+        install_signal_handlers();
+        assert!(!signal_stop_requested());
+        // Calling a second time must be idempotent.
+        install_signal_handlers();
+        assert!(!signal_stop_requested());
     }
 }
