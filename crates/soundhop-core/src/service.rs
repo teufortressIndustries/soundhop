@@ -746,6 +746,7 @@ pub fn sync_appimage_paths_if_installed(stop_old_service: bool) -> ServiceSyncOu
         return ServiceSyncOutcome::default();
     }
 
+    #[cfg_attr(windows, allow(unused_mut))]
     let mut outcome = sync_appimage_paths_at(&unit_path(), &autostart_path(), current);
     if outcome.unit_updated {
         let _ = daemon_reload();

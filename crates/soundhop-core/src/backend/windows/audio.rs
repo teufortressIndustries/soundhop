@@ -79,7 +79,9 @@ fn lerp_i16(a: i16, b: i16, t: f64) -> i16 {
 pub struct LinearResampler {
     src_rate: u32,
     dst_rate: u32,
-    pos: f64,
+    /// Exact rational sample position in units of `1 / dst_rate` relative to the start of the
+    /// current input slice (may be negative to interpolate between `prev` and `frames[0]`).
+    pos_num: i64,
     prev: (i16, i16),
     has_prev: bool,
 }
@@ -89,7 +91,7 @@ impl LinearResampler {
         Self {
             src_rate: src_rate.max(1),
             dst_rate: dst_rate.max(1),
-            pos: 0.0,
+            pos_num: 0,
             prev: (0, 0),
             has_prev: false,
         }
@@ -112,30 +114,33 @@ impl LinearResampler {
         if !self.has_prev {
             self.prev = frames[0];
             self.has_prev = true;
-            self.pos = 0.0;
+            self.pos_num = 0;
         }
 
-        let step = f64::from(self.src_rate) / f64::from(self.dst_rate);
-        let limit = (frames.len() - 1) as f64;
-        let est_out = ((frames.len() as f64) / step).ceil() as usize + 2;
+        let src = i64::from(self.src_rate);
+        let dst = i64::from(self.dst_rate);
+        let dst_f = dst as f64;
+        let limit_num = (frames.len() as i64 - 1) * dst;
+        let est_out = ((frames.len() as f64) * dst_f / (src as f64)).ceil() as usize + 2;
         out.reserve(est_out * 4);
 
-        while self.pos < limit {
-            let (a, b, t) = if self.pos < 0.0 {
-                (self.prev, frames[0], self.pos + 1.0)
+        while self.pos_num < limit_num {
+            let (a, b, t) = if self.pos_num < 0 {
+                (self.prev, frames[0], (self.pos_num + dst) as f64 / dst_f)
             } else {
-                let idx = self.pos.floor() as usize;
-                (frames[idx], frames[idx + 1], self.pos - idx as f64)
+                let idx = (self.pos_num / dst) as usize;
+                let rem = self.pos_num % dst;
+                (frames[idx], frames[idx + 1], rem as f64 / dst_f)
             };
             let l = lerp_i16(a.0, b.0, t);
             let r = lerp_i16(a.1, b.1, t);
             out.extend_from_slice(&l.to_le_bytes());
             out.extend_from_slice(&r.to_le_bytes());
-            self.pos += step;
+            self.pos_num += src;
         }
 
         self.prev = frames[frames.len() - 1];
-        self.pos -= frames.len() as f64;
+        self.pos_num -= (frames.len() as i64) * dst;
     }
 }
 
