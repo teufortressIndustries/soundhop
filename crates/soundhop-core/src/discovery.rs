@@ -80,6 +80,7 @@ impl Peer {
 pub struct PeerStore {
     pub timeout_secs: f64,
     peers: RwLock<HashMap<String, Peer>>,
+    v3_meta: RwLock<HashMap<String, BeaconV3Meta>>,
     #[allow(clippy::type_complexity)]
     on_peer: Mutex<Option<Arc<dyn Fn(&Peer) + Send + Sync>>>,
     #[allow(clippy::type_complexity)]
@@ -97,9 +98,26 @@ impl PeerStore {
         Self {
             timeout_secs,
             peers: RwLock::new(HashMap::new()),
+            v3_meta: RwLock::new(HashMap::new()),
             on_peer: Mutex::new(None),
             on_remove: Mutex::new(None),
         }
+    }
+
+    pub fn update_v3_meta(&self, peer_id: &str, meta: BeaconV3Meta) {
+        if peer_id.trim().is_empty() || meta.is_empty() {
+            return;
+        }
+        let mut guard = self.v3_meta.write().unwrap_or_else(|e| e.into_inner());
+        guard.insert(peer_id.to_string(), meta);
+    }
+
+    pub fn v3_meta(&self, peer_id: &str) -> Option<BeaconV3Meta> {
+        self.v3_meta
+            .read()
+            .unwrap_or_else(|e| e.into_inner())
+            .get(peer_id)
+            .cloned()
     }
 
     pub fn set_on_peer<F>(&self, cb: F)
@@ -165,6 +183,10 @@ impl PeerStore {
 
     pub fn remove(&self, peer_id: &str) {
         let existed = self.peers.write().unwrap().remove(peer_id).is_some();
+        self.v3_meta
+            .write()
+            .unwrap_or_else(|e| e.into_inner())
+            .remove(peer_id);
         if existed {
             if let Some(cb) = lock_or_recover(&self.on_remove).clone() {
                 cb(peer_id);
@@ -206,6 +228,12 @@ impl PeerStore {
             keys
         };
         if !stale.is_empty() {
+            {
+                let mut v3 = self.v3_meta.write().unwrap_or_else(|e| e.into_inner());
+                for id in &stale {
+                    v3.remove(id);
+                }
+            }
             if let Some(cb) = lock_or_recover(&self.on_remove).clone() {
                 for id in &stale {
                     cb(id);
@@ -223,6 +251,21 @@ pub struct BeaconV3Meta {
     pub pair_port: Option<u16>,
     pub pub_fp: Option<String>,
     pub caps: Vec<String>,
+}
+
+impl BeaconV3Meta {
+    /// Returns `true` when the peer advertises a valid SHT3 TCP port and the `"sht3"` capability.
+    pub fn supports_sht3(&self) -> bool {
+        self.v3_port.is_some_and(|p| p > 0)
+            && self.caps.iter().any(|c| c.eq_ignore_ascii_case("sht3"))
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.v3_port.is_none()
+            && self.pair_port.is_none()
+            && self.pub_fp.is_none()
+            && self.caps.is_empty()
+    }
 }
 
 /// Default Transport v3 capabilities advertised by this build.
@@ -817,10 +860,17 @@ impl DiscoveryManager {
                                             .unwrap_or(sender);
                                         let _ = sock.send_to(&reply, reply_target);
                                     }
-                                }
-                                if let Some(peer) = peer_opt {
-                                    if peer.id != dev_id {
-                                        store.update(peer);
+                                    if let Some(peer) = peer_opt {
+                                        if peer.id != dev_id {
+                                            let meta = BeaconV3Meta {
+                                                v3_port: pkt.v3_port,
+                                                pair_port: pkt.pair_port,
+                                                pub_fp: pkt.pub_fp,
+                                                caps: pkt.caps,
+                                            };
+                                            store.update_v3_meta(&peer.id, meta);
+                                            store.update(peer);
+                                        }
                                     }
                                 }
                             }
@@ -880,6 +930,8 @@ impl DiscoveryManager {
                                     {
                                         if let Some(peer) = parse_mdns_service_info(&info, &own_id)
                                         {
+                                            let meta = parse_mdns_v3_metadata(&info);
+                                            store.update_v3_meta(&peer.id, meta);
                                             store.update(peer);
                                         }
                                     }
@@ -909,7 +961,7 @@ impl DiscoveryManager {
     pub fn probe(&self) {
         if let Some(sock) = lock_or_recover(&self.udp_socket).as_ref() {
             let local_port = sock.local_addr().map(|a| a.port()).ok();
-            let probe = make_beacon_with_reply_port(
+            let probe = make_beacon_v3(
                 &self.device_id,
                 &self.name,
                 self.audio_port,
@@ -918,6 +970,7 @@ impl DiscoveryManager {
                 self.psk_key.as_deref(),
                 None,
                 local_port,
+                &self.v3_meta,
             );
             for target in broadcast_addresses(true) {
                 if let Ok(ip) = target.parse::<IpAddr>() {
@@ -929,6 +982,10 @@ impl DiscoveryManager {
 
     pub fn peers(&self) -> Vec<Peer> {
         self.store.snapshot(true)
+    }
+
+    pub fn peer_v3_meta(&self, peer_id: &str) -> Option<BeaconV3Meta> {
+        self.store.v3_meta(peer_id)
     }
 
     pub fn stop(&self) {

@@ -1,11 +1,13 @@
 //! Audio sharing listener lifecycle, PIN/PSK pairing, and Pairing v2 interactive requests.
 
 use std::collections::HashMap;
+use std::net::{IpAddr, Ipv4Addr, SocketAddr};
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex, OnceLock};
 use std::time::Duration;
 
 use crate::backend::Listener;
+use crate::config::{is_paired_security_mode, Config};
 use crate::pairing::{
     identity_key_path, initiate_pair_request, DeviceIdentity, PairingManager, PendingPairRequest,
     TrustStore, TrustedPeer, DEFAULT_PAIR_PORT, PENDING_REQUEST_TTL_SECS,
@@ -14,6 +16,9 @@ use crate::security::{
     derive_key_hex, derive_pa_cookie, generate_pairing_pin, soundhop_cookie_path, write_pa_cookie,
 };
 use crate::state::PairedPeer;
+use crate::transport::{
+    PcmPlayback, PcmPlaybackFactory, Sht3ServerConfig, TrustLookup, DEFAULT_V3_PORT,
+};
 use crate::util::{local_addresses, lock_or_recover, notify, now_secs, tcp_reachable};
 
 use super::{Controller, ControllerError};
@@ -44,9 +49,13 @@ impl Controller {
         &self,
         notify_user: Option<bool>,
     ) -> Result<serde_json::Value, ControllerError> {
-        self.ensure_backend()?;
+        let paired_only = is_paired_security_mode(&lock_or_recover(&self.config).sharing.security);
+        if !paired_only {
+            self.ensure_backend()?;
+        }
         self.reconcile_listener();
         let listener = self.ensure_listener_internal()?;
+        let v3_addr = self.sht3_manager.listener_addr();
         if self.should_notify(notify_user) {
             notify(
                 "SoundHop",
@@ -60,6 +69,9 @@ impl Controller {
             "security": listener.security,
             "module": listener.module_id,
             "created": listener.created,
+            "v3_active": v3_addr.is_some(),
+            "v3_port": v3_addr.map(|a| a.port()),
+            "legacy_pa_disabled": self.is_legacy_pa_disabled(),
             "addresses": local_addresses(false),
         }))
     }
@@ -68,6 +80,26 @@ impl Controller {
         &self,
         notify_user: Option<bool>,
     ) -> Result<serde_json::Value, ControllerError> {
+        let (removed, note) = self.stop_legacy_pa_listener()?;
+        let v3_was_running = self.sht3_manager.listener_addr().is_some();
+        self.sht3_manager.stop_listener();
+        self.save();
+        if self.should_notify(notify_user) {
+            notify(
+                "SoundHop",
+                "No longer sharing this device's speakers",
+                "normal",
+            );
+        }
+        Ok(serde_json::json!({
+            "enabled": false,
+            "removed": removed || v3_was_running,
+            "v3_stopped": v3_was_running,
+            "note": note,
+        }))
+    }
+
+    fn stop_legacy_pa_listener(&self) -> Result<(bool, String), ControllerError> {
         let mut removed = false;
         let mut note = String::new();
         let (mod_id, created) = {
@@ -88,23 +120,103 @@ impl Controller {
             st.listener_port = 0;
             st.listener_security.clear();
         }
-        self.save();
-        if self.should_notify(notify_user) {
-            notify(
-                "SoundHop",
-                "No longer sharing this device's speakers",
-                "normal",
-            );
+        Ok((removed, note))
+    }
+
+    fn playback_factory(&self) -> PcmPlaybackFactory {
+        #[cfg(test)]
+        if let Some(factory) = lock_or_recover(&self.playback_factory_override).clone() {
+            return factory;
         }
-        Ok(serde_json::json!({
-            "enabled": false,
-            "removed": removed,
-            "note": note,
-        }))
+        #[cfg(target_os = "linux")]
+        {
+            Arc::new(|_peer_id: &str| {
+                let playback = crate::transport::LinuxPcmPlayback::spawn()?;
+                Ok(Box::new(playback) as Box<dyn PcmPlayback>)
+            })
+        }
+        #[cfg(target_os = "windows")]
+        {
+            Arc::new(|_peer_id: &str| {
+                let playback = crate::transport::WindowsPcmPlayback::start();
+                Ok(Box::new(playback) as Box<dyn PcmPlayback>)
+            })
+        }
+        #[cfg(not(any(target_os = "linux", target_os = "windows")))]
+        {
+            Arc::new(|_peer_id: &str| {
+                let (playback, _handle) = crate::transport::MockPcmPlayback::pair();
+                Ok(Box::new(playback) as Box<dyn PcmPlayback>)
+            })
+        }
+    }
+
+    fn sync_trust_store_from_state(&self) -> Arc<TrustStore> {
+        let store = self.pairing_manager().trust_store();
+        let state_peers = lock_or_recover(&self.state).trusted_peers.clone();
+        for peer in state_peers {
+            if !store.contains(&peer.device_id) {
+                store.upsert(peer);
+            }
+        }
+        store
+    }
+
+    fn start_sht3_listener_internal(
+        &self,
+        port: u16,
+        cfg: &Config,
+    ) -> Result<SocketAddr, ControllerError> {
+        if port > 0 {
+            if let Some(existing) = self.sht3_manager.listener_addr() {
+                if existing.port() == port {
+                    return Ok(existing);
+                }
+            }
+        }
+        let trust: Arc<dyn TrustLookup> = self.sync_trust_store_from_state();
+        let addr = SocketAddr::new(IpAddr::V4(Ipv4Addr::UNSPECIFIED), port);
+        let server_cfg = Sht3ServerConfig::new(cfg.device.id.clone());
+        self.sht3_manager
+            .start_listener(addr, server_cfg, trust, self.playback_factory())
+            .map_err(|e| {
+                ControllerError::Message(format!(
+                    "Could not start encrypted SHT3 listener on port {port}: {e}"
+                ))
+            })
     }
 
     pub(super) fn ensure_listener_internal(&self) -> Result<Listener, ControllerError> {
         let cfg = lock_or_recover(&self.config).clone();
+        let paired_only = is_paired_security_mode(&cfg.sharing.security);
+        let v3_port = if cfg.sharing.v3_port == 0 {
+            DEFAULT_V3_PORT
+        } else {
+            cfg.sharing.v3_port
+        };
+
+        if paired_only {
+            // Hard enforcement: unload legacy PA-TCP (4713/tcp) completely and accept
+            // inbound audio ONLY over SHT3 backed by TrustStore.
+            let _ = self.stop_legacy_pa_listener();
+            let bound = self.start_sht3_listener_internal(v3_port, &cfg)?;
+            {
+                let mut st = lock_or_recover(&self.state);
+                st.listener_module = 0;
+                st.listener_created = false;
+                st.listener_port = 0;
+                st.listener_security = "paired".to_string();
+            }
+            self.save();
+            return Ok(Listener {
+                module_id: 0,
+                created: true,
+                args: format!("sht3 port={}", bound.port()),
+                port: bound.port(),
+                security: "paired".to_string(),
+            });
+        }
+
         let (mod_id, created) = {
             let st = lock_or_recover(&self.state);
             (st.listener_module, st.listener_created)
@@ -130,6 +242,9 @@ impl Controller {
             &cfg.sharing.security,
             &cfg.sharing.allowed_networks,
         )?;
+        // In trusted-lan / open mode, keep legacy PA-TCP active AND optionally run SHT3
+        // on v3_port for paired peers.
+        let _ = self.start_sht3_listener_internal(v3_port, &cfg);
         {
             let mut st = lock_or_recover(&self.state);
             st.listener_module = listener.module_id;
@@ -163,6 +278,10 @@ impl Controller {
     }
 
     pub fn listener_running(&self) -> bool {
+        let paired_only = is_paired_security_mode(&lock_or_recover(&self.config).sharing.security);
+        if paired_only {
+            return self.sht3_manager.listener_addr().is_some();
+        }
         let mod_id = lock_or_recover(&self.state).listener_module;
         if mod_id == 0 {
             return false;
@@ -371,7 +490,8 @@ impl Controller {
         }))
     }
 
-    /// Revoke a trusted peer by `device_id`, removing it from both `State` and `TrustStore`.
+    /// Revoke a trusted peer by `device_id`, removing it from both `State` and `TrustStore`
+    /// and immediately dropping any active SHT3 session for that device.
     pub fn revoke_trusted_peer(
         &self,
         device_id: &str,
@@ -384,12 +504,28 @@ impl Controller {
         }
         let removed_store = self.pairing_manager().revoke(target).is_some();
         let removed_state = lock_or_recover(&self.state).remove_trusted_peer(target);
+        let disconnected_inbound = self.sht3_manager.disconnect_peer(target);
+        let disconnected_outbound = {
+            let mut guard = lock_or_recover(&self.sht3_outbound);
+            if guard
+                .as_ref()
+                .is_some_and(|h| h.server_device_id() == target)
+            {
+                if let Some(handle) = guard.take() {
+                    handle.stop();
+                }
+                true
+            } else {
+                false
+            }
+        };
         if removed_state {
             self.save();
         }
         Ok(serde_json::json!({
             "ok": true,
             "revoked": removed_store || removed_state,
+            "disconnected": disconnected_inbound || disconnected_outbound,
             "device_id": target,
         }))
     }
@@ -556,5 +692,254 @@ mod tests {
         // Calling again when cookie is already gone must succeed (NotFound ignored)
         let res2 = ctrl.clear_pairing_with_cookie_path(&cookie_path);
         assert_eq!(res2["ok"], true);
+    }
+
+    #[test]
+    fn test_paired_mode_disables_legacy_pa_tcp_and_enforces_sht3_trust_store() {
+        use std::net::{IpAddr, Ipv4Addr, SocketAddr, TcpListener};
+        use std::sync::Mutex;
+
+        use crate::pairing::TrustedPeer;
+        use crate::transport::{
+            AudioProfile, MockPcmPlayback, PcmPlayback, Sht3ClientConfig, Sht3ClientConnection,
+            TransportError,
+        };
+
+        let unloaded = Arc::new(Mutex::new(Vec::<String>::new()));
+        let unloaded_c = Arc::clone(&unloaded);
+        let pa_listener_loaded = Arc::new(Mutex::new(false));
+        let pa_loaded_c = Arc::clone(&pa_listener_loaded);
+
+        let runner = Arc::new(MockRunner::new(move |args, _| {
+            let joined = args.join(" ");
+            let stdout = if joined.contains("info") {
+                "Server Name: PulseAudio (on PipeWire 1.2.0)\nDefault Sink: alsa_output.pci\n"
+                    .to_string()
+            } else if joined.contains("unload-module") {
+                unloaded_c.lock().unwrap().push(joined.clone());
+                *pa_loaded_c.lock().unwrap() = false;
+                String::new()
+            } else if joined.contains("load-module module-native-protocol-tcp") {
+                *pa_loaded_c.lock().unwrap() = true;
+                "42\n".to_string()
+            } else if joined.contains("list short modules") {
+                if *pa_loaded_c.lock().unwrap() {
+                    "42\tmodule-native-protocol-tcp\tport=4713 auth-anonymous=1 auth-ip-acl=127.0.0.1;192.168.0.0/16\n"
+                        .to_string()
+                } else {
+                    String::new()
+                }
+            } else {
+                String::new()
+            };
+            Ok(CommandResult {
+                args: args.to_vec(),
+                returncode: 0,
+                stdout,
+                stderr: String::new(),
+            })
+        }));
+
+        // Reserve a free ephemeral port for SHT3 so parallel tests never collide.
+        let free_port = {
+            let sock = TcpListener::bind("127.0.0.1:0").unwrap();
+            sock.local_addr().unwrap().port()
+        };
+
+        let mut cfg = Config::default();
+        cfg.sharing.security = "trusted-lan".to_string();
+        cfg.sharing.v3_port = free_port;
+
+        let backend = Arc::new(LinuxAudioBackend::with_runner(runner));
+        let ctrl = Controller::new(
+            Some(cfg),
+            Some(State::default()),
+            Some(backend),
+            None,
+            None,
+            false,
+        );
+        ctrl.set_save_enabled(false);
+        ctrl.set_playback_factory(Arc::new(|_peer_id| {
+            let (playback, _handle) = MockPcmPlayback::pair();
+            Ok(Box::new(playback) as Box<dyn PcmPlayback>)
+        }));
+
+        // 1. In trusted-lan mode, legacy PA-TCP is active and SHT3 optionally runs alongside.
+        let lan_res = ctrl.start_listener(Some(false)).unwrap();
+        assert_eq!(lan_res["module"], 42);
+        assert_eq!(lan_res["legacy_pa_disabled"], false);
+        assert_eq!(lan_res["v3_active"], true);
+        assert_eq!(ctrl.state.lock().unwrap().listener_module, 42);
+
+        // 2. Switching to "paired" (normalized from "psk"/"pin") MUST unload legacy PA-TCP
+        //    and accept inbound audio ONLY over SHT3 backed by TrustStore.
+        {
+            let mut c = ctrl.config.lock().unwrap();
+            c.set_dotted("sharing.security", "paired").unwrap();
+        }
+        let paired_res = ctrl.start_listener(Some(false)).unwrap();
+        assert_eq!(paired_res["module"], 0);
+        assert_eq!(paired_res["security"], "paired");
+        assert_eq!(paired_res["v3_active"], true);
+        assert_eq!(paired_res["legacy_pa_disabled"], true);
+        assert_eq!(ctrl.state.lock().unwrap().listener_module, 0);
+        assert!(
+            unloaded
+                .lock()
+                .unwrap()
+                .iter()
+                .any(|cmd| cmd.contains("42")),
+            "paired mode must unload legacy PA-TCP module 42"
+        );
+        assert!(ctrl.is_v3_active());
+        assert!(ctrl.is_legacy_pa_disabled());
+        assert!(ctrl.listener_running());
+
+        let status = ctrl.status(None);
+        assert_eq!(status["v3_active"], true);
+        assert_eq!(status["legacy_pa_disabled"], true);
+        assert_eq!(status["sharing"]["v3_active"], true);
+        assert_eq!(status["sharing"]["legacy_pa_disabled"], true);
+
+        let v3_addr = SocketAddr::new(
+            IpAddr::V4(Ipv4Addr::LOCALHOST),
+            ctrl.sht3_manager.listener_addr().unwrap().port(),
+        );
+
+        // 3. Untrusted device must be rejected by SHT3 TrustStore.
+        let untrusted_cfg = Sht3ClientConfig::new(
+            "untrusted-dev",
+            AudioProfile::PcmLossless.to_audio_params(20),
+        );
+        let err = Sht3ClientConnection::connect(v3_addr, untrusted_cfg, &[0x11u8; 32]);
+        assert!(
+            matches!(err, Err(TransportError::AuthRejected(_))),
+            "untrusted device must be rejected by SHT3 TrustStore"
+        );
+
+        // 4. Adding a TrustedPeer allows SHT3 handshake to succeed.
+        let k_pair = [0x42u8; 32];
+        ctrl.record_trusted_peer(TrustedPeer {
+            device_id: "trusted-dev".to_string(),
+            display_name: "Trusted Laptop".to_string(),
+            ed25519_pub: [0x22u8; 32],
+            pairwise_secret: k_pair,
+            fingerprint: "1122-3344-5566-7788".to_string(),
+            paired_at: 100.0,
+        });
+        let trusted_cfg =
+            Sht3ClientConfig::new("trusted-dev", AudioProfile::PcmLossless.to_audio_params(20));
+        let mut conn = Sht3ClientConnection::connect(v3_addr, trusted_cfg, &k_pair)
+            .expect("trusted peer should pass SHT3 handshake");
+        let _ = conn.send_close();
+
+        ctrl.stop_listener(Some(false)).unwrap();
+        assert!(!ctrl.is_v3_active());
+    }
+
+    #[test]
+    fn test_revoke_trusted_peer_immediately_drops_active_sht3_session() {
+        use std::net::{IpAddr, Ipv4Addr, SocketAddr, TcpListener};
+        use std::time::{Duration, Instant};
+
+        use crate::pairing::TrustedPeer;
+        use crate::transport::{
+            AudioProfile, MockPcmCapture, MockPcmPlayback, OutboundConfig, OutboundSessionHandle,
+            PcmPlayback, Sht3ClientConfig, Sht3ClientConnection, TransportError,
+        };
+
+        let runner = Arc::new(MockRunner::new(|args, _| {
+            Ok(CommandResult {
+                args: args.to_vec(),
+                returncode: 0,
+                stdout: String::new(),
+                stderr: String::new(),
+            })
+        }));
+
+        let free_port = {
+            let sock = TcpListener::bind("127.0.0.1:0").unwrap();
+            sock.local_addr().unwrap().port()
+        };
+
+        let mut cfg = Config::default();
+        cfg.sharing.security = "paired".to_string();
+        cfg.sharing.v3_port = free_port;
+
+        let backend = Arc::new(LinuxAudioBackend::with_runner(runner));
+        let ctrl = Controller::new(
+            Some(cfg),
+            Some(State::default()),
+            Some(backend),
+            None,
+            None,
+            false,
+        );
+        ctrl.set_save_enabled(false);
+        ctrl.set_playback_factory(Arc::new(|_peer_id| {
+            let (playback, _handle) = MockPcmPlayback::pair();
+            Ok(Box::new(playback) as Box<dyn PcmPlayback>)
+        }));
+
+        let k_pair = [0x7Au8; 32];
+        ctrl.record_trusted_peer(TrustedPeer {
+            device_id: "peer-revoked".to_string(),
+            display_name: "Guest Laptop".to_string(),
+            ed25519_pub: [0x55u8; 32],
+            pairwise_secret: k_pair,
+            fingerprint: "AABB-CCDD-EEFF-0011".to_string(),
+            paired_at: 200.0,
+        });
+
+        ctrl.start_listener(Some(false)).unwrap();
+        let v3_addr = SocketAddr::new(
+            IpAddr::V4(Ipv4Addr::LOCALHOST),
+            ctrl.sht3_manager.listener_addr().unwrap().port(),
+        );
+
+        // Start a long-running outbound SHT3 stream from "peer-revoked".
+        let capture = Box::new(
+            MockPcmCapture::sine_wave(440.0, Some(200)).with_pace(Duration::from_millis(20)),
+        );
+        let outbound_cfg = OutboundConfig::new("peer-revoked", v3_addr, k_pair)
+            .with_profile(AudioProfile::PcmLossless);
+        let outbound = OutboundSessionHandle::start(outbound_cfg, capture).unwrap();
+
+        // Wait briefly for the server to register the active inbound session.
+        let deadline = Instant::now() + Duration::from_secs(2);
+        while !ctrl
+            .sht3_manager
+            .active_inbound_peers()
+            .iter()
+            .any(|id| id == "peer-revoked")
+        {
+            assert!(
+                Instant::now() < deadline,
+                "timed out waiting for peer-revoked to appear in active_inbound_peers"
+            );
+            std::thread::sleep(Duration::from_millis(15));
+        }
+
+        // Revoke the peer -> must immediately disconnect the active SHT3 inbound session.
+        let revoke_res = ctrl.revoke_trusted_peer("peer-revoked").unwrap();
+        assert_eq!(revoke_res["ok"], true);
+        assert_eq!(revoke_res["revoked"], true);
+        assert_eq!(revoke_res["disconnected"], true);
+        assert!(
+            ctrl.sht3_manager.active_inbound_peers().is_empty(),
+            "revoked peer must be dropped immediately from SHT3 manager"
+        );
+
+        // Subsequent reconnect attempt must fail authentication.
+        let retry_cfg = Sht3ClientConfig::new(
+            "peer-revoked",
+            AudioProfile::PcmLossless.to_audio_params(20),
+        );
+        let retry = Sht3ClientConnection::connect(v3_addr, retry_cfg, &k_pair);
+        assert!(matches!(retry, Err(TransportError::AuthRejected(_))));
+
+        outbound.stop();
+        ctrl.stop_listener(Some(false)).unwrap();
     }
 }

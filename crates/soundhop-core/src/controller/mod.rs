@@ -8,6 +8,7 @@ mod routing;
 mod session;
 mod volume;
 
+use std::collections::HashMap;
 use std::path::PathBuf;
 use std::sync::{Arc, Mutex};
 
@@ -15,15 +16,21 @@ use thiserror::Error;
 
 use crate::android::{AndroidCaptureSession, AndroidManager};
 use crate::backend::{create_backend, AudioBackend, Module};
-use crate::config::Config;
+use crate::config::{is_paired_security_mode, Config};
 use crate::constants::{PROTOCOL_VERSION, SINK_PREFIX, SOURCE_PREFIX, VERSION};
-use crate::discovery::Peer;
+use crate::discovery::{BeaconV3Meta, Peer};
+use crate::pairing::TrustedPeer;
 use crate::state::{KnownPeer, PairedPeer, State};
 use crate::telemetry::{AudioTelemetryMonitor, TelemetrySnapshot, TelemetryTracker};
+use crate::transport::{OutboundSessionHandle, Sht3SessionManager};
+#[cfg(test)]
+use crate::transport::{PcmCapture, PcmPlaybackFactory, TransportResult};
 use crate::util::{
     format_duration, is_own_non_loopback_ip, local_addresses, lock_or_recover, now_secs, short_id,
     slugify,
 };
+
+pub use session::parse_audio_profile;
 
 #[derive(Debug, Error)]
 pub enum ControllerError {
@@ -67,6 +74,15 @@ pub struct Controller {
     pub android_manager: Arc<AndroidManager>,
     pub android_session: Arc<AndroidCaptureSession>,
     pub telemetry: Arc<TelemetryTracker>,
+    pub sht3_manager: Arc<Sht3SessionManager>,
+    pub(super) sht3_outbound: Mutex<Option<OutboundSessionHandle>>,
+    pub(super) peer_v3_meta: Mutex<HashMap<String, BeaconV3Meta>>,
+    #[cfg(test)]
+    pub(super) playback_factory_override: Mutex<Option<PcmPlaybackFactory>>,
+    #[cfg(test)]
+    #[allow(clippy::type_complexity)]
+    pub(super) capture_factory_override:
+        Mutex<Option<Arc<dyn Fn() -> TransportResult<Box<dyn PcmCapture>> + Send + Sync>>>,
     pub(super) config_path: Option<PathBuf>,
     pub(super) state_path: Option<PathBuf>,
     pub(super) notify_enabled: bool,
@@ -102,12 +118,60 @@ impl Controller {
             android_manager: mgr,
             android_session: sess,
             telemetry: Arc::new(TelemetryTracker::new()),
+            sht3_manager: Arc::new(Sht3SessionManager::new()),
+            sht3_outbound: Mutex::new(None),
+            peer_v3_meta: Mutex::new(HashMap::new()),
+            #[cfg(test)]
+            playback_factory_override: Mutex::new(None),
+            #[cfg(test)]
+            capture_factory_override: Mutex::new(None),
             config_path,
             state_path,
             notify_enabled,
             save_enabled: Mutex::new(true),
             connect_lock: Mutex::new(()),
         }
+    }
+
+    pub fn remember_peer_v3_meta(&self, peer_id: &str, meta: BeaconV3Meta) {
+        if peer_id.trim().is_empty() || meta.is_empty() {
+            return;
+        }
+        lock_or_recover(&self.peer_v3_meta).insert(peer_id.to_string(), meta);
+    }
+
+    pub fn peer_v3_meta(&self, peer_id: &str) -> Option<BeaconV3Meta> {
+        lock_or_recover(&self.peer_v3_meta).get(peer_id).cloned()
+    }
+
+    pub fn is_v3_active(&self) -> bool {
+        self.sht3_manager.listener_addr().is_some()
+    }
+
+    pub fn is_legacy_pa_disabled(&self) -> bool {
+        let sec = lock_or_recover(&self.config).sharing.security.clone();
+        let mod_id = lock_or_recover(&self.state).listener_module;
+        is_paired_security_mode(&sec) && mod_id == 0
+    }
+
+    pub fn sht3_outbound_active(&self) -> bool {
+        lock_or_recover(&self.sht3_outbound)
+            .as_ref()
+            .is_some_and(OutboundSessionHandle::is_running)
+    }
+
+    #[cfg(test)]
+    pub(crate) fn set_playback_factory(&self, factory: PcmPlaybackFactory) {
+        *lock_or_recover(&self.playback_factory_override) = Some(factory);
+    }
+
+    #[cfg(test)]
+    #[allow(dead_code)]
+    pub(crate) fn set_capture_factory(
+        &self,
+        factory: Arc<dyn Fn() -> TransportResult<Box<dyn PcmCapture>> + Send + Sync>,
+    ) {
+        *lock_or_recover(&self.capture_factory_override) = Some(factory);
     }
 
     pub fn set_save_enabled(&self, enabled: bool) {
@@ -279,6 +343,7 @@ impl Controller {
         };
 
         let connection_json = if st.is_connected() {
+            let sht3_out_active = self.sht3_outbound_active();
             let sink_present = self
                 .backend
                 .sink_exists(&st.connected_sink)
@@ -290,7 +355,7 @@ impl Controller {
                     .flatten()
                     .is_some()
             } else {
-                false
+                sht3_out_active
             };
             let dur = if st.connected_since > 0.0 {
                 Some(now_secs() - st.connected_since)
@@ -306,6 +371,7 @@ impl Controller {
                 "port": st.connected_port,
                 "sink": st.connected_sink,
                 "module": st.connected_module,
+                "transport": if sht3_out_active { "sht3" } else { "pa-tcp" },
                 "multiroom": st.is_multiroom(),
                 "multiroom_peers": st.multiroom_peers,
                 "keep_local": st.keep_local,
@@ -329,6 +395,13 @@ impl Controller {
         let peers_json: Vec<serde_json::Value> =
             peers.unwrap_or(&[]).iter().map(|p| p.to_json()).collect();
 
+        let trusted_list = self.trusted_peers();
+        let trusted_peers_count = trusted_list.len();
+        let v3_addr = self.sht3_manager.listener_addr();
+        let v3_active = v3_addr.is_some();
+        let legacy_pa_disabled =
+            is_paired_security_mode(&cfg.sharing.security) && st.listener_module == 0;
+
         serde_json::json!({
             "version": VERSION,
             "protocol": PROTOCOL_VERSION,
@@ -337,15 +410,28 @@ impl Controller {
                 "name": cfg.device.name,
                 "id": cfg.device.id,
             },
+            "audio": {
+                "profile": cfg.audio.profile,
+            },
             "sharing": {
                 "enabled": cfg.sharing.enabled,
                 "port": cfg.sharing.port,
+                "v3_port": cfg.sharing.v3_port,
+                "pair_port": cfg.sharing.pair_port,
                 "security": cfg.sharing.security,
                 "listener_module": st.listener_module,
                 "listener_created": st.listener_created,
                 "listener_security": st.listener_security,
+                "v3_active": v3_active,
+                "v3_addr": v3_addr.map(|a| a.to_string()),
+                "v3_inbound_peers": self.sht3_manager.active_inbound_peers(),
+                "legacy_pa_disabled": legacy_pa_disabled,
+                "trusted_peers_count": trusted_peers_count,
                 "addresses": local_addresses(false),
             },
+            "v3_active": v3_active,
+            "legacy_pa_disabled": legacy_pa_disabled,
+            "trusted_peers_count": trusted_peers_count,
             "auto": {
                 "enabled": cfg.connection.auto_connect,
                 "paused": st.auto_paused,
@@ -367,6 +453,10 @@ impl Controller {
                 .values()
                 .map(PairedPeer::to_public_json)
                 .collect::<Vec<_>>(),
+            "trusted_peers": trusted_list
+                .iter()
+                .map(TrustedPeer::to_public_json)
+                .collect::<Vec<_>>(),
             "backend": backend_json,
         })
     }
@@ -387,7 +477,7 @@ impl Controller {
             });
         }
         let st_snap = lock_or_recover(&self.state).clone();
-        if st_snap.is_connected() {
+        if st_snap.is_connected() && !self.sht3_outbound_active() {
             let sink_ok = self
                 .backend
                 .sink_exists(&st_snap.connected_sink)
@@ -413,7 +503,7 @@ impl Controller {
         }
         self.reconcile_listener();
         let sharing_enabled = lock_or_recover(&self.config).sharing.enabled;
-        let has_listener = lock_or_recover(&self.state).listener_module > 0;
+        let has_listener = self.listener_running();
         if sharing_enabled && !has_listener && self.ensure_listener_internal().is_ok() {
             actions.push("resurrected audio listener".to_string());
         }

@@ -268,6 +268,7 @@ impl Daemon {
         if let Some(srv) = lock_or_recover(&self.pairing_server).take() {
             srv.stop();
         }
+        self.controller.sht3_manager.stop_listener();
         if let Some(disc) = lock_or_recover(&self.discovery).take() {
             disc.stop();
         }
@@ -299,6 +300,7 @@ impl Daemon {
         self.advertising.store(false, Ordering::SeqCst);
         let enabled = lock_or_recover(&self.controller.config).sharing.enabled;
         if !enabled {
+            let _ = self.controller.stop_listener(Some(false));
             return;
         }
         match self.controller.start_listener(Some(false)) {
@@ -389,7 +391,11 @@ impl Daemon {
             .with_v3_meta(v3_meta),
         );
         let ctrl_clone = Arc::clone(&self.controller);
+        let disc_store = Arc::clone(&disc.store);
         disc.store.set_on_peer(move |peer| {
+            if let Some(meta) = disc_store.v3_meta(&peer.id) {
+                ctrl_clone.remember_peer_v3_meta(&peer.id, meta);
+            }
             ctrl_clone.remember_peer(peer);
         });
         let warnings = disc.start(self.advertising.load(Ordering::SeqCst));
@@ -901,10 +907,20 @@ impl Daemon {
             });
         }
 
-        let live_peers = lock_or_recover(&self.discovery)
-            .as_ref()
-            .map(|d| d.peers())
-            .unwrap_or_default();
+        let live_peers = {
+            let guard = lock_or_recover(&self.discovery);
+            if let Some(d) = guard.as_ref() {
+                let peers = d.peers();
+                for p in &peers {
+                    if let Some(meta) = d.peer_v3_meta(&p.id) {
+                        self.controller.remember_peer_v3_meta(&p.id, meta);
+                    }
+                }
+                peers
+            } else {
+                Vec::new()
+            }
+        };
 
         let q = query.unwrap_or("").trim();
         if q.is_empty() {
@@ -1011,6 +1027,9 @@ impl Daemon {
                             "pid": std::process::id(),
                             "uptime_s": (now_secs() - self.started_at).max(0.0),
                             "advertising": self.advertising.load(Ordering::SeqCst),
+                            "v3_active": self.controller.is_v3_active(),
+                            "legacy_pa_disabled": self.controller.is_legacy_pa_disabled(),
+                            "trusted_peers_count": self.controller.trusted_peers().len(),
                             "warnings": *lock_or_recover(&self.warnings),
                             "runtime_dir": runtime_dir().to_string_lossy(),
                         }),
