@@ -4,11 +4,11 @@
 use eframe::egui::{self, RichText};
 use soundhop_core::security::generate_pairing_pin;
 
-use crate::backend::{GuiBackend, GuiCommand, GuiSnapshot};
+use crate::backend::{security_friendly_label, GuiBackend, GuiCommand, GuiSnapshot};
 use crate::theme::{Palette, ThemeMode};
 use crate::widgets::{
-    card, collapsible_advanced, danger_button, pill_badge, primary_button, secondary_button,
-    section_header, segmented_control, selectable_card, toggle_switch,
+    callout_card, card, collapsible_advanced, danger_button, pill_badge, primary_button,
+    secondary_button, section_header, segmented_control, selectable_card, toggle_switch,
 };
 
 pub struct SettingsViewState {
@@ -260,13 +260,110 @@ pub fn render(
                 );
             });
             ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                if !snap.config.sharing.psk_hash.is_empty() {
-                    pill_badge(ui, "PIN Paired", pal.success, pal.success_soft);
+                if !snap.sharing_enabled && snap.listener_security.is_empty() {
+                    pill_badge(ui, "Sharing Off", pal.text_muted, pal.card_elevated);
                 } else {
-                    pill_badge(ui, "Home Wi-Fi", pal.accent, pal.accent_soft);
+                    match snap.listener_security.as_str() {
+                        "cookie" | "psk" | "paired" | "pin" => {
+                            if !snap.config.sharing.psk_hash.is_empty()
+                                && snap.paired_peer_count > 0
+                            {
+                                pill_badge(
+                                    ui,
+                                    "Enforcing: PIN Paired",
+                                    pal.success,
+                                    pal.success_soft,
+                                );
+                            } else {
+                                pill_badge(ui, "Enforcing: Cookie", pal.accent, pal.accent_soft);
+                            }
+                        }
+                        "trusted-lan" => {
+                            pill_badge(ui, "Enforcing: Home Wi-Fi", pal.accent, pal.accent_soft);
+                        }
+                        "open" => {
+                            pill_badge(ui, "Enforcing: Open", pal.warning, pal.warning_soft);
+                        }
+                        _ => {
+                            if !snap.config.sharing.psk_hash.is_empty() {
+                                pill_badge(ui, "PIN Paired", pal.success, pal.success_soft);
+                            } else {
+                                pill_badge(ui, "Home Wi-Fi", pal.accent, pal.accent_soft);
+                            }
+                        }
+                    }
                 }
             });
         });
+
+        ui.add_space(6.0);
+        let live_enforcement_line = if !snap.sharing_enabled && snap.listener_security.is_empty() {
+            format!(
+                "Listener inactive (speaker sharing is off) • {} paired device{}",
+                snap.paired_peer_count,
+                if snap.paired_peer_count == 1 { "" } else { "s" }
+            )
+        } else if snap.listener_security.is_empty() {
+            format!(
+                "Configured: {} (listener not running) • {} paired device{}",
+                security_friendly_label(&snap.config.sharing.security),
+                snap.paired_peer_count,
+                if snap.paired_peer_count == 1 { "" } else { "s" }
+            )
+        } else {
+            let enforced_label = match snap.listener_security.as_str() {
+                "cookie" => {
+                    if matches!(
+                        snap.config.sharing.security.as_str(),
+                        "psk" | "paired" | "pin"
+                    ) {
+                        "PIN-Paired Devices Only (cookie auth)"
+                    } else {
+                        "System Audio Cookie"
+                    }
+                }
+                "psk" | "paired" | "pin" => "PIN-Paired Devices Only",
+                "open" => "Open (No Check)",
+                "trusted-lan" => "Home Wi-Fi (Automatic)",
+                other => other,
+            };
+            format!(
+                "Live enforcement: {} • {} paired device{}",
+                enforced_label,
+                snap.paired_peer_count,
+                if snap.paired_peer_count == 1 { "" } else { "s" }
+            )
+        };
+        ui.label(
+            RichText::new(live_enforcement_line)
+                .color(pal.text_secondary)
+                .size(12.0),
+        );
+
+        let psk_mode_selected = matches!(
+            snap.config.sharing.security.as_str(),
+            "psk" | "paired" | "pin"
+        );
+        if psk_mode_selected
+            && (snap.paired_peer_count == 0 || snap.config.sharing.psk_hash.is_empty())
+        {
+            ui.add_space(8.0);
+            callout_card(ui, pal.warning_soft, pal.warning, |ui| {
+                ui.label(
+                    RichText::new("No active pairing code or paired devices")
+                        .color(pal.warning)
+                        .size(12.5)
+                        .strong(),
+                );
+                ui.label(
+                    RichText::new(
+                        "\"PIN-Paired Devices Only\" is selected, but no devices are paired yet. Create or enter a shared pairing code below so your devices can connect.",
+                    )
+                    .color(pal.text_secondary)
+                    .size(11.5),
+                );
+            });
+        }
 
         ui.add_space(10.0);
 

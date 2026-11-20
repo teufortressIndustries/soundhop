@@ -290,7 +290,9 @@ pub fn render(
                                 pal.card_elevated,
                             );
                             if peer.paired {
-                                pill_badge(ui, "Paired", pal.accent, pal.accent_soft);
+                                pill_badge(ui, "Paired", pal.success, pal.success_soft);
+                            } else if matches!(peer.security.as_str(), "psk" | "paired" | "pin") {
+                                pill_badge(ui, "Pairing Required", pal.warning, pal.warning_soft);
                             }
                             if is_conn {
                                 pill_badge(ui, "Connected", pal.success, pal.success_soft);

@@ -2,8 +2,11 @@
 //! `module-combine-sink` support, per-app stream routing, and microphone pass-through.
 
 use std::collections::{HashMap, HashSet};
+use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
+
+use sha2::{Digest, Sha256};
 
 use crate::backend::{
     listener_security_from_args, AudioBackend, BackendError, Listener, Module, Sink, SinkInput,
@@ -12,8 +15,16 @@ use crate::backend::{
 use crate::constants::{
     DEFAULT_LAN_NETWORKS, SINK_PREFIX, SINK_TIMEOUT_SECS, SOURCE_PREFIX, SOURCE_TIMEOUT_SECS,
 };
-use crate::security::{ensure_pa_cookie, soundhop_cookie_path};
+use crate::security::{ensure_pa_cookie_at, soundhop_cookie_path};
 use crate::util::{sanitize_sink_name, tcp_server_arg, CommandResult, ProcessRunner, SystemRunner};
+
+fn file_sha256(path: &Path) -> Option<[u8; 32]> {
+    let bytes = std::fs::read(path).ok()?;
+    let digest = Sha256::digest(&bytes);
+    let mut out = [0u8; 32];
+    out.copy_from_slice(&digest);
+    Some(out)
+}
 
 pub struct LinuxAudioBackend {
     pub pactl: String,
@@ -21,6 +32,8 @@ pub struct LinuxAudioBackend {
     sleep_fn: Arc<dyn Fn(Duration) + Send + Sync>,
     info_cache: Mutex<Option<HashMap<String, String>>>,
     remote_prev_default_sources: Mutex<HashMap<String, String>>,
+    loaded_cookie_hash: Mutex<Option<[u8; 32]>>,
+    cookie_path_override: Option<PathBuf>,
 }
 
 impl Default for LinuxAudioBackend {
@@ -37,6 +50,8 @@ impl LinuxAudioBackend {
             sleep_fn: Arc::new(std::thread::sleep),
             info_cache: Mutex::new(None),
             remote_prev_default_sources: Mutex::new(HashMap::new()),
+            loaded_cookie_hash: Mutex::new(None),
+            cookie_path_override: None,
         }
     }
 
@@ -47,7 +62,31 @@ impl LinuxAudioBackend {
             sleep_fn: Arc::new(|_| {}),
             info_cache: Mutex::new(None),
             remote_prev_default_sources: Mutex::new(HashMap::new()),
+            loaded_cookie_hash: Mutex::new(None),
+            cookie_path_override: None,
         }
+    }
+
+    #[cfg(test)]
+    pub fn with_runner_and_cookie_path(
+        runner: Arc<dyn ProcessRunner>,
+        cookie_path: PathBuf,
+    ) -> Self {
+        Self {
+            pactl: "pactl".to_string(),
+            runner,
+            sleep_fn: Arc::new(|_| {}),
+            info_cache: Mutex::new(None),
+            remote_prev_default_sources: Mutex::new(HashMap::new()),
+            loaded_cookie_hash: Mutex::new(None),
+            cookie_path_override: Some(cookie_path),
+        }
+    }
+
+    fn cookie_path(&self) -> PathBuf {
+        self.cookie_path_override
+            .clone()
+            .unwrap_or_else(soundhop_cookie_path)
     }
 
     fn pactl_call(&self, args: &[&str], check: bool) -> Result<CommandResult, BackendError> {
@@ -730,7 +769,7 @@ impl AudioBackend for LinuxAudioBackend {
         allowed_networks: &[String],
     ) -> Result<Listener, BackendError> {
         let desired_sec = match security {
-            "psk" | "pin" | "cookie" => "cookie",
+            "psk" | "paired" | "pin" | "cookie" => "cookie",
             "open" => "open",
             _ => "trusted-lan",
         };
@@ -739,11 +778,21 @@ impl AudioBackend for LinuxAudioBackend {
         } else {
             Some(effective_allowed_networks(allowed_networks).join(";"))
         };
+        let cookie_path = self.cookie_path();
         let desired_cookie = if desired_sec == "cookie" {
-            Some(soundhop_cookie_path().to_string_lossy().into_owned())
+            Some(cookie_path.to_string_lossy().into_owned())
         } else {
             None
         };
+        let current_cookie_hash = if desired_sec == "cookie" {
+            file_sha256(&cookie_path)
+        } else {
+            None
+        };
+        let loaded_cookie_hash = *self
+            .loaded_cookie_hash
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
         for module in self.modules()? {
             if module.name != "module-native-protocol-tcp" {
                 continue;
@@ -759,6 +808,8 @@ impl AudioBackend for LinuxAudioBackend {
                 let cookie_matches = if desired_sec == "cookie" {
                     actual_cookie == desired_cookie
                         && module.arg("auth-cookie-enabled").as_deref() != Some("0")
+                        && current_cookie_hash.is_some()
+                        && loaded_cookie_hash == current_cookie_hash
                 } else {
                     true
                 };
@@ -773,21 +824,32 @@ impl AudioBackend for LinuxAudioBackend {
                         security: desired_sec.to_string(),
                     });
                 }
-                // Security mode, cookie path, or allowed_networks changed: replace the existing listener
+                // Security mode, cookie path/content, or allowed_networks changed: replace the existing listener
                 let _ = self.unload_module(module.id, true);
             }
         }
 
-        let args: Vec<String> = match desired_sec {
+        let (args, new_cookie_hash): (Vec<String>, Option<[u8; 32]>) = match desired_sec {
             "cookie" => {
-                let cookie_file = ensure_pa_cookie(None).map_err(|e| {
+                let cookie_file = ensure_pa_cookie_at(Some(&cookie_path), None).map_err(|e| {
                     BackendError::Message(format!("Failed to prepare PulseAudio cookie: {e}"))
                 })?;
-                build_listener_args(port, desired_sec, allowed_networks, Some(&cookie_file))
+                let hash = file_sha256(&cookie_file);
+                (
+                    build_listener_args(port, desired_sec, allowed_networks, Some(&cookie_file)),
+                    hash,
+                )
             }
-            _ => build_listener_args(port, desired_sec, allowed_networks, None),
+            _ => (
+                build_listener_args(port, desired_sec, allowed_networks, None),
+                None,
+            ),
         };
         let module_id = self.load_module("module-native-protocol-tcp", &args)?;
+        *self
+            .loaded_cookie_hash
+            .lock()
+            .unwrap_or_else(|e| e.into_inner()) = new_cookie_hash;
         Ok(Listener {
             module_id,
             created: true,
@@ -841,8 +903,7 @@ impl AudioBackend for LinuxAudioBackend {
         if !safe_extra.iter().any(|x| x.starts_with("format=")) {
             args.push("format=s16le".to_string());
         }
-        let cookie_file = soundhop_cookie_path();
-        if cookie_file.exists() {
+        if let Some(cookie_file) = params.cookie_path.as_deref().filter(|p| p.exists()) {
             args.push(format!("cookie={}", cookie_file.display()));
         }
         args.extend(safe_extra);
@@ -945,7 +1006,7 @@ impl AudioBackend for LinuxAudioBackend {
         if !safe_extra.iter().any(|x| x.starts_with("format=")) {
             args.push("format=s16le".to_string());
         }
-        let cookie_file = soundhop_cookie_path();
+        let cookie_file = self.cookie_path();
         if cookie_file.exists() {
             args.push(format!("cookie={}", cookie_file.display()));
         }
@@ -1495,6 +1556,7 @@ mod tests {
                 reconnect_delay_ms: 3000,
                 latency_ms: None,
                 extra_args: &extra,
+                cookie_path: None,
             })
             .unwrap();
         assert_eq!(mid, 77);
@@ -1715,5 +1777,178 @@ mod tests {
             log.iter().filter(|c| c.contains("unload-module 0")).count(),
             3
         );
+    }
+
+    #[test]
+    fn test_ensure_tcp_listener_reloads_on_cookie_content_change() {
+        let dir = tempfile::tempdir().unwrap();
+        let cookie_file = dir.path().join("pulse-cookie");
+        let cookie_str = cookie_file.to_string_lossy().into_owned();
+        let cookie_for_closure = cookie_str.clone();
+
+        // Write initial cookie A
+        crate::security::write_pa_cookie(
+            Some(&cookie_file),
+            &crate::security::derive_pa_cookie("pin-alpha-1111"),
+        )
+        .unwrap();
+
+        let next_id = Arc::new(std::sync::atomic::AtomicU32::new(20));
+        let next_id_c = Arc::clone(&next_id);
+        let active_id = Arc::new(std::sync::atomic::AtomicU32::new(0));
+        let active_id_c = Arc::clone(&active_id);
+        let unloaded = Arc::new(Mutex::new(Vec::<String>::new()));
+        let unloaded_c = Arc::clone(&unloaded);
+
+        let runner = Arc::new(MockRunner::new(move |args, _| {
+            let joined = args.join(" ");
+            let stdout = if joined.contains("unload-module") {
+                unloaded_c.lock().unwrap().push(joined.clone());
+                active_id_c.store(0, std::sync::atomic::Ordering::SeqCst);
+                String::new()
+            } else if joined.contains("list short modules") {
+                let id = active_id_c.load(std::sync::atomic::Ordering::SeqCst);
+                if id > 0 {
+                    format!(
+                        "{id}\tmodule-native-protocol-tcp\tport=4713 auth-cookie={cookie_for_closure} auth-cookie-enabled=1 auth-ip-acl=127.0.0.1;192.168.1.0/24\n"
+                    )
+                } else {
+                    String::new()
+                }
+            } else if joined.contains("load-module") {
+                let id = next_id_c.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                active_id_c.store(id, std::sync::atomic::Ordering::SeqCst);
+                format!("{id}\n")
+            } else {
+                String::new()
+            };
+            Ok(CommandResult {
+                args: args.to_vec(),
+                returncode: 0,
+                stdout,
+                stderr: String::new(),
+            })
+        }));
+
+        let backend = LinuxAudioBackend::with_runner_and_cookie_path(runner, cookie_file.clone());
+        let nets = vec!["192.168.1.0/24".to_string()];
+
+        // First call loads module 20
+        let first = backend.ensure_tcp_listener(4713, "psk", &nets).unwrap();
+        assert!(first.created);
+        assert_eq!(first.module_id, 20);
+
+        // Second call with identical cookie bytes reuses module 20
+        let second = backend.ensure_tcp_listener(4713, "psk", &nets).unwrap();
+        assert!(!second.created);
+        assert_eq!(second.module_id, 20);
+        assert!(unloaded.lock().unwrap().is_empty());
+
+        // Overwrite cookie file with different bytes (same path!)
+        crate::security::write_pa_cookie(
+            Some(&cookie_file),
+            &crate::security::derive_pa_cookie("pin-beta-2222"),
+        )
+        .unwrap();
+
+        // Must unload module 20 and load fresh module 21
+        let third = backend.ensure_tcp_listener(4713, "psk", &nets).unwrap();
+        assert!(third.created);
+        assert_eq!(third.module_id, 21);
+        assert!(unloaded
+            .lock()
+            .unwrap()
+            .iter()
+            .any(|c| c.contains("unload-module 20")));
+    }
+
+    #[test]
+    fn test_connect_tunnel_uses_explicit_cookie_path_only() {
+        let dir = tempfile::tempdir().unwrap();
+        let cookie_file = dir.path().join("pulse-cookie");
+        crate::security::write_pa_cookie(
+            Some(&cookie_file),
+            &crate::security::derive_pa_cookie("pin-tunnel-test"),
+        )
+        .unwrap();
+
+        let recorded = Arc::new(Mutex::new(Vec::<Vec<String>>::new()));
+        let rec_c = Arc::clone(&recorded);
+        let loaded = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let loaded_c = Arc::clone(&loaded);
+        let runner = Arc::new(MockRunner::new(move |call_args, _| {
+            rec_c.lock().unwrap().push(call_args.to_vec());
+            let joined = call_args.join(" ");
+            let stdout = if joined.contains("list short sinks") {
+                if loaded_c.load(std::sync::atomic::Ordering::SeqCst) {
+                    "1\tsoundhop_peer_a\tmodule-tunnel-sink\ts16le 2ch 48000Hz\tRUNNING\n"
+                } else {
+                    ""
+                }
+            } else if joined.contains("unload-module") {
+                loaded_c.store(false, std::sync::atomic::Ordering::SeqCst);
+                ""
+            } else if joined.contains("load-module") {
+                loaded_c.store(true, std::sync::atomic::Ordering::SeqCst);
+                "88\n"
+            } else {
+                ""
+            };
+            Ok(CommandResult {
+                args: call_args.to_vec(),
+                returncode: 0,
+                stdout: stdout.to_string(),
+                stderr: String::new(),
+            })
+        }));
+
+        let backend = LinuxAudioBackend::with_runner_and_cookie_path(runner, cookie_file.clone());
+
+        // Without cookie_path (trusted-lan): must NOT pass cookie= even though cookie_file exists on disk
+        backend
+            .connect_tunnel(&TunnelParams {
+                host: "192.168.1.50",
+                port: 4713,
+                sink_name: "soundhop_peer_a",
+                description: "PeerA",
+                reconnect_delay_ms: 1000,
+                latency_ms: None,
+                extra_args: &[],
+                cookie_path: None,
+            })
+            .unwrap();
+        {
+            let calls = recorded.lock().unwrap();
+            let load_call = calls
+                .iter()
+                .find(|c| c.iter().any(|a| a == "load-module"))
+                .unwrap();
+            assert!(!load_call.iter().any(|a| a.starts_with("cookie=")));
+        }
+
+        // With explicit cookie_path (psk/paired): must pass cookie=<path>
+        loaded.store(false, std::sync::atomic::Ordering::SeqCst);
+        recorded.lock().unwrap().clear();
+        backend
+            .connect_tunnel(&TunnelParams {
+                host: "192.168.1.50",
+                port: 4713,
+                sink_name: "soundhop_peer_a",
+                description: "PeerA",
+                reconnect_delay_ms: 1000,
+                latency_ms: None,
+                extra_args: &[],
+                cookie_path: Some(cookie_file.clone()),
+            })
+            .unwrap();
+        {
+            let calls = recorded.lock().unwrap();
+            let load_call = calls
+                .iter()
+                .find(|c| c.iter().any(|a| a == "load-module"))
+                .unwrap();
+            let expected = format!("cookie={}", cookie_file.display());
+            assert!(load_call.iter().any(|a| a == &expected));
+        }
     }
 }

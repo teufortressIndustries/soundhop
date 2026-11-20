@@ -552,9 +552,26 @@ impl WorkerState {
             })
         } else {
             let _sync = lock_or_recover(&self.controller_sync_lock);
+            let (prev_security, prev_port) = {
+                let cfg = lock_or_recover(&self.controller.config);
+                (cfg.sharing.security.clone(), cfg.sharing.port)
+            };
             let r = lock_or_recover(&self.controller.config).apply_patch(&patch);
             if r.is_ok() {
                 self.controller.save();
+                let (sharing_enabled, new_security, new_port) = {
+                    let cfg = lock_or_recover(&self.controller.config);
+                    (
+                        cfg.sharing.enabled,
+                        cfg.sharing.security.clone(),
+                        cfg.sharing.port,
+                    )
+                };
+                if (new_security != prev_security || new_port != prev_port)
+                    && (sharing_enabled || self.controller.listener_running())
+                {
+                    let _ = self.controller.start_listener(Some(false));
+                }
                 let _ = self.controller.enforce_routed_apps();
             }
             r.map_err(|e| e.to_string())

@@ -7,6 +7,7 @@ pub mod protocol;
 use std::collections::HashMap;
 use std::io::Write;
 use std::net::{IpAddr, SocketAddr, TcpListener, TcpStream, ToSocketAddrs};
+use std::path::Path;
 use std::sync::atomic::{AtomicBool, AtomicU32, AtomicUsize, Ordering};
 use std::sync::mpsc::{self, RecvTimeoutError, SyncSender, TrySendError};
 use std::sync::{Arc, Mutex};
@@ -14,6 +15,7 @@ use std::thread::{self, JoinHandle};
 use std::time::Duration;
 
 use ipnet::IpNet;
+use sha2::{Digest, Sha256};
 
 use crate::backend::windows::audio::{
     list_audio_endpoints, WindowsLoopbackRecorder, WindowsPlayer,
@@ -114,6 +116,7 @@ pub struct WindowsAudioBackend {
     listener_port: Mutex<Option<u16>>,
     listener_security: Mutex<String>,
     listener_allowed_networks: Mutex<Vec<String>>,
+    listener_cookie_hash: Mutex<Option<[u8; 32]>>,
     next_module_id: AtomicU32,
     modules: Mutex<Vec<Module>>,
     default_sink: Mutex<Option<String>>,
@@ -149,6 +152,7 @@ impl WindowsAudioBackend {
             listener_port: Mutex::new(None),
             listener_security: Mutex::new("trusted-lan".to_string()),
             listener_allowed_networks: Mutex::new(Vec::new()),
+            listener_cookie_hash: Mutex::new(None),
             next_module_id: AtomicU32::new(101),
             modules: Mutex::new(Vec::new()),
             default_sink: Mutex::new(None),
@@ -182,6 +186,10 @@ impl WindowsAudioBackend {
             let _ = handle.join();
         }
         *self.listener_port.lock().unwrap_or_else(|e| e.into_inner()) = None;
+        *self
+            .listener_cookie_hash
+            .lock()
+            .unwrap_or_else(|e| e.into_inner()) = None;
     }
 }
 
@@ -429,6 +437,12 @@ impl AudioBackend for WindowsAudioBackend {
         security: &str,
         allowed_networks: &[String],
     ) -> Result<Listener, BackendError> {
+        let cookie_auth = matches!(security, "psk" | "paired" | "pin" | "cookie");
+        let current_cookie_hash = if cookie_auth {
+            file_sha256(&crate::security::soundhop_cookie_path())
+        } else {
+            None
+        };
         if let Some(active_port) = *self.listener_port.lock().unwrap_or_else(|e| e.into_inner()) {
             let current_sec = self
                 .listener_security
@@ -440,7 +454,20 @@ impl AudioBackend for WindowsAudioBackend {
                 .lock()
                 .unwrap_or_else(|e| e.into_inner())
                 .clone();
-            if active_port == port && current_sec == security && current_nets == allowed_networks {
+            let loaded_cookie_hash = *self
+                .listener_cookie_hash
+                .lock()
+                .unwrap_or_else(|e| e.into_inner());
+            let cookie_matches = if cookie_auth {
+                current_cookie_hash.is_some() && loaded_cookie_hash == current_cookie_hash
+            } else {
+                true
+            };
+            if active_port == port
+                && current_sec == security
+                && current_nets == allowed_networks
+                && cookie_matches
+            {
                 return Ok(Listener {
                     module_id: 100,
                     created: false,
@@ -450,10 +477,15 @@ impl AudioBackend for WindowsAudioBackend {
                 });
             }
         }
+        // Security mode, port, ACL, or cookie content changed: stop listener and drop active sessions
         self.stop_listener_internal();
-        if matches!(security, "psk" | "pin" | "cookie") {
-            let _ = crate::security::ensure_pa_cookie(None);
-        }
+        let new_cookie_hash = if cookie_auth {
+            let cookie_path = crate::security::ensure_pa_cookie(None)
+                .unwrap_or_else(|_| crate::security::soundhop_cookie_path());
+            file_sha256(&cookie_path)
+        } else {
+            None
+        };
         let tcp = TcpListener::bind(("0.0.0.0", port))
             .map_err(|e| BackendError::Message(format!("Could not bind TCP port {port}: {e}")))?;
         let bound_port = tcp.local_addr().map(|a| a.port()).unwrap_or(port);
@@ -471,6 +503,10 @@ impl AudioBackend for WindowsAudioBackend {
             .listener_allowed_networks
             .lock()
             .unwrap_or_else(|e| e.into_inner()) = allowed_networks.to_vec();
+        *self
+            .listener_cookie_hash
+            .lock()
+            .unwrap_or_else(|e| e.into_inner()) = new_cookie_hash;
 
         const MAX_CONCURRENT_PA_CLIENTS: usize = 16;
         let stop_clone = generation_stop;
@@ -558,7 +594,11 @@ impl AudioBackend for WindowsAudioBackend {
         stream.set_write_timeout(Some(Duration::from_secs(3))).ok();
 
         // PulseAudio Native Protocol Handshake
-        let cookie = load_cookie_bytes().unwrap_or([0u8; 256]);
+        let cookie = params
+            .cookie_path
+            .as_deref()
+            .and_then(load_cookie_bytes_from)
+            .unwrap_or([0u8; 256]);
         stream
             .write_all(&make_command_auth(0, PA_PROTOCOL_VERSION, &cookie))
             .map_err(|e| BackendError::Message(format!("PA auth send failed: {e}")))?;
@@ -957,15 +997,26 @@ impl Drop for ClientSlotGuard {
     }
 }
 
-fn load_cookie_bytes() -> Option<[u8; 256]> {
-    let cookie_path = crate::security::soundhop_cookie_path();
-    let bytes = std::fs::read(&cookie_path).ok()?;
+fn file_sha256(path: &Path) -> Option<[u8; 32]> {
+    let bytes = std::fs::read(path).ok()?;
+    let digest = Sha256::digest(&bytes);
+    let mut out = [0u8; 32];
+    out.copy_from_slice(&digest);
+    Some(out)
+}
+
+fn load_cookie_bytes_from(cookie_path: &Path) -> Option<[u8; 256]> {
+    let bytes = std::fs::read(cookie_path).ok()?;
     if bytes.len() < 256 {
         return None;
     }
     let mut cookie = [0u8; 256];
     cookie.copy_from_slice(&bytes[..256]);
     Some(cookie)
+}
+
+fn load_cookie_bytes() -> Option<[u8; 256]> {
+    load_cookie_bytes_from(&crate::security::soundhop_cookie_path())
 }
 
 fn handle_incoming_pa_client(
@@ -975,7 +1026,7 @@ fn handle_incoming_pa_client(
     volume_pct: Arc<AtomicU32>,
     muted: Arc<AtomicBool>,
 ) {
-    let cookie_required = matches!(security.as_str(), "psk" | "pin" | "cookie");
+    let cookie_required = matches!(security.as_str(), "psk" | "paired" | "pin" | "cookie");
     let expected_cookie = if cookie_required {
         match load_cookie_bytes() {
             Some(c) => Some(c),
@@ -1263,6 +1314,7 @@ mod tests {
                 reconnect_delay_ms: 1000,
                 latency_ms: None,
                 extra_args: &[],
+                cookie_path: None,
             })
             .unwrap();
         assert!(mod_id >= 101);
@@ -1399,6 +1451,7 @@ mod tests {
                 reconnect_delay_ms: 1000,
                 latency_ms: None,
                 extra_args: &[],
+                cookie_path: None,
             })
             .unwrap();
         // Reconnecting with the same sink_name must replace & clean up the old module
@@ -1411,6 +1464,7 @@ mod tests {
                 reconnect_delay_ms: 1000,
                 latency_ms: None,
                 extra_args: &[],
+                cookie_path: None,
             })
             .unwrap();
         assert_ne!(m1, m1_new);
@@ -1425,6 +1479,7 @@ mod tests {
                 reconnect_delay_ms: 1000,
                 latency_ms: None,
                 extra_args: &[],
+                cookie_path: None,
             })
             .unwrap();
 
@@ -1748,6 +1803,7 @@ mod tests {
                 reconnect_delay_ms: 1000,
                 latency_ms: None,
                 extra_args: &[],
+                cookie_path: None,
             })
             .unwrap();
 

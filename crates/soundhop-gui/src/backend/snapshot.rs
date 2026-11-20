@@ -109,7 +109,8 @@ pub struct GuiSnapshot {
     pub refreshing_android: bool,
     pub pending_peer_id: Option<String>,
     pub show_onboarding: bool,
-    pub paired_count: usize,
+    pub listener_security: String,
+    pub paired_peer_count: usize,
     pub hydrated: bool,
 }
 
@@ -121,7 +122,8 @@ impl GuiSnapshot {
         Self {
             daemon_connected: false,
             show_onboarding: !cfg.ui.onboarding_completed && st.known_peers.is_empty(),
-            paired_count: st.paired_peers.len(),
+            listener_security: st.listener_security.clone(),
+            paired_peer_count: st.paired_peers.len(),
             config: cfg.clone(),
             connected: st.is_connected(),
             multiroom: st.is_multiroom(),
@@ -260,7 +262,8 @@ pub(super) struct RefreshUpdate {
     jitter_ms: Option<f64>,
     android_session_active: bool,
     android_session_device: String,
-    paired_count: usize,
+    listener_security: String,
+    paired_peer_count: usize,
 }
 
 impl RefreshUpdate {
@@ -334,6 +337,12 @@ impl RefreshUpdate {
             .and_then(|s| s.get("enabled"))
             .and_then(|v| v.as_bool())
             .unwrap_or(cfg.sharing.enabled);
+        let listener_security = status_json
+            .get("sharing")
+            .and_then(|s| s.get("listener_security"))
+            .and_then(|v| v.as_str())
+            .map(String::from)
+            .unwrap_or_else(|| st.listener_security.clone());
         let auto_connect = status_json
             .get("auto")
             .and_then(|a| a.get("enabled"))
@@ -397,7 +406,16 @@ impl RefreshUpdate {
         };
 
         // Peers (merge live + remembered)
-        let paired_ids: HashSet<String> = st.paired_peers.keys().cloned().collect();
+        let paired_ids: HashSet<String> =
+            if let Some(arr) = status_json.get("paired_peers").and_then(|v| v.as_array()) {
+                arr.iter()
+                    .filter_map(|item| item.get("peer_id").and_then(|v| v.as_str()))
+                    .filter(|pid| !pid.is_empty())
+                    .map(String::from)
+                    .collect()
+            } else {
+                st.paired_peers.keys().cloned().collect()
+            };
         let mut peer_views = Vec::new();
         let mut seen_ids = HashSet::new();
         for p in live_peers {
@@ -417,7 +435,7 @@ impl RefreshUpdate {
                 security: p.security.clone(),
                 rtt_ms: p.rtt_ms,
                 online: true,
-                paired: paired_ids.contains(&p.id) || p.security == "psk",
+                paired: paired_ids.contains(&p.id),
             });
         }
         for kp in st.known_peers.values() {
@@ -441,7 +459,7 @@ impl RefreshUpdate {
                 security: kp.security.clone(),
                 rtt_ms: if is_conn { rtt_ms } else { None },
                 online: is_conn,
-                paired: paired_ids.contains(&kp.id) || kp.security == "psk",
+                paired: paired_ids.contains(&kp.id),
             });
         }
 
@@ -514,7 +532,8 @@ impl RefreshUpdate {
             jitter_ms,
             android_session_active,
             android_session_device,
-            paired_count: paired_ids.len(),
+            listener_security,
+            paired_peer_count: paired_ids.len(),
         }
     }
 
@@ -550,6 +569,130 @@ impl RefreshUpdate {
         guard.jitter_ms = self.jitter_ms;
         guard.android_session_active = self.android_session_active;
         guard.android_session_device = self.android_session_device;
-        guard.paired_count = self.paired_count;
+        guard.listener_security = self.listener_security;
+        guard.paired_peer_count = self.paired_peer_count;
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use soundhop_core::constants::{PROTOCOL_VERSION, VERSION};
+    use soundhop_core::state::{KnownPeer, PairedPeer};
+    use soundhop_core::telemetry::AudioLevelSnapshot;
+
+    fn empty_telemetry() -> TelemetrySnapshot {
+        TelemetrySnapshot {
+            audio: AudioLevelSnapshot::default(),
+            peers: Default::default(),
+        }
+    }
+
+    #[test]
+    fn test_peer_view_paired_is_false_for_unpaired_psk_peers_and_exposes_listener_security() {
+        let cfg = Config::default();
+        let mut st = State::default();
+        st.known_peers.insert(
+            "known-unpaired-psk".to_string(),
+            KnownPeer {
+                id: "known-unpaired-psk".to_string(),
+                name: "Saved Studio".to_string(),
+                host: "192.168.1.51".to_string(),
+                port: 4713,
+                version: VERSION.to_string(),
+                security: "psk".to_string(),
+                platform: "linux".to_string(),
+                last_seen: 100.0,
+            },
+        );
+        st.paired_peers.insert(
+            "live-paired-psk".to_string(),
+            PairedPeer {
+                peer_id: "live-paired-psk".to_string(),
+                name: "Paired Desk".to_string(),
+                shared_key_hex: "abc".to_string(),
+                cookie_hex: "def".to_string(),
+                paired_at: 100.0,
+            },
+        );
+
+        let live_peers = vec![
+            Peer {
+                id: "live-unpaired-psk".to_string(),
+                name: "Unpaired Host".to_string(),
+                host: "192.168.1.50".to_string(),
+                port: 4713,
+                version: VERSION.to_string(),
+                protocol: PROTOCOL_VERSION,
+                security: "psk".to_string(),
+                platform: "linux".to_string(),
+                last_seen: 100.0,
+                source: "udp".to_string(),
+                rtt_ms: Some(3.2),
+            },
+            Peer {
+                id: "live-paired-psk".to_string(),
+                name: "Paired Desk".to_string(),
+                host: "192.168.1.52".to_string(),
+                port: 4713,
+                version: VERSION.to_string(),
+                protocol: PROTOCOL_VERSION,
+                security: "psk".to_string(),
+                platform: "linux".to_string(),
+                last_seen: 100.0,
+                source: "udp".to_string(),
+                rtt_ms: Some(4.1),
+            },
+        ];
+
+        let status_json = serde_json::json!({
+            "sharing": {
+                "enabled": true,
+                "listener_security": "cookie",
+            },
+            "paired_peers": [
+                { "peer_id": "live-paired-psk", "name": "Paired Desk" }
+            ],
+        });
+
+        let update = RefreshUpdate::from_status(
+            true,
+            cfg,
+            st,
+            empty_telemetry(),
+            &status_json,
+            Vec::new(),
+            &live_peers,
+        );
+
+        assert_eq!(update.listener_security, "cookie");
+        assert_eq!(update.paired_peer_count, 1);
+
+        let unpaired_live = update
+            .peers
+            .iter()
+            .find(|p| p.id == "live-unpaired-psk")
+            .unwrap();
+        assert!(
+            !unpaired_live.paired,
+            "unpaired live psk peer must NOT be marked paired"
+        );
+
+        let unpaired_known = update
+            .peers
+            .iter()
+            .find(|p| p.id == "known-unpaired-psk")
+            .unwrap();
+        assert!(
+            !unpaired_known.paired,
+            "unpaired known psk peer must NOT be marked paired"
+        );
+
+        let paired_live = update
+            .peers
+            .iter()
+            .find(|p| p.id == "live-paired-psk")
+            .unwrap();
+        assert!(paired_live.paired);
     }
 }

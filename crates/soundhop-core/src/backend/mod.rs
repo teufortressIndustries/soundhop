@@ -3,6 +3,7 @@
 pub mod linux;
 pub mod windows;
 
+use std::path::PathBuf;
 use std::sync::Arc;
 
 use serde::{Deserialize, Serialize};
@@ -127,6 +128,7 @@ pub struct TunnelParams<'a> {
     pub reconnect_delay_ms: u64,
     pub latency_ms: Option<u32>,
     pub extra_args: &'a [String],
+    pub cookie_path: Option<PathBuf>,
 }
 
 #[derive(Debug, Clone, Default)]

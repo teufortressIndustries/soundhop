@@ -172,15 +172,9 @@ pub fn handle_pair(controller: &Arc<Controller>, args: &PairArgs, json_out: bool
                 }
             };
         }
-        {
-            let mut cfg = lock_or_recover(&controller.config);
-            cfg.sharing.psk_hash.clear();
-            cfg.sharing.security = "trusted-lan".to_string();
-        }
-        lock_or_recover(&controller.state).paired_peers.clear();
-        controller.save();
+        let res = controller.clear_pairing();
         if json_out {
-            print_json(&serde_json::json!({ "cleared": true }));
+            print_json(&res);
         } else {
             ok("Cleared PIN/PSK pairing and reverted to trusted-lan mode.");
         }

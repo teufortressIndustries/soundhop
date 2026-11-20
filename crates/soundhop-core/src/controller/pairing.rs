@@ -1,7 +1,11 @@
 //! Audio sharing listener lifecycle and PIN/PSK pairing.
 
+use std::path::Path;
+
 use crate::backend::Listener;
-use crate::security::{derive_key_hex, derive_pa_cookie, generate_pairing_pin, write_pa_cookie};
+use crate::security::{
+    derive_key_hex, derive_pa_cookie, generate_pairing_pin, soundhop_cookie_path, write_pa_cookie,
+};
 use crate::state::PairedPeer;
 use crate::util::{local_addresses, lock_or_recover, notify, now_secs, tcp_reachable};
 
@@ -193,12 +197,16 @@ impl Controller {
         lock_or_recover(&self.state)
             .paired_peers
             .insert(peer_id_or_name.to_string(), paired);
-        {
+        let should_reload = {
             let mut cfg = lock_or_recover(&self.config);
             cfg.sharing.psk_hash = shared_key.clone();
             if cfg.sharing.security == "trusted-lan" {
                 cfg.sharing.security = "psk".to_string();
             }
+            cfg.sharing.enabled
+        };
+        if should_reload || self.listener_running() {
+            let _ = self.ensure_listener_internal();
         }
         self.save();
 
@@ -213,13 +221,26 @@ impl Controller {
     }
 
     pub fn clear_pairing(&self) -> serde_json::Value {
+        self.clear_pairing_with_cookie_path(&soundhop_cookie_path())
+    }
+
+    pub(crate) fn clear_pairing_with_cookie_path(&self, cookie_path: &Path) -> serde_json::Value {
         lock_or_recover(&self.state).paired_peers.clear();
-        {
+        let should_reload = {
             let mut cfg = lock_or_recover(&self.config);
             cfg.sharing.psk_hash.clear();
-            if cfg.sharing.security == "psk" {
+            if matches!(cfg.sharing.security.as_str(), "psk" | "paired" | "pin") {
                 cfg.sharing.security = "trusted-lan".to_string();
             }
+            cfg.sharing.enabled
+        };
+        if let Err(e) = std::fs::remove_file(cookie_path) {
+            if e.kind() != std::io::ErrorKind::NotFound {
+                let _ = e;
+            }
+        }
+        if should_reload || self.listener_running() {
+            let _ = self.ensure_listener_internal();
         }
         self.save();
         serde_json::json!({ "ok": true, "cleared": true })
@@ -294,5 +315,66 @@ mod tests {
         assert_eq!(paired[0]["name"], "Studio Speaker");
         assert_eq!(paired[0]["has_shared_key"], true);
         assert_eq!(paired[0]["has_cookie"], true);
+    }
+
+    #[test]
+    fn test_clear_pairing_deletes_cookie_and_reverts_security() {
+        let dir = tempfile::tempdir().unwrap();
+        let state_path = dir.path().join("state.json");
+        let cfg_path = dir.path().join("config.toml");
+        let cookie_path = dir.path().join("pulse-cookie");
+        crate::security::write_pa_cookie(
+            Some(&cookie_path),
+            &crate::security::derive_pa_cookie("stale-pin-key"),
+        )
+        .unwrap();
+        assert!(cookie_path.exists());
+
+        let runner = Arc::new(MockRunner::new(|args, _| {
+            Ok(CommandResult {
+                args: args.to_vec(),
+                returncode: 0,
+                stdout: String::new(),
+                stderr: String::new(),
+            })
+        }));
+        let backend = Arc::new(LinuxAudioBackend::with_runner(runner));
+        let mut cfg = Config::default();
+        cfg.sharing.security = "psk".to_string();
+        cfg.sharing.psk_hash = "some-derived-hash".to_string();
+        let mut st = State::default();
+        st.paired_peers.insert(
+            "peer-1".to_string(),
+            PairedPeer {
+                peer_id: "peer-1".to_string(),
+                name: "Living Room".to_string(),
+                shared_key_hex: "abc".to_string(),
+                cookie_hex: "def".to_string(),
+                paired_at: 100.0,
+            },
+        );
+        let ctrl = Controller::new(
+            Some(cfg),
+            Some(st),
+            Some(backend),
+            Some(cfg_path),
+            Some(state_path),
+            false,
+        );
+
+        let res = ctrl.clear_pairing_with_cookie_path(&cookie_path);
+        assert_eq!(res["ok"], true);
+        assert_eq!(res["cleared"], true);
+        assert!(
+            !cookie_path.exists(),
+            "clear_pairing must delete stale pulse-cookie from disk"
+        );
+        assert!(ctrl.state.lock().unwrap().paired_peers.is_empty());
+        assert!(ctrl.config.lock().unwrap().sharing.psk_hash.is_empty());
+        assert_eq!(ctrl.config.lock().unwrap().sharing.security, "trusted-lan");
+
+        // Calling again when cookie is already gone must succeed (NotFound ignored)
+        let res2 = ctrl.clear_pairing_with_cookie_path(&cookie_path);
+        assert_eq!(res2["ok"], true);
     }
 }

@@ -1,11 +1,13 @@
 //! Single & multi-room connection orchestration, disconnection, and auto-connect controls.
 
+use std::path::PathBuf;
 use std::time::Duration;
 
 use crate::backend::TunnelParams;
 use crate::config::Config;
 use crate::constants::{MULTIROOM_SINK_NAME, PROTOCOL_VERSION, SINK_PREFIX};
 use crate::discovery::{discover_once_with_psk, Peer};
+use crate::security::soundhop_cookie_path;
 use crate::state::ActivePeerSession;
 use crate::util::{
     is_own_non_loopback_ip, is_private_address, lock_or_recover, notify, now_secs, tcp_probe_rtt,
@@ -81,6 +83,7 @@ impl Controller {
             .move_streams
             .unwrap_or(cfg.connection.move_streams && !selective_default);
 
+        let cookie_path = self.tunnel_cookie_path(peer, &cfg);
         let module_id = self
             .backend
             .connect_tunnel(&TunnelParams {
@@ -91,6 +94,7 @@ impl Controller {
                 reconnect_delay_ms: cfg.connection.reconnect_delay_ms,
                 latency_ms: cfg.connection.latency_ms,
                 extra_args: &cfg.connection.extra_tunnel_args,
+                cookie_path,
             })
             .map_err(|e| {
                 ControllerError::Message(format!(
@@ -205,6 +209,7 @@ impl Controller {
 
         for p in peers {
             let sname = Self::sink_name_for(p);
+            let cookie_path = self.tunnel_cookie_path(p, &cfg);
             match self.backend.connect_tunnel(&TunnelParams {
                 host: &p.host,
                 port: p.port,
@@ -213,6 +218,7 @@ impl Controller {
                 reconnect_delay_ms: cfg.connection.reconnect_delay_ms,
                 latency_ms: cfg.connection.latency_ms,
                 extra_args: &cfg.connection.extra_tunnel_args,
+                cookie_path,
             }) {
                 Ok(mid) => {
                     slave_sinks.push(sname.clone());
@@ -294,6 +300,26 @@ impl Controller {
         Ok(self.connection_dict())
     }
 
+    pub(crate) fn tunnel_cookie_path(&self, peer: &Peer, cfg: &Config) -> Option<PathBuf> {
+        let peer_requires_auth =
+            matches!(peer.security.as_str(), "psk" | "paired" | "pin" | "cookie");
+        let manual_with_local_auth = peer.source == "manual"
+            && matches!(
+                cfg.sharing.security.as_str(),
+                "psk" | "paired" | "pin" | "cookie"
+            );
+        if !peer_requires_auth && !manual_with_local_auth {
+            return None;
+        }
+        let has_pairing = !cfg.sharing.psk_hash.trim().is_empty()
+            && !lock_or_recover(&self.state).paired_peers.is_empty();
+        if has_pairing || peer.security == "cookie" {
+            Some(soundhop_cookie_path())
+        } else {
+            None
+        }
+    }
+
     fn validate_peer(&self, peer: &Peer, cfg: &Config) -> Result<(), ControllerError> {
         if peer.id.trim().is_empty() {
             return Err(ControllerError::Message(
@@ -316,6 +342,15 @@ impl Controller {
                 peer.protocol,
                 PROTOCOL_VERSION
             )));
+        }
+        if matches!(peer.security.as_str(), "psk" | "paired" | "pin") {
+            let has_pairing = !cfg.sharing.psk_hash.trim().is_empty()
+                && !lock_or_recover(&self.state).paired_peers.is_empty();
+            if !has_pairing {
+                return Err(ControllerError::Message(
+                    "This device requires pairing. Pair with it first.".to_string(),
+                ));
+            }
         }
         Ok(())
     }
@@ -582,5 +617,100 @@ mod tests {
         assert!(unloaded_cmds.iter().any(|c| c.contains("202")));
         drop(listener1);
         drop(listener2);
+    }
+
+    #[test]
+    fn test_tunnel_cookie_path_omits_cookie_in_trusted_lan_and_validate_peer_enforces_pairing() {
+        let runner = Arc::new(MockRunner::new(|args, _| {
+            Ok(CommandResult {
+                args: args.to_vec(),
+                returncode: 0,
+                stdout: String::new(),
+                stderr: String::new(),
+            })
+        }));
+        let backend = Arc::new(LinuxAudioBackend::with_runner(runner));
+        let ctrl = Controller::new(
+            Some(Config::default()),
+            Some(State::default()),
+            Some(backend),
+            None,
+            None,
+            false,
+        );
+        ctrl.set_save_enabled(false);
+
+        let lan_peer = Peer {
+            id: "peer-lan".to_string(),
+            name: "Living Room".to_string(),
+            host: "192.168.1.40".to_string(),
+            port: 4713,
+            version: VERSION.to_string(),
+            protocol: PROTOCOL_VERSION,
+            security: "trusted-lan".to_string(),
+            platform: "linux".to_string(),
+            last_seen: now_secs(),
+            source: "udp".to_string(),
+            rtt_ms: None,
+        };
+        let psk_peer = Peer {
+            id: "peer-psk".to_string(),
+            name: "Studio".to_string(),
+            security: "psk".to_string(),
+            ..lan_peer.clone()
+        };
+        let paired_peer = Peer {
+            id: "peer-paired".to_string(),
+            name: "Office".to_string(),
+            security: "paired".to_string(),
+            ..lan_peer.clone()
+        };
+
+        let cfg_unpaired = ctrl.config.lock().unwrap().clone();
+        // Unpaired client: trusted-lan has no cookie and passes validation
+        assert!(ctrl.tunnel_cookie_path(&lan_peer, &cfg_unpaired).is_none());
+        assert!(ctrl.validate_peer(&lan_peer, &cfg_unpaired).is_ok());
+
+        // Unpaired client: psk and paired peers must be rejected with actionable error
+        let err_psk = ctrl
+            .validate_peer(&psk_peer, &cfg_unpaired)
+            .unwrap_err()
+            .to_string();
+        assert_eq!(err_psk, "This device requires pairing. Pair with it first.");
+        let err_paired = ctrl
+            .validate_peer(&paired_peer, &cfg_unpaired)
+            .unwrap_err()
+            .to_string();
+        assert_eq!(
+            err_paired,
+            "This device requires pairing. Pair with it first."
+        );
+        assert!(ctrl.tunnel_cookie_path(&psk_peer, &cfg_unpaired).is_none());
+
+        // Once paired: psk/paired peers pass validation and get cookie_path; trusted-lan STILL omits cookie
+        {
+            let mut cfg = ctrl.config.lock().unwrap();
+            cfg.sharing.security = "psk".to_string();
+            cfg.sharing.psk_hash = "deadbeef".to_string();
+        }
+        ctrl.state.lock().unwrap().paired_peers.insert(
+            "lan-group".to_string(),
+            crate::state::PairedPeer {
+                peer_id: "lan-group".to_string(),
+                name: "lan-group".to_string(),
+                shared_key_hex: "deadbeef".to_string(),
+                cookie_hex: "cafebabe".to_string(),
+                paired_at: 100.0,
+            },
+        );
+        let cfg_paired = ctrl.config.lock().unwrap().clone();
+        assert!(ctrl.validate_peer(&psk_peer, &cfg_paired).is_ok());
+        assert!(ctrl.validate_peer(&paired_peer, &cfg_paired).is_ok());
+        assert!(ctrl.tunnel_cookie_path(&psk_peer, &cfg_paired).is_some());
+        assert!(ctrl.tunnel_cookie_path(&paired_peer, &cfg_paired).is_some());
+        assert!(
+            ctrl.tunnel_cookie_path(&lan_peer, &cfg_paired).is_none(),
+            "trusted-lan peers must never receive pulse-cookie"
+        );
     }
 }
