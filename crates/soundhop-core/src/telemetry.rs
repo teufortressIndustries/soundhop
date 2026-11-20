@@ -1,7 +1,9 @@
 //! Real-time audio level (Peak/RMS VU meter) and network latency/jitter telemetry.
 
 use std::collections::{BTreeMap, HashSet, VecDeque};
+#[cfg(not(target_os = "windows"))]
 use std::io::Read;
+#[cfg(not(target_os = "windows"))]
 use std::process::{Child, Command, Stdio};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex, RwLock};
@@ -11,9 +13,9 @@ use std::time::{Duration, Instant};
 use serde::{Deserialize, Serialize};
 
 use crate::controller::Controller;
-use crate::util::{
-    command_exists, is_own_non_loopback_ip, is_private_address, now_secs, tcp_probe_rtt,
-};
+#[cfg(not(target_os = "windows"))]
+use crate::util::command_exists;
+use crate::util::{is_own_non_loopback_ip, is_private_address, now_secs, tcp_probe_rtt};
 
 const MAX_RTT_SAMPLES: usize = 30;
 
@@ -74,7 +76,7 @@ impl TelemetryTracker {
     /// Record a new RTT sample (in milliseconds) for a peer and compute rolling stats.
     pub fn record_rtt(&self, peer_id: &str, rtt_ms: f64) -> PeerNetStats {
         let clamped = rtt_ms.max(0.05);
-        let mut map = self.rtt_history.write().unwrap();
+        let mut map = self.rtt_history.write().unwrap_or_else(|e| e.into_inner());
         let queue = map.entry(peer_id.to_string()).or_default();
         if queue.len() >= MAX_RTT_SAMPLES {
             queue.pop_front();
@@ -84,14 +86,14 @@ impl TelemetryTracker {
     }
 
     pub fn peer_stats(&self, peer_id: &str) -> Option<PeerNetStats> {
-        let map = self.rtt_history.read().unwrap();
+        let map = self.rtt_history.read().unwrap_or_else(|e| e.into_inner());
         map.get(peer_id).map(|q| compute_stats(peer_id, q))
     }
 
     /// Update real-time audio levels from interleaved S16LE stereo PCM bytes with smooth VU ballistics.
     pub fn update_audio_from_s16le(&self, pcm_bytes: &[u8]) {
         let raw = compute_levels_s16le(pcm_bytes);
-        let mut guard = self.audio.write().unwrap();
+        let mut guard = self.audio.write().unwrap_or_else(|e| e.into_inner());
         let decayed_peak_l = (guard.peak_left * 0.82).clamp(0.0, 1.0);
         let decayed_peak_r = (guard.peak_right * 0.82).clamp(0.0, 1.0);
         let decayed_rms_l = (guard.rms_left * 0.82).clamp(0.0, 1.0);
@@ -121,14 +123,20 @@ impl TelemetryTracker {
         };
     }
 
+    /// Smoothly decay VU levels toward silence when no PCM callbacks are arriving
+    /// (e.g. WASAPI shared loopback pauses callbacks during silence).
+    pub fn decay_audio_levels(&self) {
+        self.update_audio_from_s16le(&[]);
+    }
+
     /// Update audio levels explicitly (e.g., from volume/sink activity state on Linux).
     pub fn set_audio_levels(&self, snapshot: AudioLevelSnapshot) {
-        *self.audio.write().unwrap() = snapshot;
+        *self.audio.write().unwrap_or_else(|e| e.into_inner()) = snapshot;
     }
 
     pub fn snapshot(&self) -> TelemetrySnapshot {
-        let audio = self.audio.read().unwrap().clone();
-        let map = self.rtt_history.read().unwrap();
+        let audio = self.audio.read().unwrap_or_else(|e| e.into_inner()).clone();
+        let map = self.rtt_history.read().unwrap_or_else(|e| e.into_inner());
         let mut peers = BTreeMap::new();
         for (id, q) in map.iter() {
             if !q.is_empty() {
@@ -223,9 +231,11 @@ pub fn compute_levels_s16le(pcm_bytes: &[u8]) -> AudioLevelSnapshot {
     }
 }
 
-/// Live audio VU monitor (`parec` / `pacat --record` on Linux) and periodic TCP RTT/Jitter probe.
+/// Live audio VU monitor (`parec` / `pacat --record` on Linux, WASAPI loopback on Windows)
+/// and periodic TCP RTT/Jitter probe.
 pub struct AudioTelemetryMonitor {
     stop_flag: Arc<AtomicBool>,
+    #[cfg(not(target_os = "windows"))]
     active_child: Arc<Mutex<Option<Child>>>,
     audio_thread: Mutex<Option<JoinHandle<()>>>,
     net_thread: Mutex<Option<JoinHandle<()>>>,
@@ -234,11 +244,13 @@ pub struct AudioTelemetryMonitor {
 impl AudioTelemetryMonitor {
     pub fn start(controller: Arc<Controller>) -> Self {
         let stop_flag = Arc::new(AtomicBool::new(false));
+        #[cfg(not(target_os = "windows"))]
         let active_child: Arc<Mutex<Option<Child>>> = Arc::new(Mutex::new(None));
 
         if !controller.is_save_enabled() {
             return Self {
                 stop_flag,
+                #[cfg(not(target_os = "windows"))]
                 active_child,
                 audio_thread: Mutex::new(None),
                 net_thread: Mutex::new(None),
@@ -246,10 +258,17 @@ impl AudioTelemetryMonitor {
         }
 
         let stop_audio = Arc::clone(&stop_flag);
-        let child_slot = Arc::clone(&active_child);
         let ctrl_audio = Arc::clone(&controller);
+        #[cfg(not(target_os = "windows"))]
+        let audio_thread = {
+            let child_slot = Arc::clone(&active_child);
+            thread::spawn(move || {
+                run_audio_capture_loop_unix(ctrl_audio, stop_audio, child_slot);
+            })
+        };
+        #[cfg(target_os = "windows")]
         let audio_thread = thread::spawn(move || {
-            run_audio_capture_loop(ctrl_audio, stop_audio, child_slot);
+            run_audio_capture_loop_windows(ctrl_audio, stop_audio);
         });
 
         let stop_net = Arc::clone(&stop_flag);
@@ -260,6 +279,7 @@ impl AudioTelemetryMonitor {
 
         Self {
             stop_flag,
+            #[cfg(not(target_os = "windows"))]
             active_child,
             audio_thread: Mutex::new(Some(audio_thread)),
             net_thread: Mutex::new(Some(net_thread)),
@@ -268,14 +288,30 @@ impl AudioTelemetryMonitor {
 
     pub fn stop(&self) {
         self.stop_flag.store(true, Ordering::SeqCst);
-        if let Some(mut child) = self.active_child.lock().unwrap().take() {
+        #[cfg(not(target_os = "windows"))]
+        if let Some(mut child) = self
+            .active_child
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .take()
+        {
             let _ = child.kill();
             let _ = child.wait();
         }
-        if let Some(h) = self.audio_thread.lock().unwrap().take() {
+        if let Some(h) = self
+            .audio_thread
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .take()
+        {
             let _ = h.join();
         }
-        if let Some(h) = self.net_thread.lock().unwrap().take() {
+        if let Some(h) = self
+            .net_thread
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .take()
+        {
             let _ = h.join();
         }
     }
@@ -287,9 +323,54 @@ impl Drop for AudioTelemetryMonitor {
     }
 }
 
+#[cfg(target_os = "windows")]
+fn run_audio_capture_loop_windows(controller: Arc<Controller>, stop_flag: Arc<AtomicBool>) {
+    use crate::backend::windows::audio::{ReconnectBackoff, WindowsLoopbackRecorder};
+
+    let mut backoff = ReconnectBackoff::new(250, 2_000);
+    while !stop_flag.load(Ordering::SeqCst) {
+        let last_callback_at = Arc::new(Mutex::new(Instant::now()));
+        let last_cb = Arc::clone(&last_callback_at);
+        let ctrl_cb = Arc::clone(&controller);
+
+        match WindowsLoopbackRecorder::try_new(move |pcm_chunk| {
+            *last_cb.lock().unwrap_or_else(|e| e.into_inner()) = Instant::now();
+            ctrl_cb.telemetry.update_audio_from_s16le(pcm_chunk);
+        }) {
+            Ok(recorder) => {
+                backoff.reset();
+                while !stop_flag.load(Ordering::SeqCst) && recorder.is_alive() {
+                    thread::sleep(Duration::from_millis(40));
+                    let elapsed = last_callback_at
+                        .lock()
+                        .unwrap_or_else(|e| e.into_inner())
+                        .elapsed();
+                    if elapsed >= Duration::from_millis(80) {
+                        controller.telemetry.decay_audio_levels();
+                    }
+                }
+                recorder.stop();
+            }
+            Err(_) => {
+                controller.telemetry.decay_audio_levels();
+                let mut rem = backoff.next_delay();
+                while !rem.is_zero() {
+                    if stop_flag.load(Ordering::SeqCst) {
+                        return;
+                    }
+                    let nap = rem.min(Duration::from_millis(50));
+                    thread::sleep(nap);
+                    rem = rem.saturating_sub(nap);
+                }
+            }
+        }
+    }
+}
+
+#[cfg(not(target_os = "windows"))]
 fn desired_monitor_source(controller: &Controller, force_default: bool) -> String {
     if !force_default {
-        let st = controller.state.lock().unwrap();
+        let st = controller.state.lock().unwrap_or_else(|e| e.into_inner());
         if st.is_connected() && !st.connected_sink.is_empty() {
             return format!("{}.monitor", st.connected_sink);
         }
@@ -297,7 +378,8 @@ fn desired_monitor_source(controller: &Controller, force_default: bool) -> Strin
     "@DEFAULT_SINK@.monitor".to_string()
 }
 
-fn run_audio_capture_loop(
+#[cfg(not(target_os = "windows"))]
+fn run_audio_capture_loop_unix(
     controller: Arc<Controller>,
     stop_flag: Arc<AtomicBool>,
     active_child: Arc<Mutex<Option<Child>>>,
@@ -379,7 +461,11 @@ fn run_audio_capture_loop(
             }
         }
 
-        if let Some(mut c) = active_child.lock().unwrap().take() {
+        if let Some(mut c) = active_child
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .take()
+        {
             let _ = c.kill();
             let _ = c.wait();
         }
@@ -508,5 +594,67 @@ mod tests {
         ctrl.set_save_enabled(false);
         let monitor = AudioTelemetryMonitor::start(ctrl);
         monitor.stop();
+    }
+
+    #[test]
+    fn test_s16le_silence_and_full_scale_levels() {
+        let silence = vec![0u8; 400];
+        let snap_silent = compute_levels_s16le(&silence);
+        assert!(!snap_silent.active);
+        assert_eq!(snap_silent.peak_left, 0.0);
+        assert_eq!(snap_silent.peak_right, 0.0);
+        assert_eq!(snap_silent.dbfs, -60.0);
+
+        let mut full = Vec::new();
+        for _ in 0..100 {
+            full.extend_from_slice(&i16::MAX.to_le_bytes());
+            full.extend_from_slice(&i16::MIN.to_le_bytes());
+        }
+        let snap_full = compute_levels_s16le(&full);
+        assert!(snap_full.active);
+        assert!(snap_full.peak_left > 0.99);
+        assert_eq!(snap_full.peak_right, 1.0);
+        assert!(snap_full.dbfs > -0.2);
+    }
+
+    #[test]
+    fn test_vu_ballistics_decay_to_silence() {
+        let tracker = TelemetryTracker::new();
+        let mut loud = Vec::new();
+        for _ in 0..100 {
+            loud.extend_from_slice(&24_000_i16.to_le_bytes());
+            loud.extend_from_slice(&24_000_i16.to_le_bytes());
+        }
+        tracker.update_audio_from_s16le(&loud);
+        let initial = tracker.snapshot().audio;
+        assert!(initial.active);
+        assert!(initial.peak_left > 0.7);
+        assert!(initial.dbfs > -10.0);
+
+        // Repeated decay calls smoothly fall to silence (-60 dBFS, active=false)
+        for _ in 0..40 {
+            tracker.decay_audio_levels();
+        }
+        let decayed = tracker.snapshot().audio;
+        assert!(!decayed.active);
+        assert_eq!(decayed.peak_left, 0.0);
+        assert_eq!(decayed.peak_right, 0.0);
+        assert_eq!(decayed.dbfs, -60.0);
+    }
+
+    #[test]
+    fn test_telemetry_tracker_recovers_from_poisoned_lock() {
+        let tracker = Arc::new(TelemetryTracker::new());
+        let t_clone = Arc::clone(&tracker);
+        let _ = thread::spawn(move || {
+            let _guard = t_clone.audio.write().unwrap();
+            panic!("intentional poison");
+        })
+        .join();
+
+        // Poison-safe methods must not panic
+        tracker.update_audio_from_s16le(&[0u8; 64]);
+        let snap = tracker.snapshot();
+        assert_eq!(snap.audio.dbfs, -60.0);
     }
 }

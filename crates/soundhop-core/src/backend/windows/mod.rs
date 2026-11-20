@@ -8,6 +8,7 @@ use std::collections::HashMap;
 use std::io::Write;
 use std::net::{IpAddr, SocketAddr, TcpListener, TcpStream, ToSocketAddrs};
 use std::sync::atomic::{AtomicBool, AtomicU32, AtomicUsize, Ordering};
+use std::sync::mpsc::{self, RecvTimeoutError, SyncSender, TrySendError};
 use std::sync::{Arc, Mutex};
 use std::thread::{self, JoinHandle};
 use std::time::Duration;
@@ -19,20 +20,23 @@ use crate::backend::windows::audio::{
 };
 use crate::backend::windows::protocol::{
     default_channel_map, make_command_auth, make_command_create_playback_stream,
-    make_command_request, make_command_set_client_name, make_reply_auth,
+    make_command_get_server_info, make_command_request, make_command_set_client_name,
+    make_command_set_sink_mute, make_command_set_sink_volume, make_reply_auth,
     make_reply_create_playback_stream, make_reply_error, make_reply_ok,
     make_reply_playback_latency, make_reply_server_info, make_reply_set_client_name,
     make_reply_sink_info, make_reply_u32, negotiate_protocol_version, parse_create_playback_stream,
-    read_packet, write_packet, BufferAttr, SampleSpec, TagStructReader, DEFAULT_MINREQ,
-    PA_COMMAND_AUTH, PA_COMMAND_CORK_PLAYBACK_STREAM, PA_COMMAND_CREATE_PLAYBACK_STREAM,
-    PA_COMMAND_DELETE_PLAYBACK_STREAM, PA_COMMAND_DRAIN_PLAYBACK_STREAM, PA_COMMAND_EXIT,
-    PA_COMMAND_FLUSH_PLAYBACK_STREAM, PA_COMMAND_GET_PLAYBACK_LATENCY, PA_COMMAND_GET_SERVER_INFO,
-    PA_COMMAND_GET_SINK_INFO, PA_COMMAND_GET_SINK_INFO_LIST, PA_COMMAND_LOOKUP_SINK,
-    PA_COMMAND_OVERFLOW, PA_COMMAND_PREBUF_PLAYBACK_STREAM, PA_COMMAND_REPLY,
-    PA_COMMAND_SET_CLIENT_NAME, PA_COMMAND_SET_SINK_INPUT_MUTE, PA_COMMAND_SET_SINK_INPUT_VOLUME,
-    PA_COMMAND_SET_SINK_MUTE, PA_COMMAND_SET_SINK_VOLUME, PA_COMMAND_SUBSCRIBE,
-    PA_COMMAND_TRIGGER_PLAYBACK_STREAM, PA_COMMAND_UNDERFLOW, PA_ERR_ACCESS, PA_INVALID_INDEX,
-    PA_PROTOCOL_VERSION, PA_PROTOCOL_VERSION_MASK,
+    parse_reply_server_info_default_sink, parse_set_sink_input_mute, parse_set_sink_input_volume,
+    parse_set_sink_mute, parse_set_sink_volume, read_packet, write_packet, BufferAttr, SampleSpec,
+    TagStructReader, DEFAULT_MINREQ, PA_COMMAND_AUTH, PA_COMMAND_CORK_PLAYBACK_STREAM,
+    PA_COMMAND_CREATE_PLAYBACK_STREAM, PA_COMMAND_DELETE_PLAYBACK_STREAM,
+    PA_COMMAND_DRAIN_PLAYBACK_STREAM, PA_COMMAND_EXIT, PA_COMMAND_FLUSH_PLAYBACK_STREAM,
+    PA_COMMAND_GET_PLAYBACK_LATENCY, PA_COMMAND_GET_SERVER_INFO, PA_COMMAND_GET_SINK_INFO,
+    PA_COMMAND_GET_SINK_INFO_LIST, PA_COMMAND_LOOKUP_SINK, PA_COMMAND_OVERFLOW,
+    PA_COMMAND_PREBUF_PLAYBACK_STREAM, PA_COMMAND_REPLY, PA_COMMAND_SET_CLIENT_NAME,
+    PA_COMMAND_SET_SINK_INPUT_MUTE, PA_COMMAND_SET_SINK_INPUT_VOLUME, PA_COMMAND_SET_SINK_MUTE,
+    PA_COMMAND_SET_SINK_VOLUME, PA_COMMAND_SUBSCRIBE, PA_COMMAND_TRIGGER_PLAYBACK_STREAM,
+    PA_COMMAND_UNDERFLOW, PA_ERR_ACCESS, PA_INVALID_INDEX, PA_PROTOCOL_VERSION,
+    PA_PROTOCOL_VERSION_MASK,
 };
 use crate::backend::{
     AudioBackend, BackendError, Listener, Module, Sink, SinkInput, SinkInputInfo, Source,
@@ -41,23 +45,35 @@ use crate::backend::{
 use crate::constants::SINK_PREFIX;
 use crate::util::sanitize_sink_name;
 
+const TUNNEL_QUEUE_CAPACITY: usize = 32;
+
 struct ActiveTunnelSession {
     pub module_id: u32,
     stop_flag: Arc<AtomicBool>,
     recorder: Option<WindowsLoopbackRecorder>,
-    writer_stream: Option<Arc<Mutex<TcpStream>>>,
-    data_channel: u32,
+    tx: Mutex<Option<SyncSender<Arc<[u8]>>>>,
+    writer_thread: Mutex<Option<JoinHandle<()>>>,
 }
 
 impl ActiveTunnelSession {
     fn is_alive(&self) -> bool {
         !self.stop_flag.load(Ordering::SeqCst)
+            && self.recorder.as_ref().is_none_or(|r| r.is_alive())
     }
 
     fn stop(&self) {
         self.stop_flag.store(true, Ordering::SeqCst);
         if let Some(rec) = &self.recorder {
             rec.stop();
+        }
+        let _ = self.tx.lock().unwrap_or_else(|e| e.into_inner()).take();
+        if let Some(h) = self
+            .writer_thread
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .take()
+        {
+            let _ = h.join();
         }
     }
 }
@@ -66,6 +82,30 @@ impl Drop for ActiveTunnelSession {
     fn drop(&mut self) {
         self.stop();
     }
+}
+
+fn spawn_tunnel_writer(
+    mut stream: TcpStream,
+    data_channel: u32,
+    stop_flag: Arc<AtomicBool>,
+) -> (SyncSender<Arc<[u8]>>, JoinHandle<()>) {
+    let (tx, rx) = mpsc::sync_channel::<Arc<[u8]>>(TUNNEL_QUEUE_CAPACITY);
+    let handle = thread::spawn(move || {
+        while !stop_flag.load(Ordering::SeqCst) {
+            match rx.recv_timeout(Duration::from_millis(100)) {
+                Ok(pcm_chunk) => {
+                    let pkt = write_packet(data_channel, &pcm_chunk);
+                    if stream.write_all(&pkt).is_err() {
+                        stop_flag.store(true, Ordering::SeqCst);
+                        break;
+                    }
+                }
+                Err(RecvTimeoutError::Timeout) => continue,
+                Err(RecvTimeoutError::Disconnected) => break,
+            }
+        }
+    });
+    (tx, handle)
 }
 
 pub struct WindowsAudioBackend {
@@ -78,8 +118,8 @@ pub struct WindowsAudioBackend {
     modules: Mutex<Vec<Module>>,
     default_sink: Mutex<Option<String>>,
     active_senders: Mutex<HashMap<String, ActiveTunnelSession>>,
-    volume_pct: AtomicU32,
-    muted: AtomicBool,
+    volume_pct: Arc<AtomicU32>,
+    muted: Arc<AtomicBool>,
 }
 
 impl Default for WindowsAudioBackend {
@@ -113,8 +153,8 @@ impl WindowsAudioBackend {
             modules: Mutex::new(Vec::new()),
             default_sink: Mutex::new(None),
             active_senders: Mutex::new(HashMap::new()),
-            volume_pct: AtomicU32::new(100),
-            muted: AtomicBool::new(false),
+            volume_pct: Arc::new(AtomicU32::new(100)),
+            muted: Arc::new(AtomicBool::new(false)),
         }
     }
 
@@ -165,7 +205,12 @@ impl AudioBackend for WindowsAudioBackend {
     }
 
     fn default_sink(&self) -> Result<String, BackendError> {
-        if let Some(def) = self.default_sink.lock().unwrap().clone() {
+        if let Some(def) = self
+            .default_sink
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .clone()
+        {
             if self.sink_exists(&def)? {
                 return Ok(def);
             }
@@ -182,7 +227,11 @@ impl AudioBackend for WindowsAudioBackend {
     }
 
     fn modules(&self) -> Result<Vec<Module>, BackendError> {
-        Ok(self.modules.lock().unwrap().clone())
+        Ok(self
+            .modules
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .clone())
     }
 
     fn sinks(&self) -> Result<Vec<Sink>, BackendError> {
@@ -196,7 +245,12 @@ impl AudioBackend for WindowsAudioBackend {
                 state: "RUNNING".to_string(),
             });
         }
-        for (sink_name, session) in self.active_senders.lock().unwrap().iter() {
+        for (sink_name, session) in self
+            .active_senders
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .iter()
+        {
             out.push(Sink {
                 id: session.module_id,
                 name: sink_name.clone(),
@@ -236,21 +290,30 @@ impl AudioBackend for WindowsAudioBackend {
 
     fn load_module(&self, name: &str, args: &[String]) -> Result<u32, BackendError> {
         let id = self.next_module_id.fetch_add(1, Ordering::SeqCst);
-        self.modules.lock().unwrap().push(Module {
-            id,
-            name: name.to_string(),
-            args: args.join(" "),
-        });
+        self.modules
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .push(Module {
+                id,
+                name: name.to_string(),
+                args: args.join(" "),
+            });
         Ok(id)
     }
 
     fn unload_module(&self, module_id: u32, ignore_missing: bool) -> Result<bool, BackendError> {
         if module_id == 100 {
             self.stop_listener_internal();
-            self.modules.lock().unwrap().retain(|m| m.id != 100);
+            self.modules
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .retain(|m| m.id != 100);
             return Ok(true);
         }
-        let mut senders = self.active_senders.lock().unwrap();
+        let mut senders = self
+            .active_senders
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
         let found_key = senders
             .iter()
             .find(|(_, s)| s.module_id == module_id)
@@ -259,14 +322,17 @@ impl AudioBackend for WindowsAudioBackend {
             if let Some(sess) = senders.remove(&key) {
                 sess.stop();
             }
-            self.modules.lock().unwrap().retain(|m| m.id != module_id);
-            let mut def = self.default_sink.lock().unwrap();
+            self.modules
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .retain(|m| m.id != module_id);
+            let mut def = self.default_sink.lock().unwrap_or_else(|e| e.into_inner());
             if def.as_deref() == Some(key.as_str()) {
                 *def = None;
             }
             return Ok(true);
         }
-        let mut mods = self.modules.lock().unwrap();
+        let mut mods = self.modules.lock().unwrap_or_else(|e| e.into_inner());
         let before = mods.len();
         mods.retain(|m| m.id != module_id);
         if mods.len() < before {
@@ -282,7 +348,10 @@ impl AudioBackend for WindowsAudioBackend {
 
     fn unload_tunnels(&self, sink_prefix: &str) -> Result<Vec<u32>, BackendError> {
         let mut removed = Vec::new();
-        let mut senders = self.active_senders.lock().unwrap();
+        let mut senders = self
+            .active_senders
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
         let keys: Vec<String> = senders
             .keys()
             .filter(|k| k.starts_with(sink_prefix))
@@ -296,7 +365,7 @@ impl AudioBackend for WindowsAudioBackend {
         }
         self.modules
             .lock()
-            .unwrap()
+            .unwrap_or_else(|e| e.into_inner())
             .retain(|m| !removed.contains(&m.id));
         Ok(removed)
     }
@@ -305,7 +374,7 @@ impl AudioBackend for WindowsAudioBackend {
         Ok(self
             .modules
             .lock()
-            .unwrap()
+            .unwrap_or_else(|e| e.into_inner())
             .iter()
             .filter(|m| {
                 m.arg("sink_name")
@@ -322,7 +391,7 @@ impl AudioBackend for WindowsAudioBackend {
                 "Refusing to set an empty default sink".to_string(),
             ));
         }
-        *self.default_sink.lock().unwrap() = Some(name.to_string());
+        *self.default_sink.lock().unwrap_or_else(|e| e.into_inner()) = Some(name.to_string());
         Ok(())
     }
 
@@ -408,6 +477,8 @@ impl AudioBackend for WindowsAudioBackend {
         let sec_owned = security.to_string();
         let nets_owned: Vec<String> = effective_allowed_networks(allowed_networks);
         let active_clients = Arc::new(AtomicUsize::new(0));
+        let vol_shared = Arc::clone(&self.volume_pct);
+        let mute_shared = Arc::clone(&self.muted);
         let handle = thread::spawn(move || {
             while !stop_clone.load(Ordering::SeqCst) {
                 match tcp.accept() {
@@ -429,9 +500,17 @@ impl AudioBackend for WindowsAudioBackend {
                         let client_stop = Arc::clone(&stop_clone);
                         let client_sec = sec_owned.clone();
                         let clients_ref = Arc::clone(&active_clients);
+                        let client_vol = Arc::clone(&vol_shared);
+                        let client_mute = Arc::clone(&mute_shared);
                         thread::spawn(move || {
                             let _slot_guard = ClientSlotGuard(clients_ref);
-                            handle_incoming_pa_client(stream, client_stop, client_sec);
+                            handle_incoming_pa_client(
+                                stream,
+                                client_stop,
+                                client_sec,
+                                client_vol,
+                                client_mute,
+                            );
                         });
                     }
                     Err(ref e) if e.kind() == std::io::ErrorKind::WouldBlock => {
@@ -441,10 +520,13 @@ impl AudioBackend for WindowsAudioBackend {
                 }
             }
         });
-        *self.listener_thread.lock().unwrap() = Some(handle);
+        *self
+            .listener_thread
+            .lock()
+            .unwrap_or_else(|e| e.into_inner()) = Some(handle);
 
         let args_str = format!("port={bound_port} security={security}");
-        let mut mods = self.modules.lock().unwrap();
+        let mut mods = self.modules.lock().unwrap_or_else(|e| e.into_inner());
         mods.retain(|m| m.id != 100);
         mods.push(Module {
             id: 100,
@@ -471,6 +553,7 @@ impl AudioBackend for WindowsAudioBackend {
 
         let mut stream = TcpStream::connect_timeout(&addr, Duration::from_secs(3))
             .map_err(|e| BackendError::Message(format!("Cannot connect to {addr}: {e}")))?;
+        stream.set_nodelay(true).ok();
         stream.set_read_timeout(Some(Duration::from_secs(3))).ok();
         stream.set_write_timeout(Some(Duration::from_secs(3))).ok();
 
@@ -520,15 +603,24 @@ impl AudioBackend for WindowsAudioBackend {
 
         let mod_id = self.next_module_id.fetch_add(1, Ordering::SeqCst);
         let stop_flag = Arc::new(AtomicBool::new(false));
-        let writer_stream = Arc::new(Mutex::new(stream));
-        let writer_for_rec = Arc::clone(&writer_stream);
-        let recorder = WindowsLoopbackRecorder::try_new(move |pcm_chunk| {
-            let pkt = write_packet(data_channel, pcm_chunk);
-            if let Ok(mut guard) = writer_for_rec.lock() {
-                let _ = guard.write_all(&pkt);
+        let (tx, writer_handle) =
+            spawn_tunnel_writer(stream, data_channel, Arc::clone(&stop_flag));
+        let tx_for_rec = tx.clone();
+        let stop_for_rec = Arc::clone(&stop_flag);
+        let recorder = match WindowsLoopbackRecorder::try_new(move |pcm_chunk| {
+            let chunk: Arc<[u8]> = Arc::from(pcm_chunk);
+            if let Err(TrySendError::Disconnected(_)) = tx_for_rec.try_send(chunk) {
+                stop_for_rec.store(true, Ordering::SeqCst);
             }
-        })
-        .map_err(BackendError::Message)?;
+        }) {
+            Ok(rec) => rec,
+            Err(err) => {
+                stop_flag.store(true, Ordering::SeqCst);
+                drop(tx);
+                let _ = writer_handle.join();
+                return Err(BackendError::Message(err));
+            }
+        };
 
         let replaced = self
             .active_senders
@@ -540,8 +632,8 @@ impl AudioBackend for WindowsAudioBackend {
                     module_id: mod_id,
                     stop_flag,
                     recorder: Some(recorder),
-                    writer_stream: Some(writer_stream),
-                    data_channel,
+                    tx: Mutex::new(Some(tx)),
+                    writer_thread: Mutex::new(Some(writer_handle)),
                 },
             );
         if let Some(old_sess) = replaced {
@@ -603,7 +695,7 @@ impl AudioBackend for WindowsAudioBackend {
         let mod_id = self.next_module_id.fetch_add(1, Ordering::SeqCst);
         let stop_flag = Arc::new(AtomicBool::new(false));
         let mut slave_recorders_to_stop = Vec::new();
-        let targets: Vec<(Arc<Mutex<TcpStream>>, u32)> = {
+        let targets: Vec<SyncSender<Arc<[u8]>>> = {
             let mut senders = self
                 .active_senders
                 .lock()
@@ -613,9 +705,10 @@ impl AudioBackend for WindowsAudioBackend {
                 .filter_map(|name| {
                     senders.get_mut(name).and_then(|sess| {
                         let target = sess
-                            .writer_stream
-                            .as_ref()
-                            .map(|ws| (Arc::clone(ws), sess.data_channel));
+                            .tx
+                            .lock()
+                            .unwrap_or_else(|e| e.into_inner())
+                            .clone();
                         if target.is_some() {
                             if let Some(rec) = sess.recorder.take() {
                                 slave_recorders_to_stop.push(rec);
@@ -632,13 +725,21 @@ impl AudioBackend for WindowsAudioBackend {
         let recorder = if targets.is_empty() {
             None
         } else {
+            let stop_for_rec = Arc::clone(&stop_flag);
             Some(
                 WindowsLoopbackRecorder::try_new(move |pcm_chunk| {
-                    for (ws, ch) in &targets {
-                        let pkt = write_packet(*ch, pcm_chunk);
-                        if let Ok(mut guard) = ws.lock() {
-                            let _ = guard.write_all(&pkt);
+                    let chunk: Arc<[u8]> = Arc::from(pcm_chunk);
+                    let mut any_connected = false;
+                    for tx in &targets {
+                        match tx.try_send(Arc::clone(&chunk)) {
+                            Ok(()) | Err(TrySendError::Full(_)) => {
+                                any_connected = true;
+                            }
+                            Err(TrySendError::Disconnected(_)) => {}
                         }
+                    }
+                    if !any_connected {
+                        stop_for_rec.store(true, Ordering::SeqCst);
                     }
                 })
                 .map_err(BackendError::Message)?,
@@ -654,8 +755,8 @@ impl AudioBackend for WindowsAudioBackend {
                     module_id: mod_id,
                     stop_flag,
                     recorder,
-                    writer_stream: None,
-                    data_channel: 0,
+                    tx: Mutex::new(None),
+                    writer_thread: Mutex::new(None),
                 },
             );
         if let Some(old_sess) = replaced {
@@ -731,12 +832,95 @@ impl AudioBackend for WindowsAudioBackend {
         self.muted.store(mute, Ordering::SeqCst);
     }
 
-    fn remote_set_volume(&self, _host: &str, _port: u16, volume_percent: u32, mute: Option<bool>) {
-        self.set_sink_volume("", volume_percent);
-        if let Some(m) = mute {
-            self.set_sink_mute("", m);
+    fn remote_set_volume(&self, host: &str, port: u16, volume_percent: u32, mute: Option<bool>) {
+        if host.trim().is_empty() || port == 0 {
+            self.set_sink_volume("", volume_percent);
+            if let Some(m) = mute {
+                self.set_sink_mute("", m);
+            }
+            return;
+        }
+        let _ = send_remote_pa_volume(host, port, volume_percent, mute);
+    }
+}
+
+fn send_remote_pa_volume(
+    host: &str,
+    port: u16,
+    volume_percent: u32,
+    mute: Option<bool>,
+) -> std::io::Result<()> {
+    let addr = (host, port)
+        .to_socket_addrs()?
+        .next()
+        .ok_or_else(|| std::io::Error::new(std::io::ErrorKind::NotFound, "No address found"))?;
+
+    let mut stream = TcpStream::connect_timeout(&addr, Duration::from_millis(1_500))?;
+    let _ = stream.set_nodelay(true);
+    let _ = stream.set_read_timeout(Some(Duration::from_millis(1_500)));
+    let _ = stream.set_write_timeout(Some(Duration::from_millis(1_500)));
+
+    // 1. AUTH
+    let cookie = load_cookie_bytes().unwrap_or([0u8; 256]);
+    stream.write_all(&make_command_auth(0, PA_PROTOCOL_VERSION, &cookie))?;
+    let auth_reply = read_packet(&mut stream)?;
+    let mut r = TagStructReader::new(&auth_reply.data);
+    if r.read_u32().unwrap_or(0) != PA_COMMAND_REPLY {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::PermissionDenied,
+            "Remote PA auth rejected",
+        ));
+    }
+    let _tag = r.read_u32().unwrap_or(0);
+    let server_ver = r.read_u32().unwrap_or(PA_PROTOCOL_VERSION) & PA_PROTOCOL_VERSION_MASK;
+    let negotiated_ver = server_ver.min(PA_PROTOCOL_VERSION);
+
+    // 2. SET_CLIENT_NAME
+    let _ = stream.write_all(&make_command_set_client_name(
+        1,
+        negotiated_ver,
+        "SoundHop-VolumeControl",
+    ));
+    let _ = read_packet(&mut stream);
+
+    // 3. GET_SERVER_INFO to discover default sink name & channel count
+    let mut sink_index = 0u32;
+    let mut sink_name: Option<String> = None;
+    let mut channels = 2u8;
+    if stream.write_all(&make_command_get_server_info(2)).is_ok() {
+        if let Ok(info_pkt) = read_packet(&mut stream) {
+            if let Ok((def_sink, ch)) = parse_reply_server_info_default_sink(&info_pkt.data) {
+                channels = ch.max(1);
+                if let Some(name) = def_sink.filter(|s| !s.is_empty()) {
+                    sink_index = PA_INVALID_INDEX;
+                    sink_name = Some(name);
+                }
+            }
         }
     }
+
+    // 4. SET_SINK_VOLUME
+    stream.write_all(&make_command_set_sink_volume(
+        3,
+        sink_index,
+        sink_name.as_deref(),
+        channels,
+        volume_percent,
+    ))?;
+    let _ = read_packet(&mut stream);
+
+    // 5. Optional SET_SINK_MUTE
+    if let Some(m) = mute {
+        stream.write_all(&make_command_set_sink_mute(
+            4,
+            sink_index,
+            sink_name.as_deref(),
+            m,
+        ))?;
+        let _ = read_packet(&mut stream);
+    }
+
+    Ok(())
 }
 
 fn effective_allowed_networks(allowed_networks: &[String]) -> Vec<String> {
@@ -789,7 +973,13 @@ fn load_cookie_bytes() -> Option<[u8; 256]> {
     Some(cookie)
 }
 
-fn handle_incoming_pa_client(stream: TcpStream, stop_flag: Arc<AtomicBool>, security: String) {
+fn handle_incoming_pa_client(
+    stream: TcpStream,
+    stop_flag: Arc<AtomicBool>,
+    security: String,
+    volume_pct: Arc<AtomicU32>,
+    muted: Arc<AtomicBool>,
+) {
     let cookie_required = matches!(security.as_str(), "psk" | "pin" | "cookie");
     let expected_cookie = if cookie_required {
         match load_cookie_bytes() {
@@ -799,19 +989,46 @@ fn handle_incoming_pa_client(stream: TcpStream, stop_flag: Arc<AtomicBool>, secu
     } else {
         None
     };
-    handle_incoming_pa_client_with_cookie(stream, stop_flag, cookie_required, expected_cookie);
+    handle_incoming_pa_client_with_cookie_and_volume(
+        stream,
+        stop_flag,
+        cookie_required,
+        expected_cookie,
+        volume_pct,
+        muted,
+    );
 }
 
+#[cfg(test)]
 fn handle_incoming_pa_client_with_cookie(
+    stream: TcpStream,
+    stop_flag: Arc<AtomicBool>,
+    cookie_required: bool,
+    expected_cookie: Option<[u8; 256]>,
+) {
+    handle_incoming_pa_client_with_cookie_and_volume(
+        stream,
+        stop_flag,
+        cookie_required,
+        expected_cookie,
+        Arc::new(AtomicU32::new(100)),
+        Arc::new(AtomicBool::new(false)),
+    );
+}
+
+fn handle_incoming_pa_client_with_cookie_and_volume(
     mut stream: TcpStream,
     stop_flag: Arc<AtomicBool>,
     cookie_required: bool,
     expected_cookie: Option<[u8; 256]>,
+    volume_pct: Arc<AtomicU32>,
+    muted: Arc<AtomicBool>,
 ) {
     if cookie_required && expected_cookie.is_none() {
         return;
     }
     let _ = stream.set_nonblocking(false);
+    let _ = stream.set_nodelay(true);
     let _ = stream.set_read_timeout(Some(Duration::from_millis(500)));
 
     let mut authenticated = !cookie_required;
@@ -876,7 +1093,12 @@ fn handle_incoming_pa_client_with_cookie(
                 }
                 PA_COMMAND_GET_SERVER_INFO => Some(make_reply_server_info(tag, protocol_version)),
                 PA_COMMAND_GET_SINK_INFO | PA_COMMAND_GET_SINK_INFO_LIST => {
-                    Some(make_reply_sink_info(tag, protocol_version, 100, false))
+                    Some(make_reply_sink_info(
+                        tag,
+                        protocol_version,
+                        volume_pct.load(Ordering::SeqCst),
+                        muted.load(Ordering::SeqCst),
+                    ))
                 }
                 PA_COMMAND_LOOKUP_SINK => Some(make_reply_u32(tag, 0)),
                 PA_COMMAND_CREATE_PLAYBACK_STREAM => {
@@ -893,7 +1115,12 @@ fn handle_incoming_pa_client_with_cookie(
                         }
                     };
                     if player.is_none() {
-                        let wp = WindowsPlayer::new(spec.rate.max(8_000), spec.channels.max(1));
+                        let wp = WindowsPlayer::with_volume(
+                            spec.rate.max(8_000),
+                            spec.channels.max(1),
+                            Arc::clone(&volume_pct),
+                            Arc::clone(&muted),
+                        );
                         wp.start();
                         player = Some(wp);
                     }
@@ -932,15 +1159,35 @@ fn handle_incoming_pa_client_with_cookie(
                     uncredited_bytes = 0;
                     Some(make_reply_ok(tag))
                 }
+                PA_COMMAND_SET_SINK_VOLUME => {
+                    if let Ok((_, _, pct)) = parse_set_sink_volume(&mut r) {
+                        volume_pct.store(pct.min(150), Ordering::SeqCst);
+                    }
+                    Some(make_reply_ok(tag))
+                }
+                PA_COMMAND_SET_SINK_MUTE => {
+                    if let Ok((_, _, m)) = parse_set_sink_mute(&mut r) {
+                        muted.store(m, Ordering::SeqCst);
+                    }
+                    Some(make_reply_ok(tag))
+                }
+                PA_COMMAND_SET_SINK_INPUT_VOLUME => {
+                    if let Ok((_, pct)) = parse_set_sink_input_volume(&mut r) {
+                        volume_pct.store(pct.min(150), Ordering::SeqCst);
+                    }
+                    Some(make_reply_ok(tag))
+                }
+                PA_COMMAND_SET_SINK_INPUT_MUTE => {
+                    if let Ok((_, m)) = parse_set_sink_input_mute(&mut r) {
+                        muted.store(m, Ordering::SeqCst);
+                    }
+                    Some(make_reply_ok(tag))
+                }
                 PA_COMMAND_DRAIN_PLAYBACK_STREAM
                 | PA_COMMAND_FLUSH_PLAYBACK_STREAM
                 | PA_COMMAND_CORK_PLAYBACK_STREAM
                 | PA_COMMAND_TRIGGER_PLAYBACK_STREAM
                 | PA_COMMAND_PREBUF_PLAYBACK_STREAM
-                | PA_COMMAND_SET_SINK_INPUT_VOLUME
-                | PA_COMMAND_SET_SINK_INPUT_MUTE
-                | PA_COMMAND_SET_SINK_VOLUME
-                | PA_COMMAND_SET_SINK_MUTE
                 | PA_COMMAND_SUBSCRIBE => Some(make_reply_ok(tag)),
                 PA_COMMAND_UNDERFLOW | PA_COMMAND_OVERFLOW => {
                     if tag == PA_INVALID_INDEX {
@@ -970,7 +1217,12 @@ fn handle_incoming_pa_client_with_cookie(
             }
         } else if authenticated {
             let p = player.get_or_insert_with(|| {
-                let wp = WindowsPlayer::new(48_000, 2);
+                let wp = WindowsPlayer::with_volume(
+                    48_000,
+                    2,
+                    Arc::clone(&volume_pct),
+                    Arc::clone(&muted),
+                );
                 wp.start();
                 wp
             });
@@ -1427,5 +1679,116 @@ mod tests {
         stop.store(true, Ordering::SeqCst);
         drop(client);
         h.join().unwrap();
+    }
+
+    #[test]
+    fn test_windows_remote_set_volume_and_get_sink_info_reflect_real_state() {
+        use protocol::{pa_volume_to_pct, TagStructWriter, PA_CONTROL_CHANNEL};
+
+        let receiver = WindowsAudioBackend::new();
+        let listener = receiver
+            .ensure_tcp_listener(0, "open", &["127.0.0.1".to_string()])
+            .unwrap();
+        assert_eq!(receiver.get_sink_volume(""), 100);
+        assert!(!receiver.get_sink_mute(""));
+
+        let sender = WindowsAudioBackend::new();
+        sender.remote_set_volume("127.0.0.1", listener.port, 65, Some(true));
+
+        assert_eq!(receiver.get_sink_volume(""), 65);
+        assert!(receiver.get_sink_mute(""));
+
+        // Verify PA_COMMAND_GET_SINK_INFO returns the updated volume & mute state
+        let mut client = TcpStream::connect(("127.0.0.1", listener.port)).unwrap();
+        client
+            .set_read_timeout(Some(Duration::from_secs(2)))
+            .unwrap();
+        client
+            .write_all(&make_command_auth(0, PA_PROTOCOL_VERSION, &[0u8; 256]))
+            .unwrap();
+        let _ = read_packet(&mut client).unwrap();
+
+        let mut req = TagStructWriter::new();
+        req.write_u32(PA_COMMAND_GET_SINK_INFO);
+        req.write_u32(1);
+        req.write_u32(0);
+        req.write_string(None);
+        client
+            .write_all(&write_packet(PA_CONTROL_CHANNEL, &req.into_bytes()))
+            .unwrap();
+
+        let reply = read_packet(&mut client).unwrap();
+        let mut r = TagStructReader::new(&reply.data);
+        assert_eq!(r.read_u32().unwrap(), PA_COMMAND_REPLY);
+        assert_eq!(r.read_u32().unwrap(), 1);
+        assert_eq!(r.read_u32().unwrap(), 0); // sink index
+        let _name = r.read_string().unwrap();
+        let _desc = r.read_string().unwrap();
+        let _spec = r.read_sample_spec().unwrap();
+        let _map = r.read_channel_map().unwrap();
+        let _owner = r.read_u32().unwrap();
+        let (_ch, vols) = r.read_cvolume().unwrap();
+        let muted = r.read_boolean().unwrap();
+        assert_eq!(pa_volume_to_pct(vols[0]), 65);
+        assert!(muted);
+
+        drop(client);
+        receiver.remove_listener(listener.module_id).unwrap();
+    }
+
+    #[test]
+    fn test_windows_tunnel_marks_dead_on_write_error() {
+        let receiver = WindowsAudioBackend::new();
+        let listener = receiver
+            .ensure_tcp_listener(0, "open", &["127.0.0.1".to_string()])
+            .unwrap();
+
+        let sender = WindowsAudioBackend::new();
+        sender
+            .connect_tunnel(&TunnelParams {
+                host: "127.0.0.1",
+                port: listener.port,
+                sink_name: "soundhop_dead_test",
+                description: "DeadTest",
+                reconnect_delay_ms: 1000,
+                latency_ms: None,
+                extra_args: &[],
+            })
+            .unwrap();
+
+        // Initially alive
+        let running = sender
+            .sinks()
+            .unwrap()
+            .into_iter()
+            .find(|s| s.name == "soundhop_dead_test")
+            .unwrap();
+        assert_eq!(running.state, "RUNNING");
+
+        // Shut down receiver listener -> TCP connection closes; writer thread sees write error
+        receiver.remove_listener(listener.module_id).unwrap();
+
+        // Poll up to 2s for writer thread to detect broken pipe and mark tunnel dead
+        let mut marked_dead = false;
+        for _ in 0..40 {
+            thread::sleep(Duration::from_millis(50));
+            if let Some(sink) = sender
+                .sinks()
+                .unwrap()
+                .into_iter()
+                .find(|s| s.name == "soundhop_dead_test")
+            {
+                if sink.state == "SUSPENDED" {
+                    marked_dead = true;
+                    break;
+                }
+            }
+        }
+        assert!(
+            marked_dead,
+            "tunnel should transition to SUSPENDED when remote peer disconnects"
+        );
+
+        sender.disconnect_tunnel("soundhop_dead_test").unwrap();
     }
 }

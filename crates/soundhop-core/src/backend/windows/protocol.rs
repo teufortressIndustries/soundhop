@@ -739,6 +739,16 @@ pub fn make_reply_server_info(tag: u32, protocol_version: u32) -> Vec<u8> {
     write_packet(PA_CONTROL_CHANNEL, &w.into_bytes())
 }
 
+/// Convert percentage volume (`0..=150`) to PulseAudio `pa_volume_t` (`PA_VOLUME_NORM = 0x10000`).
+pub fn volume_pct_to_pa(volume_pct: u32) -> u32 {
+    ((volume_pct.min(150) as u64 * PA_VOLUME_NORM as u64) / 100) as u32
+}
+
+/// Convert PulseAudio `pa_volume_t` back to percentage (`0..=150`), rounded to nearest percent.
+pub fn pa_volume_to_pct(pa_vol: u32) -> u32 {
+    (((pa_vol as u64) * 100 + (PA_VOLUME_NORM as u64 / 2)) / PA_VOLUME_NORM as u64).min(150) as u32
+}
+
 pub fn make_reply_sink_info(
     tag: u32,
     protocol_version: u32,
@@ -747,7 +757,7 @@ pub fn make_reply_sink_info(
 ) -> Vec<u8> {
     let spec = SampleSpec::default();
     let ch_map = default_channel_map(spec.channels);
-    let pa_vol = ((volume_pct.min(150) as u64 * PA_VOLUME_NORM as u64) / 100) as u32;
+    let pa_vol = volume_pct_to_pa(volume_pct);
 
     let mut w = TagStructWriter::new();
     w.write_u32(PA_COMMAND_REPLY);
@@ -1018,6 +1028,103 @@ pub fn make_command_create_playback_stream(
     write_packet(PA_CONTROL_CHANNEL, &w.into_bytes())
 }
 
+pub fn make_command_get_server_info(tag: u32) -> Vec<u8> {
+    let mut w = TagStructWriter::new();
+    w.write_u32(PA_COMMAND_GET_SERVER_INFO);
+    w.write_u32(tag);
+    write_packet(PA_CONTROL_CHANNEL, &w.into_bytes())
+}
+
+/// Extract `(default_sink_name, default_channels)` from a `PA_COMMAND_GET_SERVER_INFO` reply payload.
+pub fn parse_reply_server_info_default_sink(data: &[u8]) -> io::Result<(Option<String>, u8)> {
+    let mut r = TagStructReader::new(data);
+    let cmd = r.read_u32()?;
+    if cmd != PA_COMMAND_REPLY {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            format!("Expected PA_COMMAND_REPLY, got {cmd}"),
+        ));
+    }
+    let _tag = r.read_u32()?;
+    let _package = r.read_string()?;
+    let _version = r.read_string()?;
+    let _user = r.read_string()?;
+    let _host = r.read_string()?;
+    let spec = r.read_sample_spec()?;
+    let default_sink = r.read_string()?;
+    Ok((default_sink, spec.channels.max(1)))
+}
+
+pub fn make_command_set_sink_volume(
+    tag: u32,
+    sink_index: u32,
+    sink_name: Option<&str>,
+    channels: u8,
+    volume_pct: u32,
+) -> Vec<u8> {
+    let mut w = TagStructWriter::new();
+    w.write_u32(PA_COMMAND_SET_SINK_VOLUME);
+    w.write_u32(tag);
+    w.write_u32(sink_index);
+    w.write_string(sink_name.filter(|s| !s.is_empty()));
+    w.write_cvolume(channels.max(1), volume_pct_to_pa(volume_pct));
+    write_packet(PA_CONTROL_CHANNEL, &w.into_bytes())
+}
+
+pub fn make_command_set_sink_mute(
+    tag: u32,
+    sink_index: u32,
+    sink_name: Option<&str>,
+    mute: bool,
+) -> Vec<u8> {
+    let mut w = TagStructWriter::new();
+    w.write_u32(PA_COMMAND_SET_SINK_MUTE);
+    w.write_u32(tag);
+    w.write_u32(sink_index);
+    w.write_string(sink_name.filter(|s| !s.is_empty()));
+    w.write_boolean(mute);
+    write_packet(PA_CONTROL_CHANNEL, &w.into_bytes())
+}
+
+fn cvolume_to_pct(vols: &[u32]) -> u32 {
+    if vols.is_empty() {
+        return 100;
+    }
+    let sum: u64 = vols.iter().map(|&v| u64::from(v)).sum();
+    let avg = (sum / vols.len() as u64) as u32;
+    pa_volume_to_pct(avg)
+}
+
+/// Parse the body of `PA_COMMAND_SET_SINK_VOLUME` after command & tag have been read.
+pub fn parse_set_sink_volume(r: &mut TagStructReader<'_>) -> io::Result<(u32, Option<String>, u32)> {
+    let sink_index = r.read_u32()?;
+    let sink_name = r.read_string()?;
+    let (_channels, vols) = r.read_cvolume()?;
+    Ok((sink_index, sink_name, cvolume_to_pct(&vols)))
+}
+
+/// Parse the body of `PA_COMMAND_SET_SINK_MUTE` after command & tag have been read.
+pub fn parse_set_sink_mute(r: &mut TagStructReader<'_>) -> io::Result<(u32, Option<String>, bool)> {
+    let sink_index = r.read_u32()?;
+    let sink_name = r.read_string()?;
+    let mute = r.read_boolean()?;
+    Ok((sink_index, sink_name, mute))
+}
+
+/// Parse the body of `PA_COMMAND_SET_SINK_INPUT_VOLUME` after command & tag have been read.
+pub fn parse_set_sink_input_volume(r: &mut TagStructReader<'_>) -> io::Result<(u32, u32)> {
+    let idx = r.read_u32()?;
+    let (_channels, vols) = r.read_cvolume()?;
+    Ok((idx, cvolume_to_pct(&vols)))
+}
+
+/// Parse the body of `PA_COMMAND_SET_SINK_INPUT_MUTE` after command & tag have been read.
+pub fn parse_set_sink_input_mute(r: &mut TagStructReader<'_>) -> io::Result<(u32, bool)> {
+    let idx = r.read_u32()?;
+    let mute = r.read_boolean()?;
+    Ok((idx, mute))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1283,5 +1390,59 @@ mod tests {
         let _ = r.read_byte().unwrap();
         let err2 = r.read_slice(usize::MAX).unwrap_err();
         assert_eq!(err2.kind(), io::ErrorKind::UnexpectedEof);
+    }
+
+    #[test]
+    fn test_volume_conversion_roundtrip_and_clamping() {
+        for pct in [0u32, 1, 25, 50, 75, 100, 125, 150] {
+            let pa = volume_pct_to_pa(pct);
+            assert_eq!(pa_volume_to_pct(pa), pct, "roundtrip failed for {pct}%");
+        }
+        assert_eq!(volume_pct_to_pa(100), PA_VOLUME_NORM);
+        assert_eq!(volume_pct_to_pa(250), volume_pct_to_pa(150));
+        assert_eq!(pa_volume_to_pct(PA_VOLUME_NORM * 3), 150);
+    }
+
+    #[test]
+    fn test_set_sink_volume_and_mute_roundtrip() {
+        let vol_raw =
+            make_command_set_sink_volume(11, PA_INVALID_INDEX, Some("SoundHop-Speakers"), 2, 75);
+        let vol_pkt = read_packet(&mut Cursor::new(vol_raw)).unwrap();
+        let mut r = TagStructReader::new(&vol_pkt.data);
+        assert_eq!(r.read_u32().unwrap(), PA_COMMAND_SET_SINK_VOLUME);
+        assert_eq!(r.read_u32().unwrap(), 11);
+        let (idx, name, pct) = parse_set_sink_volume(&mut r).unwrap();
+        assert_eq!(idx, PA_INVALID_INDEX);
+        assert_eq!(name.as_deref(), Some("SoundHop-Speakers"));
+        assert_eq!(pct, 75);
+        assert_eq!(r.remaining(), 0);
+
+        let mute_raw = make_command_set_sink_mute(12, 0, None, true);
+        let mute_pkt = read_packet(&mut Cursor::new(mute_raw)).unwrap();
+        let mut mr = TagStructReader::new(&mute_pkt.data);
+        assert_eq!(mr.read_u32().unwrap(), PA_COMMAND_SET_SINK_MUTE);
+        assert_eq!(mr.read_u32().unwrap(), 12);
+        let (m_idx, m_name, muted) = parse_set_sink_mute(&mut mr).unwrap();
+        assert_eq!(m_idx, 0);
+        assert_eq!(m_name, None);
+        assert!(muted);
+        assert_eq!(mr.remaining(), 0);
+    }
+
+    #[test]
+    fn test_server_info_default_sink_extraction() {
+        let req_raw = make_command_get_server_info(5);
+        let req_pkt = read_packet(&mut Cursor::new(req_raw)).unwrap();
+        let mut rr = TagStructReader::new(&req_pkt.data);
+        assert_eq!(rr.read_u32().unwrap(), PA_COMMAND_GET_SERVER_INFO);
+        assert_eq!(rr.read_u32().unwrap(), 5);
+        assert_eq!(rr.remaining(), 0);
+
+        let reply_raw = make_reply_server_info(5, PA_PROTOCOL_VERSION);
+        let reply_pkt = read_packet(&mut Cursor::new(reply_raw)).unwrap();
+        let (default_sink, channels) =
+            parse_reply_server_info_default_sink(&reply_pkt.data).unwrap();
+        assert_eq!(default_sink.as_deref(), Some("SoundHop-Speakers"));
+        assert_eq!(channels, 2);
     }
 }
