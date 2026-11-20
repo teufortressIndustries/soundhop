@@ -506,8 +506,22 @@ mod tests {
             }
             let snr_db = 10.0 * (sig_pow / (err_pow + 1e-9)).log10();
             assert!(
-                best_corr > 0.90 && snr_db > 8.0,
-                "expected high-fidelity Opus reconstruction for {profile:?}, got corr={best_corr:.4}, snr={snr_db:.2} dB"
+                best_corr > 0.99 && snr_db > 22.0,
+                "expected high-fidelity Opus reconstruction (L) for {profile:?}, got corr={best_corr:.4}, snr={snr_db:.2} dB"
+            );
+
+            let mut sig_r = 0.0f64;
+            let mut err_r = 0.0f64;
+            for idx in search_start..search_end {
+                let a = f64::from(in_r[idx]);
+                let b = f64::from(out_r[idx + best_lag]);
+                sig_r += a * a;
+                err_r += (a - b) * (a - b);
+            }
+            let snr_r_db = 10.0 * (sig_r / (err_r + 1e-9)).log10();
+            assert!(
+                snr_r_db > 22.0,
+                "expected high-fidelity Opus reconstruction (R) for {profile:?}, got snr={snr_r_db:.2} dB"
             );
 
             // PLC must produce a valid full frame of samples.

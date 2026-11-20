@@ -1082,6 +1082,116 @@ mod tests {
         );
     }
 
+    #[cfg(feature = "opus")]
+    #[test]
+    fn end_to_end_opus_profiles_fidelity_snr() {
+        for profile in [
+            AudioProfile::OpusBalanced,
+            AudioProfile::OpusLowLatency,
+            AudioProfile::OpusLowBandwidth,
+        ] {
+            let k_pair = [0x88; 32];
+            let trust = Arc::new(InMemoryTrustStore::new());
+            trust.insert("sender-fidelity", k_pair);
+
+            let playback_handles: Arc<Mutex<Vec<MockPcmPlaybackHandle>>> =
+                Arc::new(Mutex::new(Vec::new()));
+            let handles_c = Arc::clone(&playback_handles);
+            let factory: PcmPlaybackFactory = Arc::new(move |_peer_id| {
+                let (play, handle) = MockPcmPlayback::pair();
+                handles_c.lock().unwrap().push(handle);
+                Ok(Box::new(play))
+            });
+
+            let manager = Sht3SessionManager::new();
+            let addr = manager
+                .start_listener(
+                    "127.0.0.1:0".parse().unwrap(),
+                    Sht3ServerConfig::new("receiver-fidelity"),
+                    trust,
+                    factory,
+                )
+                .unwrap();
+
+            let spc = profile.frame_samples_per_channel();
+            let total_frames = 40usize;
+            let mut expected_frames = Vec::with_capacity(total_frames);
+            let mut in_l = Vec::with_capacity(total_frames * spc);
+            for f_idx in 0..total_frames {
+                let mut pcm = Vec::with_capacity(spc * 2);
+                for i in 0..spc {
+                    let t = (f_idx * spc + i) as f64 / 48_000.0;
+                    let env = 0.25 + 0.75 * ((t * 3.0 * std::f64::consts::PI).sin().abs());
+                    let l = (env
+                        * (8000.0 * (2.0 * std::f64::consts::PI * 110.0 * t).sin()
+                            + 6000.0 * (2.0 * std::f64::consts::PI * 660.0 * t).sin()
+                            + 3000.0 * (2.0 * std::f64::consts::PI * 3520.0 * t).cos()))
+                    .clamp(-32000.0, 32000.0) as i16;
+                    let r = (env
+                        * (8000.0 * (2.0 * std::f64::consts::PI * 110.0 * t).sin()
+                            + 5500.0 * (2.0 * std::f64::consts::PI * 880.0 * t).cos()
+                            + 3000.0 * (2.0 * std::f64::consts::PI * 2640.0 * t).sin()))
+                    .clamp(-32000.0, 32000.0) as i16;
+                    in_l.push(l);
+                    pcm.push(l);
+                    pcm.push(r);
+                }
+                expected_frames.push(pcm);
+            }
+
+            let capture = Box::new(MockPcmCapture::from_frames(expected_frames));
+            let out_cfg = OutboundConfig::new("sender-fidelity", addr, k_pair)
+                .with_profile(profile)
+                .with_jitter_ms(40);
+            let session = manager.start_outbound(out_cfg, capture).unwrap();
+            session.join();
+
+            let handle = playback_handles.lock().unwrap().first().cloned().unwrap();
+            assert!(wait_until(Duration::from_secs(2), || handle.is_closed()));
+            assert_eq!(handle.frame_count(), total_frames);
+
+            let out_l: Vec<i16> = handle
+                .frames()
+                .into_iter()
+                .flat_map(|f| f.into_iter().step_by(2))
+                .collect();
+            let search_start = spc * 5;
+            let search_end = in_l.len() - spc * 2;
+            let mut best_lag = 0usize;
+            let mut best_corr = -1.0f64;
+            for lag in 0..300usize {
+                let mut dot = 0.0f64;
+                let mut ei = 0.0f64;
+                let mut eo = 0.0f64;
+                for idx in search_start..search_end {
+                    let a = f64::from(in_l[idx]);
+                    let b = f64::from(out_l[idx + lag]);
+                    dot += a * b;
+                    ei += a * a;
+                    eo += b * b;
+                }
+                let corr = dot / (ei.sqrt() * eo.sqrt() + 1e-9);
+                if corr > best_corr {
+                    best_corr = corr;
+                    best_lag = lag;
+                }
+            }
+            let mut sig_pow = 0.0f64;
+            let mut err_pow = 0.0f64;
+            for idx in search_start..search_end {
+                let a = f64::from(in_l[idx]);
+                let b = f64::from(out_l[idx + best_lag]);
+                sig_pow += a * a;
+                err_pow += (a - b) * (a - b);
+            }
+            let snr_db = 10.0 * (sig_pow / (err_pow + 1e-9)).log10();
+            assert!(
+                best_corr > 0.99 && snr_db > 22.0,
+                "end-to-end SHT3 {profile:?} fidelity too low: corr={best_corr:.4}, snr={snr_db:.2} dB"
+            );
+        }
+    }
+
     #[test]
     fn live_volume_and_mute_control_propagation() {
         let k_pair = [0x91; 32];

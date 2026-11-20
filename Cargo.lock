@@ -3909,6 +3909,7 @@ dependencies = [
  "ipnet",
  "libc",
  "mdns-sd",
+ "mousiki",
  "opus2",
  "rand",
  "serde",

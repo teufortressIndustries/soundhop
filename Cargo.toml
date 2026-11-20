@@ -40,6 +40,7 @@ x25519-dalek = { version = "2", features = ["static_secrets"] }
 chacha20poly1305 = "0.10"
 zeroize = { version = "1.8", features = ["derive"] }
 opus2 = { version = "0.4", default-features = false, features = ["backend-mousiki"] }
+mousiki = { version = "0.2.1", default-features = false, features = ["fixed_point"] }
 hex = "0.4"
 rand = "0.8"
 ureq = { version = "2.10", default-features = false, features = ["tls"] }
