@@ -22,6 +22,10 @@ pub const MDNS_PORT: u16 = 5353;
 /// mDNS service type registered via `mdns-sd`.
 pub const MDNS_SERVICE_TYPE: &str = "_soundhop._tcp.local.";
 
+/// mDNS service types advertised by Android Wireless Debugging / ADB over TCP.
+pub const ADB_MDNS_TLS_CONNECT_SERVICE_TYPE: &str = "_adb-tls-connect._tcp.local.";
+pub const ADB_MDNS_TCP_SERVICE_TYPE: &str = "_adb._tcp.local.";
+
 /// Prefix for PulseAudio/PipeWire modules, sinks, and sources created by SoundHop.
 pub const MODULE_PREFIX: &str = "soundhop_";
 pub const SINK_PREFIX: &str = "soundhop_";
@@ -72,5 +76,9 @@ pub const DEFAULT_AUDIO_BUFFER_MS: u32 = 50;
 pub const DEFAULT_SCRCPY_VERSION: &str = "3.1";
 pub const SCRCPY_V3_1_SHA256_LINUX_X86_64: &str =
     "37dba54092ed9ec6b2f8f95432f61b8ea124aec9f1e9f2b3d22d4b10bb04c59a";
+/// Upstream scrcpy v3.1 does not publish an official prebuilt Linux aarch64 tarball;
+/// leave unpinned (`None`) so automatic downloads fail closed unless a caller provides
+/// an explicit verified SHA-256 or installs system `scrcpy`.
+pub const SCRCPY_V3_1_SHA256_LINUX_AARCH64: Option<&str> = None;
 pub const SCRCPY_V3_1_SHA256_WIN64: &str =
     "0c05ea395d95cfe36bee974eeb435a3db87ea5594ff738370d5dc3068a9538ca";

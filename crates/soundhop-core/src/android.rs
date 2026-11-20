@@ -5,11 +5,13 @@ use std::fs::{self, File};
 use std::io::{BufRead, BufReader, Read, Write};
 use std::path::{Path, PathBuf};
 use std::process::{Child, Command, Stdio};
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
-use std::thread;
-use std::time::Duration;
+use std::thread::{self, JoinHandle};
+use std::time::{Duration, Instant};
 
 use flate2::read::GzDecoder;
+use mdns_sd::{ServiceDaemon, ServiceEvent, ServiceInfo};
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use tar::Archive;
@@ -17,13 +19,14 @@ use thiserror::Error;
 
 use crate::backend::AudioBackend;
 use crate::constants::{
-    DEFAULT_AUDIO_BIT_RATE, DEFAULT_AUDIO_BUFFER_MS, DEFAULT_AUDIO_CODEC, DEFAULT_SCRCPY_VERSION,
-    SCRCPY_V3_1_SHA256_LINUX_X86_64, SCRCPY_V3_1_SHA256_WIN64, SUPPORTED_AUDIO_CODECS,
-    SUPPORTED_AUDIO_SOURCES,
+    ADB_MDNS_TCP_SERVICE_TYPE, ADB_MDNS_TLS_CONNECT_SERVICE_TYPE, DEFAULT_AUDIO_BIT_RATE,
+    DEFAULT_AUDIO_BUFFER_MS, DEFAULT_AUDIO_CODEC, DEFAULT_SCRCPY_VERSION,
+    SCRCPY_V3_1_SHA256_LINUX_AARCH64, SCRCPY_V3_1_SHA256_LINUX_X86_64, SCRCPY_V3_1_SHA256_WIN64,
+    SUPPORTED_AUDIO_CODECS, SUPPORTED_AUDIO_SOURCES,
 };
 use crate::util::{
-    data_dir, home_dir, is_executable, now_secs, which_binary, CommandResult, ProcessRunner,
-    SystemRunner,
+    data_dir, home_dir, is_executable, is_own_non_loopback_ip, is_private_address, lock_or_recover,
+    now_secs, select_best_peer_ip, which_binary, CommandResult, ProcessRunner, SystemRunner,
 };
 
 #[derive(Debug, Error)]
@@ -99,6 +102,232 @@ pub struct ToolStatus {
 impl ToolStatus {
     pub fn ready(&self) -> bool {
         self.scrcpy_path.is_some() && self.adb_path.is_some()
+    }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct DiscoveredAdbDevice {
+    pub name: String,
+    pub host: String,
+    pub port: u16,
+    pub service_type: String,
+    pub tls: bool,
+}
+
+impl DiscoveredAdbDevice {
+    pub fn endpoint(&self) -> String {
+        format!("{}:{}", self.host, self.port)
+    }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct WifiSwitchOutcome {
+    pub usb_serial: String,
+    pub wifi_serial: String,
+    pub ip: String,
+    pub port: u16,
+    pub model: String,
+    pub manufacturer: String,
+}
+
+/// Resolve the required SHA-256 checksum for a `scrcpy` download.
+///
+/// Fails closed if no pinned checksum exists for the requested OS/architecture/version
+/// and no explicit `expected_sha256` was supplied by the caller.
+pub fn resolve_scrcpy_sha256<'a>(
+    target_os: &str,
+    target_arch: &str,
+    version: &str,
+    expected_sha256: Option<&'a str>,
+) -> Result<&'a str, AndroidError> {
+    if let Some(explicit) = expected_sha256.map(str::trim).filter(|s| !s.is_empty()) {
+        return Ok(explicit);
+    }
+    if version == DEFAULT_SCRCPY_VERSION {
+        if target_os == "windows" {
+            return Ok(SCRCPY_V3_1_SHA256_WIN64);
+        }
+        if target_os == "linux" && target_arch == "x86_64" {
+            return Ok(SCRCPY_V3_1_SHA256_LINUX_X86_64);
+        }
+        if target_os == "linux" && target_arch == "aarch64" {
+            if let Some(pinned) = SCRCPY_V3_1_SHA256_LINUX_AARCH64 {
+                return Ok(pinned);
+            }
+            return Err(AndroidError::Message(format!(
+                "Refusing unverified scrcpy v{version} download on linux/aarch64: no pinned SHA-256 checksum exists (upstream scrcpy v{version} does not publish a verified Linux aarch64 tarball). Install system `scrcpy` via your package manager, configure `android.scrcpy_path`, or provide an explicit verified SHA-256 checksum."
+            )));
+        }
+    }
+    Err(AndroidError::Message(format!(
+        "Refusing unverified scrcpy v{version} download on {target_os}/{target_arch}: no pinned SHA-256 checksum exists. Install system `scrcpy`, configure `android.scrcpy_path`, or supply an explicit verified SHA-256 checksum."
+    )))
+}
+
+pub fn verify_scrcpy_sha256(actual_hex: &str, expected_hex: &str) -> Result<(), AndroidError> {
+    let actual_lower = actual_hex.trim().to_ascii_lowercase();
+    let expected_lower = expected_hex.trim().to_ascii_lowercase();
+    if expected_lower.is_empty()
+        || !crate::security::constant_time_eq(actual_lower.as_bytes(), expected_lower.as_bytes())
+    {
+        return Err(AndroidError::Message(format!(
+            "SHA-256 checksum mismatch: expected {expected_hex}, got {actual_hex}"
+        )));
+    }
+    Ok(())
+}
+
+pub fn parse_adb_mdns_service_info(info: &ServiceInfo) -> Option<DiscoveredAdbDevice> {
+    let port = info.get_port();
+    if port == 0 {
+        return None;
+    }
+    let host = select_best_peer_ip(info.get_addresses())?;
+    if !is_private_address(&host) || is_own_non_loopback_ip(&host) {
+        return None;
+    }
+    let service_type = info.get_type().to_string();
+    let tls = service_type == ADB_MDNS_TLS_CONNECT_SERVICE_TYPE;
+    let raw_full = info.get_fullname();
+    let name = raw_full
+        .strip_suffix(&format!(".{service_type}"))
+        .filter(|s| !s.trim().is_empty())
+        .unwrap_or_else(|| info.get_hostname().trim_end_matches('.'))
+        .to_string();
+    Some(DiscoveredAdbDevice {
+        name,
+        host,
+        port,
+        service_type,
+        tls,
+    })
+}
+
+pub fn parse_adb_mdns_services_output(stdout: &str) -> Vec<DiscoveredAdbDevice> {
+    let mut devices = Vec::new();
+    for line in stdout.lines() {
+        let trimmed = line.trim();
+        if trimmed.is_empty() || trimmed.starts_with("List of discovered") {
+            continue;
+        }
+        let parts: Vec<&str> = trimmed.split_whitespace().collect();
+        if parts.len() < 3 {
+            continue;
+        }
+        let name = parts[0].to_string();
+        let raw_service = parts[1];
+        let endpoint = parts[2];
+        let service_type = if raw_service.contains("_adb-tls-connect._tcp") {
+            ADB_MDNS_TLS_CONNECT_SERVICE_TYPE.to_string()
+        } else if raw_service.contains("_adb._tcp") {
+            ADB_MDNS_TCP_SERVICE_TYPE.to_string()
+        } else {
+            continue;
+        };
+        let Some((host, port_str)) = endpoint.rsplit_once(':') else {
+            continue;
+        };
+        let host = host.trim_matches(|c| c == '[' || c == ']');
+        let Ok(port) = port_str.parse::<u16>() else {
+            continue;
+        };
+        if port == 0 || !is_private_address(host) || is_own_non_loopback_ip(host) {
+            continue;
+        }
+        let tls = service_type == ADB_MDNS_TLS_CONNECT_SERVICE_TYPE;
+        devices.push(DiscoveredAdbDevice {
+            name,
+            host: host.to_string(),
+            port,
+            service_type,
+            tls,
+        });
+    }
+    devices
+}
+
+/// Background mDNS browser for wireless Android ADB endpoints
+/// (`_adb-tls-connect._tcp.local.` and `_adb._tcp.local.`).
+pub struct AdbMdnsBrowser {
+    devices: Arc<Mutex<BTreeMap<String, DiscoveredAdbDevice>>>,
+    stop_flag: Arc<AtomicBool>,
+    daemon: Mutex<Option<ServiceDaemon>>,
+    threads: Mutex<Vec<JoinHandle<()>>>,
+}
+
+impl Default for AdbMdnsBrowser {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+impl AdbMdnsBrowser {
+    pub fn new() -> Self {
+        Self {
+            devices: Arc::new(Mutex::new(BTreeMap::new())),
+            stop_flag: Arc::new(AtomicBool::new(false)),
+            daemon: Mutex::new(None),
+            threads: Mutex::new(Vec::new()),
+        }
+    }
+
+    pub fn start(&self) -> Result<(), AndroidError> {
+        self.stop();
+        self.stop_flag.store(false, Ordering::SeqCst);
+        let mdns = ServiceDaemon::new().map_err(|e| {
+            AndroidError::Message(format!("Failed to start Android ADB mDNS browser: {e}"))
+        })?;
+        let mut handles = Vec::new();
+        for svc_type in [ADB_MDNS_TLS_CONNECT_SERVICE_TYPE, ADB_MDNS_TCP_SERVICE_TYPE] {
+            if let Ok(receiver) = mdns.browse(svc_type) {
+                let stop = Arc::clone(&self.stop_flag);
+                let map = Arc::clone(&self.devices);
+                let handle = thread::spawn(move || {
+                    while !stop.load(Ordering::SeqCst) {
+                        match receiver.recv_timeout(Duration::from_millis(250)) {
+                            Ok(ServiceEvent::ServiceResolved(info)) => {
+                                if let Some(dev) = parse_adb_mdns_service_info(&info) {
+                                    lock_or_recover(&map).insert(dev.endpoint(), dev);
+                                }
+                            }
+                            Ok(ServiceEvent::ServiceRemoved(_, fullname)) => {
+                                lock_or_recover(&map).retain(|_, d| !fullname.starts_with(&d.name));
+                            }
+                            _ => {}
+                        }
+                    }
+                });
+                handles.push(handle);
+            }
+        }
+        *lock_or_recover(&self.daemon) = Some(mdns);
+        *lock_or_recover(&self.threads) = handles;
+        Ok(())
+    }
+
+    pub fn stop(&self) {
+        self.stop_flag.store(true, Ordering::SeqCst);
+        if let Some(mdns) = lock_or_recover(&self.daemon).take() {
+            let _ = mdns.shutdown();
+        }
+        let handles: Vec<JoinHandle<()>> = std::mem::take(&mut *lock_or_recover(&self.threads));
+        for h in handles {
+            let _ = h.join();
+        }
+    }
+
+    pub fn record_device(&self, dev: DiscoveredAdbDevice) {
+        lock_or_recover(&self.devices).insert(dev.endpoint(), dev);
+    }
+
+    pub fn devices(&self) -> Vec<DiscoveredAdbDevice> {
+        lock_or_recover(&self.devices).values().cloned().collect()
+    }
+}
+
+impl Drop for AdbMdnsBrowser {
+    fn drop(&mut self) {
+        self.stop();
     }
 }
 
@@ -250,6 +479,13 @@ impl AndroidManager {
         expected_sha256: Option<&str>,
     ) -> Result<PathBuf, AndroidError> {
         let ver = version.unwrap_or(DEFAULT_SCRCPY_VERSION);
+        // Fail closed before performing any network download if no pinned checksum exists.
+        let pinned_sha256 = resolve_scrcpy_sha256(
+            std::env::consts::OS,
+            std::env::consts::ARCH,
+            ver,
+            expected_sha256,
+        )?;
         let dest_dir = Self::managed_dir();
         fs::create_dir_all(&dest_dir)?;
 
@@ -318,32 +554,10 @@ impl AndroidManager {
         }
         drop(out_file);
 
-        let pinned_sha256: Option<&str> = expected_sha256
-            .map(str::trim)
-            .filter(|s| !s.is_empty())
-            .or_else(|| {
-                if ver == DEFAULT_SCRCPY_VERSION {
-                    if cfg!(windows) {
-                        Some(SCRCPY_V3_1_SHA256_WIN64)
-                    } else if std::env::consts::ARCH == "x86_64" {
-                        Some(SCRCPY_V3_1_SHA256_LINUX_X86_64)
-                    } else {
-                        None
-                    }
-                } else {
-                    None
-                }
-            });
-
-        if let Some(expected) = pinned_sha256 {
-            let actual = hex::encode(hasher.finalize());
-            let expected_lower = expected.to_ascii_lowercase();
-            if !crate::security::constant_time_eq(actual.as_bytes(), expected_lower.as_bytes()) {
-                let _ = fs::remove_file(&archive_path);
-                return Err(AndroidError::Message(format!(
-                    "SHA-256 checksum mismatch: expected {expected}, got {actual}"
-                )));
-            }
+        let actual = hex::encode(hasher.finalize());
+        if let Err(err) = verify_scrcpy_sha256(&actual, pinned_sha256) {
+            let _ = fs::remove_file(&archive_path);
+            return Err(err);
         }
 
         let extract_res = if cfg!(windows) {
@@ -459,6 +673,93 @@ impl AndroidManager {
             Ok(res) => (true, res.stdout.trim().to_string()),
             Err(e) => (false, e.to_string()),
         }
+    }
+
+    /// Discover wireless Android ADB targets via `adb mdns services` and `mdns-sd`
+    /// (`_adb-tls-connect._tcp.local.` and `_adb._tcp.local.`).
+    ///
+    /// Strictly gated by `enabled` (`config.android.mdns_discovery`).
+    pub fn discover_mdns_devices(
+        &self,
+        enabled: bool,
+        timeout: Duration,
+    ) -> Vec<DiscoveredAdbDevice> {
+        if !enabled {
+            return Vec::new();
+        }
+        let mut found: BTreeMap<String, DiscoveredAdbDevice> = BTreeMap::new();
+        if let Ok(res) = self.run_adb(&["mdns", "services"], None) {
+            if res.ok() {
+                for dev in parse_adb_mdns_services_output(&res.stdout) {
+                    found.insert(dev.endpoint(), dev);
+                }
+            }
+        }
+        if !timeout.is_zero() {
+            if let Ok(mdns) = ServiceDaemon::new() {
+                let mut receivers = Vec::new();
+                for svc_type in [ADB_MDNS_TLS_CONNECT_SERVICE_TYPE, ADB_MDNS_TCP_SERVICE_TYPE] {
+                    if let Ok(rx) = mdns.browse(svc_type) {
+                        receivers.push(rx);
+                    }
+                }
+                let deadline = Instant::now() + timeout;
+                while Instant::now() < deadline && !receivers.is_empty() {
+                    let remaining = deadline.saturating_duration_since(Instant::now());
+                    let step = remaining.min(Duration::from_millis(50));
+                    for rx in &receivers {
+                        if let Ok(ServiceEvent::ServiceResolved(info)) = rx.recv_timeout(step) {
+                            if let Some(dev) = parse_adb_mdns_service_info(&info) {
+                                found.insert(dev.endpoint(), dev);
+                            }
+                        }
+                    }
+                }
+                let _ = mdns.shutdown();
+            }
+        }
+        found.into_values().collect()
+    }
+
+    /// Automatically switch a ready USB Android device into ADB TCP/IP Wi-Fi mode.
+    ///
+    /// Strictly gated by `enabled` (`config.android.auto_switch_wifi`).
+    pub fn auto_switch_usb_to_wifi(
+        &self,
+        dev: &AdbDevice,
+        enabled: bool,
+        port: u16,
+    ) -> Result<Option<WifiSwitchOutcome>, AndroidError> {
+        if !enabled || dev.is_wifi || !dev.is_ready() {
+            return Ok(None);
+        }
+        let ip = self.get_device_wifi_ip(&dev.serial).ok_or_else(|| {
+            AndroidError::Message(format!(
+                "Could not determine Wi-Fi IP for USB Android device {}",
+                dev.serial
+            ))
+        })?;
+        let (tcp_ok, tcp_msg) = self.enable_tcpip(&dev.serial, port);
+        if !tcp_ok {
+            return Err(AndroidError::Message(format!(
+                "Failed to enable ADB TCP/IP on {}: {tcp_msg}",
+                dev.serial
+            )));
+        }
+        let (conn_ok, conn_msg) = self.connect_wifi(&ip, port);
+        if !conn_ok {
+            return Err(AndroidError::Message(format!(
+                "Failed to connect to {ip}:{port} over Wi-Fi: {conn_msg}"
+            )));
+        }
+        Ok(Some(WifiSwitchOutcome {
+            usb_serial: dev.serial.clone(),
+            wifi_serial: format!("{ip}:{port}"),
+            ip,
+            port,
+            model: dev.model.clone(),
+            manufacturer: dev.manufacturer.clone(),
+        }))
     }
 
     pub fn list_encoders(&self, serial: Option<&str>) -> Result<AudioEncoderInfo, AndroidError> {
@@ -1241,5 +1542,202 @@ mod tests {
                 .any(|c| c.contains("set-default-source soundhop_android_mic")),
             "must not switch default source when remap-source failed; calls: {recorded2:?}"
         );
+    }
+
+    #[test]
+    fn test_aarch64_scrcpy_checksum_fails_closed_and_verifies() {
+        // Linux aarch64 v3.1 has no pinned upstream checksum -> must fail closed.
+        let err = resolve_scrcpy_sha256("linux", "aarch64", DEFAULT_SCRCPY_VERSION, None)
+            .expect_err("linux/aarch64 must fail closed without an explicit verified SHA-256");
+        let msg = err.to_string();
+        assert!(msg.contains("aarch64"), "unexpected error: {msg}");
+        assert!(msg.contains("scrcpy"), "unexpected error: {msg}");
+
+        // Custom unpinned version also fails closed without an explicit SHA-256.
+        assert!(resolve_scrcpy_sha256("linux", "x86_64", "9.9.9", None).is_err());
+
+        // Pinned platforms resolve cleanly.
+        assert_eq!(
+            resolve_scrcpy_sha256("linux", "x86_64", DEFAULT_SCRCPY_VERSION, None).unwrap(),
+            SCRCPY_V3_1_SHA256_LINUX_X86_64
+        );
+        assert_eq!(
+            resolve_scrcpy_sha256("windows", "x86_64", DEFAULT_SCRCPY_VERSION, None).unwrap(),
+            SCRCPY_V3_1_SHA256_WIN64
+        );
+
+        // Explicit verified hash is accepted on aarch64.
+        let explicit = "abcdef0123456789abcdef0123456789abcdef0123456789abcdef0123456789";
+        assert_eq!(
+            resolve_scrcpy_sha256("linux", "aarch64", DEFAULT_SCRCPY_VERSION, Some(explicit))
+                .unwrap(),
+            explicit
+        );
+
+        // Checksum verification enforces constant-time match and rejects mismatches.
+        assert!(verify_scrcpy_sha256(explicit, &explicit.to_uppercase()).is_ok());
+        assert!(verify_scrcpy_sha256("deadbeef", explicit).is_err());
+        assert!(verify_scrcpy_sha256(explicit, "").is_err());
+    }
+
+    #[test]
+    fn test_mdns_discovery_flag_gates_adb_wireless_discovery() {
+        use crate::util::MockRunner;
+        use std::sync::atomic::AtomicUsize;
+
+        let dir = tempfile::tempdir().unwrap();
+        let fake_adb = dir.path().join("adb");
+        fs::write(&fake_adb, b"#!/bin/sh\n").unwrap();
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            fs::set_permissions(&fake_adb, fs::Permissions::from_mode(0o755)).unwrap();
+        }
+
+        let call_count = Arc::new(AtomicUsize::new(0));
+        let call_count_c = Arc::clone(&call_count);
+        let runner = Arc::new(MockRunner::new(move |args, _| {
+            call_count_c.fetch_add(1, Ordering::SeqCst);
+            if args.iter().any(|a| a == "mdns") {
+                return Ok(CommandResult {
+                    args: args.to_vec(),
+                    returncode: 0,
+                    stdout: "List of discovered mdns services\nadb-R58M123-abc123\t_adb-tls-connect._tcp.\t192.168.1.77:37123\npixel8-tcp\t_adb._tcp.\t192.168.1.88:5555\npublic-host\t_adb._tcp.\t8.8.8.8:5555\n".to_string(),
+                    stderr: String::new(),
+                });
+            }
+            Ok(CommandResult {
+                args: args.to_vec(),
+                returncode: 0,
+                stdout: String::new(),
+                stderr: String::new(),
+            })
+        }));
+
+        let mgr = AndroidManager::with_runner("", &fake_adb.to_string_lossy(), runner);
+
+        // Disabled flag: returns empty without running adb.
+        let disabled = mgr.discover_mdns_devices(false, Duration::ZERO);
+        assert!(disabled.is_empty());
+        assert_eq!(call_count.load(Ordering::SeqCst), 0);
+
+        // Enabled flag: returns both private TLS and TCP endpoints, filtering out public IPs.
+        let enabled = mgr.discover_mdns_devices(true, Duration::ZERO);
+        assert_eq!(call_count.load(Ordering::SeqCst), 1);
+        assert_eq!(enabled.len(), 2);
+        assert!(enabled
+            .iter()
+            .any(|d| d.endpoint() == "192.168.1.77:37123" && d.tls));
+        assert!(enabled
+            .iter()
+            .any(|d| d.endpoint() == "192.168.1.88:5555" && !d.tls));
+
+        // ServiceInfo parser handles `_adb-tls-connect._tcp.local.` cleanly.
+        let empty_props: &[(&str, &str)] = &[];
+        let info = ServiceInfo::new(
+            ADB_MDNS_TLS_CONNECT_SERVICE_TYPE,
+            "adb-pixel-8",
+            "pixel8.local.",
+            "192.168.1.99",
+            41234,
+            empty_props,
+        )
+        .unwrap();
+        let parsed = parse_adb_mdns_service_info(&info).expect("should parse private ADB mDNS");
+        assert_eq!(parsed.name, "adb-pixel-8");
+        assert_eq!(parsed.endpoint(), "192.168.1.99:41234");
+        assert!(parsed.tls);
+    }
+
+    #[test]
+    fn test_auto_switch_wifi_flag_gates_usb_to_tcpip_switch() {
+        use crate::util::MockRunner;
+
+        let dir = tempfile::tempdir().unwrap();
+        let fake_adb = dir.path().join("adb");
+        fs::write(&fake_adb, b"#!/bin/sh\n").unwrap();
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            fs::set_permissions(&fake_adb, fs::Permissions::from_mode(0o755)).unwrap();
+        }
+
+        let calls: Arc<Mutex<Vec<String>>> = Arc::new(Mutex::new(Vec::new()));
+        let calls_c = Arc::clone(&calls);
+        let runner = Arc::new(MockRunner::new(move |args, _| {
+            let joined = args.join(" ");
+            calls_c.lock().unwrap().push(joined.clone());
+            if joined.contains("ip -f inet addr show wlan0") {
+                return Ok(CommandResult {
+                    args: args.to_vec(),
+                    returncode: 0,
+                    stdout: "    inet 192.168.1.64/24 brd 192.168.1.255 scope global wlan0\n"
+                        .to_string(),
+                    stderr: String::new(),
+                });
+            }
+            if joined.contains("tcpip 5555") {
+                return Ok(CommandResult {
+                    args: args.to_vec(),
+                    returncode: 0,
+                    stdout: "restarting in TCP mode port: 5555\n".to_string(),
+                    stderr: String::new(),
+                });
+            }
+            if joined.contains("connect 192.168.1.64:5555") {
+                return Ok(CommandResult {
+                    args: args.to_vec(),
+                    returncode: 0,
+                    stdout: "connected to 192.168.1.64:5555\n".to_string(),
+                    stderr: String::new(),
+                });
+            }
+            Ok(CommandResult {
+                args: args.to_vec(),
+                returncode: 0,
+                stdout: String::new(),
+                stderr: String::new(),
+            })
+        }));
+
+        let mgr = AndroidManager::with_runner("", &fake_adb.to_string_lossy(), runner);
+        let usb_dev = AdbDevice {
+            serial: "R58M123456".to_string(),
+            state: "device".to_string(),
+            model: "Pixel_8".to_string(),
+            product: "shiba".to_string(),
+            device: "shiba".to_string(),
+            transport_id: "1".to_string(),
+            is_wifi: false,
+            ip: String::new(),
+            port: 5555,
+            android_version: "14".to_string(),
+            sdk_version: 34,
+            manufacturer: "Google".to_string(),
+        };
+
+        // Disabled flag: returns Ok(None) and makes zero adb calls.
+        let skipped = mgr
+            .auto_switch_usb_to_wifi(&usb_dev, false, 5555)
+            .expect("disabled auto_switch_wifi should succeed with None");
+        assert!(skipped.is_none());
+        assert!(calls.lock().unwrap().is_empty());
+
+        // Enabled flag: switches USB device to Wi-Fi and returns outcome.
+        let outcome = mgr
+            .auto_switch_usb_to_wifi(&usb_dev, true, 5555)
+            .expect("enabled auto_switch_wifi should succeed")
+            .expect("expected WifiSwitchOutcome");
+        assert_eq!(outcome.usb_serial, "R58M123456");
+        assert_eq!(outcome.wifi_serial, "192.168.1.64:5555");
+        assert_eq!(outcome.ip, "192.168.1.64");
+        assert_eq!(outcome.port, 5555);
+        assert_eq!(outcome.model, "Pixel_8");
+
+        let recorded = calls.lock().unwrap().clone();
+        assert!(recorded.iter().any(|c| c.contains("tcpip 5555")));
+        assert!(recorded
+            .iter()
+            .any(|c| c.contains("connect 192.168.1.64:5555")));
     }
 }

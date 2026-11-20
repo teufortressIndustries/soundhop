@@ -2,6 +2,7 @@
 //! `AudioEventMonitor` (`pactl subscribe`), `TelemetryMonitor`, auto-connect supervisor,
 //! and local IPC control socket.
 
+use std::collections::{BTreeMap, HashSet};
 use std::fs;
 use std::io::{BufRead, BufReader};
 use std::path::PathBuf;
@@ -13,6 +14,7 @@ use std::time::{Duration, Instant};
 
 use serde_json::Value;
 
+use crate::android::{AdbMdnsBrowser, DiscoveredAdbDevice};
 use crate::constants::{OFFLINE_PROBE_LIMIT, SUPERVISOR_INTERVAL_SECS, VERSION};
 use crate::controller::{ConnectOptions, Controller};
 use crate::discovery::{discover_once_with_psk, DiscoveryManager, Peer};
@@ -22,14 +24,65 @@ use crate::util::{
     runtime_dir, socket_path, split_host_port, tcp_probe_rtt,
 };
 
+const ANDROID_AUTO_RECONNECT_MAX_ATTEMPTS: u32 = 3;
+
+#[derive(Debug, Clone)]
+pub(crate) struct AndroidReconnectTarget {
+    pub serial: String,
+    pub device_name: String,
+    pub codec: String,
+    pub source: String,
+    pub as_mic: bool,
+    pub buffer_ms: Option<u32>,
+    pub bit_rate: Option<u32>,
+    pub duplicate: bool,
+    pub wifi_host: String,
+    pub wifi_port: u16,
+}
+
+#[derive(Debug)]
+pub(crate) struct AndroidSupervisorState {
+    pub attempted_usb_switches: HashSet<String>,
+    pub was_active: bool,
+    pub last_session: Option<AndroidReconnectTarget>,
+    pub reconnect_attempts: u32,
+    pub max_reconnect_attempts: u32,
+    pub next_reconnect_after: Option<Instant>,
+    pub backoff_base: Duration,
+}
+
+impl Default for AndroidSupervisorState {
+    fn default() -> Self {
+        Self {
+            attempted_usb_switches: HashSet::new(),
+            was_active: false,
+            last_session: None,
+            reconnect_attempts: 0,
+            max_reconnect_attempts: ANDROID_AUTO_RECONNECT_MAX_ATTEMPTS,
+            next_reconnect_after: None,
+            backoff_base: Duration::from_secs(2),
+        }
+    }
+}
+
+impl AndroidSupervisorState {
+    fn backoff_for_attempt(&self, attempt: u32) -> Duration {
+        let shift = attempt.saturating_sub(1).min(4);
+        self.backoff_base.saturating_mul(1u32 << shift)
+    }
+}
+
 pub struct Daemon {
     pub controller: Arc<Controller>,
     pub discovery: Mutex<Option<Arc<DiscoveryManager>>>,
+    pub android_mdns: Mutex<Option<Arc<AdbMdnsBrowser>>>,
     pub ipc: Mutex<Option<IpcServer>>,
     ipc_path: Option<PathBuf>,
     stop_flag: Arc<AtomicBool>,
     started_at: f64,
     advertising: Arc<AtomicBool>,
+    android_manually_stopped: AtomicBool,
+    android_last_session: Mutex<Option<AndroidReconnectTarget>>,
     warnings: Arc<Mutex<Vec<String>>>,
     supervisor_thread: Mutex<Option<JoinHandle<()>>>,
     audio_monitor_thread: Mutex<Option<JoinHandle<()>>>,
@@ -51,14 +104,24 @@ impl Daemon {
             state_path,
             notify_enabled,
         ));
+        Self::with_controller(controller, ipc_path)
+    }
+
+    pub(crate) fn with_controller(
+        controller: Arc<Controller>,
+        ipc_path: Option<PathBuf>,
+    ) -> Arc<Self> {
         Arc::new(Self {
             controller,
             discovery: Mutex::new(None),
+            android_mdns: Mutex::new(None),
             ipc: Mutex::new(None),
             ipc_path,
             stop_flag: Arc::new(AtomicBool::new(false)),
             started_at: now_secs(),
             advertising: Arc::new(AtomicBool::new(false)),
+            android_manually_stopped: AtomicBool::new(false),
+            android_last_session: Mutex::new(None),
             warnings: Arc::new(Mutex::new(Vec::new())),
             supervisor_thread: Mutex::new(None),
             audio_monitor_thread: Mutex::new(None),
@@ -78,6 +141,7 @@ impl Daemon {
         let _ = self.controller.reconcile();
         self.setup_sharing();
         self.setup_discovery();
+        self.setup_android_mdns();
 
         let self_weak = Arc::downgrade(self);
         let ipc_server = IpcServer::new(
@@ -198,6 +262,9 @@ impl Daemon {
         if let Some(disc) = lock_or_recover(&self.discovery).take() {
             disc.stop();
         }
+        if let Some(browser) = lock_or_recover(&self.android_mdns).take() {
+            browser.stop();
+        }
         if let Some(h) = lock_or_recover(&self.supervisor_thread).take() {
             let _ = h.join();
         }
@@ -265,6 +332,53 @@ impl Daemon {
         *lock_or_recover(&self.discovery) = Some(disc);
     }
 
+    fn setup_android_mdns(&self) {
+        let enabled = lock_or_recover(&self.controller.config)
+            .android
+            .mdns_discovery;
+        if !enabled {
+            if let Some(old) = lock_or_recover(&self.android_mdns).take() {
+                old.stop();
+            }
+            return;
+        }
+        let mut guard = lock_or_recover(&self.android_mdns);
+        if guard.is_some() {
+            return;
+        }
+        let browser = Arc::new(AdbMdnsBrowser::new());
+        if let Err(err) = browser.start() {
+            let msg = format!("Android ADB mDNS discovery unavailable: {err}");
+            crate::util::append_log_line("WARN", &msg);
+            lock_or_recover(&self.warnings).push(msg);
+            return;
+        }
+        *guard = Some(browser);
+    }
+
+    pub fn android_mdns_devices(&self) -> Vec<DiscoveredAdbDevice> {
+        let enabled = lock_or_recover(&self.controller.config)
+            .android
+            .mdns_discovery;
+        if !enabled {
+            return Vec::new();
+        }
+        let mut merged: BTreeMap<String, DiscoveredAdbDevice> = BTreeMap::new();
+        if let Some(browser) = lock_or_recover(&self.android_mdns).as_ref() {
+            for dev in browser.devices() {
+                merged.insert(dev.endpoint(), dev);
+            }
+        }
+        for dev in self
+            .controller
+            .android_manager
+            .discover_mdns_devices(true, Duration::ZERO)
+        {
+            merged.insert(dev.endpoint(), dev);
+        }
+        merged.into_values().collect()
+    }
+
     fn write_pid(&self) {
         let p = pid_path();
         if let Some(parent) = p.parent() {
@@ -278,6 +392,7 @@ impl Daemon {
     fn supervisor_loop(&self) {
         let mut offline_count = 0u32;
         let mut last_reconcile = Instant::now();
+        let mut android_tracker = AndroidSupervisorState::default();
         while !self.stop_flag.load(Ordering::SeqCst) {
             thread::sleep(Duration::from_secs_f64(SUPERVISOR_INTERVAL_SECS));
             if self.stop_flag.load(Ordering::SeqCst) {
@@ -336,7 +451,283 @@ impl Daemon {
                     );
                 }
             }
+
+            self.run_android_supervisor_tick(&mut android_tracker);
         }
+    }
+
+    pub(crate) fn run_android_supervisor_tick(&self, tracker: &mut AndroidSupervisorState) {
+        let cfg = lock_or_recover(&self.controller.config).clone();
+
+        // 1. Auto-switch newly connected USB Android devices to ADB TCP/IP Wi-Fi mode.
+        if cfg.android.auto_switch_wifi {
+            let devices = self.controller.android_manager.list_devices();
+            let live_serials: HashSet<&str> = devices.iter().map(|d| d.serial.as_str()).collect();
+            tracker
+                .attempted_usb_switches
+                .retain(|s| live_serials.contains(s.as_str()));
+
+            for dev in &devices {
+                if dev.is_wifi || !dev.is_ready() {
+                    continue;
+                }
+                if tracker.attempted_usb_switches.contains(&dev.serial) {
+                    continue;
+                }
+                tracker.attempted_usb_switches.insert(dev.serial.clone());
+                match self
+                    .controller
+                    .android_manager
+                    .auto_switch_usb_to_wifi(dev, true, 5555)
+                {
+                    Ok(Some(outcome)) => {
+                        let now = now_secs();
+                        {
+                            let mut st = lock_or_recover(&self.controller.state);
+                            st.remember_android_device(
+                                &outcome.wifi_serial,
+                                &outcome.model,
+                                &outcome.manufacturer,
+                                &outcome.ip,
+                                outcome.port,
+                                true,
+                                true,
+                                Some(now),
+                            );
+                        }
+                        self.controller.save();
+                        crate::util::append_log_line(
+                            "INFO",
+                            &format!(
+                                "Auto-switched Android USB device {} to Wi-Fi {}",
+                                outcome.usb_serial, outcome.wifi_serial
+                            ),
+                        );
+                    }
+                    Ok(None) => {}
+                    Err(err) => {
+                        crate::util::append_log_line(
+                            "WARN",
+                            &format!("Auto Wi-Fi switch skipped for {}: {err}", dev.serial),
+                        );
+                    }
+                }
+            }
+        } else {
+            tracker.attempted_usb_switches.clear();
+        }
+
+        // 2. Bounded auto-reconnect on Android audio session drop.
+        if self.controller.android_session.is_active() {
+            let sess = self.controller.android_session.status();
+            let serial = sess["serial"].as_str().unwrap_or("").to_string();
+            let device_name = sess["device_name"].as_str().unwrap_or("").to_string();
+            let codec = sess["codec"]
+                .as_str()
+                .filter(|s| !s.is_empty())
+                .unwrap_or(&cfg.android.default_codec)
+                .to_string();
+            let source = sess["source"]
+                .as_str()
+                .filter(|s| !s.is_empty())
+                .unwrap_or(&cfg.android.default_source)
+                .to_string();
+            let as_mic = sess["as_mic"].as_bool().unwrap_or(false);
+            let (wifi_host, wifi_port) = split_wifi_serial(&serial);
+            let target = AndroidReconnectTarget {
+                serial,
+                device_name,
+                codec,
+                source,
+                as_mic,
+                buffer_ms: Some(cfg.android.buffer_ms),
+                bit_rate: Some(cfg.android.bit_rate),
+                duplicate: cfg.android.duplicate_audio,
+                wifi_host,
+                wifi_port,
+            };
+            tracker.was_active = true;
+            tracker.reconnect_attempts = 0;
+            tracker.next_reconnect_after = None;
+            tracker.last_session = Some(target.clone());
+            *lock_or_recover(&self.android_last_session) = Some(target);
+            self.android_manually_stopped.store(false, Ordering::SeqCst);
+            return;
+        }
+
+        if !cfg.android.auto_reconnect || self.android_manually_stopped.load(Ordering::SeqCst) {
+            tracker.reconnect_attempts = 0;
+            tracker.next_reconnect_after = None;
+            return;
+        }
+
+        if tracker.reconnect_attempts >= tracker.max_reconnect_attempts {
+            return;
+        }
+        if tracker
+            .next_reconnect_after
+            .is_some_and(|deadline| Instant::now() < deadline)
+        {
+            return;
+        }
+
+        let target_opt = self.resolve_android_reconnect_target(tracker, &cfg);
+        let Some(target) = target_opt else {
+            return;
+        };
+
+        tracker.reconnect_attempts += 1;
+        if !target.wifi_host.is_empty() {
+            let _ = self
+                .controller
+                .android_manager
+                .connect_wifi(&target.wifi_host, target.wifi_port);
+        }
+
+        match self.controller.android_session.start(
+            &target.serial,
+            &target.device_name,
+            Some(&target.codec),
+            Some(&target.source),
+            target.as_mic,
+            target.buffer_ms,
+            target.bit_rate,
+            target.duplicate,
+        ) {
+            Ok(_) => {
+                tracker.reconnect_attempts = 0;
+                tracker.next_reconnect_after = None;
+                tracker.was_active = true;
+                tracker.last_session = Some(target.clone());
+                *lock_or_recover(&self.android_last_session) = Some(target.clone());
+                let now = now_secs();
+                {
+                    let mut st = lock_or_recover(&self.controller.state);
+                    st.android_active = true;
+                    st.android_serial = target.serial.clone();
+                    st.android_model = target.device_name.clone();
+                    st.android_codec = target.codec.clone();
+                    st.android_source = target.source.clone();
+                    st.android_as_mic = target.as_mic;
+                    st.android_since = now;
+                    st.remember_android_device(
+                        &target.serial,
+                        &target.device_name,
+                        "",
+                        &target.wifi_host,
+                        target.wifi_port,
+                        !target.wifi_host.is_empty(),
+                        true,
+                        Some(now),
+                    );
+                }
+                self.controller.save();
+                crate::util::append_log_line(
+                    "INFO",
+                    &format!(
+                        "Auto-reconnected Android audio session for {}",
+                        target.serial
+                    ),
+                );
+            }
+            Err(err) => {
+                let backoff = tracker.backoff_for_attempt(tracker.reconnect_attempts);
+                tracker.next_reconnect_after = Some(Instant::now() + backoff);
+                crate::util::append_log_line(
+                    "WARN",
+                    &format!(
+                        "Android auto-reconnect attempt {}/{} for {} failed: {err}",
+                        tracker.reconnect_attempts, tracker.max_reconnect_attempts, target.serial
+                    ),
+                );
+            }
+        }
+    }
+
+    fn resolve_android_reconnect_target(
+        &self,
+        tracker: &AndroidSupervisorState,
+        cfg: &crate::config::Config,
+    ) -> Option<AndroidReconnectTarget> {
+        if tracker.was_active {
+            if let Some(target) = tracker
+                .last_session
+                .clone()
+                .or_else(|| lock_or_recover(&self.android_last_session).clone())
+            {
+                return Some(target);
+            }
+        }
+
+        let st = lock_or_recover(&self.controller.state).clone();
+        if st.android_active && !st.android_serial.is_empty() {
+            let (mut wifi_host, mut wifi_port) = split_wifi_serial(&st.android_serial);
+            if wifi_host.is_empty() {
+                if let Some(known) = st.known_android_devices.get(&st.android_serial) {
+                    if !known.last_ip.is_empty() {
+                        wifi_host = known.last_ip.clone();
+                        wifi_port = known.last_port;
+                    }
+                }
+            }
+            let serial = if !wifi_host.is_empty() && !st.android_serial.contains(':') {
+                format!("{wifi_host}:{wifi_port}")
+            } else {
+                st.android_serial.clone()
+            };
+            return Some(AndroidReconnectTarget {
+                serial,
+                device_name: st.android_model.clone(),
+                codec: if st.android_codec.is_empty() {
+                    cfg.android.default_codec.clone()
+                } else {
+                    st.android_codec.clone()
+                },
+                source: if st.android_source.is_empty() {
+                    cfg.android.default_source.clone()
+                } else {
+                    st.android_source.clone()
+                },
+                as_mic: st.android_as_mic,
+                buffer_ms: Some(cfg.android.buffer_ms),
+                bit_rate: Some(cfg.android.bit_rate),
+                duplicate: cfg.android.duplicate_audio,
+                wifi_host,
+                wifi_port,
+            });
+        }
+
+        // Fall back to a known device in `android_history` marked `auto_connect` that was
+        // previously connected.
+        let known = st
+            .known_android_devices
+            .values()
+            .filter(|d| d.auto_connect && d.last_connected > 0.0)
+            .max_by(|a, b| {
+                a.last_connected
+                    .partial_cmp(&b.last_connected)
+                    .unwrap_or(std::cmp::Ordering::Equal)
+            })?;
+        let serial = if !known.last_ip.is_empty() {
+            format!("{}:{}", known.last_ip, known.last_port)
+        } else {
+            known.serial.clone()
+        };
+        if serial.is_empty() {
+            return None;
+        }
+        Some(AndroidReconnectTarget {
+            serial,
+            device_name: known.display_name(),
+            codec: cfg.android.default_codec.clone(),
+            source: cfg.android.default_source.clone(),
+            as_mic: false,
+            buffer_ms: Some(cfg.android.buffer_ms),
+            bit_rate: Some(cfg.android.bit_rate),
+            duplicate: cfg.android.duplicate_audio,
+            wifi_host: known.last_ip.clone(),
+            wifi_port: known.last_port,
+        })
     }
 
     fn audio_monitor_loop(&self) {
@@ -796,12 +1187,18 @@ impl Daemon {
                 }
             }
             "firewall_status" => {
-                let st = crate::firewall::detect();
+                let cfg = lock_or_recover(&self.controller.config).clone();
+                let st = crate::firewall::detect_for_ports(
+                    cfg.sharing.port,
+                    cfg.discovery.port,
+                    cfg.discovery.mdns,
+                );
                 serde_json::json!({
                     "ok": true,
                     "kind": st.kind,
                     "active": st.active,
                     "detail": st.detail,
+                    "ports_allowed": st.ports_allowed,
                 })
             }
             "firewall_open" => {
@@ -898,6 +1295,7 @@ impl Daemon {
                     self.controller.save();
                     self.setup_sharing();
                     self.setup_discovery();
+                    self.setup_android_mdns();
                 }
                 let cfg_json = lock_or_recover(&self.controller.config).to_json_value();
                 serde_json::json!({ "ok": true, "config": cfg_json })
@@ -906,6 +1304,7 @@ impl Daemon {
                 Ok(cfg) => {
                     self.setup_sharing();
                     self.setup_discovery();
+                    self.setup_android_mdns();
                     serde_json::json!({ "ok": true, "config": cfg.to_json_value() })
                 }
                 Err(e) => serde_json::json!({ "ok": false, "error": e.to_string() }),
@@ -916,6 +1315,7 @@ impl Daemon {
                     "session": self.controller.android_session.status(),
                     "tools": self.controller.android_tool_status(),
                     "devices": self.controller.android_list_devices(),
+                    "mdns_devices": self.android_mdns_devices(),
                     "history": self.controller.android_history(),
                 })
             }
@@ -944,12 +1344,65 @@ impl Daemon {
                 match self.controller.android_session.start(
                     serial, name, codec, source, as_mic, buffer_ms, bit_rate, duplicate,
                 ) {
-                    Ok(st) => serde_json::json!({ "ok": true, "session": st }),
+                    Ok(st) => {
+                        self.android_manually_stopped.store(false, Ordering::SeqCst);
+                        let (wifi_host, wifi_port) = split_wifi_serial(serial);
+                        let cfg_android = lock_or_recover(&self.controller.config).android.clone();
+                        let eff_codec = codec
+                            .map(str::to_string)
+                            .unwrap_or(cfg_android.default_codec);
+                        let eff_source = source
+                            .map(str::to_string)
+                            .unwrap_or(cfg_android.default_source);
+                        *lock_or_recover(&self.android_last_session) =
+                            Some(AndroidReconnectTarget {
+                                serial: serial.to_string(),
+                                device_name: name.to_string(),
+                                codec: eff_codec.clone(),
+                                source: eff_source.clone(),
+                                as_mic,
+                                buffer_ms,
+                                bit_rate,
+                                duplicate,
+                                wifi_host: wifi_host.clone(),
+                                wifi_port,
+                            });
+                        let now = now_secs();
+                        {
+                            let mut state = lock_or_recover(&self.controller.state);
+                            state.android_active = true;
+                            state.android_serial = serial.to_string();
+                            state.android_model = name.to_string();
+                            state.android_codec = eff_codec;
+                            state.android_source = eff_source;
+                            state.android_as_mic = as_mic;
+                            state.android_since = now;
+                            state.remember_android_device(
+                                serial,
+                                name,
+                                "",
+                                &wifi_host,
+                                wifi_port,
+                                !wifi_host.is_empty(),
+                                true,
+                                Some(now),
+                            );
+                        }
+                        self.controller.save();
+                        serde_json::json!({ "ok": true, "session": st })
+                    }
                     Err(e) => serde_json::json!({ "ok": false, "error": e.to_string() }),
                 }
             }
             "android_stop" => {
+                self.android_manually_stopped.store(true, Ordering::SeqCst);
+                *lock_or_recover(&self.android_last_session) = None;
                 let st = self.controller.android_session.stop();
+                {
+                    let mut state = lock_or_recover(&self.controller.state);
+                    state.android_active = false;
+                }
+                self.controller.save();
                 serde_json::json!({ "ok": true, "session": st })
             }
             "logs" => {
@@ -1006,6 +1459,17 @@ impl Daemon {
         }
         lines
     }
+}
+
+fn split_wifi_serial(serial: &str) -> (String, u16) {
+    if let Some((host, port_str)) = serial.rsplit_once(':') {
+        let clean_host = host.trim_matches(|c| c == '[' || c == ']');
+        if !clean_host.is_empty() {
+            let port = port_str.parse::<u16>().unwrap_or(5555);
+            return (clean_host.to_string(), port);
+        }
+    }
+    (String::new(), 5555)
 }
 
 #[cfg(test)]
@@ -1146,5 +1610,254 @@ mod tests {
                 .latency_ms,
             Some(45)
         );
+    }
+
+    #[test]
+    fn test_daemon_android_auto_switch_wifi_and_mdns_gating() {
+        use crate::android::AndroidManager;
+        use crate::backend::linux::LinuxAudioBackend;
+        use crate::util::{CommandResult, MockRunner};
+
+        let dir = tempfile::tempdir().unwrap();
+        let cfg_path = dir.path().join("config.toml");
+        let state_path = dir.path().join("state.json");
+        let fake_adb = dir.path().join("adb");
+        fs::write(&fake_adb, b"#!/bin/sh\n").unwrap();
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            fs::set_permissions(&fake_adb, fs::Permissions::from_mode(0o755)).unwrap();
+        }
+
+        let adb_calls: Arc<Mutex<Vec<String>>> = Arc::new(Mutex::new(Vec::new()));
+        let adb_calls_c = Arc::clone(&adb_calls);
+        let runner = Arc::new(MockRunner::new(move |args, _| {
+            let joined = args.join(" ");
+            adb_calls_c.lock().unwrap().push(joined.clone());
+            if joined.contains("devices -l") {
+                return Ok(CommandResult {
+                    args: args.to_vec(),
+                    returncode: 0,
+                    stdout: "List of devices attached\nUSB12345\tdevice product:shiba model:Pixel_8 device:shiba transport_id:1\n".to_string(),
+                    stderr: String::new(),
+                });
+            }
+            if joined.contains("ip -f inet addr show wlan0") {
+                return Ok(CommandResult {
+                    args: args.to_vec(),
+                    returncode: 0,
+                    stdout: "    inet 192.168.1.91/24 scope global wlan0\n".to_string(),
+                    stderr: String::new(),
+                });
+            }
+            if joined.contains("tcpip 5555") {
+                return Ok(CommandResult {
+                    args: args.to_vec(),
+                    returncode: 0,
+                    stdout: "restarting in TCP mode port: 5555\n".to_string(),
+                    stderr: String::new(),
+                });
+            }
+            if joined.contains("connect 192.168.1.91:5555") {
+                return Ok(CommandResult {
+                    args: args.to_vec(),
+                    returncode: 0,
+                    stdout: "connected to 192.168.1.91:5555\n".to_string(),
+                    stderr: String::new(),
+                });
+            }
+            if joined.contains("mdns services") {
+                return Ok(CommandResult {
+                    args: args.to_vec(),
+                    returncode: 0,
+                    stdout: "List of discovered mdns services\nadb-pixel\t_adb-tls-connect._tcp.\t192.168.1.91:38455\n".to_string(),
+                    stderr: String::new(),
+                });
+            }
+            Ok(CommandResult {
+                args: args.to_vec(),
+                returncode: 0,
+                stdout: String::new(),
+                stderr: String::new(),
+            })
+        }));
+
+        let backend = Arc::new(LinuxAudioBackend::with_runner(Arc::clone(&runner) as _));
+        let android_mgr = Arc::new(AndroidManager::with_runner(
+            "",
+            &fake_adb.to_string_lossy(),
+            runner,
+        ));
+        let mut controller = Controller::new(
+            None,
+            None,
+            Some(backend),
+            Some(cfg_path),
+            Some(state_path),
+            false,
+        );
+        controller.android_manager = Arc::clone(&android_mgr);
+        let controller = Arc::new(controller);
+        controller.set_save_enabled(false);
+        let daemon = Daemon::with_controller(Arc::clone(&controller), None);
+
+        let mut tracker = AndroidSupervisorState::default();
+
+        // 1. auto_switch_wifi = false -> does NOT switch USB device or populate history.
+        {
+            let mut cfg = lock_or_recover(&daemon.controller.config);
+            cfg.android.auto_switch_wifi = false;
+            cfg.android.auto_reconnect = false;
+            cfg.android.mdns_discovery = false;
+        }
+        daemon.run_android_supervisor_tick(&mut tracker);
+        assert!(daemon.controller.android_history().is_empty());
+        assert!(daemon.android_mdns_devices().is_empty());
+
+        // 2. auto_switch_wifi = true -> switches USB device to Wi-Fi and records in android_history.
+        {
+            let mut cfg = lock_or_recover(&daemon.controller.config);
+            cfg.android.auto_switch_wifi = true;
+            cfg.android.mdns_discovery = true;
+        }
+        daemon.run_android_supervisor_tick(&mut tracker);
+        let history = daemon.controller.android_history();
+        assert_eq!(history.len(), 1);
+        assert_eq!(history[0]["serial"], "192.168.1.91:5555");
+        assert_eq!(history[0]["is_wifi"], true);
+
+        // 3. mdns_discovery = true -> exposes discovered wireless Android endpoints.
+        let mdns_devs = daemon.android_mdns_devices();
+        assert_eq!(mdns_devs.len(), 1);
+        assert_eq!(mdns_devs[0].endpoint(), "192.168.1.91:38455");
+        assert!(mdns_devs[0].tls);
+    }
+
+    #[test]
+    fn test_daemon_android_auto_reconnect_bounded_and_respects_flag_and_manual_stop() {
+        use crate::android::{AndroidCaptureSession, AndroidManager};
+        use crate::backend::linux::LinuxAudioBackend;
+        use crate::util::{CommandResult, MockRunner};
+
+        let dir = tempfile::tempdir().unwrap();
+        let cfg_path = dir.path().join("config.toml");
+        let state_path = dir.path().join("state.json");
+        let fake_adb = dir.path().join("adb");
+        fs::write(&fake_adb, b"#!/bin/sh\n").unwrap();
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            fs::set_permissions(&fake_adb, fs::Permissions::from_mode(0o755)).unwrap();
+        }
+
+        let connect_calls = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let connect_calls_c = Arc::clone(&connect_calls);
+        let runner = Arc::new(MockRunner::new(move |args, _| {
+            let joined = args.join(" ");
+            if joined.contains("connect 192.168.1.92:5555") {
+                connect_calls_c.fetch_add(1, Ordering::SeqCst);
+                return Ok(CommandResult {
+                    args: args.to_vec(),
+                    returncode: 0,
+                    stdout: "connected to 192.168.1.92:5555\n".to_string(),
+                    stderr: String::new(),
+                });
+            }
+            Ok(CommandResult {
+                args: args.to_vec(),
+                returncode: 0,
+                stdout: String::new(),
+                stderr: String::new(),
+            })
+        }));
+
+        let backend: Arc<dyn crate::backend::AudioBackend> =
+            Arc::new(LinuxAudioBackend::with_runner(Arc::clone(&runner) as _));
+        // Create an executable stub with a nonexistent shebang so `find_scrcpy()` selects it
+        // (never falling back to any system `scrcpy`) while `Command::spawn` fails deterministically.
+        let failing_scrcpy = dir.path().join("failing-scrcpy");
+        fs::write(
+            &failing_scrcpy,
+            b"#!/nonexistent/soundhop-test-interpreter\n",
+        )
+        .unwrap();
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            fs::set_permissions(&failing_scrcpy, fs::Permissions::from_mode(0o755)).unwrap();
+        }
+        let android_mgr = Arc::new(AndroidManager::with_runner(
+            &failing_scrcpy.to_string_lossy(),
+            &fake_adb.to_string_lossy(),
+            runner,
+        ));
+        let android_session = Arc::new(AndroidCaptureSession::new(
+            Arc::clone(&android_mgr),
+            Arc::clone(&backend),
+        ));
+        let mut controller = Controller::new(
+            None,
+            None,
+            Some(backend),
+            Some(cfg_path),
+            Some(state_path),
+            false,
+        );
+        controller.android_manager = android_mgr;
+        controller.android_session = android_session;
+        let controller = Arc::new(controller);
+        controller.set_save_enabled(false);
+
+        // Seed state with a previously active/known Wi-Fi Android device in android_history.
+        {
+            let mut st = lock_or_recover(&controller.state);
+            st.android_active = true;
+            st.android_serial = "192.168.1.92:5555".to_string();
+            st.android_model = "Pixel 8".to_string();
+            st.remember_android_device(
+                "192.168.1.92:5555",
+                "Pixel 8",
+                "Google",
+                "192.168.1.92",
+                5555,
+                true,
+                true,
+                Some(now_secs()),
+            );
+        }
+
+        let daemon = Daemon::with_controller(Arc::clone(&controller), None);
+        let mut tracker = AndroidSupervisorState {
+            max_reconnect_attempts: 2,
+            backoff_base: Duration::ZERO,
+            ..Default::default()
+        };
+
+        // 1. auto_reconnect = false -> zero reconnect attempts.
+        {
+            let mut cfg = lock_or_recover(&daemon.controller.config);
+            cfg.android.auto_switch_wifi = false;
+            cfg.android.auto_reconnect = false;
+        }
+        daemon.run_android_supervisor_tick(&mut tracker);
+        assert_eq!(tracker.reconnect_attempts, 0);
+        assert_eq!(connect_calls.load(Ordering::SeqCst), 0);
+
+        // 2. auto_reconnect = true -> attempts bounded to max_reconnect_attempts (2).
+        lock_or_recover(&daemon.controller.config)
+            .android
+            .auto_reconnect = true;
+        daemon.run_android_supervisor_tick(&mut tracker);
+        daemon.run_android_supervisor_tick(&mut tracker);
+        daemon.run_android_supervisor_tick(&mut tracker);
+        assert_eq!(tracker.reconnect_attempts, 2);
+        assert_eq!(connect_calls.load(Ordering::SeqCst), 2);
+
+        // 3. Manual stop resets and prevents further auto-reconnect attempts.
+        tracker.reconnect_attempts = 0;
+        let _ = daemon.handle_ipc(serde_json::json!({ "cmd": "android_stop" }));
+        daemon.run_android_supervisor_tick(&mut tracker);
+        assert_eq!(tracker.reconnect_attempts, 0);
+        assert_eq!(connect_calls.load(Ordering::SeqCst), 2);
     }
 }
