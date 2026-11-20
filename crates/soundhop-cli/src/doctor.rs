@@ -346,6 +346,7 @@ pub fn run_doctor(controller: &Arc<Controller>, fix: bool, json_out: bool) -> i3
     if outcome.backend_ok {
         #[cfg(windows)]
         {
+            let _ = outcome.is_pw;
             if outcome.server_name.to_ascii_lowercase().contains("wasapi") {
                 ok(&format!(
                     "Audio Backend: {} (Default Output: {})",
