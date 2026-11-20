@@ -14,7 +14,7 @@ use rand::Rng;
 use serde_json::Value;
 use thiserror::Error;
 
-use crate::util::{ensure_dir, socket_path};
+use crate::util::{ensure_dir, lock_or_recover, socket_path};
 
 #[derive(Debug, Error)]
 pub enum IpcError {
@@ -83,7 +83,7 @@ impl IpcServer {
                         }
                     }
                 });
-                *self.thread.lock().unwrap() = Some(handle);
+                *lock_or_recover(&self.thread) = Some(handle);
                 return Ok(());
             }
         }
@@ -122,13 +122,13 @@ impl IpcServer {
                 }
             }
         });
-        *self.thread.lock().unwrap() = Some(handle);
+        *lock_or_recover(&self.thread) = Some(handle);
         Ok(())
     }
 
     pub fn stop(&self) {
         self.stop_flag.store(true, Ordering::SeqCst);
-        if let Some(h) = self.thread.lock().unwrap().take() {
+        if let Some(h) = lock_or_recover(&self.thread).take() {
             let _ = h.join();
         }
         let _ = fs::remove_file(&self.path);

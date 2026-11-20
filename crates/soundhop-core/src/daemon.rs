@@ -18,8 +18,8 @@ use crate::controller::{ConnectOptions, Controller};
 use crate::discovery::{discover_once_with_psk, DiscoveryManager, Peer};
 use crate::ipc::{is_reachable, ping, request as ipc_request, IpcServer};
 use crate::util::{
-    command_exists, ensure_dir, is_private_address, now_secs, pid_path, runtime_dir, socket_path,
-    split_host_port, tcp_probe_rtt,
+    command_exists, ensure_dir, is_private_address, lock_or_recover, now_secs, pid_path,
+    runtime_dir, socket_path, split_host_port, tcp_probe_rtt,
 };
 
 pub struct Daemon {
@@ -91,17 +91,17 @@ impl Daemon {
             self.ipc_path.clone(),
         );
         ipc_server.start().map_err(|e| e.to_string())?;
-        *self.ipc.lock().unwrap() = Some(ipc_server);
+        *lock_or_recover(&self.ipc) = Some(ipc_server);
 
         self.write_pid();
 
         let sup_daemon = Arc::clone(self);
-        *self.supervisor_thread.lock().unwrap() = Some(thread::spawn(move || {
+        *lock_or_recover(&self.supervisor_thread) = Some(thread::spawn(move || {
             sup_daemon.supervisor_loop();
         }));
 
         let mon_daemon = Arc::clone(self);
-        *self.audio_monitor_thread.lock().unwrap() = Some(thread::spawn(move || {
+        *lock_or_recover(&self.audio_monitor_thread) = Some(thread::spawn(move || {
             mon_daemon.audio_monitor_loop();
         }));
 
@@ -111,7 +111,7 @@ impl Daemon {
     /// Start UDP/mDNS discovery without owning the IPC socket (used when an external
     /// `soundhop daemon` service is already running on the host).
     pub fn start_discovery_only(&self) {
-        let enabled = self.controller.config.lock().unwrap().sharing.enabled;
+        let enabled = lock_or_recover(&self.controller.config).sharing.enabled;
         self.advertising.store(enabled, Ordering::SeqCst);
         self.setup_discovery();
     }
@@ -180,7 +180,7 @@ impl Daemon {
 
     pub fn request_stop(&self) {
         self.stop_flag.store(true, Ordering::SeqCst);
-        if let Some(mut child) = self.audio_monitor_child.lock().unwrap().take() {
+        if let Some(mut child) = lock_or_recover(&self.audio_monitor_child).take() {
             let _ = child.kill();
             let _ = child.wait();
         }
@@ -188,37 +188,26 @@ impl Daemon {
 
     pub fn shutdown(&self) {
         self.stop_flag.store(true, Ordering::SeqCst);
-        if let Some(mut child) = self.audio_monitor_child.lock().unwrap().take() {
+        if let Some(mut child) = lock_or_recover(&self.audio_monitor_child).take() {
             let _ = child.kill();
             let _ = child.wait();
         }
-        if let Some(ipc) = self.ipc.lock().unwrap().take() {
+        if let Some(ipc) = lock_or_recover(&self.ipc).take() {
             ipc.stop();
         }
-        if let Some(disc) = self.discovery.lock().unwrap().take() {
+        if let Some(disc) = lock_or_recover(&self.discovery).take() {
             disc.stop();
         }
-        if let Some(h) = self.supervisor_thread.lock().unwrap().take() {
+        if let Some(h) = lock_or_recover(&self.supervisor_thread).take() {
             let _ = h.join();
         }
-        if let Some(h) = self.audio_monitor_thread.lock().unwrap().take() {
+        if let Some(h) = lock_or_recover(&self.audio_monitor_thread).take() {
             let _ = h.join();
         }
-        let disconnect_on_quit = self
-            .controller
-            .config
-            .lock()
-            .unwrap()
+        let disconnect_on_quit = lock_or_recover(&self.controller.config)
             .connection
             .disconnect_on_quit;
-        if disconnect_on_quit
-            && self
-                .controller
-                .state
-                .lock()
-                .unwrap_or_else(|e| e.into_inner())
-                .is_connected()
-        {
+        if disconnect_on_quit && lock_or_recover(&self.controller.state).is_connected() {
             let _ = self
                 .controller
                 .disconnect(false, None, false, Some(false), true, false);
@@ -232,7 +221,7 @@ impl Daemon {
 
     fn setup_sharing(&self) {
         self.advertising.store(false, Ordering::SeqCst);
-        let enabled = self.controller.config.lock().unwrap().sharing.enabled;
+        let enabled = lock_or_recover(&self.controller.config).sharing.enabled;
         if !enabled {
             return;
         }
@@ -241,16 +230,16 @@ impl Daemon {
             Err(e) => {
                 let msg = format!("Could not start the audio listener: {e}");
                 crate::util::append_log_line("WARN", &msg);
-                self.warnings.lock().unwrap().push(msg);
+                lock_or_recover(&self.warnings).push(msg);
             }
         }
     }
 
     fn setup_discovery(&self) {
-        if let Some(old) = self.discovery.lock().unwrap().take() {
+        if let Some(old) = lock_or_recover(&self.discovery).take() {
             old.stop();
         }
-        let cfg = self.controller.config.lock().unwrap().clone();
+        let cfg = lock_or_recover(&self.controller.config).clone();
         let psk = if cfg.sharing.psk_hash.is_empty() {
             None
         } else {
@@ -272,8 +261,8 @@ impl Daemon {
             ctrl_clone.remember_peer(peer);
         });
         let warnings = disc.start(self.advertising.load(Ordering::SeqCst));
-        self.warnings.lock().unwrap().extend(warnings);
-        *self.discovery.lock().unwrap() = Some(disc);
+        lock_or_recover(&self.warnings).extend(warnings);
+        *lock_or_recover(&self.discovery) = Some(disc);
     }
 
     fn write_pid(&self) {
@@ -282,7 +271,7 @@ impl Daemon {
             let _ = ensure_dir(parent);
         }
         let _ = fs::write(&p, format!("{}\n", std::process::id()));
-        self.controller.state.lock().unwrap().daemon_last_started = now_secs();
+        lock_or_recover(&self.controller.state).daemon_last_started = now_secs();
         self.controller.save();
     }
 
@@ -301,8 +290,8 @@ impl Daemon {
                 self.controller.reload_from_disk();
             }
 
-            let st = self.controller.state.lock().unwrap().clone();
-            let cfg = self.controller.config.lock().unwrap().clone();
+            let st = lock_or_recover(&self.controller.state).clone();
+            let cfg = lock_or_recover(&self.controller.config).clone();
 
             if st.is_connected() {
                 if let Some(rtt) = tcp_probe_rtt(
@@ -333,10 +322,7 @@ impl Daemon {
                 && !cfg.connection.last_peer.is_empty()
             {
                 let target_id = &cfg.connection.last_peer;
-                let peer_opt = self
-                    .discovery
-                    .lock()
-                    .unwrap()
+                let peer_opt = lock_or_recover(&self.discovery)
                     .as_ref()
                     .and_then(|d| d.store.get(target_id))
                     .or_else(|| self.controller.known_peer(target_id));
@@ -356,7 +342,7 @@ impl Daemon {
     fn audio_monitor_loop(&self) {
         if !command_exists("pactl") {
             while !self.stop_flag.load(Ordering::SeqCst) {
-                if self.controller.state.lock().unwrap().is_connected() {
+                if lock_or_recover(&self.controller.state).is_connected() {
                     let _ = self.controller.sync_remote_volume();
                     let _ = self.controller.enforce_routed_apps();
                 }
@@ -417,7 +403,7 @@ impl Daemon {
                 }
             }
 
-            if let Some(mut child) = self.audio_monitor_child.lock().unwrap().take() {
+            if let Some(mut child) = lock_or_recover(&self.audio_monitor_child).take() {
                 let _ = child.kill();
                 let _ = child.wait();
             }
@@ -434,7 +420,7 @@ impl Daemon {
         port: Option<u16>,
         name: Option<&str>,
     ) -> Result<Peer, String> {
-        let cfg = self.controller.config.lock().unwrap().clone();
+        let cfg = lock_or_recover(&self.controller.config).clone();
         if let Some(h) = host.filter(|s| !s.trim().is_empty()) {
             let (parsed_host, parsed_port) = split_host_port(h, port.unwrap_or(cfg.sharing.port));
             if !is_private_address(&parsed_host) {
@@ -459,10 +445,7 @@ impl Daemon {
             });
         }
 
-        let live_peers = self
-            .discovery
-            .lock()
-            .unwrap()
+        let live_peers = lock_or_recover(&self.discovery)
             .as_ref()
             .map(|d| d.peers())
             .unwrap_or_default();
@@ -558,10 +541,7 @@ impl Daemon {
                 "version": VERSION,
             }),
             "status" => {
-                let peers = self
-                    .discovery
-                    .lock()
-                    .unwrap()
+                let peers = lock_or_recover(&self.discovery)
                     .as_ref()
                     .map(|d| d.peers())
                     .unwrap_or_default();
@@ -575,7 +555,7 @@ impl Daemon {
                             "pid": std::process::id(),
                             "uptime_s": (now_secs() - self.started_at).max(0.0),
                             "advertising": self.advertising.load(Ordering::SeqCst),
-                            "warnings": *self.warnings.lock().unwrap(),
+                            "warnings": *lock_or_recover(&self.warnings),
                             "runtime_dir": runtime_dir().to_string_lossy(),
                         }),
                     );
@@ -776,7 +756,7 @@ impl Daemon {
                         self.advertising.store(enabled, Ordering::SeqCst);
                         if port_changed {
                             self.setup_discovery();
-                        } else if let Some(disc) = self.discovery.lock().unwrap().as_ref() {
+                        } else if let Some(disc) = lock_or_recover(&self.discovery).as_ref() {
                             disc.set_advertising(enabled);
                         }
                         if let Some(obj) = res.as_object_mut() {
@@ -865,7 +845,7 @@ impl Daemon {
                         Err(e) => serde_json::json!({ "ok": false, "error": e.to_string() }),
                     },
                     _ => {
-                        let st = self.controller.state.lock().unwrap();
+                        let st = lock_or_recover(&self.controller.state);
                         serde_json::json!({
                             "ok": true,
                             "enabled": !st.connected_source.is_empty(),
@@ -895,14 +875,10 @@ impl Daemon {
                     "pause" => self.controller.pause_auto(true),
                     "resume" => self.controller.pause_auto(false),
                     _ => {
-                        let enabled = self
-                            .controller
-                            .config
-                            .lock()
-                            .unwrap()
+                        let enabled = lock_or_recover(&self.controller.config)
                             .connection
                             .auto_connect;
-                        let paused = self.controller.state.lock().unwrap().auto_paused;
+                        let paused = lock_or_recover(&self.controller.state).auto_paused;
                         serde_json::json!({ "ok": true, "auto_connect": enabled, "paused": paused })
                     }
                 }
@@ -915,7 +891,7 @@ impl Daemon {
             }
             "config_patch" => {
                 if let Some(patch) = req.get("patch") {
-                    let res = self.controller.config.lock().unwrap().apply_patch(patch);
+                    let res = lock_or_recover(&self.controller.config).apply_patch(patch);
                     if let Err(e) = res {
                         return serde_json::json!({ "ok": false, "error": e.to_string() });
                     }
@@ -923,7 +899,7 @@ impl Daemon {
                     self.setup_sharing();
                     self.setup_discovery();
                 }
-                let cfg_json = self.controller.config.lock().unwrap().to_json_value();
+                let cfg_json = lock_or_recover(&self.controller.config).to_json_value();
                 serde_json::json!({ "ok": true, "config": cfg_json })
             }
             "reload" => match self.controller.reload_config() {

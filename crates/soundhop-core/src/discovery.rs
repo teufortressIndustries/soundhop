@@ -16,7 +16,7 @@ use crate::constants::{MDNS_SERVICE_TYPE, PEER_TIMEOUT_SECS, PROTOCOL_VERSION, V
 use crate::security::{compute_hmac_hex, verify_hmac_hex};
 use crate::util::{
     broadcast_addresses, hostname_name, is_own_non_loopback_ip, is_private_address,
-    is_same_lan_subnet, local_addresses, now_secs, select_best_peer_ip, slugify,
+    is_same_lan_subnet, local_addresses, lock_or_recover, now_secs, select_best_peer_ip, slugify,
 };
 
 pub const MAGIC: &str = "soundhop";
@@ -106,14 +106,14 @@ impl PeerStore {
     where
         F: Fn(&Peer) + Send + Sync + 'static,
     {
-        *self.on_peer.lock().unwrap() = Some(Arc::new(cb));
+        *lock_or_recover(&self.on_peer) = Some(Arc::new(cb));
     }
 
     pub fn set_on_remove<F>(&self, cb: F)
     where
         F: Fn(&str) + Send + Sync + 'static,
     {
-        *self.on_remove.lock().unwrap() = Some(Arc::new(cb));
+        *lock_or_recover(&self.on_remove) = Some(Arc::new(cb));
     }
 
     pub fn update(&self, mut peer: Peer) -> bool {
@@ -155,7 +155,7 @@ impl PeerStore {
             is_changed
         };
         if changed {
-            if let Some(cb) = self.on_peer.lock().unwrap().clone() {
+            if let Some(cb) = lock_or_recover(&self.on_peer).clone() {
                 cb(&peer);
             }
         }
@@ -165,7 +165,7 @@ impl PeerStore {
     pub fn remove(&self, peer_id: &str) {
         let existed = self.peers.write().unwrap().remove(peer_id).is_some();
         if existed {
-            if let Some(cb) = self.on_remove.lock().unwrap().clone() {
+            if let Some(cb) = lock_or_recover(&self.on_remove).clone() {
                 cb(peer_id);
             }
         }
@@ -205,7 +205,7 @@ impl PeerStore {
             keys
         };
         if !stale.is_empty() {
-            if let Some(cb) = self.on_remove.lock().unwrap().clone() {
+            if let Some(cb) = lock_or_recover(&self.on_remove).clone() {
                 for id in &stale {
                     cb(id);
                 }
@@ -563,7 +563,7 @@ impl DiscoveryManager {
                 Ok(sock) => {
                     let local_port = sock.local_addr().map(|a| a.port()).ok();
                     let sock_clone = sock.try_clone().ok();
-                    *self.udp_socket.lock().unwrap() = sock_clone;
+                    *lock_or_recover(&self.udp_socket) = sock_clone;
                     let stop = Arc::clone(&self.stop_flag);
                     let adv = Arc::clone(&self.advertising);
                     let store = Arc::clone(&self.store);
@@ -669,7 +669,7 @@ impl DiscoveryManager {
                             }
                         }
                     });
-                    *self.udp_thread.lock().unwrap() = Some(handle);
+                    *lock_or_recover(&self.udp_thread) = Some(handle);
                 }
                 Err(err) => {
                     warnings.push(format!(
@@ -725,10 +725,10 @@ impl DiscoveryManager {
                                     }
                                 }
                             });
-                            *self.mdns_thread.lock().unwrap() = Some(handle);
+                            *lock_or_recover(&self.mdns_thread) = Some(handle);
                         }
                     }
-                    *self.mdns_daemon.lock().unwrap() = Some(mdns);
+                    *lock_or_recover(&self.mdns_daemon) = Some(mdns);
                 }
                 Err(err) => {
                     warnings.push(format!("mDNS discovery unavailable: {err}"));
@@ -747,7 +747,7 @@ impl DiscoveryManager {
     }
 
     pub fn probe(&self) {
-        if let Some(sock) = self.udp_socket.lock().unwrap().as_ref() {
+        if let Some(sock) = lock_or_recover(&self.udp_socket).as_ref() {
             let local_port = sock.local_addr().map(|a| a.port()).ok();
             let probe = make_beacon_with_reply_port(
                 &self.device_id,
@@ -773,14 +773,14 @@ impl DiscoveryManager {
 
     pub fn stop(&self) {
         self.stop_flag.store(true, Ordering::SeqCst);
-        *self.udp_socket.lock().unwrap() = None;
-        if let Some(h) = self.udp_thread.lock().unwrap().take() {
+        *lock_or_recover(&self.udp_socket) = None;
+        if let Some(h) = lock_or_recover(&self.udp_thread).take() {
             let _ = h.join();
         }
-        if let Some(mdns) = self.mdns_daemon.lock().unwrap().take() {
+        if let Some(mdns) = lock_or_recover(&self.mdns_daemon).take() {
             let _ = mdns.shutdown();
         }
-        if let Some(h) = self.mdns_thread.lock().unwrap().take() {
+        if let Some(h) = lock_or_recover(&self.mdns_thread).take() {
             let _ = h.join();
         }
     }

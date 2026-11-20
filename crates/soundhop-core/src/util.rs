@@ -8,7 +8,7 @@ use std::io::Write;
 use std::net::{IpAddr, Ipv4Addr, SocketAddr, TcpStream, ToSocketAddrs};
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
-use std::sync::{Arc, Mutex, OnceLock};
+use std::sync::{Arc, Mutex, MutexGuard, OnceLock};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use ipnet::Ipv4Net;
@@ -16,6 +16,15 @@ use rand::Rng;
 use thiserror::Error;
 
 use crate::constants::{APP_SLUG, VERSION};
+
+// ---------------------------------------------------------------------------
+// Synchronization helpers
+// ---------------------------------------------------------------------------
+
+/// Lock a [`Mutex`], recovering the inner guard if a previous holder panicked.
+pub fn lock_or_recover<T>(mutex: &Mutex<T>) -> MutexGuard<'_, T> {
+    mutex.lock().unwrap_or_else(|e| e.into_inner())
+}
 
 // ---------------------------------------------------------------------------
 // Process execution & Mockable Runner
@@ -1546,6 +1555,26 @@ mod tests {
             select_best_peer_ip(&candidates).as_deref(),
             Some("192.168.1.250")
         );
+    }
+
+    #[test]
+    fn test_lock_or_recover_recovers_from_poison() {
+        let mutex = Arc::new(Mutex::new(41_u32));
+        let poisoned = Arc::clone(&mutex);
+        let handle = std::thread::spawn(move || {
+            let mut guard = poisoned.lock().unwrap();
+            *guard = 42;
+            panic!("intentional panic to poison mutex");
+        });
+        assert!(handle.join().is_err());
+        assert!(mutex.is_poisoned());
+
+        let mut recovered = lock_or_recover(&mutex);
+        assert_eq!(*recovered, 42);
+        *recovered = 99;
+        drop(recovered);
+
+        assert_eq!(*lock_or_recover(&mutex), 99);
     }
 
     #[test]
