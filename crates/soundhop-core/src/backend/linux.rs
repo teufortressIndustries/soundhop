@@ -1680,7 +1680,9 @@ mod tests {
 
     #[test]
     fn test_ensure_tcp_listener_checks_cookie_path_and_consistent_security() {
-        let cookie_path = soundhop_cookie_path().to_string_lossy().into_owned();
+        let dir = tempfile::tempdir().unwrap();
+        let cookie_file = dir.path().join("pulse-cookie");
+        let cookie_path = cookie_file.to_string_lossy().into_owned();
         let unloaded = Arc::new(Mutex::new(Vec::<String>::new()));
         let unloaded_c = Arc::clone(&unloaded);
         let wrong_cookie = Arc::new(std::sync::atomic::AtomicBool::new(true));
@@ -1712,7 +1714,7 @@ mod tests {
             })
         }));
 
-        let backend = LinuxAudioBackend::with_runner(runner);
+        let backend = LinuxAudioBackend::with_runner_and_cookie_path(runner, cookie_file);
         // Wrong auth-cookie path must replace module 10
         let first = backend
             .ensure_tcp_listener(4713, "psk", &["192.168.1.0/24".to_string()])
