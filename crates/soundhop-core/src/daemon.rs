@@ -17,8 +17,11 @@ use serde_json::Value;
 use crate::android::{AdbMdnsBrowser, DiscoveredAdbDevice};
 use crate::constants::{OFFLINE_PROBE_LIMIT, SUPERVISOR_INTERVAL_SECS, VERSION};
 use crate::controller::{ConnectOptions, Controller};
-use crate::discovery::{discover_once_with_psk, DiscoveryManager, Peer};
+use crate::discovery::{
+    default_v3_caps, discover_once_with_psk, BeaconV3Meta, DiscoveryManager, Peer,
+};
 use crate::ipc::{is_reachable, ping, request as ipc_request, IpcServer};
+use crate::pairing::PairingServer;
 use crate::util::{
     command_exists, ensure_dir, is_private_address, lock_or_recover, now_secs, pid_path,
     runtime_dir, socket_path, split_host_port, tcp_probe_rtt,
@@ -76,6 +79,7 @@ pub struct Daemon {
     pub controller: Arc<Controller>,
     pub discovery: Mutex<Option<Arc<DiscoveryManager>>>,
     pub android_mdns: Mutex<Option<Arc<AdbMdnsBrowser>>>,
+    pub pairing_server: Mutex<Option<PairingServer>>,
     pub ipc: Mutex<Option<IpcServer>>,
     ipc_path: Option<PathBuf>,
     stop_flag: Arc<AtomicBool>,
@@ -115,6 +119,7 @@ impl Daemon {
             controller,
             discovery: Mutex::new(None),
             android_mdns: Mutex::new(None),
+            pairing_server: Mutex::new(None),
             ipc: Mutex::new(None),
             ipc_path,
             stop_flag: Arc::new(AtomicBool::new(false)),
@@ -140,6 +145,7 @@ impl Daemon {
         self.stop_flag.store(false, Ordering::SeqCst);
         let _ = self.controller.reconcile();
         self.setup_sharing();
+        self.setup_pairing_server();
         self.setup_discovery();
         self.setup_android_mdns();
 
@@ -259,6 +265,9 @@ impl Daemon {
         if let Some(ipc) = lock_or_recover(&self.ipc).take() {
             ipc.stop();
         }
+        if let Some(srv) = lock_or_recover(&self.pairing_server).take() {
+            srv.stop();
+        }
         if let Some(disc) = lock_or_recover(&self.discovery).take() {
             disc.stop();
         }
@@ -302,6 +311,48 @@ impl Daemon {
         }
     }
 
+    fn setup_pairing_server(&self) {
+        if let Some(old) = lock_or_recover(&self.pairing_server).take() {
+            old.stop();
+        }
+        let cfg = lock_or_recover(&self.controller.config).clone();
+        let identity = match self.controller.device_identity() {
+            Ok(id) => id,
+            Err(e) => {
+                let msg = format!("Could not load device identity for Pairing v2: {e}");
+                crate::util::append_log_line("WARN", &msg);
+                lock_or_recover(&self.warnings).push(msg);
+                return;
+            }
+        };
+        let manager = self.controller.pairing_manager();
+        let ctrl_weak = Arc::downgrade(&self.controller);
+        manager.set_on_paired(move |peer| {
+            if let Some(ctrl) = ctrl_weak.upgrade() {
+                lock_or_recover(&ctrl.state).upsert_trusted_peer(peer);
+                ctrl.save();
+            }
+        });
+        match PairingServer::start_on_port(
+            cfg.sharing.pair_port,
+            identity,
+            cfg.device.name.clone(),
+            manager,
+        ) {
+            Ok(srv) => {
+                *lock_or_recover(&self.pairing_server) = Some(srv);
+            }
+            Err(e) => {
+                let msg = format!(
+                    "Pairing v2 server unavailable on port {}: {e}",
+                    cfg.sharing.pair_port
+                );
+                crate::util::append_log_line("WARN", &msg);
+                lock_or_recover(&self.warnings).push(msg);
+            }
+        }
+    }
+
     fn setup_discovery(&self) {
         if let Some(old) = lock_or_recover(&self.discovery).take() {
             old.stop();
@@ -312,17 +363,31 @@ impl Daemon {
         } else {
             Some(cfg.sharing.psk_hash.clone())
         };
-        let disc = Arc::new(DiscoveryManager::new(
-            cfg.device.id.clone(),
-            cfg.device.name.clone(),
-            cfg.sharing.port,
-            cfg.discovery.port,
-            cfg.sharing.security.clone(),
-            psk,
-            cfg.discovery.interval_s,
-            cfg.discovery.udp,
-            cfg.discovery.mdns,
-        ));
+        let pub_fp = self
+            .controller
+            .device_identity()
+            .ok()
+            .map(|id| id.fingerprint());
+        let v3_meta = BeaconV3Meta {
+            v3_port: Some(cfg.sharing.v3_port),
+            pair_port: Some(cfg.sharing.pair_port),
+            pub_fp,
+            caps: default_v3_caps(),
+        };
+        let disc = Arc::new(
+            DiscoveryManager::new(
+                cfg.device.id.clone(),
+                cfg.device.name.clone(),
+                cfg.sharing.port,
+                cfg.discovery.port,
+                cfg.sharing.security.clone(),
+                psk,
+                cfg.discovery.interval_s,
+                cfg.discovery.udp,
+                cfg.discovery.mdns,
+            )
+            .with_v3_meta(v3_meta),
+        );
         let ctrl_clone = Arc::clone(&self.controller);
         disc.store.set_on_peer(move |peer| {
             ctrl_clone.remember_peer(peer);
@@ -1123,6 +1188,96 @@ impl Daemon {
                     Err(e) => serde_json::json!({ "ok": false, "error": e.to_string() }),
                 }
             }
+            "pair_request" => {
+                let explicit_host = req
+                    .get("host")
+                    .and_then(|v| v.as_str())
+                    .map(str::trim)
+                    .filter(|s| !s.is_empty());
+                let peer_query = req
+                    .get("peer")
+                    .or_else(|| req.get("query"))
+                    .and_then(|v| v.as_str())
+                    .map(str::trim)
+                    .filter(|s| !s.is_empty());
+                let pair_port = req
+                    .get("pair_port")
+                    .or_else(|| req.get("port"))
+                    .and_then(|v| v.as_u64())
+                    .and_then(|p| u16::try_from(p).ok())
+                    .filter(|&p| p > 0);
+                let code = req.get("code").and_then(|v| v.as_str());
+
+                let resolved_host = if let Some(h) = explicit_host {
+                    Ok(h.to_string())
+                } else if let Some(q) = peer_query {
+                    self.resolve_peer(Some(q), None, None, None).map(|p| p.host)
+                } else {
+                    Err("Specify host or peer for pair_request".to_string())
+                };
+                match resolved_host {
+                    Ok(host) => match self.controller.pair_request(&host, pair_port, code) {
+                        Ok(res) => res,
+                        Err(e) => serde_json::json!({ "ok": false, "error": e.to_string() }),
+                    },
+                    Err(e) => serde_json::json!({ "ok": false, "error": e }),
+                }
+            }
+            "pair_pending" => {
+                let requests = self.controller.pending_pair_requests();
+                serde_json::json!({
+                    "ok": true,
+                    "requests": requests,
+                })
+            }
+            "pair_approve" => {
+                let id = req
+                    .get("request_id")
+                    .or_else(|| req.get("id"))
+                    .or_else(|| req.get("code"))
+                    .and_then(|v| v.as_str())
+                    .unwrap_or("");
+                match self.controller.approve_pair_request(id) {
+                    Ok(res) => res,
+                    Err(e) => serde_json::json!({ "ok": false, "error": e.to_string() }),
+                }
+            }
+            "pair_deny" => {
+                let id = req
+                    .get("request_id")
+                    .or_else(|| req.get("id"))
+                    .and_then(|v| v.as_str())
+                    .unwrap_or("");
+                match self.controller.deny_pair_request(id) {
+                    Ok(res) => res,
+                    Err(e) => serde_json::json!({ "ok": false, "error": e.to_string() }),
+                }
+            }
+            "pair_revoke" => {
+                let device_id = req
+                    .get("device_id")
+                    .or_else(|| req.get("peer_id"))
+                    .or_else(|| req.get("id"))
+                    .and_then(|v| v.as_str())
+                    .unwrap_or("");
+                match self.controller.revoke_trusted_peer(device_id) {
+                    Ok(res) => res,
+                    Err(e) => serde_json::json!({ "ok": false, "error": e.to_string() }),
+                }
+            }
+            "pair_list" => {
+                let peers: Vec<Value> = self
+                    .controller
+                    .trusted_peers()
+                    .iter()
+                    .map(|p| p.to_public_json())
+                    .collect();
+                serde_json::json!({
+                    "ok": true,
+                    "trusted_peers": peers,
+                })
+            }
+            "pair_code" => self.controller.generate_headless_pair_code(),
             "share" => {
                 let enabled = req.get("enabled").and_then(|v| v.as_bool()).unwrap_or(true);
                 let port_changed = if let Some(p) = req
@@ -1859,5 +2014,106 @@ mod tests {
         daemon.run_android_supervisor_tick(&mut tracker);
         assert_eq!(tracker.reconnect_attempts, 0);
         assert_eq!(connect_calls.load(Ordering::SeqCst), 2);
+    }
+
+    #[test]
+    fn test_daemon_pairing_v2_ipc_commands() {
+        let dir_resp = tempfile::tempdir().unwrap();
+        let dir_init = tempfile::tempdir().unwrap();
+        let resp_daemon = Daemon::new(
+            Some(dir_resp.path().join("config.toml")),
+            Some(dir_resp.path().join("state.json")),
+            false,
+            None,
+        );
+        let init_daemon = Daemon::new(
+            Some(dir_init.path().join("config.toml")),
+            Some(dir_init.path().join("state.json")),
+            false,
+            None,
+        );
+
+        // Bind responder PairingServer on an ephemeral loopback port
+        let resp_identity = resp_daemon.controller.device_identity().unwrap();
+        let resp_manager = resp_daemon.controller.pairing_manager();
+        let resp_ctrl_weak = Arc::downgrade(&resp_daemon.controller);
+        resp_manager.set_on_paired(move |peer| {
+            if let Some(ctrl) = resp_ctrl_weak.upgrade() {
+                lock_or_recover(&ctrl.state).upsert_trusted_peer(peer);
+                ctrl.save();
+            }
+        });
+        let srv = PairingServer::start(
+            std::net::SocketAddr::new(std::net::IpAddr::V4(std::net::Ipv4Addr::LOCALHOST), 0),
+            resp_identity,
+            "Responder Host".to_string(),
+            resp_manager,
+        )
+        .unwrap();
+        let pair_port = srv.local_addr().port();
+        *lock_or_recover(&resp_daemon.pairing_server) = Some(srv);
+
+        // 1. Headless code flow via IPC: pair_code -> pair_request -> pair_list -> pair_revoke
+        let code_resp = resp_daemon.handle_ipc(serde_json::json!({ "cmd": "pair_code" }));
+        assert_eq!(code_resp["ok"], true);
+        let code = code_resp["code"].as_str().unwrap().to_string();
+
+        let req_resp = init_daemon.handle_ipc(serde_json::json!({
+            "cmd": "pair_request",
+            "host": "127.0.0.1",
+            "pair_port": pair_port,
+            "code": code,
+        }));
+        assert_eq!(req_resp["ok"], true);
+        assert_eq!(req_resp["paired"], true);
+
+        let list_init = init_daemon.handle_ipc(serde_json::json!({ "cmd": "pair_list" }));
+        assert_eq!(list_init["ok"], true);
+        let trusted = list_init["trusted_peers"].as_array().unwrap();
+        assert_eq!(trusted.len(), 1);
+        let resp_dev_id = trusted[0]["device_id"].as_str().unwrap().to_string();
+        assert!(
+            trusted[0].get("pairwise_secret").is_none(),
+            "pair_list must never expose raw pairwise_secret"
+        );
+
+        let revoke_resp = init_daemon.handle_ipc(serde_json::json!({
+            "cmd": "pair_revoke",
+            "device_id": resp_dev_id,
+        }));
+        assert_eq!(revoke_resp["ok"], true);
+        assert_eq!(revoke_resp["revoked"], true);
+        let list_after = init_daemon.handle_ipc(serde_json::json!({ "cmd": "pair_list" }));
+        assert!(list_after["trusted_peers"].as_array().unwrap().is_empty());
+
+        // 2. Interactive deny flow via IPC: pair_request -> pair_pending -> pair_deny
+        let init_clone = Arc::clone(&init_daemon);
+        let client_thread = thread::spawn(move || {
+            init_clone.handle_ipc(serde_json::json!({
+                "cmd": "pair_request",
+                "host": "127.0.0.1",
+                "pair_port": pair_port,
+            }))
+        });
+
+        let pending_id = loop {
+            let p = resp_daemon.handle_ipc(serde_json::json!({ "cmd": "pair_pending" }));
+            let arr = p["requests"].as_array().unwrap();
+            if !arr.is_empty() {
+                break arr[0]["request_id"].as_str().unwrap().to_string();
+            }
+            thread::sleep(Duration::from_millis(10));
+        };
+        let deny_resp = resp_daemon.handle_ipc(serde_json::json!({
+            "cmd": "pair_deny",
+            "request_id": pending_id,
+        }));
+        assert_eq!(deny_resp["ok"], true);
+        assert_eq!(deny_resp["denied"], true);
+
+        let client_res = client_thread.join().unwrap();
+        assert_eq!(client_res["ok"], false);
+
+        resp_daemon.shutdown();
     }
 }

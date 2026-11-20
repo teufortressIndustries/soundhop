@@ -12,7 +12,17 @@ use crate::constants::{
     DEFAULT_AUDIO_BIT_RATE, DEFAULT_AUDIO_BUFFER_MS, DEFAULT_AUDIO_CODEC, DEFAULT_AUDIO_PORT,
     DEFAULT_DISCOVERY_PORT, DEFAULT_LAN_NETWORKS, SECURITY_MODES,
 };
+use crate::pairing::DEFAULT_PAIR_PORT;
+use crate::transport::DEFAULT_V3_PORT;
 use crate::util::{atomic_write, config_path, hostname_name, new_device_id};
+
+/// Valid values for `audio.profile`.
+pub const VALID_AUDIO_PROFILES: &[&str] = &[
+    "opus-balanced",
+    "opus-low-latency",
+    "opus-low-bandwidth",
+    "pcm-lossless",
+];
 
 #[derive(Debug, Error)]
 pub enum ConfigError {
@@ -51,6 +61,10 @@ impl Default for DeviceConfig {
 pub struct SharingConfig {
     pub enabled: bool,
     pub port: u16,
+    /// SoundHop Transport v3 (`SHT3`) encrypted audio TCP port (default `4714`).
+    pub v3_port: u16,
+    /// Pairing v2 interactive handshake TCP port (default `4715`).
+    pub pair_port: u16,
     pub security: String,
     pub allowed_networks: Vec<String>,
     /// Optional SHA-256 / HMAC pre-shared key hash for `psk` / `pin` security mode.
@@ -62,12 +76,30 @@ impl Default for SharingConfig {
         Self {
             enabled: true,
             port: DEFAULT_AUDIO_PORT,
+            v3_port: DEFAULT_V3_PORT,
+            pair_port: DEFAULT_PAIR_PORT,
             security: "trusted-lan".to_string(),
             allowed_networks: DEFAULT_LAN_NETWORKS
                 .iter()
                 .map(|s| (*s).to_string())
                 .collect(),
             psk_hash: String::new(),
+        }
+    }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+#[serde(default)]
+pub struct AudioConfig {
+    /// Transport v3 audio encoding profile (`opus-balanced`, `opus-low-latency`,
+    /// `opus-low-bandwidth`, or `pcm-lossless`).
+    pub profile: String,
+}
+
+impl Default for AudioConfig {
+    fn default() -> Self {
+        Self {
+            profile: "opus-balanced".to_string(),
         }
     }
 }
@@ -213,6 +245,7 @@ pub struct Config {
     pub path: PathBuf,
     pub device: DeviceConfig,
     pub sharing: SharingConfig,
+    pub audio: AudioConfig,
     pub connection: ConnectionConfig,
     pub routing: RoutingConfig,
     pub discovery: DiscoveryConfig,
@@ -226,6 +259,7 @@ impl Default for Config {
             path: config_path(),
             device: DeviceConfig::default(),
             sharing: SharingConfig::default(),
+            audio: AudioConfig::default(),
             connection: ConnectionConfig::default(),
             routing: RoutingConfig::default(),
             discovery: DiscoveryConfig::default(),
@@ -276,8 +310,15 @@ impl Config {
         if self.sharing.port == 0 {
             self.sharing.port = DEFAULT_AUDIO_PORT;
         }
+        if self.sharing.v3_port == 0 {
+            self.sharing.v3_port = DEFAULT_V3_PORT;
+        }
+        if self.sharing.pair_port == 0 {
+            self.sharing.pair_port = DEFAULT_PAIR_PORT;
+        }
         self.sharing.security = normalize_security(&self.sharing.security)?;
         self.sharing.psk_hash = self.sharing.psk_hash.trim().to_string();
+        self.audio.profile = normalize_audio_profile(&self.audio.profile)?;
 
         let mut valid_nets = Vec::new();
         let source_nets: Vec<String> = if self.sharing.allowed_networks.is_empty() {
@@ -527,19 +568,42 @@ fn resolve_config_alias(dotted: &str) -> &str {
     }
 }
 
+pub fn is_paired_security_mode(security: &str) -> bool {
+    matches!(
+        security.trim().to_lowercase().as_str(),
+        "psk" | "pin" | "paired"
+    )
+}
+
 pub fn normalize_security(raw: &str) -> Result<String, ConfigError> {
     let lower = raw.trim().to_lowercase();
     let mapped = match lower.as_str() {
         "lan" | "trusted" | "private" => "trusted-lan",
         "anonymous" | "none" => "open",
+        "psk" | "pin" | "paired" => "psk",
         other => other,
     };
     if SECURITY_MODES.contains(&mapped) {
         Ok(mapped.to_string())
     } else {
         Err(ConfigError::Invalid(format!(
-            "sharing.security must be one of {}",
+            "sharing.security must be one of {}, paired",
             SECURITY_MODES.join(", ")
+        )))
+    }
+}
+
+pub fn normalize_audio_profile(raw: &str) -> Result<String, ConfigError> {
+    let lower = raw.trim().to_lowercase();
+    if lower.is_empty() {
+        return Ok("opus-balanced".to_string());
+    }
+    if VALID_AUDIO_PROFILES.contains(&lower.as_str()) {
+        Ok(lower)
+    } else {
+        Err(ConfigError::Invalid(format!(
+            "audio.profile must be one of {}",
+            VALID_AUDIO_PROFILES.join(", ")
         )))
     }
 }
@@ -663,5 +727,30 @@ mod tests {
                 "expected {bad:?} to be rejected"
             );
         }
+    }
+
+    #[test]
+    fn test_v3_ports_audio_profile_and_security_normalization() {
+        let mut cfg = Config::default();
+        assert_eq!(cfg.sharing.v3_port, 4714);
+        assert_eq!(cfg.sharing.pair_port, 4715);
+        assert_eq!(cfg.audio.profile, "opus-balanced");
+
+        for sec in ["psk", "pin", "paired", "PAIRED", "PIN"] {
+            cfg.set_dotted("sharing.security", sec).unwrap();
+            assert_eq!(cfg.sharing.security, "psk");
+            assert!(is_paired_security_mode(sec));
+        }
+
+        for profile in VALID_AUDIO_PROFILES {
+            cfg.set_dotted("audio.profile", profile).unwrap();
+            assert_eq!(cfg.audio.profile, *profile);
+        }
+        assert!(cfg.set_dotted("audio.profile", "mp3-invalid").is_err());
+
+        cfg.set_dotted("sharing.v3_port", "4724").unwrap();
+        cfg.set_dotted("sharing.pair_port", "4725").unwrap();
+        assert_eq!(cfg.sharing.v3_port, 4724);
+        assert_eq!(cfg.sharing.pair_port, 4725);
     }
 }

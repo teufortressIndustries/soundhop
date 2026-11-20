@@ -9,6 +9,7 @@ pub mod daemon;
 pub mod discovery;
 pub mod firewall;
 pub mod ipc;
+pub mod pairing;
 pub mod security;
 pub mod service;
 pub mod state;

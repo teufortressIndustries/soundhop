@@ -127,7 +127,8 @@ impl PeerStore {
             let mut map = self.peers.write().unwrap();
             let prev = map.get(&peer.id);
             if let Some(p) = prev {
-                if (p.security == "psk" || p.security == "pin") && peer.source == "mdns" {
+                if matches!(p.security.as_str(), "psk" | "pin" | "paired") && peer.source == "mdns"
+                {
                     return false;
                 }
                 if is_same_lan_subnet(&p.host) && !is_same_lan_subnet(&peer.host) {
@@ -215,6 +216,27 @@ impl PeerStore {
     }
 }
 
+/// Optional v3 / Pairing v2 metadata advertised in UDP beacons and mDNS TXT records.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct BeaconV3Meta {
+    pub v3_port: Option<u16>,
+    pub pair_port: Option<u16>,
+    pub pub_fp: Option<String>,
+    pub caps: Vec<String>,
+}
+
+/// Default Transport v3 capabilities advertised by this build.
+pub fn default_v3_caps() -> Vec<String> {
+    #[cfg(feature = "opus")]
+    {
+        vec!["sht3".to_string(), "opus".to_string(), "pcm".to_string()]
+    }
+    #[cfg(not(feature = "opus"))]
+    {
+        vec!["sht3".to_string(), "pcm".to_string()]
+    }
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct BeaconPacket {
     pub magic: String,
@@ -233,6 +255,14 @@ pub struct BeaconPacket {
     pub hmac: String,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub reply_port: Option<u16>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub v3_port: Option<u16>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub pair_port: Option<u16>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub pub_fp: Option<String>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub caps: Vec<String>,
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -251,7 +281,7 @@ pub fn make_beacon(
 }
 
 fn beacon_signing_input(pkt: &BeaconPacket) -> String {
-    format!(
+    let base = format!(
         "{}:{}:{}:{}:{}:{}:{}:{}:{}:{}:{}",
         pkt.magic,
         pkt.proto,
@@ -264,7 +294,22 @@ fn beacon_signing_input(pkt: &BeaconPacket) -> String {
         pkt.platform,
         pkt.ts_us,
         pkt.reply_port.unwrap_or(0)
-    )
+    );
+    if pkt.v3_port.is_none()
+        && pkt.pair_port.is_none()
+        && pkt.pub_fp.is_none()
+        && pkt.caps.is_empty()
+    {
+        base
+    } else {
+        format!(
+            "{base}:{}:{}:{}:{}",
+            pkt.v3_port.unwrap_or(0),
+            pkt.pair_port.unwrap_or(0),
+            pkt.pub_fp.as_deref().unwrap_or(""),
+            pkt.caps.join(",")
+        )
+    }
 }
 
 /// Returns the normalized platform identifier for this host (`"windows"`, `"linux"`, `"macos"`, ...).
@@ -283,6 +328,31 @@ pub fn make_beacon_with_reply_port(
     ts_us: Option<u64>,
     reply_port: Option<u16>,
 ) -> Vec<u8> {
+    make_beacon_v3(
+        device_id,
+        name,
+        port,
+        security,
+        msg_type,
+        psk_key,
+        ts_us,
+        reply_port,
+        &BeaconV3Meta::default(),
+    )
+}
+
+#[allow(clippy::too_many_arguments)]
+pub fn make_beacon_v3(
+    device_id: &str,
+    name: &str,
+    port: u16,
+    security: &str,
+    msg_type: &str,
+    psk_key: Option<&str>,
+    ts_us: Option<u64>,
+    reply_port: Option<u16>,
+    v3: &BeaconV3Meta,
+) -> Vec<u8> {
     let platform = current_platform();
     let ts = ts_us.unwrap_or_else(|| (now_secs() * 1_000_000.0) as u64);
     let mut pkt = BeaconPacket {
@@ -298,6 +368,10 @@ pub fn make_beacon_with_reply_port(
         ts_us: ts,
         hmac: String::new(),
         reply_port,
+        v3_port: v3.v3_port,
+        pair_port: v3.pair_port,
+        pub_fp: v3.pub_fp.clone(),
+        caps: v3.caps.clone(),
     };
     if let Some(key) = psk_key.filter(|k| !k.trim().is_empty()) {
         let sig_input = beacon_signing_input(&pkt);
@@ -438,6 +512,7 @@ fn bind_udp_reusable(port: u16) -> std::io::Result<UdpSocket> {
     Ok(sock.into())
 }
 
+#[cfg_attr(not(test), allow(dead_code))]
 fn build_mdns_txt_properties<'a>(
     device_id: &'a str,
     name: &'a str,
@@ -452,6 +527,74 @@ fn build_mdns_txt_properties<'a>(
         ("security", security),
         ("platform", platform),
     ]
+}
+
+fn build_mdns_txt_properties_v3(
+    device_id: &str,
+    name: &str,
+    security: &str,
+    platform: &str,
+    v3: &BeaconV3Meta,
+) -> Vec<(&'static str, String)> {
+    let mut props = vec![
+        ("id", device_id.to_string()),
+        ("name", name.to_string()),
+        ("ver", VERSION.to_string()),
+        ("proto", "2".to_string()),
+        ("security", security.to_string()),
+        ("platform", platform.to_string()),
+    ];
+    if let Some(v3_port) = v3.v3_port.filter(|&p| p > 0) {
+        props.push(("v3_port", v3_port.to_string()));
+    }
+    if let Some(pair_port) = v3.pair_port.filter(|&p| p > 0) {
+        props.push(("pair_port", pair_port.to_string()));
+    }
+    if let Some(pub_fp) = v3
+        .pub_fp
+        .as_deref()
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+    {
+        props.push(("pub_fp", pub_fp.to_string()));
+    }
+    if !v3.caps.is_empty() {
+        props.push(("caps", v3.caps.join(",")));
+    }
+    props
+}
+
+/// Extract optional v3 / Pairing v2 TXT metadata from a resolved mDNS [`ServiceInfo`].
+pub fn parse_mdns_v3_metadata(info: &ServiceInfo) -> BeaconV3Meta {
+    let v3_port = info
+        .get_property_val_str("v3_port")
+        .and_then(|v| v.parse::<u16>().ok())
+        .filter(|&p| p > 0);
+    let pair_port = info
+        .get_property_val_str("pair_port")
+        .and_then(|v| v.parse::<u16>().ok())
+        .filter(|&p| p > 0);
+    let pub_fp = info
+        .get_property_val_str("pub_fp")
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+        .map(str::to_string);
+    let caps = info
+        .get_property_val_str("caps")
+        .map(|raw| {
+            raw.split(',')
+                .map(str::trim)
+                .filter(|s| !s.is_empty())
+                .map(str::to_string)
+                .collect()
+        })
+        .unwrap_or_default();
+    BeaconV3Meta {
+        v3_port,
+        pair_port,
+        pub_fp,
+        caps,
+    }
 }
 
 fn parse_mdns_service_info(info: &ServiceInfo, own_id: &str) -> Option<Peer> {
@@ -510,6 +653,7 @@ pub struct DiscoveryManager {
     pub interval_secs: f64,
     pub use_udp: bool,
     pub use_mdns: bool,
+    pub v3_meta: BeaconV3Meta,
     pub store: Arc<PeerStore>,
     advertising: Arc<AtomicBool>,
     stop_flag: Arc<AtomicBool>,
@@ -542,6 +686,7 @@ impl DiscoveryManager {
             interval_secs: interval_secs.max(1.0),
             use_udp,
             use_mdns,
+            v3_meta: BeaconV3Meta::default(),
             store: Arc::new(PeerStore::new(PEER_TIMEOUT_SECS)),
             advertising: Arc::new(AtomicBool::new(false)),
             stop_flag: Arc::new(AtomicBool::new(false)),
@@ -550,6 +695,11 @@ impl DiscoveryManager {
             mdns_daemon: Mutex::new(None),
             mdns_thread: Mutex::new(None),
         }
+    }
+
+    pub fn with_v3_meta(mut self, v3_meta: BeaconV3Meta) -> Self {
+        self.v3_meta = v3_meta;
+        self
     }
 
     pub fn start(&self, advertising: bool) -> Vec<String> {
@@ -573,13 +723,14 @@ impl DiscoveryManager {
                     let disc_port = self.discovery_port;
                     let sec = self.security.clone();
                     let psk = self.psk_key.clone();
+                    let v3_meta = self.v3_meta.clone();
                     let interval = Duration::from_secs_f64(self.interval_secs);
 
                     let handle = thread::spawn(move || {
                         let mut next_beacon = Instant::now();
                         let mut buf = [0u8; 4096];
                         // Send initial probe
-                        let probe = make_beacon_with_reply_port(
+                        let probe = make_beacon_v3(
                             &dev_id,
                             &dev_name,
                             audio_port,
@@ -588,6 +739,7 @@ impl DiscoveryManager {
                             psk.as_deref(),
                             None,
                             local_port,
+                            &v3_meta,
                         );
                         for target in broadcast_addresses(true) {
                             if let Ok(ip) = target.parse::<IpAddr>() {
@@ -598,7 +750,7 @@ impl DiscoveryManager {
                         while !stop.load(Ordering::SeqCst) {
                             if Instant::now() >= next_beacon {
                                 if adv.load(Ordering::SeqCst) {
-                                    let offer = make_beacon(
+                                    let offer = make_beacon_v3(
                                         &dev_id,
                                         &dev_name,
                                         audio_port,
@@ -606,6 +758,8 @@ impl DiscoveryManager {
                                         "offer",
                                         psk.as_deref(),
                                         None,
+                                        None,
+                                        &v3_meta,
                                     );
                                     for target in broadcast_addresses(true) {
                                         if let Ok(ip) = target.parse::<IpAddr>() {
@@ -616,7 +770,7 @@ impl DiscoveryManager {
                                 }
                                 // Also send periodic probe so peers & RTT stay fresh even if
                                 // another local process shares port 47777 or we are on an ephemeral port
-                                let probe_pkt = make_beacon_with_reply_port(
+                                let probe_pkt = make_beacon_v3(
                                     &dev_id,
                                     &dev_name,
                                     audio_port,
@@ -625,6 +779,7 @@ impl DiscoveryManager {
                                     psk.as_deref(),
                                     None,
                                     local_port,
+                                    &v3_meta,
                                 );
                                 for target in broadcast_addresses(true) {
                                     if let Ok(ip) = target.parse::<IpAddr>() {
@@ -644,7 +799,7 @@ impl DiscoveryManager {
                                         continue;
                                     }
                                     if pkt.msg_type == "probe" && adv.load(Ordering::SeqCst) {
-                                        let reply = make_beacon(
+                                        let reply = make_beacon_v3(
                                             &dev_id,
                                             &dev_name,
                                             audio_port,
@@ -652,6 +807,8 @@ impl DiscoveryManager {
                                             "offer",
                                             psk.as_deref(),
                                             Some(pkt.ts_us),
+                                            None,
+                                            &v3_meta,
                                         );
                                         let reply_target = pkt
                                             .reply_port
@@ -689,25 +846,28 @@ impl DiscoveryManager {
                         let host_fqdn = format!("{instance_name}.local.");
                         let addrs = local_addresses(false);
                         let ip_str = addrs.first().map(|s| s.as_str()).unwrap_or("");
-                        let props = build_mdns_txt_properties(
+                        let props_owned = build_mdns_txt_properties_v3(
                             &self.device_id,
                             &self.name,
                             &self.security,
                             current_platform(),
+                            &self.v3_meta,
                         );
+                        let props_refs: Vec<(&str, &str)> =
+                            props_owned.iter().map(|(k, v)| (*k, v.as_str())).collect();
                         if let Ok(info) = ServiceInfo::new(
                             MDNS_SERVICE_TYPE,
                             &instance_name,
                             &host_fqdn,
                             ip_str,
                             self.audio_port,
-                            &props[..],
+                            &props_refs[..],
                         ) {
                             let _ = mdns.register(info);
                         }
                     }
                     let psk_mode = self.psk_key.as_ref().is_some_and(|k| !k.trim().is_empty())
-                        || matches!(self.security.as_str(), "psk" | "pin");
+                        || matches!(self.security.as_str(), "psk" | "pin" | "paired");
                     if !psk_mode {
                         if let Ok(receiver) = mdns.browse(MDNS_SERVICE_TYPE) {
                             let stop = Arc::clone(&self.stop_flag);
@@ -1022,5 +1182,59 @@ mod tests {
     fn test_bind_udp_reusable_ephemeral_socket() {
         let sock = bind_udp_reusable(0).expect("ephemeral UDP bind should succeed");
         assert!(sock.local_addr().unwrap().port() > 0);
+    }
+
+    #[test]
+    fn test_beacon_and_mdns_v3_optional_fields() {
+        let meta = BeaconV3Meta {
+            v3_port: Some(4714),
+            pair_port: Some(4715),
+            pub_fp: Some("A1B2-C3D4-E5F6-0708".to_string()),
+            caps: vec!["sht3".to_string(), "opus".to_string(), "pcm".to_string()],
+        };
+        let key = "0123456789abcdef0123456789abcdef";
+        let raw = make_beacon_v3(
+            "dev-v3",
+            "Studio V3",
+            4713,
+            "psk",
+            "offer",
+            Some(key),
+            None,
+            None,
+            &meta,
+        );
+        let (pkt, peer) = parse_beacon(&raw, "192.168.1.55", "udp", Some(key));
+        let pkt = pkt.unwrap();
+        assert_eq!(pkt.v3_port, Some(4714));
+        assert_eq!(pkt.pair_port, Some(4715));
+        assert_eq!(pkt.pub_fp.as_deref(), Some("A1B2-C3D4-E5F6-0708"));
+        assert_eq!(pkt.caps, vec!["sht3", "opus", "pcm"]);
+        assert!(peer.is_some());
+
+        // Tampering with pair_port must invalidate HMAC
+        let mut tampered = pkt.clone();
+        tampered.pair_port = Some(9999);
+        let tampered_raw = serde_json::to_vec(&tampered).unwrap();
+        assert!(
+            parse_beacon(&tampered_raw, "192.168.1.55", "udp", Some(key))
+                .1
+                .is_none()
+        );
+
+        // mDNS TXT v3 roundtrip
+        let props = build_mdns_txt_properties_v3("dev-v3", "Studio V3", "psk", "linux", &meta);
+        let prop_refs: Vec<(&str, &str)> = props.iter().map(|(k, v)| (*k, v.as_str())).collect();
+        let info = ServiceInfo::new(
+            MDNS_SERVICE_TYPE,
+            "studio-v3",
+            "studio-v3.local.",
+            "10.254.254.55",
+            4713,
+            &prop_refs[..],
+        )
+        .unwrap();
+        let parsed_meta = parse_mdns_v3_metadata(&info);
+        assert_eq!(parsed_meta, meta);
     }
 }

@@ -1,8 +1,15 @@
-//! Audio sharing listener lifecycle and PIN/PSK pairing.
+//! Audio sharing listener lifecycle, PIN/PSK pairing, and Pairing v2 interactive requests.
 
-use std::path::Path;
+use std::collections::HashMap;
+use std::path::{Path, PathBuf};
+use std::sync::{Arc, Mutex, OnceLock};
+use std::time::Duration;
 
 use crate::backend::Listener;
+use crate::pairing::{
+    identity_key_path, initiate_pair_request, DeviceIdentity, PairingManager, PendingPairRequest,
+    TrustStore, TrustedPeer, DEFAULT_PAIR_PORT, PENDING_REQUEST_TTL_SECS,
+};
 use crate::security::{
     derive_key_hex, derive_pa_cookie, generate_pairing_pin, soundhop_cookie_path, write_pa_cookie,
 };
@@ -10,6 +17,8 @@ use crate::state::PairedPeer;
 use crate::util::{local_addresses, lock_or_recover, notify, now_secs, tcp_reachable};
 
 use super::{Controller, ControllerError};
+
+static PAIRING_MANAGERS: OnceLock<Mutex<HashMap<String, Arc<PairingManager>>>> = OnceLock::new();
 
 impl Controller {
     // -- Sharing & Listener ----------------------------------------------
@@ -244,6 +253,177 @@ impl Controller {
         }
         self.save();
         serde_json::json!({ "ok": true, "cleared": true })
+    }
+
+    // -- Pairing v2 (Per-Device Identity & Interactive Pair Requests) ----
+
+    fn identity_path_for_controller(&self) -> PathBuf {
+        self.config_path
+            .as_ref()
+            .and_then(|p| p.parent())
+            .map(|dir| dir.join("identity.key"))
+            .unwrap_or_else(identity_key_path)
+    }
+
+    /// Load or create this device's persistent Ed25519 [`DeviceIdentity`].
+    pub fn device_identity(&self) -> Result<DeviceIdentity, ControllerError> {
+        let device_id = lock_or_recover(&self.config).device.id.clone();
+        let path = self.identity_path_for_controller();
+        DeviceIdentity::load_or_create(Some(&path), Some(&device_id))
+            .map_err(|e| ControllerError::Message(format!("Failed loading device identity: {e}")))
+    }
+
+    /// Return the [`PairingManager`] associated with this controller, initialized with
+    /// the controller's persisted [`TrustedPeer`]s.
+    pub fn pairing_manager(&self) -> Arc<PairingManager> {
+        let device_id = lock_or_recover(&self.config).device.id.clone();
+        let registry = PAIRING_MANAGERS.get_or_init(|| Mutex::new(HashMap::new()));
+        let mut guard = lock_or_recover(registry);
+        Arc::clone(guard.entry(device_id).or_insert_with(|| {
+            let existing = lock_or_recover(&self.state).trusted_peers.clone();
+            Arc::new(PairingManager::new(Arc::new(TrustStore::from_peers(
+                existing,
+            ))))
+        }))
+    }
+
+    /// Persist a newly paired [`TrustedPeer`] into `State` and the live [`TrustStore`].
+    pub fn record_trusted_peer(&self, peer: TrustedPeer) {
+        self.pairing_manager().trust_store().upsert(peer.clone());
+        lock_or_recover(&self.state).upsert_trusted_peer(peer);
+        self.save();
+    }
+
+    /// Initiate a Pairing v2 TCP handshake against `host:pair_port` (optionally using a
+    /// headless one-time `code`). Persists the resulting [`TrustedPeer`] on success.
+    pub fn pair_request(
+        &self,
+        host: &str,
+        pair_port: Option<u16>,
+        code: Option<&str>,
+    ) -> Result<serde_json::Value, ControllerError> {
+        let trimmed_host = host.trim();
+        if trimmed_host.is_empty() {
+            return Err(ControllerError::Message(
+                "Target host is required for pair_request".to_string(),
+            ));
+        }
+        let (display_name, default_port) = {
+            let cfg = lock_or_recover(&self.config);
+            let port = if cfg.sharing.pair_port == 0 {
+                DEFAULT_PAIR_PORT
+            } else {
+                cfg.sharing.pair_port
+            };
+            (cfg.device.name.clone(), port)
+        };
+        let port = pair_port.filter(|&p| p > 0).unwrap_or(default_port);
+        let identity = self.device_identity()?;
+        let outcome = initiate_pair_request(
+            trimmed_host,
+            port,
+            &identity,
+            &display_name,
+            code,
+            Duration::from_secs(PENDING_REQUEST_TTL_SECS),
+            None,
+        )
+        .map_err(|e| ControllerError::Message(e.to_string()))?;
+
+        self.record_trusted_peer(outcome.peer.clone());
+        Ok(serde_json::json!({
+            "ok": true,
+            "paired": true,
+            "request_id": outcome.request_id,
+            "sas_code": outcome.sas_code,
+            "peer": outcome.peer.to_public_json(),
+        }))
+    }
+
+    /// Return all active incoming Pairing v2 requests awaiting approval.
+    pub fn pending_pair_requests(&self) -> Vec<PendingPairRequest> {
+        self.pairing_manager().pending_requests()
+    }
+
+    /// Approve a pending incoming Pairing v2 request by `request_id` (or matching SAS code).
+    pub fn approve_pair_request(&self, id: &str) -> Result<serde_json::Value, ControllerError> {
+        let req = self
+            .pairing_manager()
+            .approve(id)
+            .map_err(|e| ControllerError::Message(e.to_string()))?;
+        Ok(serde_json::json!({
+            "ok": true,
+            "approved": true,
+            "request": req,
+        }))
+    }
+
+    /// Deny a pending incoming Pairing v2 request by `request_id` (or matching SAS code).
+    pub fn deny_pair_request(&self, id: &str) -> Result<serde_json::Value, ControllerError> {
+        let req = self
+            .pairing_manager()
+            .deny(id)
+            .map_err(|e| ControllerError::Message(e.to_string()))?;
+        Ok(serde_json::json!({
+            "ok": true,
+            "denied": true,
+            "request": req,
+        }))
+    }
+
+    /// Revoke a trusted peer by `device_id`, removing it from both `State` and `TrustStore`.
+    pub fn revoke_trusted_peer(
+        &self,
+        device_id: &str,
+    ) -> Result<serde_json::Value, ControllerError> {
+        let target = device_id.trim();
+        if target.is_empty() {
+            return Err(ControllerError::Message(
+                "device_id is required to revoke a trusted peer".to_string(),
+            ));
+        }
+        let removed_store = self.pairing_manager().revoke(target).is_some();
+        let removed_state = lock_or_recover(&self.state).remove_trusted_peer(target);
+        if removed_state {
+            self.save();
+        }
+        Ok(serde_json::json!({
+            "ok": true,
+            "revoked": removed_store || removed_state,
+            "device_id": target,
+        }))
+    }
+
+    /// Return all persisted [`TrustedPeer`]s (synced with the live [`TrustStore`]).
+    pub fn trusted_peers(&self) -> Vec<TrustedPeer> {
+        let mut merged: HashMap<String, TrustedPeer> = HashMap::new();
+        for p in &lock_or_recover(&self.state).trusted_peers {
+            if !p.device_id.trim().is_empty() && p.device_id != "lan-group" {
+                merged.insert(p.device_id.clone(), p.clone());
+            }
+        }
+        for p in self.pairing_manager().trust_store().list() {
+            merged.insert(p.device_id.clone(), p);
+        }
+        let mut out: Vec<TrustedPeer> = merged.into_values().collect();
+        out.sort_by(|a, b| {
+            a.display_name
+                .to_lowercase()
+                .cmp(&b.display_name.to_lowercase())
+        });
+        out
+    }
+
+    /// Generate a 120-second one-time pairing code for headless / Raspberry Pi devices.
+    pub fn generate_headless_pair_code(&self) -> serde_json::Value {
+        let code = self.pairing_manager().generate_one_time_code();
+        serde_json::json!({
+            "ok": true,
+            "code": code.code,
+            "created_at": code.created_at,
+            "expires_at": code.expires_at,
+            "ttl_secs": code.ttl_secs,
+        })
     }
 }
 

@@ -6,6 +6,7 @@ use std::path::{Path, PathBuf};
 
 use serde::{Deserialize, Serialize};
 
+use crate::pairing::TrustedPeer;
 use crate::util::{atomic_write, is_own_non_loopback_ip, now_secs, state_path};
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
@@ -154,6 +155,8 @@ pub struct State {
     pub last_synced_mute: bool,
     pub known_peers: BTreeMap<String, KnownPeer>,
     pub paired_peers: BTreeMap<String, PairedPeer>,
+    #[serde(default)]
+    pub trusted_peers: Vec<TrustedPeer>,
     pub known_android_devices: BTreeMap<String, KnownAndroidDevice>,
     pub daemon_last_started: f64,
     pub android_active: bool,
@@ -200,6 +203,7 @@ impl Default for State {
             last_synced_mute: false,
             known_peers: BTreeMap::new(),
             paired_peers: BTreeMap::new(),
+            trusted_peers: Vec::new(),
             known_android_devices: BTreeMap::new(),
             daemon_last_started: 0.0,
             android_active: false,
@@ -226,6 +230,7 @@ impl State {
             .map_err(|e| format!("Failed to parse state file {}: {e}", target.display()))?;
         st.known_peers
             .retain(|_, p| !is_own_non_loopback_ip(&p.host));
+        st.sanitize_legacy_pairing();
         Ok(st)
     }
 
@@ -235,11 +240,47 @@ impl State {
 
     pub fn save(&mut self, path: Option<&Path>) -> std::io::Result<PathBuf> {
         let target = path.map(Path::to_path_buf).unwrap_or_else(state_path);
+        self.sanitize_legacy_pairing();
         self.prune_known_peers(90.0 * 86400.0, 50);
         self.prune_known_android_devices(90.0 * 86400.0, 50);
         let text = serde_json::to_string_pretty(self).unwrap_or_else(|_| "{}".to_string());
         atomic_write(&target, &(text + "\n"))?;
         Ok(target)
+    }
+
+    /// Migrate/drop synthetic `"lan-group"` pairing entries from legacy state files.
+    pub fn sanitize_legacy_pairing(&mut self) {
+        self.paired_peers.remove("lan-group");
+        self.trusted_peers
+            .retain(|p| !p.device_id.trim().is_empty() && p.device_id != "lan-group");
+    }
+
+    /// Insert or update a [`TrustedPeer`] by `device_id`, ignoring empty or synthetic `"lan-group"` IDs.
+    pub fn upsert_trusted_peer(&mut self, peer: TrustedPeer) {
+        if peer.device_id.trim().is_empty() || peer.device_id == "lan-group" {
+            return;
+        }
+        if let Some(existing) = self
+            .trusted_peers
+            .iter_mut()
+            .find(|p| p.device_id == peer.device_id)
+        {
+            *existing = peer;
+        } else {
+            self.trusted_peers.push(peer);
+        }
+    }
+
+    /// Remove a [`TrustedPeer`] by `device_id`. Returns `true` if one was removed.
+    pub fn remove_trusted_peer(&mut self, device_id: &str) -> bool {
+        let before = self.trusted_peers.len();
+        self.trusted_peers.retain(|p| p.device_id != device_id);
+        self.trusted_peers.len() < before
+    }
+
+    /// Look up a [`TrustedPeer`] by `device_id`.
+    pub fn find_trusted_peer(&self, device_id: &str) -> Option<&TrustedPeer> {
+        self.trusted_peers.iter().find(|p| p.device_id == device_id)
     }
 
     pub fn is_connected(&self) -> bool {
@@ -401,5 +442,62 @@ mod tests {
         let loaded = State::load(Some(&path));
         assert!(loaded.known_peers.contains_key("peer1"));
         assert!(!loaded.known_peers.contains_key("stale_peer"));
+    }
+
+    #[test]
+    fn test_state_trusted_peers_and_lan_group_migration() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("state.json");
+
+        // Legacy JSON containing synthetic "lan-group" and no "trusted_peers" field
+        let legacy_json = serde_json::json!({
+            "paired_peers": {
+                "lan-group": {
+                    "peer_id": "lan-group",
+                    "name": "LAN Group",
+                    "shared_key_hex": "aa",
+                    "cookie_hex": "bb",
+                    "paired_at": 100.0
+                },
+                "real-peer": {
+                    "peer_id": "real-peer",
+                    "name": "Real Peer",
+                    "shared_key_hex": "cc",
+                    "cookie_hex": "dd",
+                    "paired_at": 200.0
+                }
+            }
+        });
+        fs::write(&path, serde_json::to_string_pretty(&legacy_json).unwrap()).unwrap();
+
+        let mut loaded = State::try_load(Some(&path)).unwrap();
+        assert!(!loaded.paired_peers.contains_key("lan-group"));
+        assert!(loaded.paired_peers.contains_key("real-peer"));
+        assert!(loaded.trusted_peers.is_empty());
+
+        loaded.upsert_trusted_peer(TrustedPeer {
+            device_id: "lan-group".to_string(),
+            display_name: "Synthetic".to_string(),
+            ed25519_pub: [1u8; 32],
+            pairwise_secret: [2u8; 32],
+            fingerprint: "0102-0304-0506-0708".to_string(),
+            paired_at: 300.0,
+        });
+        assert!(loaded.trusted_peers.is_empty());
+
+        let tp = TrustedPeer {
+            device_id: "dev-123".to_string(),
+            display_name: "Studio".to_string(),
+            ed25519_pub: [3u8; 32],
+            pairwise_secret: [4u8; 32],
+            fingerprint: "A1B2-C3D4-E5F6-0708".to_string(),
+            paired_at: 400.0,
+        };
+        loaded.upsert_trusted_peer(tp.clone());
+        loaded.save(Some(&path)).unwrap();
+
+        let reloaded = State::try_load(Some(&path)).unwrap();
+        assert_eq!(reloaded.trusted_peers.len(), 1);
+        assert_eq!(reloaded.find_trusted_peer("dev-123"), Some(&tp));
     }
 }
