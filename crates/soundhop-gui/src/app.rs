@@ -67,6 +67,27 @@ pub fn open_control_center_with_toast(
         viewport = viewport.with_icon(Arc::new(icon));
     }
 
+    #[cfg(target_os = "windows")]
+    let options = {
+        let mut wgpu_setup = eframe::egui_wgpu::WgpuSetupCreateNew::default();
+        // Use DirectX 12 / Vulkan on Windows (with automatic Microsoft WARP software
+        // fallback on VMs and RDP sessions) instead of probing legacy GDI OpenGL 1.1.
+        wgpu_setup.instance_descriptor.backends = eframe::wgpu::Backends::from_env()
+            .unwrap_or(eframe::wgpu::Backends::DX12 | eframe::wgpu::Backends::VULKAN);
+        wgpu_setup.power_preference = eframe::wgpu::PowerPreference::from_env()
+            .unwrap_or(eframe::wgpu::PowerPreference::LowPower);
+        eframe::NativeOptions {
+            viewport,
+            renderer: eframe::Renderer::Wgpu,
+            wgpu_options: eframe::egui_wgpu::WgpuConfiguration {
+                wgpu_setup: eframe::egui_wgpu::WgpuSetup::CreateNew(wgpu_setup),
+                ..Default::default()
+            },
+            ..Default::default()
+        }
+    };
+
+    #[cfg(not(target_os = "windows"))]
     let options = eframe::NativeOptions {
         viewport,
         ..Default::default()

@@ -18,10 +18,17 @@ tray-icon.workspace = true
 muda.workspace = true
 image.workspace = true
 
+[target.'cfg(not(target_os = "windows"))'.dependencies]
+eframe = { workspace = true, features = ["glow"] }
+
 [target.'cfg(target_os = "linux")'.dependencies]
 gtk = "0.18"
 
 [target.'cfg(target_os = "windows")'.dependencies]
+eframe = { workspace = true, features = ["wgpu"] }
+# eframe 0.31 disables wgpu default-features (omitting dx12); explicitly enable dx12
+# so DirectX 12 + Microsoft WARP software fallback works on all Windows desktops/VMs/RDP.
+wgpu = { version = "24", default-features = false, features = ["dx12"] }
 windows-sys = { version = "0.61", features = ["Win32_Foundation", "Win32_System_LibraryLoader", "Win32_UI_WindowsAndMessaging"] }
 
 [target.'cfg(target_os = "macos")'.dependencies]
