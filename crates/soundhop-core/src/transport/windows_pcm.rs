@@ -23,7 +23,6 @@ const SHT3_PREBUFFER_SAMPLES: usize = 3_840;
 const SHT3_PLAYBACK_TARGET_MS: f64 = 40.0;
 /// Stereo frames over which partial capture timeouts are faded out before zero-fill.
 const CAPTURE_TIMEOUT_FADE_FRAMES: usize = 64;
-/// Maximum stereo frames (~4 ms @ 48 kHz) over which volume/mute transitions are ramped.
 
 /// Pull-based [`PcmCapture`] adapter over [`WindowsLoopbackRecorder`] (48 kHz stereo S16LE).
 pub struct WindowsPcmCapture {
@@ -303,7 +302,7 @@ mod tests {
 
     #[test]
     fn idle_timeout_synthesizes_stereo_aligned_silence() {
-        let mut guard = VecDeque::from(vec![100i16, -100, 200]);
+        let mut guard = VecDeque::from([100i16, -100, 200]);
         let mut buf = [999i16; 6];
         let n = read_capture_queue_into(&mut guard, &mut buf).unwrap();
         assert_eq!(n, 6);
@@ -361,7 +360,7 @@ mod tests {
 
     #[test]
     fn idle_timeout_fades_out_when_aligned_at_least_128_samples() {
-        let mut guard = VecDeque::from(vec![10_000i16, -10_000].repeat(96)); // 192 samples
+        let mut guard = VecDeque::from([10_000i16, -10_000].repeat(96)); // 192 samples
         let mut buf = [999i16; 384];
         let n = read_capture_queue_into(&mut guard, &mut buf).unwrap();
         assert_eq!(n, 384);

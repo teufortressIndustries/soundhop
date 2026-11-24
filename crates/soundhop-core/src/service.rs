@@ -462,15 +462,11 @@ pub fn restart_service() -> bool {
 /// Gracefully stops any active `soundhop.service`, daemon IPC instance, and
 /// peer SoundHop processes (GUI, tray, daemon) other than the current process.
 pub fn quit_all_soundhop(socket_path: Option<&Path>) -> serde_json::Value {
-    let mut service_stopped = false;
     #[cfg(target_os = "linux")]
-    {
-        if run_systemctl(&["is-active", "--quiet", UNIT_NAME])
-            && run_systemctl(&["stop", UNIT_NAME])
-        {
-            service_stopped = true;
-        }
-    }
+    let service_stopped =
+        run_systemctl(&["is-active", "--quiet", UNIT_NAME]) && run_systemctl(&["stop", UNIT_NAME]);
+    #[cfg(not(target_os = "linux"))]
+    let service_stopped = false;
 
     let mut daemon_stopped = false;
     if crate::ipc::is_running(socket_path) {

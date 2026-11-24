@@ -19,7 +19,6 @@ pub mod jitter;
 pub mod linux_pcm;
 pub mod pcm;
 pub mod server;
-#[cfg(target_os = "windows")]
 pub mod windows_pcm;
 pub mod wire;
 
@@ -51,7 +50,6 @@ pub use pcm::{
     PCM_FRAME_SAMPLES_10MS, PCM_FRAME_SAMPLES_20MS, PCM_SAMPLE_RATE,
 };
 pub use server::{Sht3Listener, Sht3ServerConfig, Sht3ServerConnection};
-#[cfg(target_os = "windows")]
 pub use windows_pcm::{WindowsPcmCapture, WindowsPcmPlayback};
 pub use wire::{
     AudioParams, ClientHello, CodecId, ControlMessage, DecryptedFrame, EncryptedFrame, FrameHeader,

@@ -1461,7 +1461,11 @@ mod tests {
             let path = entry.path();
             let name = entry.file_name();
             let name_str = name.to_string_lossy();
-            if name_str == ".git" || name_str == "target" {
+            if name_str == ".git"
+                || name_str == "target"
+                || name_str == "build"
+                || name_str == "dist"
+            {
                 continue;
             }
             if path.is_dir() {

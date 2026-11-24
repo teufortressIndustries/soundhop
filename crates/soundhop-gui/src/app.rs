@@ -175,7 +175,13 @@ impl ControlCenterApp {
 }
 
 impl eframe::App for ControlCenterApp {
+    #[cfg(not(target_os = "windows"))]
     fn on_exit(&mut self, _gl: Option<&eframe::glow::Context>) {
+        self.backend.shutdown();
+    }
+
+    #[cfg(target_os = "windows")]
+    fn on_exit(&mut self) {
         self.backend.shutdown();
     }
 
