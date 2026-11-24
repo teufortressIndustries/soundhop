@@ -861,11 +861,17 @@ fn collect_tray_snapshot(daemon: &Daemon) -> TrayMenuSnapshot {
     TrayMenuSnapshot::from_parts(peers, streams, st, cfg, and_running, pending_pair_requests)
 }
 
-fn handle_menu_action(id_str: &str, daemon: &Daemon, running: &AtomicBool) {
+fn handle_menu_action(
+    id_str: &str,
+    daemon: &Daemon,
+    running: &AtomicBool,
+    quit_all_requested: &AtomicBool,
+) {
     let ctrl = &daemon.controller;
     let external = is_external_daemon(daemon);
 
     if id_str == "quit_tray" {
+        quit_all_requested.store(true, Ordering::SeqCst);
         running.store(false, Ordering::SeqCst);
         return;
     }
@@ -1660,6 +1666,7 @@ pub fn run_tray(verbose: bool) -> Result<i32, String> {
 
     soundhop_core::util::install_signal_handlers();
     let running = Arc::new(AtomicBool::new(true));
+    let quit_all_requested = Arc::new(AtomicBool::new(false));
     let mut last_badge = initial_snap.badge;
     let mut last_sig = initial_snap.signature;
 
@@ -1667,6 +1674,7 @@ pub fn run_tray(verbose: bool) -> Result<i32, String> {
     let (ui_tx, ui_rx) = mpsc::channel::<TrayMenuSnapshot>();
     let worker_daemon = Arc::clone(&daemon);
     let worker_running = Arc::clone(&running);
+    let worker_quit_all = Arc::clone(&quit_all_requested);
 
     let worker_handle = std::thread::spawn(move || {
         let _ = ui_tx.send(collect_tray_snapshot(&worker_daemon));
@@ -1676,7 +1684,7 @@ pub fn run_tray(verbose: bool) -> Result<i32, String> {
         {
             match cmd_rx.recv_timeout(Duration::from_millis(200)) {
                 Ok(id_str) => {
-                    handle_menu_action(&id_str, &worker_daemon, &worker_running);
+                    handle_menu_action(&id_str, &worker_daemon, &worker_running, &worker_quit_all);
                     let snap = collect_tray_snapshot(&worker_daemon);
                     let _ = ui_tx.send(snap);
                     last_refresh = Instant::now();
@@ -1714,6 +1722,7 @@ pub fn run_tray(verbose: bool) -> Result<i32, String> {
         while let Ok(event) = MenuEvent::receiver().try_recv() {
             let id_str = event.id.0;
             if id_str == "quit_tray" {
+                quit_all_requested.store(true, Ordering::SeqCst);
                 running.store(false, Ordering::SeqCst);
                 break;
             } else if id_str == "open_gui" {
@@ -1751,9 +1760,24 @@ pub fn run_tray(verbose: bool) -> Result<i32, String> {
     }
 
     running.store(false, Ordering::SeqCst);
+    let external_daemon = is_external_daemon(&daemon);
+    daemon.request_stop();
     drop(cmd_tx);
     let _ = worker_handle.join();
     daemon.shutdown();
+    if quit_all_requested.load(Ordering::SeqCst) {
+        crate::backend::stop_systemd_service_if_active();
+        if external_daemon {
+            let _ = ipc_request(
+                "android_stop",
+                serde_json::json!({}),
+                None,
+                Duration::from_secs(2),
+            );
+            let _ = ipc_request("stop", serde_json::json!({}), None, Duration::from_secs(2));
+        }
+        crate::backend::terminate_peer_soundhop_processes(&["gui"]);
+    }
     Ok(0)
 }
 

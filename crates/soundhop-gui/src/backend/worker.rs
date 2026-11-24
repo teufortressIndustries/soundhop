@@ -32,6 +32,7 @@ pub(super) struct WorkerState {
     pub(super) mutation_seq: Arc<AtomicU64>,
     pub(super) active_commands: Arc<AtomicUsize>,
     pub(super) onboarding_reopened: Arc<AtomicBool>,
+    pub(super) quit_flag: Arc<AtomicBool>,
     pub(super) controller_sync_lock: Arc<Mutex<()>>,
     pub(super) use_ipc: bool,
 }
@@ -971,6 +972,7 @@ mod tests {
             mutation_seq: Arc::new(AtomicU64::new(0)),
             active_commands: Arc::new(AtomicUsize::new(0)),
             onboarding_reopened: Arc::new(AtomicBool::new(false)),
+            quit_flag: Arc::new(AtomicBool::new(false)),
             controller_sync_lock: Arc::new(Mutex::new(())),
             use_ipc: false,
         };

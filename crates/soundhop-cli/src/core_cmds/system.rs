@@ -178,6 +178,16 @@ pub fn handle_daemon(verbose: bool, json_out: bool) -> i32 {
 }
 
 pub fn handle_stop(controller: &Arc<Controller>, json_out: bool) -> i32 {
+    #[cfg(target_os = "linux")]
+    {
+        if service_status()
+            .get("active")
+            .and_then(|v| v.as_bool())
+            .unwrap_or(false)
+        {
+            let _ = stop_service();
+        }
+    }
     let mut stopped_daemon = false;
     if ipc_is_reachable(None)
         && ipc_request("stop", serde_json::json!({}), None, Duration::from_secs(3)).is_ok()
@@ -185,6 +195,21 @@ pub fn handle_stop(controller: &Arc<Controller>, json_out: bool) -> i32 {
         stopped_daemon = true;
     }
     let _ = controller.disconnect(false, None, true, Some(false), true, true);
+    let self_pid = u64::from(std::process::id());
+    for kind in ["tray", "gui"] {
+        if let Some(info) = soundhop_core::util::read_instance_lock_info(kind) {
+            if let Some(pid) = info.pid {
+                if pid != self_pid {
+                    let _ = soundhop_core::ipc::terminate_process(pid);
+                }
+            }
+        }
+        if let Some(pid) = soundhop_core::ipc::find_soundhop_process_with_arg(kind) {
+            if pid != self_pid {
+                let _ = soundhop_core::ipc::terminate_process(pid);
+            }
+        }
+    }
     if json_out {
         print_json(&serde_json::json!({
             "stopped_daemon": stopped_daemon,

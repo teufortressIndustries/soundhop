@@ -243,7 +243,10 @@ fn ensure_background_tray_running() {
             cmd.creation_flags(CREATE_NO_WINDOW);
         }
         soundhop_core::util::close_fds_pre_exec(&mut cmd);
-        if cmd.spawn().is_ok() {
+        if let Ok(mut child) = cmd.spawn() {
+            std::thread::spawn(move || {
+                let _ = child.wait();
+            });
             let deadline = Instant::now() + Duration::from_millis(3000);
             while Instant::now() < deadline {
                 if ipc_is_running(None) {

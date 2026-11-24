@@ -176,6 +176,9 @@ pub(super) fn apply_optimistic_update(snap: &mut GuiSnapshot, cmd: &GuiCommand) 
         GuiCommand::ReopenOnboarding => {
             snap.show_onboarding = true;
         }
+        GuiCommand::QuitAll => {
+            snap.busy_message = Some("Quitting SoundHop...".to_string());
+        }
     }
 }
 
@@ -199,6 +202,7 @@ mod tests {
             mutation_seq: Arc::new(AtomicU64::new(0)),
             active_commands: Arc::new(AtomicUsize::new(0)),
             stop_flag: Arc::new(AtomicBool::new(false)),
+            quit_flag: Arc::new(AtomicBool::new(false)),
             poller_wake: Arc::new((Mutex::new(false), Condvar::new())),
             cmd_handle: None,
             poller_handle: None,
