@@ -391,7 +391,7 @@ fn run_audio_capture_loop_unix(
     }
 
     let mut force_default = false;
-    while !stop_flag.load(Ordering::SeqCst) {
+    while !stop_flag.load(Ordering::Relaxed) && !crate::util::signal_stop_requested() {
         let monitor_source = desired_monitor_source(&controller, force_default);
         let mut cmd = if use_parec {
             Command::new("parec")
@@ -412,11 +412,12 @@ fn run_audio_capture_loop_unix(
         .stdout(Stdio::piped())
         .stderr(Stdio::null());
         crate::util::close_fds_pre_exec(&mut cmd);
+        crate::util::set_parent_death_signal(&mut cmd);
 
         let started = Instant::now();
         let stdout_opt = {
             let mut child_guard = active_child.lock().unwrap_or_else(|e| e.into_inner());
-            if stop_flag.load(Ordering::SeqCst) {
+            if stop_flag.load(Ordering::Relaxed) || crate::util::signal_stop_requested() {
                 return;
             }
             match cmd.spawn() {
@@ -429,11 +430,11 @@ fn run_audio_capture_loop_unix(
             }
         };
         if stdout_opt.is_none() {
-            for _ in 0..10 {
-                if stop_flag.load(Ordering::SeqCst) {
+            for _ in 0..40 {
+                if stop_flag.load(Ordering::Relaxed) || crate::util::signal_stop_requested() {
                     return;
                 }
-                thread::sleep(Duration::from_millis(100));
+                thread::sleep(Duration::from_millis(25));
             }
             continue;
         }
@@ -442,7 +443,7 @@ fn run_audio_capture_loop_unix(
             let mut buf = [0u8; 1600]; // ~25ms at 16kHz stereo s16le
             let mut chunks: u32 = 0;
             loop {
-                if stop_flag.load(Ordering::SeqCst) {
+                if stop_flag.load(Ordering::Relaxed) || crate::util::signal_stop_requested() {
                     break;
                 }
                 match stdout.read(&mut buf) {
@@ -470,17 +471,17 @@ fn run_audio_capture_loop_unix(
             let _ = c.wait();
         }
 
-        if stop_flag.load(Ordering::SeqCst) {
+        if stop_flag.load(Ordering::Relaxed) || crate::util::signal_stop_requested() {
             break;
         }
 
         if started.elapsed() < Duration::from_millis(300) {
             force_default = !force_default;
-            for _ in 0..5 {
-                if stop_flag.load(Ordering::SeqCst) {
+            for _ in 0..16 {
+                if stop_flag.load(Ordering::Relaxed) || crate::util::signal_stop_requested() {
                     return;
                 }
-                thread::sleep(Duration::from_millis(80));
+                thread::sleep(Duration::from_millis(25));
             }
         } else {
             force_default = false;

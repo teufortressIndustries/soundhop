@@ -242,7 +242,7 @@ impl Daemon {
         crate::util::install_signal_handlers();
         self.start()?;
         while !self.stop_flag.load(Ordering::SeqCst) && !crate::util::signal_stop_requested() {
-            thread::sleep(Duration::from_millis(150));
+            thread::sleep(Duration::from_millis(40));
         }
         self.shutdown();
         Ok(())
@@ -261,6 +261,9 @@ impl Daemon {
         if let Some(mut child) = lock_or_recover(&self.audio_monitor_child).take() {
             let _ = child.kill();
             let _ = child.wait();
+        }
+        if self.controller.android_session.is_active() {
+            let _ = self.controller.android_session.stop();
         }
         if let Some(ipc) = lock_or_recover(&self.ipc).take() {
             ipc.stop();
@@ -288,9 +291,6 @@ impl Daemon {
             let _ = self
                 .controller
                 .disconnect(false, None, false, Some(false), true, false);
-        }
-        if self.controller.android_session.is_active() {
-            let _ = self.controller.android_session.stop();
         }
         let _ = fs::remove_file(pid_path());
         crate::util::append_log_line("INFO", "SoundHop daemon stopped");
@@ -460,13 +460,32 @@ impl Daemon {
         self.controller.save();
     }
 
+    fn should_stop(&self) -> bool {
+        self.stop_flag.load(Ordering::Relaxed) || crate::util::signal_stop_requested()
+    }
+
+    /// Sleeps up to `total` in `slice` increments, returning `true` early if stop is requested.
+    fn sleep_interruptible(&self, total: Duration, slice: Duration) -> bool {
+        let deadline = Instant::now() + total;
+        while Instant::now() < deadline {
+            if self.should_stop() {
+                return true;
+            }
+            let remaining = deadline.saturating_duration_since(Instant::now());
+            thread::sleep(remaining.min(slice));
+        }
+        self.should_stop()
+    }
+
     fn supervisor_loop(&self) {
         let mut offline_count = 0u32;
         let mut last_reconcile = Instant::now();
         let mut android_tracker = AndroidSupervisorState::default();
-        while !self.stop_flag.load(Ordering::SeqCst) {
-            thread::sleep(Duration::from_secs_f64(SUPERVISOR_INTERVAL_SECS));
-            if self.stop_flag.load(Ordering::SeqCst) {
+        while !self.should_stop() {
+            if self.sleep_interruptible(
+                Duration::from_secs_f64(SUPERVISOR_INTERVAL_SECS),
+                Duration::from_millis(50),
+            ) {
                 break;
             }
             if last_reconcile.elapsed() >= Duration::from_secs(10) {
@@ -814,29 +833,32 @@ impl Daemon {
 
     fn audio_monitor_loop(&self) {
         if !command_exists("pactl") {
-            while !self.stop_flag.load(Ordering::SeqCst) {
+            while !self.should_stop() {
                 if lock_or_recover(&self.controller.state).is_connected() {
                     let _ = self.controller.sync_remote_volume();
                     let _ = self.controller.enforce_routed_apps();
                 }
-                thread::sleep(Duration::from_millis(500));
+                if self.sleep_interruptible(Duration::from_millis(500), Duration::from_millis(50)) {
+                    break;
+                }
             }
             return;
         }
 
-        while !self.stop_flag.load(Ordering::SeqCst) {
+        while !self.should_stop() {
             let mut cmd = Command::new("pactl");
             cmd.arg("subscribe")
                 .stdin(Stdio::null())
                 .stdout(Stdio::piped())
                 .stderr(Stdio::null());
             crate::util::close_fds_pre_exec(&mut cmd);
+            crate::util::set_parent_death_signal(&mut cmd);
             let stdout_opt = {
                 let mut child_guard = self
                     .audio_monitor_child
                     .lock()
                     .unwrap_or_else(|e| e.into_inner());
-                if self.stop_flag.load(Ordering::SeqCst) {
+                if self.should_stop() {
                     break;
                 }
                 match cmd.spawn() {
@@ -849,7 +871,9 @@ impl Daemon {
                 }
             };
             if stdout_opt.is_none() {
-                thread::sleep(Duration::from_secs(3));
+                if self.sleep_interruptible(Duration::from_secs(3), Duration::from_millis(50)) {
+                    break;
+                }
                 continue;
             }
 
@@ -858,7 +882,7 @@ impl Daemon {
                 let mut last_app_sync: Option<Instant> = None;
                 let mut last_vol_sync: Option<Instant> = None;
                 for line in reader.lines().map_while(Result::ok) {
-                    if self.stop_flag.load(Ordering::SeqCst) {
+                    if self.should_stop() {
                         break;
                     }
                     let lower = line.to_lowercase();
@@ -880,8 +904,10 @@ impl Daemon {
                 let _ = child.kill();
                 let _ = child.wait();
             }
-            if !self.stop_flag.load(Ordering::SeqCst) {
-                thread::sleep(Duration::from_secs(1));
+            if !self.should_stop()
+                && self.sleep_interruptible(Duration::from_secs(1), Duration::from_millis(50))
+            {
+                break;
             }
         }
     }

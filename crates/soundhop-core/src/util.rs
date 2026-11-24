@@ -649,6 +649,34 @@ pub fn close_fds_pre_exec(cmd: &mut Command) {
 #[cfg(not(unix))]
 pub fn close_fds_pre_exec(_cmd: &mut Command) {}
 
+/// Configures the kernel to deliver `SIGKILL` to the child process when its
+/// spawning parent OS thread exits (`PR_SET_PDEATHSIG`).
+///
+/// # Important
+/// On Linux, `PR_SET_PDEATHSIG` tracks the **spawning OS thread** (`man 2 prctl`),
+/// not the whole process. Callers MUST only invoke this from long-lived owner
+/// threads whose lifetime covers the child process (such as `audio_thread` or
+/// `audio_monitor_thread`).
+#[cfg(target_os = "linux")]
+pub fn set_parent_death_signal(cmd: &mut Command) {
+    use std::os::unix::process::CommandExt;
+    let expected_ppid = unsafe { libc::getpid() };
+    unsafe {
+        cmd.pre_exec(move || {
+            libc::prctl(libc::PR_SET_PDEATHSIG, libc::SIGKILL);
+            // Guard against the fork race where the parent died before prctl ran.
+            if libc::getppid() != expected_ppid {
+                libc::_exit(1);
+            }
+            Ok(())
+        });
+    }
+}
+
+/// No-op on non-Linux targets where `PR_SET_PDEATHSIG` is unavailable.
+#[cfg(not(target_os = "linux"))]
+pub fn set_parent_death_signal(_cmd: &mut Command) {}
+
 /// Metadata written by the active lock holder after acquiring `InstanceLock`.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct InstanceLockInfo {
@@ -1442,6 +1470,10 @@ pub fn install_signal_handlers() {
             libc::SIGTERM,
             handle_posix_signal as *const () as libc::sighandler_t,
         );
+        libc::signal(
+            libc::SIGHUP,
+            handle_posix_signal as *const () as libc::sighandler_t,
+        );
     }
     #[cfg(windows)]
     {
@@ -1454,6 +1486,11 @@ pub fn install_signal_handlers() {
             }
         }
     }
+}
+
+/// Programmatically sets the global signal-stop flag (useful for tests and shutdown).
+pub fn request_signal_stop() {
+    SIGNAL_STOP_FLAG.store(true, std::sync::atomic::Ordering::SeqCst);
 }
 
 pub fn signal_stop_requested() -> bool {
@@ -1703,5 +1740,59 @@ mod tests {
         // Calling a second time must be idempotent.
         install_signal_handlers();
         assert!(!signal_stop_requested());
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn test_linux_sighup_requests_signal_stop() {
+        install_signal_handlers();
+        assert!(!signal_stop_requested());
+        let rc = unsafe { libc::raise(libc::SIGHUP) };
+        assert_eq!(rc, 0);
+        assert!(signal_stop_requested());
+        SIGNAL_STOP_FLAG.store(false, std::sync::atomic::Ordering::SeqCst);
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn test_linux_parent_death_signal_kills_child_when_spawning_thread_exits() {
+        let handle = std::thread::spawn(|| {
+            let mut cmd = Command::new("sleep");
+            cmd.arg("60")
+                .stdin(Stdio::null())
+                .stdout(Stdio::null())
+                .stderr(Stdio::null());
+            close_fds_pre_exec(&mut cmd);
+            set_parent_death_signal(&mut cmd);
+            cmd.spawn().expect("spawn sleep child")
+        });
+
+        let mut child = handle.join().expect("spawning thread should join");
+        let pid = child.id();
+
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(2);
+        let mut reaped = false;
+        while std::time::Instant::now() < deadline {
+            match child.try_wait() {
+                Ok(Some(_status)) => {
+                    reaped = true;
+                    break;
+                }
+                Ok(None) => std::thread::sleep(std::time::Duration::from_millis(10)),
+                Err(_) => break,
+            }
+        }
+        if !reaped {
+            let _ = child.kill();
+        }
+        let _ = child.wait();
+        assert!(
+            reaped,
+            "child {pid} should have been killed by PR_SET_PDEATHSIG when spawning thread exited"
+        );
+        assert!(
+            !Path::new(&format!("/proc/{pid}")).exists(),
+            "/proc/{pid} must not survive after parent thread exit and wait"
+        );
     }
 }
