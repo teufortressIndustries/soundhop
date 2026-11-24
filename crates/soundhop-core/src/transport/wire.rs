@@ -102,10 +102,9 @@ pub struct EncryptedFrame {
 }
 
 impl EncryptedFrame {
-    /// Write the full frame (header + ciphertext + tag) to `w` in a single atomic write
-    /// so `TCP_NODELAY` sockets never split the 16-byte header and sub-MSS Opus payload
-    /// across separate TCP segments (avoiding Nagle / Delayed-ACK stalls over Wi-Fi).
-    pub fn write_to<W: Write>(&self, w: &mut W) -> TransportResult<()> {
+    /// Write the full frame (header + ciphertext + tag) to `w` in a single atomic `write_all`
+    /// reusing `scratch` so hot 50 fps audio senders avoid per-frame heap allocations.
+    pub fn write_into_buf(&self, scratch: &mut Vec<u8>, w: &mut impl Write) -> TransportResult<()> {
         let expected_body = usize::from(self.header.payload_len) + AEAD_TAG_LEN;
         if self.ciphertext_and_tag.len() != expected_body {
             return Err(TransportError::Wire(format!(
@@ -114,11 +113,22 @@ impl EncryptedFrame {
                 expected_body
             )));
         }
-        let mut frame_buf = Vec::with_capacity(FRAME_HEADER_LEN + expected_body);
-        frame_buf.extend_from_slice(&self.header.to_bytes());
-        frame_buf.extend_from_slice(&self.ciphertext_and_tag);
-        w.write_all(&frame_buf)?;
+        let needed = FRAME_HEADER_LEN + expected_body;
+        scratch.clear();
+        scratch.reserve(needed);
+        scratch.extend_from_slice(&self.header.to_bytes());
+        scratch.extend_from_slice(&self.ciphertext_and_tag);
+        w.write_all(scratch)?;
         Ok(())
+    }
+
+    /// Write the full frame (header + ciphertext + tag) to `w` in a single atomic write
+    /// so `TCP_NODELAY` sockets never split the 16-byte header and sub-MSS Opus payload
+    /// across separate TCP segments (avoiding Nagle / Delayed-ACK stalls over Wi-Fi).
+    pub fn write_to<W: Write>(&self, mut w: &mut W) -> TransportResult<()> {
+        let expected_body = usize::from(self.header.payload_len) + AEAD_TAG_LEN;
+        let mut frame_buf = Vec::with_capacity(FRAME_HEADER_LEN + expected_body);
+        self.write_into_buf(&mut frame_buf, &mut w)
     }
 
     /// Read a framed packet from `r`, enforcing `MAX_PAYLOAD_LEN` prior to allocating.
@@ -839,5 +849,63 @@ mod tests {
         // Subsequent read straddles multiple 5-byte chunks with TimedOut between them without losing synchronization
         let decoded = EncryptedFrame::read_from(&mut reader).unwrap();
         assert_eq!(decoded, frame);
+    }
+
+    struct SingleSyscallSpy {
+        writes: Vec<Vec<u8>>,
+    }
+
+    impl Write for SingleSyscallSpy {
+        fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+            self.writes.push(buf.to_vec());
+            Ok(buf.len())
+        }
+
+        fn flush(&mut self) -> std::io::Result<()> {
+            Ok(())
+        }
+    }
+
+    #[test]
+    fn write_into_buf_reuses_capacity_and_writes_atomically() {
+        let mut scratch = Vec::with_capacity(FRAME_HEADER_LEN + MAX_PAYLOAD_LEN + AEAD_TAG_LEN);
+        let initial_ptr = scratch.as_ptr();
+        let initial_cap = scratch.capacity();
+
+        let frame0 = EncryptedFrame {
+            header: FrameHeader {
+                frame_type: FrameType::AudioOpus,
+                flags: 0,
+                payload_len: 120,
+                seq: 0,
+                timestamp_samples: 0,
+            },
+            ciphertext_and_tag: vec![0x11; 120 + AEAD_TAG_LEN],
+        };
+        let frame1 = EncryptedFrame {
+            header: FrameHeader {
+                frame_type: FrameType::AudioOpus,
+                flags: FLAG_FEC,
+                payload_len: 160,
+                seq: 1,
+                timestamp_samples: 960,
+            },
+            ciphertext_and_tag: vec![0x22; 160 + AEAD_TAG_LEN],
+        };
+
+        let mut spy = SingleSyscallSpy { writes: Vec::new() };
+        frame0.write_into_buf(&mut scratch, &mut spy).unwrap();
+        frame1.write_into_buf(&mut scratch, &mut spy).unwrap();
+
+        assert_eq!(scratch.as_ptr(), initial_ptr);
+        assert_eq!(scratch.capacity(), initial_cap);
+        assert_eq!(spy.writes.len(), 2);
+        assert_eq!(spy.writes[0].len(), FRAME_HEADER_LEN + 120 + AEAD_TAG_LEN);
+        assert_eq!(spy.writes[1].len(), FRAME_HEADER_LEN + 160 + AEAD_TAG_LEN);
+
+        let decoded0 = EncryptedFrame::read_from(&mut Cursor::new(&spy.writes[0])).unwrap();
+        let decoded1 = EncryptedFrame::read_from(&mut Cursor::new(&spy.writes[1])).unwrap();
+        assert_eq!(decoded0, frame0);
+        assert_eq!(decoded1, frame1);
     }
 }
