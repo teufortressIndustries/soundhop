@@ -1118,9 +1118,8 @@ impl Sht3SessionManager {
                             }
                             let _slot_guard = HandshakeSlotGuard(hs_counter);
 
-                            let sock_handle = stream.try_clone().ok();
                             let Ok(conn) =
-                                Sht3Listener::handshake_arc(stream, &hs_cfg, hs_trust.as_ref())
+                            Sht3Listener::handshake_arc(stream, &hs_cfg, hs_trust.as_ref())
                             else {
                                 return;
                             };
@@ -1130,10 +1129,7 @@ impl Sht3SessionManager {
                             ))
                             .min(hs_cfg.io_timeout.unwrap_or(MAX_MANAGED_INBOUND_IO_TIMEOUT))
                             .min(MAX_MANAGED_INBOUND_IO_TIMEOUT);
-                            if let Some(sock) = sock_handle {
-                                let _ = sock.set_read_timeout(Some(frame_timeout));
-                                drop(sock);
-                            }
+                            let _ = conn.set_read_timeout(Some(frame_timeout));
 
                             if !hs_stop.load(Ordering::Acquire) {
                                 spawn_inbound_peer(
