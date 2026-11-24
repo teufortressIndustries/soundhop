@@ -1119,7 +1119,7 @@ impl Sht3SessionManager {
                             let _slot_guard = HandshakeSlotGuard(hs_counter);
 
                             let Ok(conn) =
-                            Sht3Listener::handshake_arc(stream, &hs_cfg, hs_trust.as_ref())
+                                Sht3Listener::handshake_arc(stream, &hs_cfg, hs_trust.as_ref())
                             else {
                                 return;
                             };
