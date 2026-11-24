@@ -1,5 +1,7 @@
 //! Volume management, remote volume synchronization, and status volume telemetry.
 
+use std::collections::HashSet;
+
 use crate::state::State;
 use crate::telemetry::AudioLevelSnapshot;
 use crate::util::{lock_or_recover, now_secs};
@@ -7,6 +9,29 @@ use crate::util::{lock_or_recover, now_secs};
 use super::Controller;
 
 impl Controller {
+    fn broadcast_remote_volume(&self, st: &State, vol: u32, mute: bool) {
+        let sht3_peer_ids: HashSet<String> = {
+            let guard = lock_or_recover(&self.sht3_outbounds);
+            for handle in guard.values() {
+                if handle.is_running() {
+                    let _ = handle.set_volume(vol.min(150) as u8);
+                    let _ = handle.set_mute(mute);
+                }
+            }
+            guard.keys().cloned().collect()
+        };
+        if !st.multiroom_peers.is_empty() {
+            for sess in &st.multiroom_peers {
+                if !sht3_peer_ids.contains(&sess.peer_id) {
+                    self.backend
+                        .remote_set_volume(&sess.host, sess.port, vol, Some(mute));
+                }
+            }
+        } else if !sht3_peer_ids.contains(&st.connected_peer) {
+            self.backend
+                .remote_set_volume(&st.connected_host, st.connected_port, vol, Some(mute));
+        }
+    }
     pub(super) fn status_volume_json(&self, st: &State) -> serde_json::Value {
         if !self.backend.available() {
             return serde_json::Value::Null;
@@ -87,34 +112,7 @@ impl Controller {
         if sync_remote && st.is_connected() && !st.connected_host.is_empty() {
             let cur_vol = volume.unwrap_or_else(|| self.backend.get_sink_volume(&sink));
             let cur_mute = mute.unwrap_or_else(|| self.backend.get_sink_mute(&sink));
-            let sht3_handled = {
-                let guard = lock_or_recover(&self.sht3_outbound);
-                if let Some(ref handle) = *guard {
-                    if handle.is_running() {
-                        let _ = handle.set_volume(cur_vol.min(150) as u8);
-                        let _ = handle.set_mute(cur_mute);
-                        true
-                    } else {
-                        false
-                    }
-                } else {
-                    false
-                }
-            };
-            if !sht3_handled {
-                for sess in &st.multiroom_peers {
-                    self.backend
-                        .remote_set_volume(&sess.host, sess.port, cur_vol, Some(cur_mute));
-                }
-                if st.multiroom_peers.is_empty() {
-                    self.backend.remote_set_volume(
-                        &st.connected_host,
-                        st.connected_port,
-                        cur_vol,
-                        Some(cur_mute),
-                    );
-                }
-            }
+            self.broadcast_remote_volume(&st, cur_vol, cur_mute);
             let mut guard = lock_or_recover(&self.state);
             guard.last_synced_volume = cur_vol as i32;
             guard.last_synced_mute = cur_mute;
@@ -137,35 +135,7 @@ impl Controller {
         if vol as i32 == st.last_synced_volume && mute == st.last_synced_mute {
             return false;
         }
-        let sht3_handled = {
-            let guard = lock_or_recover(&self.sht3_outbound);
-            if let Some(ref handle) = *guard {
-                if handle.is_running() {
-                    let _ = handle.set_volume(vol.min(150) as u8);
-                    let _ = handle.set_mute(mute);
-                    true
-                } else {
-                    false
-                }
-            } else {
-                false
-            }
-        };
-        if !sht3_handled {
-            if !st.multiroom_peers.is_empty() {
-                for sess in &st.multiroom_peers {
-                    self.backend
-                        .remote_set_volume(&sess.host, sess.port, vol, Some(mute));
-                }
-            } else {
-                self.backend.remote_set_volume(
-                    &st.connected_host,
-                    st.connected_port,
-                    vol,
-                    Some(mute),
-                );
-            }
-        }
+        self.broadcast_remote_volume(&st, vol, mute);
         let mut guard = lock_or_recover(&self.state);
         guard.last_synced_volume = vol as i32;
         guard.last_synced_mute = mute;

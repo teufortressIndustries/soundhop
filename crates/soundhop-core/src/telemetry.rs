@@ -488,65 +488,75 @@ fn run_audio_capture_loop_unix(
     }
 }
 
+fn probe_network_targets_once(controller: &Controller, stop_flag: &AtomicBool) {
+    if controller.sht3_outbound_active() {
+        controller.sync_sht3_telemetry();
+    }
+
+    let st = controller
+        .state
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .clone();
+    let mut targets: Vec<(String, String, u16)> = Vec::new();
+    let mut seen = HashSet::new();
+
+    if st.is_connected()
+        && !st.connected_host.is_empty()
+        && st.connected_port > 0
+        && is_private_address(&st.connected_host)
+        && !is_own_non_loopback_ip(&st.connected_host)
+    {
+        let id = if st.connected_peer.is_empty() {
+            st.connected_host.clone()
+        } else {
+            st.connected_peer.clone()
+        };
+        if seen.insert(id.clone()) && !controller.is_sht3_peer_active(&id) {
+            targets.push((id, st.connected_host.clone(), st.connected_port));
+        }
+    }
+
+    for sess in &st.multiroom_peers {
+        if !sess.host.is_empty()
+            && sess.port > 0
+            && is_private_address(&sess.host)
+            && !is_own_non_loopback_ip(&sess.host)
+            && seen.insert(sess.peer_id.clone())
+            && !controller.is_sht3_peer_active(&sess.peer_id)
+        {
+            targets.push((sess.peer_id.clone(), sess.host.clone(), sess.port));
+        }
+    }
+
+    for kp in st.known_peers.values() {
+        if targets.len() >= 4 {
+            break;
+        }
+        if !kp.host.is_empty()
+            && kp.port > 0
+            && is_private_address(&kp.host)
+            && !is_own_non_loopback_ip(&kp.host)
+            && seen.insert(kp.id.clone())
+            && !controller.is_sht3_peer_active(&kp.id)
+        {
+            targets.push((kp.id.clone(), kp.host.clone(), kp.port));
+        }
+    }
+
+    for (peer_id, host, port) in targets {
+        if stop_flag.load(Ordering::SeqCst) {
+            return;
+        }
+        if let Some(rtt) = tcp_probe_rtt(&host, port, Duration::from_millis(500)) {
+            controller.telemetry.record_rtt(&peer_id, rtt);
+        }
+    }
+}
+
 fn run_network_probe_loop(controller: Arc<Controller>, stop_flag: Arc<AtomicBool>) {
     while !stop_flag.load(Ordering::SeqCst) {
-        let st = controller
-            .state
-            .lock()
-            .unwrap_or_else(|e| e.into_inner())
-            .clone();
-        let mut targets: Vec<(String, String, u16)> = Vec::new();
-        let mut seen = HashSet::new();
-
-        if st.is_connected()
-            && !st.connected_host.is_empty()
-            && st.connected_port > 0
-            && is_private_address(&st.connected_host)
-            && !is_own_non_loopback_ip(&st.connected_host)
-        {
-            let id = if st.connected_peer.is_empty() {
-                st.connected_host.clone()
-            } else {
-                st.connected_peer.clone()
-            };
-            if seen.insert(id.clone()) {
-                targets.push((id, st.connected_host.clone(), st.connected_port));
-            }
-        }
-
-        for sess in &st.multiroom_peers {
-            if !sess.host.is_empty()
-                && sess.port > 0
-                && is_private_address(&sess.host)
-                && !is_own_non_loopback_ip(&sess.host)
-                && seen.insert(sess.peer_id.clone())
-            {
-                targets.push((sess.peer_id.clone(), sess.host.clone(), sess.port));
-            }
-        }
-
-        for kp in st.known_peers.values() {
-            if targets.len() >= 4 {
-                break;
-            }
-            if !kp.host.is_empty()
-                && kp.port > 0
-                && is_private_address(&kp.host)
-                && !is_own_non_loopback_ip(&kp.host)
-                && seen.insert(kp.id.clone())
-            {
-                targets.push((kp.id.clone(), kp.host.clone(), kp.port));
-            }
-        }
-
-        for (peer_id, host, port) in targets {
-            if stop_flag.load(Ordering::SeqCst) {
-                return;
-            }
-            if let Some(rtt) = tcp_probe_rtt(&host, port, Duration::from_millis(500)) {
-                controller.telemetry.record_rtt(&peer_id, rtt);
-            }
-        }
+        probe_network_targets_once(&controller, &stop_flag);
 
         for _ in 0..10 {
             if stop_flag.load(Ordering::SeqCst) {
@@ -656,5 +666,174 @@ mod tests {
         tracker.update_audio_from_s16le(&[0u8; 64]);
         let snap = tracker.snapshot();
         assert_eq!(snap.audio.dbfs, -60.0);
+    }
+
+    #[test]
+    fn test_network_probe_skips_raw_tcp_when_sht3_active_and_syncs_telemetry() {
+        use std::io::ErrorKind;
+        use std::net::{IpAddr, Ipv4Addr, SocketAddr, TcpListener};
+
+        use crate::backend::linux::LinuxAudioBackend;
+        use crate::config::Config;
+        use crate::constants::{PROTOCOL_VERSION, VERSION};
+        use crate::controller::ConnectOptions;
+        use crate::discovery::{BeaconV3Meta, Peer};
+        use crate::pairing::TrustedPeer;
+        use crate::state::State;
+        use crate::transport::{MockPcmCapture, MockPcmPlayback, PcmCapture, PcmPlayback};
+        use crate::util::{CommandResult, MockRunner};
+
+        let make_runner = || {
+            Arc::new(MockRunner::new(|args, _| {
+                let joined = args.join(" ");
+                let stdout = if joined.contains("info") {
+                    "Server Name: PulseAudio (on PipeWire 1.2.0)\nDefault Sink: alsa_output.pci\n"
+                        .to_string()
+                } else {
+                    String::new()
+                };
+                Ok(CommandResult {
+                    args: args.to_vec(),
+                    returncode: 0,
+                    stdout,
+                    stderr: String::new(),
+                })
+            }))
+        };
+
+        let free_v3_port = {
+            let sock = TcpListener::bind("127.0.0.1:0").unwrap();
+            sock.local_addr().unwrap().port()
+        };
+        let mut srv_cfg = Config::default();
+        srv_cfg.device.id = "srv-probe-sht3".to_string();
+        srv_cfg.sharing.security = "paired".to_string();
+        srv_cfg.sharing.v3_port = free_v3_port;
+        let server_ctrl = Controller::new(
+            Some(srv_cfg),
+            Some(State::default()),
+            Some(Arc::new(LinuxAudioBackend::with_runner(make_runner()))),
+            None,
+            None,
+            false,
+        );
+        server_ctrl.set_save_enabled(false);
+        server_ctrl.set_playback_factory(Arc::new(|_| {
+            let (playback, _) = MockPcmPlayback::pair();
+            Ok(Box::new(playback) as Box<dyn PcmPlayback>)
+        }));
+
+        let k_pair = [0x88u8; 32];
+        server_ctrl.record_trusted_peer(TrustedPeer {
+            device_id: "cli-probe".to_string(),
+            display_name: "Client".to_string(),
+            ed25519_pub: [0x11u8; 32],
+            pairwise_secret: k_pair,
+            fingerprint: "1111-2222-3333-4444".to_string(),
+            paired_at: 100.0,
+        });
+        server_ctrl.start_listener(Some(false)).unwrap();
+        let bound_v3_port = server_ctrl.sht3_manager.listener_addr().unwrap().port();
+
+        let mut cli_cfg = Config::default();
+        cli_cfg.device.id = "cli-probe".to_string();
+        cli_cfg.audio.profile = "pcm-lossless".to_string();
+        let client_ctrl = Arc::new(Controller::new(
+            Some(cli_cfg),
+            Some(State::default()),
+            Some(Arc::new(LinuxAudioBackend::with_runner(make_runner()))),
+            None,
+            None,
+            false,
+        ));
+        client_ctrl.set_save_enabled(false);
+        client_ctrl.set_capture_factory(Arc::new(|| {
+            let cap =
+                MockPcmCapture::sine_wave(440.0, Some(200)).with_pace(Duration::from_millis(15));
+            Ok(Box::new(cap) as Box<dyn PcmCapture>)
+        }));
+        client_ctrl.record_trusted_peer(TrustedPeer {
+            device_id: "srv-probe-sht3".to_string(),
+            display_name: "SHT3 Probe Target".to_string(),
+            ed25519_pub: [0x22u8; 32],
+            pairwise_secret: k_pair,
+            fingerprint: "9999-8888-7777-6666".to_string(),
+            paired_at: 100.0,
+        });
+        client_ctrl.remember_peer_v3_meta(
+            "srv-probe-sht3",
+            BeaconV3Meta {
+                v3_port: Some(bound_v3_port),
+                pair_port: Some(4715),
+                pub_fp: Some("9999-8888-7777-6666".to_string()),
+                caps: vec!["sht3".to_string(), "pcm".to_string()],
+            },
+        );
+
+        let peer = Peer {
+            id: "srv-probe-sht3".to_string(),
+            name: "SHT3 Probe Target".to_string(),
+            host: "127.0.0.1".to_string(),
+            port: 4713,
+            version: VERSION.to_string(),
+            protocol: PROTOCOL_VERSION,
+            security: "paired".to_string(),
+            platform: "linux".to_string(),
+            last_seen: now_secs(),
+            source: "udp".to_string(),
+            rtt_ms: None,
+        };
+        client_ctrl
+            .connect(&peer, ConnectOptions::default())
+            .unwrap();
+
+        // Wait for at least one Pong so sync_sht3_telemetry has a fresh sample.
+        {
+            let guard = client_ctrl.sht3_outbounds.lock().unwrap();
+            guard.get("srv-probe-sht3").unwrap().request_ping().unwrap();
+        }
+        let deadline = Instant::now() + Duration::from_secs(2);
+        loop {
+            let has_pong = {
+                let guard = client_ctrl.sht3_outbounds.lock().unwrap();
+                guard
+                    .get("srv-probe-sht3")
+                    .unwrap()
+                    .telemetry()
+                    .pongs_received
+                    > 0
+            };
+            if has_pong {
+                break;
+            }
+            assert!(Instant::now() < deadline, "timed out waiting for SHT3 pong");
+            thread::sleep(Duration::from_millis(10));
+        }
+
+        // Point connected_port at a non-blocking decoy TcpListener to assert zero raw TCP probes.
+        let decoy = TcpListener::bind(SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), 0)).unwrap();
+        decoy.set_nonblocking(true).unwrap();
+        let decoy_port = decoy.local_addr().unwrap().port();
+        {
+            let mut st = client_ctrl.state.lock().unwrap();
+            st.connected_port = decoy_port;
+            if let Some(s) = st.multiroom_peers.first_mut() {
+                s.port = decoy_port;
+            }
+        }
+
+        let stop_flag = AtomicBool::new(false);
+        probe_network_targets_once(&client_ctrl, &stop_flag);
+
+        assert!(
+            matches!(decoy.accept(), Err(ref e) if e.kind() == ErrorKind::WouldBlock),
+            "probe_network_targets_once must NOT open raw TCP sockets to active SHT3 peers"
+        );
+        assert!(client_ctrl.telemetry.peer_stats("srv-probe-sht3").is_some());
+
+        client_ctrl
+            .disconnect(false, Some(false), false, Some(false), false, false)
+            .unwrap();
+        server_ctrl.stop_listener(Some(false)).unwrap();
     }
 }

@@ -162,7 +162,7 @@ impl Controller {
         store
     }
 
-    fn start_sht3_listener_internal(
+    pub(super) fn start_sht3_listener_internal(
         &self,
         port: u16,
         cfg: &Config,
@@ -508,18 +508,28 @@ impl Controller {
         let removed_state = lock_or_recover(&self.state).remove_trusted_peer(target);
         let disconnected_inbound = self.sht3_manager.disconnect_peer(target);
         let disconnected_outbound = {
-            let mut guard = lock_or_recover(&self.sht3_outbound);
-            if guard
-                .as_ref()
-                .is_some_and(|h| h.server_device_id() == target)
+            let mut handles_to_stop = Vec::new();
             {
-                if let Some(handle) = guard.take() {
-                    handle.stop();
+                let mut guard = lock_or_recover(&self.sht3_outbounds);
+                if let Some(h) = guard.remove(target) {
+                    handles_to_stop.push(h);
                 }
-                true
-            } else {
-                false
+                let matching_keys: Vec<String> = guard
+                    .iter()
+                    .filter(|(_, h)| h.server_device_id() == target)
+                    .map(|(k, _)| k.clone())
+                    .collect();
+                for k in matching_keys {
+                    if let Some(h) = guard.remove(&k) {
+                        handles_to_stop.push(h);
+                    }
+                }
             }
+            let had_any = !handles_to_stop.is_empty();
+            for handle in handles_to_stop {
+                handle.stop();
+            }
+            had_any
         };
         if removed_state {
             self.save();

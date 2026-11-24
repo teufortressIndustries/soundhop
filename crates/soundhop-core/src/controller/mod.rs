@@ -10,6 +10,7 @@ mod volume;
 
 use std::collections::HashMap;
 use std::path::PathBuf;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 
 use thiserror::Error;
@@ -22,7 +23,9 @@ use crate::discovery::{BeaconV3Meta, Peer};
 use crate::pairing::TrustedPeer;
 use crate::state::{KnownPeer, PairedPeer, State};
 use crate::telemetry::{AudioTelemetryMonitor, TelemetrySnapshot, TelemetryTracker};
-use crate::transport::{OutboundSessionHandle, Sht3SessionManager};
+use crate::transport::{
+    AudioProfile, OutboundSessionHandle, Sht3SessionManager, StreamTelemetry, DEFAULT_V3_PORT,
+};
 #[cfg(test)]
 use crate::transport::{PcmCapture, PcmPlaybackFactory, TransportResult};
 use crate::util::{
@@ -31,6 +34,14 @@ use crate::util::{
 };
 
 pub use session::parse_audio_profile;
+
+struct Sht3StreamMetrics {
+    jitter_buf_ms: u16,
+    dropped_frames: u32,
+    frames_sent: u64,
+    bytes_sent: u64,
+    audio_profile: &'static str,
+}
 
 #[derive(Debug, Error)]
 pub enum ControllerError {
@@ -75,7 +86,8 @@ pub struct Controller {
     pub android_session: Arc<AndroidCaptureSession>,
     pub telemetry: Arc<TelemetryTracker>,
     pub sht3_manager: Arc<Sht3SessionManager>,
-    pub(super) sht3_outbound: Mutex<Option<OutboundSessionHandle>>,
+    pub(super) sht3_outbounds: Mutex<HashMap<String, OutboundSessionHandle>>,
+    pub(super) sht3_mode_active: AtomicBool,
     pub(super) peer_v3_meta: Mutex<HashMap<String, BeaconV3Meta>>,
     #[cfg(test)]
     pub(super) playback_factory_override: Mutex<Option<PcmPlaybackFactory>>,
@@ -83,6 +95,8 @@ pub struct Controller {
     #[allow(clippy::type_complexity)]
     pub(super) capture_factory_override:
         Mutex<Option<Arc<dyn Fn() -> TransportResult<Box<dyn PcmCapture>> + Send + Sync>>>,
+    #[cfg(test)]
+    pub(super) capture_creates_null_sink: AtomicBool,
     pub(super) config_path: Option<PathBuf>,
     pub(super) state_path: Option<PathBuf>,
     pub(super) notify_enabled: bool,
@@ -119,12 +133,15 @@ impl Controller {
             android_session: sess,
             telemetry: Arc::new(TelemetryTracker::new()),
             sht3_manager: Arc::new(Sht3SessionManager::new()),
-            sht3_outbound: Mutex::new(None),
+            sht3_outbounds: Mutex::new(HashMap::new()),
+            sht3_mode_active: AtomicBool::new(false),
             peer_v3_meta: Mutex::new(HashMap::new()),
             #[cfg(test)]
             playback_factory_override: Mutex::new(None),
             #[cfg(test)]
             capture_factory_override: Mutex::new(None),
+            #[cfg(test)]
+            capture_creates_null_sink: AtomicBool::new(false),
             config_path,
             state_path,
             notify_enabled,
@@ -155,9 +172,90 @@ impl Controller {
     }
 
     pub fn sht3_outbound_active(&self) -> bool {
-        lock_or_recover(&self.sht3_outbound)
-            .as_ref()
+        let guard = lock_or_recover(&self.sht3_outbounds);
+        !guard.is_empty() && guard.values().all(OutboundSessionHandle::is_running)
+    }
+
+    pub fn has_dead_sht3_session(&self) -> bool {
+        if !self.sht3_mode_active.load(Ordering::Acquire) {
+            return false;
+        }
+        let guard = lock_or_recover(&self.sht3_outbounds);
+        guard.is_empty() || guard.values().any(|h| !h.is_running())
+    }
+
+    pub fn is_sht3_peer_active(&self, peer_id: &str) -> bool {
+        lock_or_recover(&self.sht3_outbounds)
+            .get(peer_id)
             .is_some_and(OutboundSessionHandle::is_running)
+    }
+
+    /// Sync RTT samples from all running SHT3 outbound streams into `TelemetryTracker`.
+    pub fn sync_sht3_telemetry(&self) -> bool {
+        let snapshots: Vec<(String, StreamTelemetry)> = {
+            let guard = lock_or_recover(&self.sht3_outbounds);
+            guard
+                .iter()
+                .filter(|(_, handle)| handle.is_running())
+                .map(|(peer_id, handle)| (peer_id.clone(), handle.telemetry()))
+                .collect()
+        };
+        let mut recorded = false;
+        for (peer_id, stats) in snapshots {
+            if stats.pongs_received > 0 && stats.rtt_us > 0 {
+                let rtt_ms = stats.rtt_us as f64 / 1000.0;
+                self.telemetry.record_rtt(&peer_id, rtt_ms);
+                recorded = true;
+            }
+        }
+        recorded
+    }
+
+    /// Tear down a dead SHT3 outbound session and its virtual sinks while preserving
+    /// `cfg.connection.last_peer` and `auto_paused = false` so auto-connect can recover.
+    pub fn teardown_dead_sht3_session(&self) -> Result<Option<serde_json::Value>, ControllerError> {
+        let _op_guard = lock_or_recover(&self.connect_lock);
+        if !lock_or_recover(&self.state).is_connected() || !self.has_dead_sht3_session() {
+            return Ok(None);
+        }
+        let restore = lock_or_recover(&self.config).connection.restore_default;
+        let res = self.disconnect_internal(false, restore, false, None, false, false, false)?;
+        Ok(Some(res))
+    }
+
+    fn sht3_stream_metrics(&self) -> Option<Sht3StreamMetrics> {
+        let guard = lock_or_recover(&self.sht3_outbounds);
+        if guard.is_empty() {
+            return None;
+        }
+        let mut jitter_buf_ms = 0u16;
+        let mut dropped_frames = 0u32;
+        let mut frames_sent = 0u64;
+        let mut bytes_sent = 0u64;
+        let mut profile_opt: Option<AudioProfile> = None;
+        for handle in guard.values() {
+            let t = handle.telemetry();
+            jitter_buf_ms = jitter_buf_ms.max(t.jitter_buf_ms);
+            dropped_frames = dropped_frames.saturating_add(t.dropped_frames);
+            frames_sent = frames_sent.saturating_add(t.frames_sent);
+            bytes_sent = bytes_sent.saturating_add(t.bytes_sent);
+            if profile_opt.is_none() {
+                profile_opt = AudioProfile::from_audio_params(&handle.audio_params()).ok();
+            }
+        }
+        let audio_profile = match profile_opt {
+            Some(AudioProfile::OpusBalanced) | None => "opus-balanced",
+            Some(AudioProfile::OpusLowLatency) => "opus-low-latency",
+            Some(AudioProfile::OpusLowBandwidth) => "opus-low-bandwidth",
+            Some(AudioProfile::PcmLossless) => "pcm-lossless",
+        };
+        Some(Sht3StreamMetrics {
+            jitter_buf_ms,
+            dropped_frames,
+            frames_sent,
+            bytes_sent,
+            audio_profile,
+        })
     }
 
     #[cfg(test)]
@@ -172,6 +270,12 @@ impl Controller {
         factory: Arc<dyn Fn() -> TransportResult<Box<dyn PcmCapture>> + Send + Sync>,
     ) {
         *lock_or_recover(&self.capture_factory_override) = Some(factory);
+    }
+
+    #[cfg(test)]
+    pub(crate) fn set_capture_creates_null_sink(&self, enabled: bool) {
+        self.capture_creates_null_sink
+            .store(enabled, Ordering::Release);
     }
 
     pub fn set_save_enabled(&self, enabled: bool) {
@@ -363,6 +467,7 @@ impl Controller {
                 None
             };
             let net_stats = self.telemetry.peer_stats(&st.connected_peer);
+            let sht3_metrics = self.sht3_stream_metrics();
             serde_json::json!({
                 "connected": true,
                 "peer_id": st.connected_peer,
@@ -385,6 +490,11 @@ impl Controller {
                 "module_present": module_present,
                 "rtt_ms": net_stats.as_ref().map(|n| n.last_rtt_ms),
                 "jitter_ms": net_stats.as_ref().map(|n| n.jitter_ms),
+                "jitter_buf_ms": sht3_metrics.as_ref().map(|m| m.jitter_buf_ms),
+                "dropped_frames": sht3_metrics.as_ref().map(|m| m.dropped_frames),
+                "frames_sent": sht3_metrics.as_ref().map(|m| m.frames_sent),
+                "bytes_sent": sht3_metrics.as_ref().map(|m| m.bytes_sent),
+                "audio_profile": sht3_metrics.as_ref().map(|m| m.audio_profile),
             })
         } else {
             serde_json::Value::Null
@@ -477,7 +587,26 @@ impl Controller {
             });
         }
         let st_snap = lock_or_recover(&self.state).clone();
-        if st_snap.is_connected() && !self.sht3_outbound_active() {
+        if st_snap.is_connected() && self.has_dead_sht3_session() {
+            if let Ok(Some(res)) = self.teardown_dead_sht3_session() {
+                actions.push("cleared dead SHT3 session".to_string());
+                if let Some(restored) = res.get("restored_to").and_then(|v| v.as_str()) {
+                    if !restored.is_empty() {
+                        actions.push(format!("restored default sink to {restored}"));
+                    }
+                }
+            }
+        } else if !st_snap.is_connected() && self.has_dead_sht3_session() {
+            let handles: Vec<OutboundSessionHandle> = lock_or_recover(&self.sht3_outbounds)
+                .drain()
+                .map(|(_, h)| h)
+                .collect();
+            for h in handles {
+                h.stop();
+            }
+            self.sht3_mode_active.store(false, Ordering::Release);
+            actions.push("cleaned up orphaned SHT3 session handles".to_string());
+        } else if st_snap.is_connected() && !self.sht3_outbound_active() {
             let sink_ok = self
                 .backend
                 .sink_exists(&st_snap.connected_sink)
@@ -502,10 +631,23 @@ impl Controller {
             }
         }
         self.reconcile_listener();
-        let sharing_enabled = lock_or_recover(&self.config).sharing.enabled;
+        let cfg_snap = lock_or_recover(&self.config).clone();
+        let sharing_enabled = cfg_snap.sharing.enabled;
         let has_listener = self.listener_running();
         if sharing_enabled && !has_listener && self.ensure_listener_internal().is_ok() {
             actions.push("resurrected audio listener".to_string());
+        } else if sharing_enabled && !self.is_v3_active() {
+            let v3_port = if cfg_snap.sharing.v3_port == 0 {
+                DEFAULT_V3_PORT
+            } else {
+                cfg_snap.sharing.v3_port
+            };
+            if self
+                .start_sht3_listener_internal(v3_port, &cfg_snap)
+                .is_ok()
+            {
+                actions.push("restarted SHT3 listener".to_string());
+            }
         }
         if let Ok(removed_mics) = self.backend.cleanup_orphaned_remote_mic_modules() {
             if !removed_mics.is_empty() {
@@ -659,5 +801,387 @@ mod tests {
             assert_eq!(st.connected_peer, "peer-1");
             assert!(st.known_peers.contains_key("peer-1"));
         }
+    }
+
+    #[test]
+    fn test_reconcile_clears_dead_sht3_session_and_restarts_v3_listener() {
+        use std::net::TcpListener;
+        use std::sync::atomic::AtomicU32;
+        use std::time::{Duration, Instant};
+
+        use crate::discovery::{BeaconV3Meta, Peer};
+        use crate::pairing::TrustedPeer;
+        use crate::transport::{MockPcmCapture, MockPcmPlayback, PcmCapture, PcmPlayback};
+
+        let make_mock_runner = || {
+            let next_id = Arc::new(AtomicU32::new(301));
+            let active_nulls = Arc::new(Mutex::new(Vec::<(u32, String)>::new()));
+            let unloaded = Arc::new(Mutex::new(Vec::<u32>::new()));
+            let default_sinks = Arc::new(Mutex::new(Vec::<String>::new()));
+            let pa_listener_active = Arc::new(AtomicBool::new(false));
+
+            let next_id_c = Arc::clone(&next_id);
+            let active_nulls_c = Arc::clone(&active_nulls);
+            let unloaded_c = Arc::clone(&unloaded);
+            let default_sinks_c = Arc::clone(&default_sinks);
+            let pa_c = Arc::clone(&pa_listener_active);
+
+            let runner = Arc::new(MockRunner::new(move |args, _| {
+                let joined = args.join(" ");
+                let stdout = if joined.contains("info") {
+                    "Server Name: PulseAudio (on PipeWire 1.2.0)\nDefault Sink: alsa_output.pci\n"
+                        .to_string()
+                } else if joined.contains("set-default-sink") {
+                    if let Some(target) = args.last() {
+                        default_sinks_c.lock().unwrap().push(target.clone());
+                    }
+                    String::new()
+                } else if joined.contains("load-module module-native-protocol-tcp") {
+                    pa_c.store(true, Ordering::SeqCst);
+                    "42\n".to_string()
+                } else if joined.contains("load-module module-null-sink") {
+                    let id = next_id_c.fetch_add(1, Ordering::SeqCst);
+                    let sink_name = args
+                        .iter()
+                        .find_map(|a| a.strip_prefix("sink_name="))
+                        .unwrap_or("soundhop_null")
+                        .to_string();
+                    active_nulls_c.lock().unwrap().push((id, sink_name));
+                    format!("{id}\n")
+                } else if joined.contains("unload-module") {
+                    if let Some(id) = args.last().and_then(|s| s.parse::<u32>().ok()) {
+                        unloaded_c.lock().unwrap().push(id);
+                        active_nulls_c.lock().unwrap().retain(|(mid, _)| *mid != id);
+                        if id == 42 {
+                            pa_c.store(false, Ordering::SeqCst);
+                        }
+                    }
+                    String::new()
+                } else if joined.contains("list short sinks") {
+                    let mut out =
+                        "1\talsa_output.pci\tPipeWire\ts16le 2ch 48000Hz\tRUNNING\n".to_string();
+                    for (id, sname) in active_nulls_c.lock().unwrap().iter() {
+                        out.push_str(&format!(
+                            "{id}\t{sname}\tmodule-null-sink\ts16le 2ch 48000Hz\tRUNNING\n"
+                        ));
+                    }
+                    out
+                } else if joined.contains("list short modules") {
+                    let mut out = String::new();
+                    if pa_c.load(Ordering::SeqCst) {
+                        out.push_str("42\tmodule-native-protocol-tcp\tport=4713\n");
+                    }
+                    for (id, sname) in active_nulls_c.lock().unwrap().iter() {
+                        out.push_str(&format!("{id}\tmodule-null-sink\tsink_name={sname}\n"));
+                    }
+                    out
+                } else {
+                    String::new()
+                };
+                Ok(CommandResult {
+                    args: args.to_vec(),
+                    returncode: 0,
+                    stdout,
+                    stderr: String::new(),
+                })
+            }));
+            (runner, unloaded, default_sinks)
+        };
+
+        let free_v3_port = {
+            let sock = TcpListener::bind("127.0.0.1:0").unwrap();
+            sock.local_addr().unwrap().port()
+        };
+
+        let (srv_runner, _, _) = make_mock_runner();
+        let mut srv_cfg = Config::default();
+        srv_cfg.device.id = "server-dead".to_string();
+        srv_cfg.sharing.security = "trusted-lan".to_string();
+        srv_cfg.sharing.enabled = true;
+        srv_cfg.sharing.v3_port = free_v3_port;
+        let server_ctrl = Controller::new(
+            Some(srv_cfg),
+            Some(State::default()),
+            Some(Arc::new(LinuxAudioBackend::with_runner(srv_runner))),
+            None,
+            None,
+            false,
+        );
+        server_ctrl.set_save_enabled(false);
+        server_ctrl.set_playback_factory(Arc::new(|_| {
+            let (playback, _) = MockPcmPlayback::pair();
+            Ok(Box::new(playback) as Box<dyn PcmPlayback>)
+        }));
+
+        let k_pair = [0x5Au8; 32];
+        server_ctrl.record_trusted_peer(TrustedPeer {
+            device_id: "client-dead".to_string(),
+            display_name: "Client".to_string(),
+            ed25519_pub: [0x11u8; 32],
+            pairwise_secret: k_pair,
+            fingerprint: "1111-2222-3333-4444".to_string(),
+            paired_at: 100.0,
+        });
+        server_ctrl.start_listener(Some(false)).unwrap();
+        let bound_v3_port = server_ctrl.sht3_manager.listener_addr().unwrap().port();
+
+        let (cli_runner, cli_unloaded, cli_default_sinks) = make_mock_runner();
+        let mut cli_cfg = Config::default();
+        cli_cfg.device.id = "client-dead".to_string();
+        cli_cfg.audio.profile = "pcm-lossless".to_string();
+        cli_cfg.connection.restore_default = true;
+        cli_cfg.sharing.enabled = false;
+        let client_ctrl = Controller::new(
+            Some(cli_cfg),
+            Some(State::default()),
+            Some(Arc::new(LinuxAudioBackend::with_runner(cli_runner))),
+            None,
+            None,
+            false,
+        );
+        client_ctrl.set_save_enabled(false);
+        client_ctrl.set_capture_creates_null_sink(true);
+        client_ctrl.set_capture_factory(Arc::new(|| {
+            // Finite 2-frame capture exits cleanly, turning the session into a dead SHT3 zombie.
+            let cap = MockPcmCapture::sine_wave(440.0, Some(2)).with_pace(Duration::from_millis(5));
+            Ok(Box::new(cap) as Box<dyn PcmCapture>)
+        }));
+        client_ctrl.record_trusted_peer(TrustedPeer {
+            device_id: "server-dead".to_string(),
+            display_name: "Dead Peer".to_string(),
+            ed25519_pub: [0x22u8; 32],
+            pairwise_secret: k_pair,
+            fingerprint: "5555-6666-7777-8888".to_string(),
+            paired_at: 100.0,
+        });
+        client_ctrl.remember_peer_v3_meta(
+            "server-dead",
+            BeaconV3Meta {
+                v3_port: Some(bound_v3_port),
+                pair_port: Some(4715),
+                pub_fp: Some("5555-6666-7777-8888".to_string()),
+                caps: vec!["sht3".to_string(), "pcm".to_string()],
+            },
+        );
+
+        let peer = Peer {
+            id: "server-dead".to_string(),
+            name: "Dead Peer".to_string(),
+            host: "127.0.0.1".to_string(),
+            port: 4713,
+            version: VERSION.to_string(),
+            protocol: PROTOCOL_VERSION,
+            security: "paired".to_string(),
+            platform: "linux".to_string(),
+            last_seen: now_secs(),
+            source: "udp".to_string(),
+            rtt_ms: None,
+        };
+        client_ctrl
+            .connect(&peer, ConnectOptions::default())
+            .unwrap();
+
+        let deadline = Instant::now() + Duration::from_secs(2);
+        while !client_ctrl.has_dead_sht3_session() {
+            assert!(
+                Instant::now() < deadline,
+                "timed out waiting for finite SHT3 outbound session to become dead"
+            );
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        assert!(!client_ctrl.sht3_outbound_active());
+        assert!(client_ctrl.state.lock().unwrap().is_connected());
+
+        // reconcile() must tear down the zombie SHT3 session, unload module-null-sink 301,
+        // restore default sink, and preserve last_peer + auto_paused=false for auto-reconnect.
+        let rec = client_ctrl.reconcile();
+        let actions = rec["actions"].as_array().unwrap();
+        assert!(actions
+            .iter()
+            .any(|a| a.as_str() == Some("cleared dead SHT3 session")));
+        assert!(!client_ctrl.state.lock().unwrap().is_connected());
+        assert!(!client_ctrl.has_dead_sht3_session());
+        assert_eq!(
+            client_ctrl.config.lock().unwrap().connection.last_peer,
+            "server-dead"
+        );
+        assert!(!client_ctrl.state.lock().unwrap().auto_paused);
+        assert!(cli_unloaded.lock().unwrap().contains(&301));
+        assert!(cli_default_sinks
+            .lock()
+            .unwrap()
+            .iter()
+            .any(|s| s == "alsa_output.pci"));
+
+        // Verify reconcile() also restarts SHT3 listener when sharing.enabled && !is_v3_active().
+        assert!(server_ctrl.is_v3_active());
+        server_ctrl.sht3_manager.stop_listener();
+        assert!(!server_ctrl.is_v3_active());
+        assert!(server_ctrl.listener_running());
+        let srv_rec = server_ctrl.reconcile();
+        assert!(server_ctrl.is_v3_active());
+        assert!(srv_rec["actions"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|a| a.as_str() == Some("restarted SHT3 listener")));
+        server_ctrl.stop_listener(Some(false)).unwrap();
+    }
+
+    #[test]
+    fn test_sync_sht3_telemetry_and_status_metrics() {
+        use std::net::TcpListener;
+        use std::time::{Duration, Instant};
+
+        use crate::discovery::{BeaconV3Meta, Peer};
+        use crate::pairing::TrustedPeer;
+        use crate::transport::{MockPcmCapture, MockPcmPlayback, PcmCapture, PcmPlayback};
+
+        let make_runner = || {
+            Arc::new(MockRunner::new(|args, _| {
+                let joined = args.join(" ");
+                let stdout = if joined.contains("info") {
+                    "Server Name: PulseAudio (on PipeWire 1.2.0)\nDefault Sink: alsa_output.pci\n"
+                        .to_string()
+                } else {
+                    String::new()
+                };
+                Ok(CommandResult {
+                    args: args.to_vec(),
+                    returncode: 0,
+                    stdout,
+                    stderr: String::new(),
+                })
+            }))
+        };
+
+        let free_v3_port = {
+            let sock = TcpListener::bind("127.0.0.1:0").unwrap();
+            sock.local_addr().unwrap().port()
+        };
+
+        let mut srv_cfg = Config::default();
+        srv_cfg.device.id = "server-tel".to_string();
+        srv_cfg.sharing.security = "paired".to_string();
+        srv_cfg.sharing.v3_port = free_v3_port;
+        let server_ctrl = Controller::new(
+            Some(srv_cfg),
+            Some(State::default()),
+            Some(Arc::new(LinuxAudioBackend::with_runner(make_runner()))),
+            None,
+            None,
+            false,
+        );
+        server_ctrl.set_save_enabled(false);
+        server_ctrl.set_playback_factory(Arc::new(|_| {
+            let (playback, _) = MockPcmPlayback::pair();
+            Ok(Box::new(playback) as Box<dyn PcmPlayback>)
+        }));
+
+        let k_pair = [0x66u8; 32];
+        server_ctrl.record_trusted_peer(TrustedPeer {
+            device_id: "client-tel".to_string(),
+            display_name: "Client".to_string(),
+            ed25519_pub: [0x11u8; 32],
+            pairwise_secret: k_pair,
+            fingerprint: "1111-2222-3333-4444".to_string(),
+            paired_at: 100.0,
+        });
+        server_ctrl.start_listener(Some(false)).unwrap();
+        let bound_v3_port = server_ctrl.sht3_manager.listener_addr().unwrap().port();
+
+        let mut cli_cfg = Config::default();
+        cli_cfg.device.id = "client-tel".to_string();
+        cli_cfg.audio.profile = "pcm-lossless".to_string();
+        let client_ctrl = Controller::new(
+            Some(cli_cfg),
+            Some(State::default()),
+            Some(Arc::new(LinuxAudioBackend::with_runner(make_runner()))),
+            None,
+            None,
+            false,
+        );
+        client_ctrl.set_save_enabled(false);
+        client_ctrl.set_capture_factory(Arc::new(|| {
+            let cap =
+                MockPcmCapture::sine_wave(440.0, Some(200)).with_pace(Duration::from_millis(15));
+            Ok(Box::new(cap) as Box<dyn PcmCapture>)
+        }));
+        client_ctrl.record_trusted_peer(TrustedPeer {
+            device_id: "server-tel".to_string(),
+            display_name: "Telemetry Receiver".to_string(),
+            ed25519_pub: [0x22u8; 32],
+            pairwise_secret: k_pair,
+            fingerprint: "9999-8888-7777-6666".to_string(),
+            paired_at: 100.0,
+        });
+        client_ctrl.remember_peer_v3_meta(
+            "server-tel",
+            BeaconV3Meta {
+                v3_port: Some(bound_v3_port),
+                pair_port: Some(4715),
+                pub_fp: Some("9999-8888-7777-6666".to_string()),
+                caps: vec!["sht3".to_string(), "pcm".to_string()],
+            },
+        );
+
+        let peer = Peer {
+            id: "server-tel".to_string(),
+            name: "Telemetry Receiver".to_string(),
+            host: "127.0.0.1".to_string(),
+            port: 4713,
+            version: VERSION.to_string(),
+            protocol: PROTOCOL_VERSION,
+            security: "paired".to_string(),
+            platform: "linux".to_string(),
+            last_seen: now_secs(),
+            source: "udp".to_string(),
+            rtt_ms: None,
+        };
+        client_ctrl
+            .connect(&peer, ConnectOptions::default())
+            .unwrap();
+
+        // Trigger a Ping/Pong exchange and wait for Pong telemetry.
+        {
+            let guard = client_ctrl.sht3_outbounds.lock().unwrap();
+            let handle = guard.get("server-tel").unwrap();
+            handle.request_ping().unwrap();
+        }
+        let deadline = Instant::now() + Duration::from_secs(2);
+        loop {
+            let ready = {
+                let guard = client_ctrl.sht3_outbounds.lock().unwrap();
+                let t = guard.get("server-tel").unwrap().telemetry();
+                t.pongs_received > 0 && t.frames_sent > 0
+            };
+            if ready {
+                break;
+            }
+            assert!(
+                Instant::now() < deadline,
+                "timed out waiting for SHT3 pong & frames"
+            );
+            std::thread::sleep(Duration::from_millis(10));
+        }
+
+        assert!(client_ctrl.sync_sht3_telemetry());
+        let peer_stats = client_ctrl.telemetry.peer_stats("server-tel").unwrap();
+        assert!(peer_stats.last_rtt_ms > 0.0);
+
+        let status = client_ctrl.status(None);
+        let conn = &status["connection"];
+        assert_eq!(conn["transport"], "sht3");
+        assert_eq!(conn["audio_profile"], "pcm-lossless");
+        assert!(conn["frames_sent"].as_u64().unwrap() > 0);
+        assert!(conn["bytes_sent"].as_u64().unwrap() > 0);
+        assert!(conn["jitter_buf_ms"].is_u64());
+        assert!(conn["dropped_frames"].is_u64());
+        assert!(conn["rtt_ms"].as_f64().unwrap() > 0.0);
+
+        client_ctrl
+            .disconnect(false, Some(false), false, Some(false), false, false)
+            .unwrap();
+        server_ctrl.stop_listener(Some(false)).unwrap();
     }
 }

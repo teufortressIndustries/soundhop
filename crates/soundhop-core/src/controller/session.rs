@@ -2,6 +2,7 @@
 
 use std::net::{IpAddr, SocketAddr};
 use std::path::PathBuf;
+use std::sync::atomic::Ordering;
 use std::time::Duration;
 
 use crate::backend::TunnelParams;
@@ -41,10 +42,31 @@ fn effective_outbound_profile(raw: &str) -> AudioProfile {
     }
 }
 
+struct Sht3PeerTarget {
+    trusted: TrustedPeer,
+    #[cfg_attr(not(target_os = "windows"), allow(dead_code))]
+    meta: BeaconV3Meta,
+    target_ip: IpAddr,
+    v3_port: u16,
+}
+
+enum PeerTransportPlan {
+    Sht3(Box<Sht3PeerTarget>),
+    PaTcp,
+}
+
 impl Controller {
     fn resolve_live_peer(&self, peer: &Peer, cfg: &Config) -> Peer {
+        let probe_port = match (
+            self.lookup_trusted_peer(&peer.id),
+            self.peer_v3_meta(&peer.id)
+                .filter(BeaconV3Meta::supports_sht3),
+        ) {
+            (Some(_), Some(meta)) => meta.v3_port.filter(|&p| p > 0).unwrap_or(peer.port),
+            _ => peer.port,
+        };
         if !is_own_non_loopback_ip(&peer.host)
-            && tcp_probe_rtt(&peer.host, peer.port, Duration::from_millis(800)).is_some()
+            && tcp_probe_rtt(&peer.host, probe_port, Duration::from_millis(800)).is_some()
         {
             return peer.clone();
         }
@@ -56,6 +78,36 @@ impl Controller {
             }
         }
         peer.clone()
+    }
+
+    fn build_sht3_outbound_config(
+        cfg: &Config,
+        target_ip: IpAddr,
+        v3_port: u16,
+        trusted: &TrustedPeer,
+        profile: AudioProfile,
+    ) -> OutboundConfig {
+        let jitter_ms = cfg
+            .connection
+            .latency_ms
+            .map(|ms| ms.clamp(10, 500) as u16)
+            .unwrap_or(40);
+        OutboundConfig::new(
+            cfg.device.id.clone(),
+            SocketAddr::new(target_ip, v3_port),
+            trusted.pairwise_secret,
+        )
+        .with_profile(profile)
+        .with_jitter_ms(jitter_ms)
+    }
+
+    fn resolved_v3_port(cfg: &Config, meta: &BeaconV3Meta) -> u16 {
+        let default_v3_port = if cfg.sharing.v3_port == 0 {
+            DEFAULT_V3_PORT
+        } else {
+            cfg.sharing.v3_port
+        };
+        meta.v3_port.filter(|&p| p > 0).unwrap_or(default_v3_port)
     }
 
     pub fn connect(
@@ -208,6 +260,32 @@ impl Controller {
         #[cfg(test)]
         if let Some(factory) = lock_or_recover(&self.capture_factory_override).clone() {
             let _ = frame_ms;
+            if self.capture_creates_null_sink.load(Ordering::Acquire) {
+                let clean_desc = crate::util::slugify(description, 48);
+                let module_id = self
+                    .backend
+                    .load_module(
+                        "module-null-sink",
+                        &[
+                            format!("sink_name={sink_name}"),
+                            format!("sink_properties=device.description={clean_desc}"),
+                        ],
+                    )
+                    .map_err(|e| {
+                        ControllerError::Message(format!(
+                            "Could not create virtual SHT3 sink {sink_name}: {e}"
+                        ))
+                    })?;
+                return match factory() {
+                    Ok(capture) => Ok((capture, module_id)),
+                    Err(e) => {
+                        let _ = self.backend.unload_module(module_id, true);
+                        Err(ControllerError::Message(format!(
+                            "Could not start SHT3 audio capture: {e}"
+                        )))
+                    }
+                };
+            }
             let capture = factory().map_err(|e| {
                 ControllerError::Message(format!("Could not start SHT3 audio capture: {e}"))
             })?;
@@ -272,12 +350,7 @@ impl Controller {
         cfg: &Config,
         opts: ConnectOptions,
     ) -> Result<serde_json::Value, ControllerError> {
-        let default_v3_port = if cfg.sharing.v3_port == 0 {
-            DEFAULT_V3_PORT
-        } else {
-            cfg.sharing.v3_port
-        };
-        let v3_port = meta.v3_port.filter(|&p| p > 0).unwrap_or(default_v3_port);
+        let v3_port = Self::resolved_v3_port(cfg, meta);
         let target_ip: IpAddr = peer.host.parse().map_err(|e| {
             ControllerError::Message(format!("Invalid peer address {}: {e}", peer.host))
         })?;
@@ -293,7 +366,9 @@ impl Controller {
             )));
         }
 
-        if lock_or_recover(&self.state).is_connected() {
+        if lock_or_recover(&self.state).is_connected()
+            || self.sht3_mode_active.load(Ordering::Acquire)
+        {
             let _ = self.disconnect_internal(false, false, false, Some(false), true, false, false);
         }
 
@@ -308,18 +383,8 @@ impl Controller {
             .unwrap_or(cfg.connection.move_streams && !selective_default);
 
         let profile = effective_outbound_profile(&cfg.audio.profile);
-        let jitter_ms = cfg
-            .connection
-            .latency_ms
-            .map(|ms| ms.clamp(10, 500) as u16)
-            .unwrap_or(40);
-        let outbound_cfg = OutboundConfig::new(
-            cfg.device.id.clone(),
-            SocketAddr::new(target_ip, v3_port),
-            trusted.pairwise_secret,
-        )
-        .with_profile(profile)
-        .with_jitter_ms(jitter_ms);
+        let outbound_cfg =
+            Self::build_sht3_outbound_config(cfg, target_ip, v3_port, trusted, profile);
 
         let (capture, module_id) =
             self.create_outbound_capture(&sink_name, &peer.display_name(), profile.frame_ms())?;
@@ -336,12 +401,18 @@ impl Controller {
             }
         };
 
-        *lock_or_recover(&self.sht3_outbound) = Some(handle);
+        lock_or_recover(&self.sht3_outbounds).insert(peer.id.clone(), handle);
+        self.sht3_mode_active.store(true, Ordering::Release);
 
+        let connected_name = if opts.keep_local {
+            format!("{} + Local", peer.display_name())
+        } else {
+            peer.display_name()
+        };
         {
             let mut st = lock_or_recover(&self.state);
             st.connected_peer = peer.id.clone();
-            st.connected_name = peer.display_name();
+            st.connected_name = connected_name;
             st.connected_host = peer.host.clone();
             st.connected_port = v3_port;
             st.connected_sink = sink_name.clone();
@@ -355,7 +426,7 @@ impl Controller {
                 module_id,
             }];
             st.combine_module = 0;
-            st.keep_local = false;
+            st.keep_local = opts.keep_local;
             st.connected_since = now_secs();
             st.connected_by = opts.by.clone();
             st.auto_paused = false;
@@ -384,6 +455,33 @@ impl Controller {
             );
         }
         Ok(self.connection_dict())
+    }
+
+    fn rollback_multi_sessions(
+        &self,
+        inserted_sht3_ids: &[String],
+        sessions: &[ActivePeerSession],
+    ) {
+        if !inserted_sht3_ids.is_empty() {
+            let handles: Vec<_> = {
+                let mut guard = lock_or_recover(&self.sht3_outbounds);
+                inserted_sht3_ids
+                    .iter()
+                    .filter_map(|id| guard.remove(id))
+                    .collect()
+            };
+            for h in handles {
+                h.stop();
+            }
+            if lock_or_recover(&self.sht3_outbounds).is_empty() {
+                self.sht3_mode_active.store(false, Ordering::Release);
+            }
+        }
+        for s in sessions {
+            if s.module_id > 0 {
+                let _ = self.backend.unload_module(s.module_id, true);
+            }
+        }
     }
 
     /// Connect to multiple peers simultaneously (or 1 peer + local speakers) using `module-combine-sink`.
@@ -416,27 +514,81 @@ impl Controller {
             .map(|p| self.resolve_live_peer(p, &cfg))
             .collect();
         let peers = &resolved_peers[..];
+
+        let mut plans = Vec::with_capacity(peers.len());
         for p in peers {
             self.validate_peer(p, &cfg)?;
-            if let Some(rtt) = tcp_probe_rtt(&p.host, p.port, Duration::from_millis(1500)) {
-                self.telemetry.record_rtt(&p.id, rtt);
+            let trusted_peer = self.lookup_trusted_peer(&p.id);
+            let v3_meta = self.peer_v3_meta(&p.id);
+            if let (Some(trusted), Some(meta)) =
+                (trusted_peer, v3_meta.filter(BeaconV3Meta::supports_sht3))
+            {
+                let v3_port = Self::resolved_v3_port(&cfg, &meta);
+                let target_ip: IpAddr = p.host.parse().map_err(|e| {
+                    ControllerError::Message(format!("Invalid peer address {}: {e}", p.host))
+                })?;
+                if let Some(rtt) = tcp_probe_rtt(&p.host, v3_port, Duration::from_millis(1500)) {
+                    self.telemetry.record_rtt(&p.id, rtt);
+                } else {
+                    return Err(ControllerError::Message(format!(
+                        "{} is not accepting encrypted SHT3 audio at {}:{}. Is it online and sharing?",
+                        p.display_name(),
+                        p.host,
+                        v3_port
+                    )));
+                }
+                plans.push(PeerTransportPlan::Sht3(Box::new(Sht3PeerTarget {
+                    trusted,
+                    meta,
+                    target_ip,
+                    v3_port,
+                })));
             } else {
-                return Err(ControllerError::Message(format!(
-                    "{} is not accepting audio at {}:{}",
-                    p.display_name(),
-                    p.host,
-                    p.port
-                )));
+                if is_paired_security_mode(&p.security) {
+                    return Err(ControllerError::Message(
+                        "This device requires pairing over encrypted SHT3 transport. Pair with it first."
+                            .to_string(),
+                    ));
+                }
+                if let Some(rtt) = tcp_probe_rtt(&p.host, p.port, Duration::from_millis(1500)) {
+                    self.telemetry.record_rtt(&p.id, rtt);
+                } else {
+                    return Err(ControllerError::Message(format!(
+                        "{} is not accepting audio at {}:{}",
+                        p.display_name(),
+                        p.host,
+                        p.port
+                    )));
+                }
+                plans.push(PeerTransportPlan::PaTcp);
             }
         }
 
-        if lock_or_recover(&self.state).is_connected() {
+        // On Windows, WASAPI loopback already keeps local speakers active, so a single
+        // SHT3 peer with `keep_local` connects directly via SHT3 without module-combine-sink.
+        #[cfg(target_os = "windows")]
+        if peers.len() == 1 && opts.keep_local {
+            if let Some(PeerTransportPlan::Sht3(target)) = plans.first() {
+                return self.connect_sht3_internal(
+                    &peers[0],
+                    &target.trusted,
+                    &target.meta,
+                    &cfg,
+                    opts,
+                );
+            }
+        }
+
+        if lock_or_recover(&self.state).is_connected()
+            || self.sht3_mode_active.load(Ordering::Acquire)
+        {
             let _ = self.disconnect_internal(false, false, false, Some(false), true, false, false);
         }
         self.remember_previous_default();
 
         let mut sessions = Vec::new();
         let mut slave_sinks = Vec::new();
+        let mut inserted_sht3_ids = Vec::new();
         if opts.keep_local {
             let prev = lock_or_recover(&self.state).previous_default_sink.clone();
             let local_sink = self.local_default_candidate(&prev);
@@ -445,36 +597,85 @@ impl Controller {
             }
         }
 
-        for p in peers {
+        let profile = effective_outbound_profile(&cfg.audio.profile);
+        for (p, plan) in peers.iter().zip(plans.iter()) {
             let sname = Self::sink_name_for(p);
-            let cookie_path = self.tunnel_cookie_path(p, &cfg);
-            match self.backend.connect_tunnel(&TunnelParams {
-                host: &p.host,
-                port: p.port,
-                sink_name: &sname,
-                description: &p.display_name(),
-                reconnect_delay_ms: cfg.connection.reconnect_delay_ms,
-                latency_ms: cfg.connection.latency_ms,
-                extra_args: &cfg.connection.extra_tunnel_args,
-                cookie_path,
-            }) {
-                Ok(mid) => {
+            match plan {
+                PeerTransportPlan::Sht3(target) => {
+                    let outbound_cfg = Self::build_sht3_outbound_config(
+                        &cfg,
+                        target.target_ip,
+                        target.v3_port,
+                        &target.trusted,
+                        profile,
+                    );
+                    let (capture, module_id) = match self.create_outbound_capture(
+                        &sname,
+                        &p.display_name(),
+                        profile.frame_ms(),
+                    ) {
+                        Ok(res) => res,
+                        Err(e) => {
+                            self.rollback_multi_sessions(&inserted_sht3_ids, &sessions);
+                            return Err(e);
+                        }
+                    };
+                    let handle = match self.sht3_manager.start_outbound(outbound_cfg, capture) {
+                        Ok(h) => h,
+                        Err(e) => {
+                            if module_id > 0 {
+                                let _ = self.backend.unload_module(module_id, true);
+                            }
+                            self.rollback_multi_sessions(&inserted_sht3_ids, &sessions);
+                            return Err(ControllerError::Message(format!(
+                                "Could not establish encrypted SHT3 audio stream to {}: {e}",
+                                p.display_name()
+                            )));
+                        }
+                    };
+                    lock_or_recover(&self.sht3_outbounds).insert(p.id.clone(), handle);
+                    inserted_sht3_ids.push(p.id.clone());
+                    self.sht3_mode_active.store(true, Ordering::Release);
                     slave_sinks.push(sname.clone());
                     sessions.push(ActivePeerSession {
                         peer_id: p.id.clone(),
                         name: p.display_name(),
                         host: p.host.clone(),
-                        port: p.port,
+                        port: target.v3_port,
                         sink_name: sname,
-                        module_id: mid,
+                        module_id,
                     });
                     self.remember_peer(p);
                 }
-                Err(e) => {
-                    for s in &sessions {
-                        let _ = self.backend.unload_module(s.module_id, true);
+                PeerTransportPlan::PaTcp => {
+                    let cookie_path = self.tunnel_cookie_path(p, &cfg);
+                    match self.backend.connect_tunnel(&TunnelParams {
+                        host: &p.host,
+                        port: p.port,
+                        sink_name: &sname,
+                        description: &p.display_name(),
+                        reconnect_delay_ms: cfg.connection.reconnect_delay_ms,
+                        latency_ms: cfg.connection.latency_ms,
+                        extra_args: &cfg.connection.extra_tunnel_args,
+                        cookie_path,
+                    }) {
+                        Ok(mid) => {
+                            slave_sinks.push(sname.clone());
+                            sessions.push(ActivePeerSession {
+                                peer_id: p.id.clone(),
+                                name: p.display_name(),
+                                host: p.host.clone(),
+                                port: p.port,
+                                sink_name: sname,
+                                module_id: mid,
+                            });
+                            self.remember_peer(p);
+                        }
+                        Err(e) => {
+                            self.rollback_multi_sessions(&inserted_sht3_ids, &sessions);
+                            return Err(e.into());
+                        }
                     }
-                    return Err(e.into());
                 }
             }
         }
@@ -488,9 +689,7 @@ impl Controller {
             {
                 Ok(id) => id,
                 Err(e) => {
-                    for s in &sessions {
-                        let _ = self.backend.unload_module(s.module_id, true);
-                    }
+                    self.rollback_multi_sessions(&inserted_sht3_ids, &sessions);
                     return Err(e.into());
                 }
             };
@@ -624,7 +823,7 @@ impl Controller {
     }
 
     #[allow(clippy::too_many_arguments)]
-    fn disconnect_internal(
+    pub(super) fn disconnect_internal(
         &self,
         forget: bool,
         restore: bool,
@@ -635,9 +834,14 @@ impl Controller {
         stop_android: bool,
     ) -> Result<serde_json::Value, ControllerError> {
         let mut removed = Vec::new();
-        if let Some(handle) = lock_or_recover(&self.sht3_outbound).take() {
+        let sht3_handles: Vec<_> = {
+            let mut guard = lock_or_recover(&self.sht3_outbounds);
+            guard.drain().map(|(_, h)| h).collect()
+        };
+        for handle in sht3_handles {
             handle.stop();
         }
+        self.sht3_mode_active.store(false, Ordering::Release);
         if (stop_android || all_tunnels) && self.android_session.is_active() {
             let _ = self.android_session.stop();
         }
@@ -1185,5 +1389,321 @@ mod tests {
             .unwrap();
         assert!(!client_ctrl.sht3_outbound_active());
         server_ctrl.stop_listener(Some(false)).unwrap();
+    }
+
+    #[test]
+    fn test_paired_sht3_keep_local_multiroom_volume_revoke_and_rollback() {
+        use std::net::TcpListener;
+        use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
+        use std::time::{Duration, Instant};
+
+        use crate::constants::MULTIROOM_SINK_NAME;
+        use crate::discovery::BeaconV3Meta;
+        use crate::pairing::TrustedPeer;
+        use crate::transport::{MockPcmCapture, MockPcmPlayback, PcmCapture, PcmPlayback};
+
+        let make_server = |dev_id: &str| {
+            let free_port = {
+                let sock = TcpListener::bind("127.0.0.1:0").unwrap();
+                sock.local_addr().unwrap().port()
+            };
+            let runner = Arc::new(MockRunner::new(|args, _| {
+                let joined = args.join(" ");
+                let stdout = if joined.contains("info") {
+                    "Server Name: PulseAudio (on PipeWire 1.2.0)\nDefault Sink: alsa_output.pci\n"
+                        .to_string()
+                } else {
+                    String::new()
+                };
+                Ok(CommandResult {
+                    args: args.to_vec(),
+                    returncode: 0,
+                    stdout,
+                    stderr: String::new(),
+                })
+            }));
+            let mut cfg = Config::default();
+            cfg.device.id = dev_id.to_string();
+            cfg.sharing.security = "paired".to_string();
+            cfg.sharing.v3_port = free_port;
+            let ctrl = Controller::new(
+                Some(cfg),
+                Some(State::default()),
+                Some(Arc::new(LinuxAudioBackend::with_runner(runner))),
+                None,
+                None,
+                false,
+            );
+            ctrl.set_save_enabled(false);
+            let pb_handle_slot = Arc::new(Mutex::new(None));
+            let pb_slot_c = Arc::clone(&pb_handle_slot);
+            ctrl.set_playback_factory(Arc::new(move |_| {
+                let (playback, handle) = MockPcmPlayback::pair();
+                *pb_slot_c.lock().unwrap() = Some(handle);
+                Ok(Box::new(playback) as Box<dyn PcmPlayback>)
+            }));
+            (ctrl, pb_handle_slot)
+        };
+
+        let (srv1, pb1) = make_server("srv-sht3-1");
+        let (srv2, pb2) = make_server("srv-sht3-2");
+        let k1 = [0xA1u8; 32];
+        let k2 = [0xB2u8; 32];
+        srv1.record_trusted_peer(TrustedPeer {
+            device_id: "cli-multi".to_string(),
+            display_name: "Client".to_string(),
+            ed25519_pub: [0x11u8; 32],
+            pairwise_secret: k1,
+            fingerprint: "1111-1111-1111-1111".to_string(),
+            paired_at: 100.0,
+        });
+        srv2.record_trusted_peer(TrustedPeer {
+            device_id: "cli-multi".to_string(),
+            display_name: "Client".to_string(),
+            ed25519_pub: [0x11u8; 32],
+            pairwise_secret: k2,
+            fingerprint: "1111-1111-1111-1111".to_string(),
+            paired_at: 100.0,
+        });
+        srv1.start_listener(Some(false)).unwrap();
+        srv2.start_listener(Some(false)).unwrap();
+        let port1 = srv1.sht3_manager.listener_addr().unwrap().port();
+        let port2 = srv2.sht3_manager.listener_addr().unwrap().port();
+
+        let tunnel_calls = Arc::new(Mutex::new(0usize));
+        let tunnel_calls_c = Arc::clone(&tunnel_calls);
+        let unloaded = Arc::new(Mutex::new(Vec::<u32>::new()));
+        let unloaded_c = Arc::clone(&unloaded);
+        let combine_slaves = Arc::new(Mutex::new(Vec::<String>::new()));
+        let combine_slaves_c = Arc::clone(&combine_slaves);
+        let fail_combine = Arc::new(AtomicBool::new(false));
+        let fail_combine_c = Arc::clone(&fail_combine);
+        let active_sinks = Arc::new(Mutex::new(Vec::<(u32, String)>::new()));
+        let active_sinks_c = Arc::clone(&active_sinks);
+        let next_mod = Arc::new(AtomicU32::new(301));
+        let next_mod_c = Arc::clone(&next_mod);
+
+        let cli_runner = Arc::new(MockRunner::new(move |args, _| {
+            let joined = args.join(" ");
+            if joined.contains("module-tunnel-sink") {
+                *tunnel_calls_c.lock().unwrap() += 1;
+            }
+            if joined.contains("module-combine-sink") {
+                if fail_combine_c.load(Ordering::SeqCst) {
+                    return Ok(CommandResult {
+                        args: args.to_vec(),
+                        returncode: 1,
+                        stdout: String::new(),
+                        stderr: "combine failed".to_string(),
+                    });
+                }
+                if let Some(slaves) = args.iter().find_map(|a| a.strip_prefix("slaves=")) {
+                    *combine_slaves_c.lock().unwrap() =
+                        slaves.split(',').map(String::from).collect();
+                }
+                let id = next_mod_c.fetch_add(1, Ordering::SeqCst);
+                active_sinks_c
+                    .lock()
+                    .unwrap()
+                    .push((id, MULTIROOM_SINK_NAME.to_string()));
+                return Ok(CommandResult {
+                    args: args.to_vec(),
+                    returncode: 0,
+                    stdout: format!("{id}\n"),
+                    stderr: String::new(),
+                });
+            }
+            let stdout = if joined.contains("info") {
+                "Server Name: PulseAudio (on PipeWire 1.2.0)\nDefault Sink: alsa_output.pci\n"
+                    .to_string()
+            } else if joined.contains("load-module module-null-sink") {
+                let id = next_mod_c.fetch_add(1, Ordering::SeqCst);
+                let sname = args
+                    .iter()
+                    .find_map(|a| a.strip_prefix("sink_name="))
+                    .unwrap_or("soundhop_null")
+                    .to_string();
+                active_sinks_c.lock().unwrap().push((id, sname));
+                format!("{id}\n")
+            } else if joined.contains("unload-module") {
+                if let Some(id) = args.last().and_then(|s| s.parse::<u32>().ok()) {
+                    unloaded_c.lock().unwrap().push(id);
+                    active_sinks_c.lock().unwrap().retain(|(mid, _)| *mid != id);
+                }
+                String::new()
+            } else if joined.contains("list short sinks") {
+                let mut out =
+                    "1\talsa_output.pci\tPipeWire\ts16le 2ch 48000Hz\tRUNNING\n".to_string();
+                for (id, sname) in active_sinks_c.lock().unwrap().iter() {
+                    out.push_str(&format!(
+                        "{id}\t{sname}\tmodule-null-sink\ts16le 2ch 48000Hz\tRUNNING\n"
+                    ));
+                }
+                out
+            } else {
+                String::new()
+            };
+            Ok(CommandResult {
+                args: args.to_vec(),
+                returncode: 0,
+                stdout,
+                stderr: String::new(),
+            })
+        }));
+
+        let mut cli_cfg = Config::default();
+        cli_cfg.device.id = "cli-multi".to_string();
+        cli_cfg.audio.profile = "pcm-lossless".to_string();
+        let client_ctrl = Controller::new(
+            Some(cli_cfg),
+            Some(State::default()),
+            Some(Arc::new(LinuxAudioBackend::with_runner(cli_runner))),
+            None,
+            None,
+            false,
+        );
+        client_ctrl.set_save_enabled(false);
+        client_ctrl.set_capture_creates_null_sink(true);
+        client_ctrl.set_capture_factory(Arc::new(|| {
+            let cap =
+                MockPcmCapture::sine_wave(440.0, Some(300)).with_pace(Duration::from_millis(15));
+            Ok(Box::new(cap) as Box<dyn PcmCapture>)
+        }));
+
+        for (id, name, k, port) in [
+            ("srv-sht3-1", "Room One", k1, port1),
+            ("srv-sht3-2", "Room Two", k2, port2),
+        ] {
+            client_ctrl.record_trusted_peer(TrustedPeer {
+                device_id: id.to_string(),
+                display_name: name.to_string(),
+                ed25519_pub: [0x33u8; 32],
+                pairwise_secret: k,
+                fingerprint: "2222-3333-4444-5555".to_string(),
+                paired_at: 100.0,
+            });
+            client_ctrl.remember_peer_v3_meta(
+                id,
+                BeaconV3Meta {
+                    v3_port: Some(port),
+                    pair_port: Some(4715),
+                    pub_fp: Some("2222-3333-4444-5555".to_string()),
+                    caps: vec!["sht3".to_string(), "pcm".to_string()],
+                },
+            );
+        }
+
+        let peer1 = Peer {
+            id: "srv-sht3-1".to_string(),
+            name: "Room One".to_string(),
+            host: "127.0.0.1".to_string(),
+            port: 4713,
+            version: VERSION.to_string(),
+            protocol: PROTOCOL_VERSION,
+            security: "paired".to_string(),
+            platform: "linux".to_string(),
+            last_seen: now_secs(),
+            source: "udp".to_string(),
+            rtt_ms: None,
+        };
+        let peer2 = Peer {
+            id: "srv-sht3-2".to_string(),
+            name: "Room Two".to_string(),
+            ..peer1.clone()
+        };
+
+        // 1. Single paired SHT3 peer with keep_local: true connects via SHT3.
+        let single_res = client_ctrl
+            .connect(
+                &peer1,
+                ConnectOptions {
+                    keep_local: true,
+                    ..Default::default()
+                },
+            )
+            .expect("paired SHT3 keep_local connect should succeed");
+        assert_eq!(single_res["connected"], true);
+        assert_eq!(single_res["transport"], "sht3");
+        assert_eq!(single_res["keep_local"], true);
+        assert_eq!(*tunnel_calls.lock().unwrap(), 0);
+        assert!(client_ctrl.sht3_outbound_active());
+
+        // 2. Multi-room with 2 paired SHT3 peers + keep_local: true creates null sinks + combine sink.
+        let multi_res = client_ctrl
+            .connect_multi(
+                &[peer1.clone(), peer2.clone()],
+                ConnectOptions {
+                    keep_local: true,
+                    ..Default::default()
+                },
+            )
+            .expect("multi-room paired SHT3 connect should succeed");
+        assert_eq!(multi_res["connected"], true);
+        assert_eq!(multi_res["transport"], "sht3");
+        assert_eq!(multi_res["multiroom"], true);
+        assert_eq!(multi_res["keep_local"], true);
+        assert_eq!(*tunnel_calls.lock().unwrap(), 0);
+        assert_eq!(client_ctrl.sht3_outbounds.lock().unwrap().len(), 2);
+        let slaves = combine_slaves.lock().unwrap().clone();
+        assert!(slaves.contains(&"alsa_output.pci".to_string()));
+        assert!(slaves.contains(&Controller::sink_name_for(&peer1)));
+        assert!(slaves.contains(&Controller::sink_name_for(&peer2)));
+
+        // 3. Volume/mute broadcasts across all SHT3 outbound handles.
+        client_ctrl.set_volume(Some(55), Some(true), true);
+        let vol_deadline = Instant::now() + Duration::from_secs(2);
+        loop {
+            let v1 = pb1
+                .lock()
+                .unwrap()
+                .as_ref()
+                .map(|h| (h.volume(), h.is_muted()));
+            let v2 = pb2
+                .lock()
+                .unwrap()
+                .as_ref()
+                .map(|h| (h.volume(), h.is_muted()));
+            if v1 == Some((55, true)) && v2 == Some((55, true)) {
+                break;
+            }
+            assert!(
+                Instant::now() < vol_deadline,
+                "timed out waiting for SHT3 multiroom volume/mute broadcast: v1={v1:?} v2={v2:?}"
+            );
+            std::thread::sleep(Duration::from_millis(15));
+        }
+
+        // 4. revoke_trusted_peer removes & stops the matching peer in sht3_outbounds.
+        let revoke = client_ctrl.revoke_trusted_peer("srv-sht3-2").unwrap();
+        assert_eq!(revoke["revoked"], true);
+        assert_eq!(revoke["disconnected"], true);
+        assert_eq!(client_ctrl.sht3_outbounds.lock().unwrap().len(), 1);
+        assert!(!client_ctrl.is_sht3_peer_active("srv-sht3-2"));
+        assert!(client_ctrl.is_sht3_peer_active("srv-sht3-1"));
+
+        // 5. Rollback when module-combine-sink fails must stop sht3_outbounds & unload null-sinks.
+        client_ctrl
+            .disconnect(false, Some(false), false, Some(false), false, false)
+            .unwrap();
+        // Re-trust srv-sht3-2 for rollback test.
+        client_ctrl.record_trusted_peer(TrustedPeer {
+            device_id: "srv-sht3-2".to_string(),
+            display_name: "Room Two".to_string(),
+            ed25519_pub: [0x33u8; 32],
+            pairwise_secret: k2,
+            fingerprint: "2222-3333-4444-5555".to_string(),
+            paired_at: 100.0,
+        });
+        unloaded.lock().unwrap().clear();
+        fail_combine.store(true, Ordering::SeqCst);
+        let rollback_err = client_ctrl.connect_multi(&[peer1, peer2], ConnectOptions::default());
+        assert!(rollback_err.is_err());
+        assert!(client_ctrl.sht3_outbounds.lock().unwrap().is_empty());
+        assert!(!client_ctrl.sht3_outbound_active());
+        assert!(!client_ctrl.has_dead_sht3_session());
+        assert_eq!(unloaded.lock().unwrap().len(), 2);
+
+        srv1.stop_listener(Some(false)).unwrap();
+        srv2.stop_listener(Some(false)).unwrap();
     }
 }

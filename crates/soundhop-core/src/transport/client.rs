@@ -4,15 +4,44 @@ use std::io::Write;
 use std::net::{SocketAddr, TcpStream};
 use std::time::Duration;
 
+use socket2::{SockRef, TcpKeepalive};
+
 use crate::transport::crypto::{
-    compute_client_hello_mac, generate_nonce, verify_server_hello_mac, AeadSession,
-    EphemeralKeypair, Role, SessionKeys,
+    compute_client_hello_mac, generate_nonce, verify_server_hello_mac, AeadOpenHalf, AeadSealHalf,
+    AeadSession, EphemeralKeypair, Role, SessionKeys,
 };
 use crate::transport::wire::{
     AudioParams, ClientHello, ControlMessage, DecryptedFrame, EncryptedFrame, FrameType,
     HandshakeStatus, PingPayload, ServerHello,
 };
-use crate::transport::{TransportError, TransportResult, SHT3_VERSION};
+use crate::transport::{
+    TransportError, TransportResult, AEAD_TAG_LEN, FRAME_HEADER_LEN, MAX_PAYLOAD_LEN, SHT3_VERSION,
+};
+
+const DEFAULT_CONNECT_TIMEOUT: Duration = Duration::from_secs(3);
+const DEFAULT_BOUNDED_WRITE_TIMEOUT: Duration = Duration::from_secs(2);
+const KEEPALIVE_IDLE_TIME: Duration = Duration::from_secs(5);
+const KEEPALIVE_INTERVAL: Duration = Duration::from_secs(2);
+const INITIAL_WIRE_SCRATCH_CAP: usize = FRAME_HEADER_LEN + MAX_PAYLOAD_LEN + AEAD_TAG_LEN;
+
+pub(crate) fn bounded_write_timeout(io_timeout: Option<Duration>) -> Option<Duration> {
+    io_timeout.or(Some(DEFAULT_BOUNDED_WRITE_TIMEOUT))
+}
+
+pub(crate) fn configure_socket_defaults(
+    stream: &TcpStream,
+    read_timeout: Option<Duration>,
+    write_timeout: Option<Duration>,
+) -> TransportResult<()> {
+    stream.set_nodelay(true)?;
+    let keepalive = TcpKeepalive::new()
+        .with_time(KEEPALIVE_IDLE_TIME)
+        .with_interval(KEEPALIVE_INTERVAL);
+    SockRef::from(stream).set_tcp_keepalive(&keepalive)?;
+    stream.set_read_timeout(read_timeout)?;
+    stream.set_write_timeout(write_timeout)?;
+    Ok(())
+}
 
 /// Configuration for [`Sht3ClientConnection::connect`].
 #[derive(Debug, Clone)]
@@ -20,6 +49,7 @@ pub struct Sht3ClientConfig {
     pub client_device_id: String,
     pub audio_params: AudioParams,
     pub io_timeout: Option<Duration>,
+    pub connect_timeout: Duration,
 }
 
 impl Sht3ClientConfig {
@@ -28,18 +58,103 @@ impl Sht3ClientConfig {
             client_device_id: client_device_id.into(),
             audio_params,
             io_timeout: Some(Duration::from_secs(10)),
+            connect_timeout: DEFAULT_CONNECT_TIMEOUT,
         }
     }
 }
 
 /// Authenticated, encrypted client-side SHT3 connection.
 pub struct Sht3ClientConnection {
-    stream: TcpStream,
-    session: AeadSession,
+    writer: Sht3ClientWriter,
+    open: AeadOpenHalf,
     server_device_id: String,
     audio_params: AudioParams,
     initial_volume: u8,
     initial_muted: bool,
+}
+
+/// Outbound write half of a split [`Sht3ClientConnection`], reusing a pre-allocated wire buffer.
+pub struct Sht3ClientWriter {
+    stream: TcpStream,
+    seal: AeadSealHalf,
+    wire_scratch: Vec<u8>,
+}
+
+impl Sht3ClientWriter {
+    fn seal_and_write(
+        &mut self,
+        frame_type: FrameType,
+        flags: u8,
+        timestamp_samples: u32,
+        payload: &[u8],
+    ) -> TransportResult<()> {
+        let frame = self
+            .seal
+            .seal_frame(frame_type, flags, timestamp_samples, payload)?;
+        frame.write_into_buf(&mut self.wire_scratch, &mut self.stream)?;
+        Ok(())
+    }
+
+    pub fn send_audio(
+        &mut self,
+        frame_type: FrameType,
+        flags: u8,
+        timestamp_samples: u32,
+        encoded_audio: &[u8],
+    ) -> TransportResult<()> {
+        self.seal_and_write(frame_type, flags, timestamp_samples, encoded_audio)
+    }
+
+    pub fn send_control(&mut self, msg: &ControlMessage) -> TransportResult<()> {
+        let encoded = msg.encode();
+        self.seal_and_write(FrameType::Control, 0, 0, &encoded)?;
+        self.stream.flush()?;
+        Ok(())
+    }
+
+    pub fn send_ping(&mut self, ping: &PingPayload) -> TransportResult<()> {
+        let encoded = ping.encode();
+        self.seal_and_write(FrameType::Ping, 0, 0, &encoded)?;
+        self.stream.flush()?;
+        Ok(())
+    }
+
+    pub fn send_close(&mut self) -> TransportResult<()> {
+        self.seal_and_write(FrameType::Close, 0, 0, &[])?;
+        self.stream.flush()?;
+        Ok(())
+    }
+
+    pub fn flush(&mut self) -> TransportResult<()> {
+        self.stream.flush()?;
+        Ok(())
+    }
+
+    pub fn frames_remaining(&self) -> u64 {
+        self.seal.frames_remaining()
+    }
+}
+
+/// Inbound read half of a split [`Sht3ClientConnection`].
+pub struct Sht3ClientReader {
+    stream: TcpStream,
+    open: AeadOpenHalf,
+}
+
+impl Sht3ClientReader {
+    pub fn recv_frame(&mut self) -> TransportResult<DecryptedFrame> {
+        let encrypted = EncryptedFrame::read_from(&mut self.stream)?;
+        let payload = self.open.open_frame(&encrypted)?;
+        Ok(DecryptedFrame {
+            header: encrypted.header,
+            payload,
+        })
+    }
+
+    pub fn set_read_timeout(&self, dur: Option<Duration>) -> TransportResult<()> {
+        self.stream.set_read_timeout(dur)?;
+        Ok(())
+    }
 }
 
 impl Sht3ClientConnection {
@@ -49,10 +164,12 @@ impl Sht3ClientConnection {
         config: Sht3ClientConfig,
         k_pair: &[u8; 32],
     ) -> TransportResult<Self> {
-        let mut stream = TcpStream::connect(addr)?;
-        stream.set_nodelay(true)?;
-        stream.set_read_timeout(config.io_timeout)?;
-        stream.set_write_timeout(config.io_timeout)?;
+        let mut stream = TcpStream::connect_timeout(&addr, config.connect_timeout)?;
+        configure_socket_defaults(
+            &stream,
+            config.io_timeout,
+            bounded_write_timeout(config.io_timeout),
+        )?;
 
         let client_eph = EphemeralKeypair::generate();
         let client_pk = client_eph.public_bytes();
@@ -117,16 +234,32 @@ impl Sht3ClientConnection {
             &server_hello.server_nonce,
             &full_transcript,
         )?;
-        let session = AeadSession::new(Role::Client, &keys);
+        let (seal, open) = AeadSession::new(Role::Client, &keys).split();
 
         Ok(Self {
-            stream,
-            session,
+            writer: Sht3ClientWriter {
+                stream,
+                seal,
+                wire_scratch: Vec::with_capacity(INITIAL_WIRE_SCRATCH_CAP),
+            },
+            open,
             server_device_id: server_hello.server_device_id,
             audio_params: server_hello.audio_params,
             initial_volume: server_hello.initial_volume,
             initial_muted: server_hello.initial_muted,
         })
+    }
+
+    /// Split this connection into independent write and read halves for full-duplex operation.
+    pub fn into_split(self) -> TransportResult<(Sht3ClientWriter, Sht3ClientReader)> {
+        let read_stream = self.writer.stream.try_clone()?;
+        Ok((
+            self.writer,
+            Sht3ClientReader {
+                stream: read_stream,
+                open: self.open,
+            },
+        ))
     }
 
     pub fn server_device_id(&self) -> &str {
@@ -145,6 +278,10 @@ impl Sht3ClientConnection {
         self.initial_muted
     }
 
+    pub fn frames_remaining(&self) -> u64 {
+        self.writer.frames_remaining()
+    }
+
     pub fn send_audio(
         &mut self,
         frame_type: FrameType,
@@ -152,51 +289,34 @@ impl Sht3ClientConnection {
         timestamp_samples: u32,
         encoded_audio: &[u8],
     ) -> TransportResult<()> {
-        let frame = self
-            .session
-            .seal_frame(frame_type, flags, timestamp_samples, encoded_audio)?;
-        frame.write_to(&mut self.stream)?;
-        Ok(())
+        self.writer
+            .send_audio(frame_type, flags, timestamp_samples, encoded_audio)
     }
 
     pub fn send_control(&mut self, msg: &ControlMessage) -> TransportResult<()> {
-        let encoded = msg.encode();
-        let frame = self
-            .session
-            .seal_frame(FrameType::Control, 0, 0, &encoded)?;
-        frame.write_to(&mut self.stream)?;
-        self.stream.flush()?;
-        Ok(())
+        self.writer.send_control(msg)
     }
 
     pub fn send_ping(&mut self, ping: &PingPayload) -> TransportResult<()> {
-        let encoded = ping.encode();
-        let frame = self.session.seal_frame(FrameType::Ping, 0, 0, &encoded)?;
-        frame.write_to(&mut self.stream)?;
-        self.stream.flush()?;
-        Ok(())
+        self.writer.send_ping(ping)
     }
 
     pub fn send_close(&mut self) -> TransportResult<()> {
-        let frame = self.session.seal_frame(FrameType::Close, 0, 0, &[])?;
-        frame.write_to(&mut self.stream)?;
-        self.stream.flush()?;
-        Ok(())
+        self.writer.send_close()
     }
 
     pub fn flush(&mut self) -> TransportResult<()> {
-        self.stream.flush()?;
-        Ok(())
+        self.writer.flush()
     }
 
     pub fn set_read_timeout(&self, dur: Option<Duration>) -> TransportResult<()> {
-        self.stream.set_read_timeout(dur)?;
+        self.writer.stream.set_read_timeout(dur)?;
         Ok(())
     }
 
     pub fn recv_frame(&mut self) -> TransportResult<DecryptedFrame> {
-        let encrypted = EncryptedFrame::read_from(&mut self.stream)?;
-        let payload = self.session.open_frame(&encrypted)?;
+        let encrypted = EncryptedFrame::read_from(&mut self.writer.stream)?;
+        let payload = self.open.open_frame(&encrypted)?;
         Ok(DecryptedFrame {
             header: encrypted.header,
             payload,
@@ -442,5 +562,148 @@ mod tests {
         assert!(matches!(c_err2, TransportError::AuthRejected(_)));
 
         server_handle.join().unwrap();
+    }
+
+    #[test]
+    fn into_split_concurrent_full_duplex_audio_and_telemetry() {
+        let k_pair = [0x6B; 32];
+        let trust = Arc::new(InMemoryTrustStore::new());
+        trust.insert("duplex-client", k_pair);
+
+        let listener = Sht3Listener::bind(
+            "127.0.0.1:0".parse().unwrap(),
+            Sht3ServerConfig::new("duplex-server"),
+            trust,
+        )
+        .unwrap();
+        let addr = listener.local_addr().unwrap();
+
+        let server_handle = thread::spawn(move || {
+            let mut conn = listener.accept().unwrap();
+            let mut audio_count = 0usize;
+            let mut saw_ping = false;
+            let mut saw_ctrl = false;
+            loop {
+                let frame = conn.recv_frame().unwrap();
+                match frame.header.frame_type {
+                    FrameType::AudioPcm => {
+                        audio_count += 1;
+                    }
+                    FrameType::Ping => {
+                        let ping = PingPayload::decode(&frame.payload).unwrap();
+                        conn.send_pong(&PongPayload {
+                            client_time_us: ping.client_time_us,
+                            jitter_buf_ms: 40,
+                            dropped_frames: 0,
+                        })
+                        .unwrap();
+                        saw_ping = true;
+                    }
+                    FrameType::Control => {
+                        assert_eq!(
+                            ControlMessage::decode(&frame.payload).unwrap(),
+                            ControlMessage::SetVolume(55)
+                        );
+                        conn.send_control(&ControlMessage::VolumeState {
+                            volume: 55,
+                            muted: false,
+                        })
+                        .unwrap();
+                        saw_ctrl = true;
+                    }
+                    FrameType::Close => break,
+                    _ => {}
+                }
+            }
+            assert_eq!(audio_count, 20);
+            assert!(saw_ping && saw_ctrl);
+        });
+
+        let client_cfg = Sht3ClientConfig::new(
+            "duplex-client",
+            AudioProfile::PcmLossless.to_audio_params(40),
+        );
+        assert_eq!(client_cfg.connect_timeout, Duration::from_secs(3));
+        let conn = Sht3ClientConnection::connect(addr, client_cfg, &k_pair).unwrap();
+        let (mut writer, mut reader) = conn.into_split().unwrap();
+        reader
+            .set_read_timeout(Some(Duration::from_secs(2)))
+            .unwrap();
+
+        let initial_remaining = writer.frames_remaining();
+
+        let reader_thread = thread::spawn(move || {
+            let mut got_pong = false;
+            let mut got_vol = false;
+            while !(got_pong && got_vol) {
+                let frame = reader.recv_frame().unwrap();
+                match frame.header.frame_type {
+                    FrameType::Pong => {
+                        let pong = PongPayload::decode(&frame.payload).unwrap();
+                        assert_eq!(pong.client_time_us, 42_000);
+                        got_pong = true;
+                    }
+                    FrameType::Control => {
+                        assert_eq!(
+                            ControlMessage::decode(&frame.payload).unwrap(),
+                            ControlMessage::VolumeState {
+                                volume: 55,
+                                muted: false,
+                            }
+                        );
+                        got_vol = true;
+                    }
+                    other => panic!("unexpected server frame: {other:?}"),
+                }
+            }
+        });
+
+        let dummy_pcm = vec![0x12u8; 64];
+        for i in 0..20u32 {
+            writer
+                .send_audio(FrameType::AudioPcm, 0, i * 960, &dummy_pcm)
+                .unwrap();
+            if i == 5 {
+                writer
+                    .send_ping(&PingPayload {
+                        client_time_us: 42_000,
+                    })
+                    .unwrap();
+            }
+            if i == 10 {
+                writer.send_control(&ControlMessage::SetVolume(55)).unwrap();
+            }
+        }
+        writer.flush().unwrap();
+        assert_eq!(writer.frames_remaining(), initial_remaining - 22);
+
+        reader_thread.join().unwrap();
+        writer.send_close().unwrap();
+        assert_eq!(writer.frames_remaining(), initial_remaining - 23);
+        server_handle.join().unwrap();
+    }
+
+    #[test]
+    fn connect_timeout_bounds_unresponsive_peer() {
+        let mut cfg = Sht3ClientConfig::new(
+            "timeout-client",
+            AudioProfile::PcmLossless.to_audio_params(40),
+        );
+        assert_eq!(cfg.connect_timeout, Duration::from_secs(3));
+        cfg.connect_timeout = Duration::from_millis(60);
+
+        // TEST-NET-1 (RFC 5737) blackhole address: either times out in ~60ms or fails immediately
+        // with NetworkUnreachable/HostUnreachable in offline environments.
+        let blackhole: SocketAddr = "192.0.2.1:4714".parse().unwrap();
+        let start = std::time::Instant::now();
+        let err = Sht3ClientConnection::connect(blackhole, cfg, &[0x11; 32])
+            .err()
+            .expect("connect to blackhole must fail");
+        assert!(matches!(err, TransportError::Io(_)));
+        assert!(
+            start.elapsed() < Duration::from_secs(1),
+            "connect_timeout took too long: {:?}",
+            start.elapsed()
+        );
     }
 }

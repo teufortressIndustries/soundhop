@@ -118,7 +118,7 @@ pub fn verify_server_hello_mac(
 }
 
 fn compute_domain_hmac(key: &[u8; 32], domain: &[u8], data: &[u8]) -> [u8; 32] {
-    let mut mac = <HmacSha256 as Mac>::new_from_slice(key).expect("HMAC accepts 32-byte keys");
+    let mut mac = hmac_from_key(key);
     mac.update(domain);
     mac.update(data);
     let result = mac.finalize().into_bytes();
@@ -128,10 +128,18 @@ fn compute_domain_hmac(key: &[u8; 32], domain: &[u8], data: &[u8]) -> [u8; 32] {
 }
 
 fn verify_domain_hmac(key: &[u8; 32], domain: &[u8], data: &[u8], expected: &[u8; 32]) -> bool {
-    let mut mac = <HmacSha256 as Mac>::new_from_slice(key).expect("HMAC accepts 32-byte keys");
+    let mut mac = hmac_from_key(key);
     mac.update(domain);
     mac.update(data);
     mac.verify_slice(expected).is_ok()
+}
+
+/// Construct `Hmac<Sha256>` infallibly from a 32-byte key by zero-padding to the
+/// 64-byte SHA-256 block size (RFC 2104 key normalization without `.expect()`).
+fn hmac_from_key(key: &[u8; 32]) -> HmacSha256 {
+    let mut padded = Zeroizing::new([0u8; 64]);
+    padded[..32].copy_from_slice(key);
+    <HmacSha256 as KeyInit>::new((&*padded).into())
 }
 
 /// Directional session keys & 4-byte nonce prefixes derived via HKDF-SHA256.
@@ -203,50 +211,29 @@ pub enum Role {
     Server,
 }
 
-/// Stateful ChaCha20-Poly1305 AEAD session enforcing monotonic per-direction sequence numbers.
-pub struct AeadSession {
-    send_cipher: ChaCha20Poly1305,
-    recv_cipher: ChaCha20Poly1305,
-    send_iv: [u8; 4],
-    recv_iv: [u8; 4],
+/// Outbound encryption half of an [`AeadSession`], zeroizing its IV and sequence counter on drop.
+pub struct AeadSealHalf {
+    cipher: ChaCha20Poly1305,
+    iv: [u8; 4],
     send_seq: u64,
-    recv_expected_seq: u64,
 }
 
-impl Drop for AeadSession {
+impl Drop for AeadSealHalf {
     fn drop(&mut self) {
-        self.send_iv.zeroize();
-        self.recv_iv.zeroize();
+        self.iv.zeroize();
         self.send_seq.zeroize();
-        self.recv_expected_seq.zeroize();
     }
 }
 
-impl AeadSession {
-    /// Construct a directional `AeadSession` from derived [`SessionKeys`].
-    pub fn new(role: Role, keys: &SessionKeys) -> Self {
-        let (send_key, recv_key, send_iv, recv_iv) = match role {
-            Role::Client => (&keys.k_c2s, &keys.k_s2c, keys.iv_c2s, keys.iv_s2c),
-            Role::Server => (&keys.k_s2c, &keys.k_c2s, keys.iv_s2c, keys.iv_c2s),
-        };
-        Self {
-            send_cipher: ChaCha20Poly1305::new(Key::from_slice(send_key)),
-            recv_cipher: ChaCha20Poly1305::new(Key::from_slice(recv_key)),
-            send_iv,
-            recv_iv,
-            send_seq: 0,
-            recv_expected_seq: 0,
-        }
-    }
-
+impl AeadSealHalf {
     /// Next outbound sequence number to be assigned.
     pub fn send_seq(&self) -> u64 {
         self.send_seq
     }
 
-    /// Next expected inbound sequence number.
-    pub fn recv_expected_seq(&self) -> u64 {
-        self.recv_expected_seq
+    /// Number of frames that can still be sealed before [`MAX_FRAMES_PER_KEY`] is reached.
+    pub fn frames_remaining(&self) -> u64 {
+        MAX_FRAMES_PER_KEY.saturating_sub(self.send_seq)
     }
 
     /// Encrypt `plaintext` into an [`EncryptedFrame`] bound to its 16-byte plaintext header AAD.
@@ -275,9 +262,9 @@ impl AeadSession {
             timestamp_samples,
         };
         let aad = header.to_bytes();
-        let nonce_bytes = build_nonce(&self.send_iv, header.seq);
+        let nonce_bytes = build_nonce(&self.iv, header.seq);
         let ciphertext_and_tag = self
-            .send_cipher
+            .cipher
             .encrypt(
                 Nonce::from_slice(&nonce_bytes),
                 Payload {
@@ -292,6 +279,27 @@ impl AeadSession {
             header,
             ciphertext_and_tag,
         })
+    }
+}
+
+/// Inbound decryption half of an [`AeadSession`], zeroizing its IV and sequence counter on drop.
+pub struct AeadOpenHalf {
+    cipher: ChaCha20Poly1305,
+    iv: [u8; 4],
+    recv_expected_seq: u64,
+}
+
+impl Drop for AeadOpenHalf {
+    fn drop(&mut self) {
+        self.iv.zeroize();
+        self.recv_expected_seq.zeroize();
+    }
+}
+
+impl AeadOpenHalf {
+    /// Next expected inbound sequence number.
+    pub fn recv_expected_seq(&self) -> u64 {
+        self.recv_expected_seq
     }
 
     /// Authenticate and decrypt `frame`, enforcing strict monotonic `seq == expected_seq`.
@@ -321,9 +329,9 @@ impl AeadSession {
         }
 
         let aad = frame.header.to_bytes();
-        let nonce_bytes = build_nonce(&self.recv_iv, frame.header.seq);
+        let nonce_bytes = build_nonce(&self.iv, frame.header.seq);
         let plaintext = self
-            .recv_cipher
+            .cipher
             .decrypt(
                 Nonce::from_slice(&nonce_bytes),
                 Payload {
@@ -337,6 +345,72 @@ impl AeadSession {
 
         self.recv_expected_seq += 1;
         Ok(plaintext)
+    }
+}
+
+/// Stateful ChaCha20-Poly1305 AEAD session enforcing monotonic per-direction sequence numbers.
+pub struct AeadSession {
+    seal: AeadSealHalf,
+    open: AeadOpenHalf,
+}
+
+impl AeadSession {
+    /// Construct a directional `AeadSession` from derived [`SessionKeys`].
+    pub fn new(role: Role, keys: &SessionKeys) -> Self {
+        let (send_key, recv_key, send_iv, recv_iv) = match role {
+            Role::Client => (&keys.k_c2s, &keys.k_s2c, keys.iv_c2s, keys.iv_s2c),
+            Role::Server => (&keys.k_s2c, &keys.k_c2s, keys.iv_s2c, keys.iv_c2s),
+        };
+        Self {
+            seal: AeadSealHalf {
+                cipher: ChaCha20Poly1305::new(Key::from_slice(send_key)),
+                iv: send_iv,
+                send_seq: 0,
+            },
+            open: AeadOpenHalf {
+                cipher: ChaCha20Poly1305::new(Key::from_slice(recv_key)),
+                iv: recv_iv,
+                recv_expected_seq: 0,
+            },
+        }
+    }
+
+    /// Split this session into independent outbound (`AeadSealHalf`) and inbound (`AeadOpenHalf`) halves
+    /// for concurrent full-duplex operation.
+    pub fn split(self) -> (AeadSealHalf, AeadOpenHalf) {
+        (self.seal, self.open)
+    }
+
+    /// Next outbound sequence number to be assigned.
+    pub fn send_seq(&self) -> u64 {
+        self.seal.send_seq()
+    }
+
+    /// Next expected inbound sequence number.
+    pub fn recv_expected_seq(&self) -> u64 {
+        self.open.recv_expected_seq()
+    }
+
+    /// Number of outbound frames remaining before rekey is required.
+    pub fn frames_remaining(&self) -> u64 {
+        self.seal.frames_remaining()
+    }
+
+    /// Encrypt `plaintext` into an [`EncryptedFrame`] bound to its 16-byte plaintext header AAD.
+    pub fn seal_frame(
+        &mut self,
+        frame_type: FrameType,
+        flags: u8,
+        timestamp_samples: u32,
+        plaintext: &[u8],
+    ) -> TransportResult<EncryptedFrame> {
+        self.seal
+            .seal_frame(frame_type, flags, timestamp_samples, plaintext)
+    }
+
+    /// Authenticate and decrypt `frame`, enforcing strict monotonic `seq == expected_seq`.
+    pub fn open_frame(&mut self, frame: &EncryptedFrame) -> TransportResult<Vec<u8>> {
+        self.open.open_frame(frame)
     }
 }
 
@@ -449,5 +523,44 @@ mod tests {
         let eph = EphemeralKeypair::generate();
         let err = eph.diffie_hellman(&[0u8; 32]).unwrap_err();
         assert!(matches!(err, TransportError::Crypto(_)));
+    }
+
+    #[test]
+    fn split_halves_encrypt_decrypt_and_track_frames_remaining() {
+        let (client, server) = derive_pair();
+        let (mut c_seal, mut c_open) = client.split();
+        let (mut s_seal, mut s_open) = server.split();
+
+        assert_eq!(c_seal.send_seq(), 0);
+        assert_eq!(c_seal.frames_remaining(), MAX_FRAMES_PER_KEY);
+        assert_eq!(s_open.recv_expected_seq(), 0);
+
+        let f0 = c_seal
+            .seal_frame(FrameType::AudioOpus, 0, 0, b"split-frame-0")
+            .unwrap();
+        assert_eq!(c_seal.send_seq(), 1);
+        assert_eq!(c_seal.frames_remaining(), MAX_FRAMES_PER_KEY - 1);
+
+        let f1 = s_seal
+            .seal_frame(FrameType::Pong, 0, 0, b"split-pong")
+            .unwrap();
+        assert_eq!(s_seal.frames_remaining(), MAX_FRAMES_PER_KEY - 1);
+
+        assert_eq!(s_open.open_frame(&f0).unwrap(), b"split-frame-0");
+        assert_eq!(s_open.recv_expected_seq(), 1);
+
+        assert_eq!(c_open.open_frame(&f1).unwrap(), b"split-pong");
+        assert_eq!(c_open.recv_expected_seq(), 1);
+    }
+
+    #[test]
+    fn hmac_from_key_matches_new_from_slice() {
+        let key = [0x5C; 32];
+        let data = b"rfc2104-equivalence-check";
+        let mut legacy = <HmacSha256 as Mac>::new_from_slice(&key).unwrap();
+        legacy.update(CLIENT_HELLO_MAC_DOMAIN);
+        legacy.update(data);
+        let expected: [u8; 32] = legacy.finalize().into_bytes().into();
+        assert_eq!(compute_client_hello_mac(&key, data), expected);
     }
 }

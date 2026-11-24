@@ -480,27 +480,38 @@ impl Daemon {
             let cfg = lock_or_recover(&self.controller.config).clone();
 
             if st.is_connected() {
-                if let Some(rtt) = tcp_probe_rtt(
-                    &st.connected_host,
-                    st.connected_port,
-                    Duration::from_millis(1200),
-                ) {
+                if self.controller.has_dead_sht3_session() {
+                    let _ = self.controller.teardown_dead_sht3_session();
                     offline_count = 0;
-                    self.controller
-                        .telemetry
-                        .record_rtt(&st.connected_peer, rtt);
                 } else {
-                    offline_count += 1;
-                    if offline_count >= OFFLINE_PROBE_LIMIT {
-                        let _ = self.controller.disconnect(
-                            false,
-                            None,
-                            false,
-                            Some(true),
-                            false,
-                            false,
-                        );
+                    let sht3_active = self.controller.sht3_outbound_active();
+                    if sht3_active {
+                        self.controller.sync_sht3_telemetry();
+                    }
+                    if sht3_active && self.controller.is_sht3_peer_active(&st.connected_peer) {
                         offline_count = 0;
+                    } else if let Some(rtt) = tcp_probe_rtt(
+                        &st.connected_host,
+                        st.connected_port,
+                        Duration::from_millis(1200),
+                    ) {
+                        offline_count = 0;
+                        self.controller
+                            .telemetry
+                            .record_rtt(&st.connected_peer, rtt);
+                    } else {
+                        offline_count += 1;
+                        if offline_count >= OFFLINE_PROBE_LIMIT {
+                            let _ = self.controller.disconnect(
+                                false,
+                                None,
+                                false,
+                                Some(true),
+                                false,
+                                false,
+                            );
+                            offline_count = 0;
+                        }
                     }
                 }
             } else if cfg.connection.auto_connect
