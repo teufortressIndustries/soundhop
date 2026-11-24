@@ -117,6 +117,27 @@ pub trait AudioCodec: Send {
     /// Conceal one missing/lost frame using Packet Loss Concealment (PLC).
     /// Appends one frame of interleaved `i16` samples to `out_pcm` and returns sample count.
     fn decode_plc(&mut self, out_pcm: &mut Vec<i16>) -> TransportResult<usize>;
+
+    /// Reset internal encoder/decoder predictor state (e.g. across stream discontinuities).
+    fn reset(&mut self) {}
+
+    /// Dynamically adjust target encoder bitrate in kbps (no-op for fixed-rate codecs).
+    fn set_bitrate_kbps(&mut self, _kbps: u16) -> TransportResult<()> {
+        Ok(())
+    }
+
+    /// Decode an incoming packet with in-band FEC recovery enabled when supported.
+    /// Defaults to [`AudioCodec::decode`].
+    fn decode_fec(&mut self, packet: &[u8], out_pcm: &mut Vec<i16>) -> TransportResult<usize> {
+        self.decode(packet, out_pcm)
+    }
+}
+
+/// Returns `true` when every PCM sample's absolute amplitude is at or below `threshold`.
+#[inline]
+pub fn is_digital_silence(pcm: &[i16], threshold: i16) -> bool {
+    let limit = i32::from(threshold);
+    pcm.iter().all(|&s| i32::from(s).abs() <= limit)
 }
 
 /// Uncompressed 16-bit little-endian PCM codec (always available, zero external deps).
@@ -212,6 +233,10 @@ impl AudioCodec for PcmCodec {
 pub struct OpusCodec {
     encoder: opus2::Encoder,
     decoder: opus2::Decoder,
+    sample_rate: u32,
+    opus_channels: opus2::Channels,
+    application: opus2::Application,
+    target_bps: i32,
     frame_samples_per_channel: usize,
     channels: usize,
     scratch_enc: Vec<u8>,
@@ -220,8 +245,35 @@ pub struct OpusCodec {
 
 #[cfg(feature = "opus")]
 impl OpusCodec {
-    /// Create a new `OpusCodec` configured from [`AudioParams`].
+    fn configure_encoder(encoder: &mut opus2::Encoder, bps: i32) -> TransportResult<()> {
+        let kbps = bps / 1000;
+        let complexity = if kbps >= 96 { 8 } else { 6 };
+        let signal = if kbps >= 96 {
+            opus2::Signal::Music
+        } else {
+            opus2::Signal::Auto
+        };
+        encoder
+            .set_bitrate(opus2::Bitrate::Bits(bps))
+            .map_err(|e| TransportError::Codec(format!("Opus set_bitrate failed: {e}")))?;
+        let _ = encoder.set_complexity(complexity);
+        let _ = encoder.set_vbr(true);
+        let _ = encoder.set_signal(signal);
+        let _ = encoder.set_inband_fec(true);
+        let _ = encoder.set_packet_loss_perc(5);
+        Ok(())
+    }
+
+    /// Create a new `OpusCodec` configured from [`AudioParams`] with `Application::LowDelay`.
     pub fn from_params(params: &AudioParams) -> TransportResult<Self> {
+        Self::from_params_with_application(params, opus2::Application::LowDelay)
+    }
+
+    /// Create a new `OpusCodec` configured from [`AudioParams`] and an explicit Opus [`opus2::Application`].
+    pub fn from_params_with_application(
+        params: &AudioParams,
+        application: opus2::Application,
+    ) -> TransportResult<Self> {
         if params.codec != CodecId::Opus {
             return Err(TransportError::Codec(
                 "OpusCodec requires CodecId::Opus".into(),
@@ -244,20 +296,11 @@ impl OpusCodec {
             return Err(TransportError::Codec("zero Opus frame size".into()));
         }
 
-        let mut encoder = opus2::Encoder::new(
-            params.sample_rate,
-            opus_channels,
-            opus2::Application::LowDelay,
-        )
-        .map_err(|e| TransportError::Codec(format!("Opus encoder init failed: {e}")))?;
+        let mut encoder = opus2::Encoder::new(params.sample_rate, opus_channels, application)
+            .map_err(|e| TransportError::Codec(format!("Opus encoder init failed: {e}")))?;
 
         let target_bps = i32::from(params.bitrate_kbps.clamp(16, 510)) * 1000;
-        encoder
-            .set_bitrate(opus2::Bitrate::Bits(target_bps))
-            .map_err(|e| TransportError::Codec(format!("Opus set_bitrate failed: {e}")))?;
-        let _ = encoder.set_signal(opus2::Signal::Music);
-        let _ = encoder.set_vbr(true);
-        let _ = encoder.set_inband_fec(false);
+        Self::configure_encoder(&mut encoder, target_bps)?;
 
         let decoder = opus2::Decoder::new(params.sample_rate, opus_channels)
             .map_err(|e| TransportError::Codec(format!("Opus decoder init failed: {e}")))?;
@@ -265,6 +308,10 @@ impl OpusCodec {
         Ok(Self {
             encoder,
             decoder,
+            sample_rate: params.sample_rate,
+            opus_channels,
+            application,
+            target_bps,
             frame_samples_per_channel,
             channels,
             scratch_enc: vec![0u8; MAX_PAYLOAD_LEN],
@@ -285,9 +332,33 @@ impl OpusCodec {
     /// Dynamically adjust target Opus encoder bitrate (e.g. from `ControlMessage::BitrateHint`).
     pub fn set_bitrate_kbps(&mut self, kbps: u16) -> TransportResult<()> {
         let bps = i32::from(kbps.clamp(16, 510)) * 1000;
-        self.encoder
-            .set_bitrate(opus2::Bitrate::Bits(bps))
-            .map_err(|e| TransportError::Codec(format!("Opus set_bitrate failed: {e}")))
+        Self::configure_encoder(&mut self.encoder, bps)?;
+        self.target_bps = bps;
+        Ok(())
+    }
+
+    fn decode_inner(
+        &mut self,
+        packet: &[u8],
+        fec: bool,
+        out_pcm: &mut Vec<i16>,
+    ) -> TransportResult<usize> {
+        if packet.is_empty() {
+            return self.decode_plc(out_pcm);
+        }
+        let decoded_per_ch = self
+            .decoder
+            .decode(packet, &mut self.scratch_dec, fec)
+            .map_err(|e| {
+                TransportError::Codec(if fec {
+                    format!("Opus FEC decode failed: {e}")
+                } else {
+                    format!("Opus decode failed: {e}")
+                })
+            })?;
+        let total_samples = decoded_per_ch * self.channels;
+        out_pcm.extend_from_slice(&self.scratch_dec[..total_samples]);
+        Ok(total_samples)
     }
 }
 
@@ -322,16 +393,7 @@ impl AudioCodec for OpusCodec {
     }
 
     fn decode(&mut self, packet: &[u8], out_pcm: &mut Vec<i16>) -> TransportResult<usize> {
-        if packet.is_empty() {
-            return self.decode_plc(out_pcm);
-        }
-        let decoded_per_ch = self
-            .decoder
-            .decode(packet, &mut self.scratch_dec, false)
-            .map_err(|e| TransportError::Codec(format!("Opus decode failed: {e}")))?;
-        let total_samples = decoded_per_ch * self.channels;
-        out_pcm.extend_from_slice(&self.scratch_dec[..total_samples]);
-        Ok(total_samples)
+        self.decode_inner(packet, false, out_pcm)
     }
 
     fn decode_plc(&mut self, out_pcm: &mut Vec<i16>) -> TransportResult<usize> {
@@ -342,6 +404,31 @@ impl AudioCodec for OpusCodec {
         let total_samples = decoded_per_ch * self.channels;
         out_pcm.extend_from_slice(&self.scratch_dec[..total_samples]);
         Ok(total_samples)
+    }
+
+    fn reset(&mut self) {
+        if self.encoder.reset_state().is_err() {
+            if let Ok(enc) =
+                opus2::Encoder::new(self.sample_rate, self.opus_channels, self.application)
+            {
+                self.encoder = enc;
+            }
+        }
+        let _ = Self::configure_encoder(&mut self.encoder, self.target_bps);
+
+        if self.decoder.reset_state().is_err() {
+            if let Ok(dec) = opus2::Decoder::new(self.sample_rate, self.opus_channels) {
+                self.decoder = dec;
+            }
+        }
+    }
+
+    fn set_bitrate_kbps(&mut self, kbps: u16) -> TransportResult<()> {
+        OpusCodec::set_bitrate_kbps(self, kbps)
+    }
+
+    fn decode_fec(&mut self, packet: &[u8], out_pcm: &mut Vec<i16>) -> TransportResult<usize> {
+        self.decode_inner(packet, true, out_pcm)
     }
 }
 
@@ -534,6 +621,187 @@ mod tests {
                 plc_energy > 100_000,
                 "expected non-silent Opus PLC output for {profile:?}, energy={plc_energy}"
             );
+        }
+    }
+
+    #[test]
+    fn is_digital_silence_handles_thresholds_and_extremes() {
+        assert!(is_digital_silence(&[], 0));
+        assert!(is_digital_silence(&[0, 0, 0], 0));
+        assert!(is_digital_silence(&[-3, 0, 4, -4], 4));
+        assert!(!is_digital_silence(&[-3, 5, 0], 4));
+        assert!(!is_digital_silence(&[i16::MIN], 4));
+        assert!(!is_digital_silence(&[i16::MIN], i16::MAX));
+        assert!(!is_digital_silence(&[0], -1));
+    }
+
+    #[test]
+    fn pcm_codec_trait_reset_bitrate_and_fec_defaults() {
+        let mut codec: Box<dyn AudioCodec> =
+            Box::new(PcmCodec::from_profile(AudioProfile::PcmLossless).unwrap());
+        codec.reset();
+        codec.set_bitrate_kbps(64).unwrap();
+        let pcm = sine_stereo_frame(960, 440.0, 0);
+        let mut pkt = Vec::new();
+        codec.encode(&pcm, &mut pkt).unwrap();
+        let mut out = Vec::new();
+        let decoded = codec.decode_fec(&pkt, &mut out).unwrap();
+        assert_eq!(decoded, pcm.len());
+        assert_eq!(out, pcm);
+    }
+
+    #[cfg(feature = "opus")]
+    fn measure_opus_snr(profile: AudioProfile, app: opus2::Application) -> (usize, f64, f64, f64) {
+        let params = profile.to_audio_params(40);
+        let mut codec = OpusCodec::from_params_with_application(&params, app).unwrap();
+        let spc = profile.frame_samples_per_channel();
+        let total_frames = 60usize;
+        let total_spc = spc * total_frames;
+        let mut in_l = Vec::with_capacity(total_spc);
+        let mut in_r = Vec::with_capacity(total_spc);
+        let mut out_l = Vec::with_capacity(total_spc);
+        let mut out_r = Vec::with_capacity(total_spc);
+
+        for f_idx in 0..total_frames {
+            let mut pcm = Vec::with_capacity(spc * 2);
+            for i in 0..spc {
+                let s_idx = f_idx * spc + i;
+                let t = s_idx as f64 / 48_000.0;
+                let env = 0.25 + 0.75 * ((t * 3.0 * std::f64::consts::PI).sin().abs());
+                let l_val = env
+                    * (8000.0 * (2.0 * std::f64::consts::PI * 110.0 * t).sin()
+                        + 6000.0 * (2.0 * std::f64::consts::PI * 660.0 * t).sin()
+                        + 3000.0 * (2.0 * std::f64::consts::PI * 3520.0 * t).cos());
+                let r_val = env
+                    * (8000.0 * (2.0 * std::f64::consts::PI * 110.0 * t).sin()
+                        + 5500.0 * (2.0 * std::f64::consts::PI * 880.0 * t).cos()
+                        + 3000.0 * (2.0 * std::f64::consts::PI * 2640.0 * t).sin());
+                let l_i16 = l_val.clamp(-32000.0, 32000.0) as i16;
+                let r_i16 = r_val.clamp(-32000.0, 32000.0) as i16;
+                in_l.push(l_i16);
+                in_r.push(r_i16);
+                pcm.push(l_i16);
+                pcm.push(r_i16);
+            }
+            let mut pkt = Vec::new();
+            codec.encode(&pcm, &mut pkt).unwrap();
+            let mut dec = Vec::new();
+            codec.decode(&pkt, &mut dec).unwrap();
+            for &[l, r] in dec.as_chunks::<2>().0 {
+                out_l.push(l);
+                out_r.push(r);
+            }
+        }
+
+        let mut best_lag = 0usize;
+        let mut best_corr = -1.0f64;
+        let search_start = spc * 5;
+        let search_end = total_spc - spc * 2;
+        for lag in 0..800usize {
+            let mut dot = 0.0f64;
+            let mut e_in = 0.0f64;
+            let mut e_out = 0.0f64;
+            for idx in search_start..search_end {
+                let a = f64::from(in_l[idx]);
+                let b = f64::from(out_l[idx + lag]);
+                dot += a * b;
+                e_in += a * a;
+                e_out += b * b;
+            }
+            let corr = dot / (e_in.sqrt() * e_out.sqrt() + 1e-9);
+            if corr > best_corr {
+                best_corr = corr;
+                best_lag = lag;
+            }
+        }
+        let compute_snr = |in_ch: &[i16], out_ch: &[i16]| -> f64 {
+            let mut sig_pow = 0.0f64;
+            let mut err_pow = 0.0f64;
+            for idx in search_start..search_end {
+                let a = f64::from(in_ch[idx]);
+                let b = f64::from(out_ch[idx + best_lag]);
+                sig_pow += a * a;
+                err_pow += (a - b) * (a - b);
+            }
+            10.0 * (sig_pow / (err_pow + 1e-9)).log10()
+        };
+        (
+            best_lag,
+            best_corr,
+            compute_snr(&in_l, &out_l),
+            compute_snr(&in_r, &out_r),
+        )
+    }
+
+    #[cfg(feature = "opus")]
+    #[test]
+    fn opus_reset_bitrate_clamping_and_decode_fec() {
+        let mut codec = OpusCodec::from_profile(AudioProfile::OpusBalanced).unwrap();
+        let spc = codec.frame_samples_per_channel();
+
+        // Dynamically adjust bitrate across <96 and >=96 kbps and clamped extremes.
+        let trait_codec: &mut dyn AudioCodec = &mut codec;
+        trait_codec.set_bitrate_kbps(64).unwrap();
+        trait_codec.set_bitrate_kbps(8).unwrap();
+        trait_codec.set_bitrate_kbps(900).unwrap();
+        trait_codec.set_bitrate_kbps(128).unwrap();
+
+        let mut packets = Vec::new();
+        for idx in 0..4 {
+            let pcm = sine_stereo_frame(spc, 440.0, idx);
+            let mut pkt = Vec::new();
+            trait_codec.encode(&pcm, &mut pkt).unwrap();
+            packets.push(pkt);
+        }
+
+        // Decode packet 0 normally, skip packet 1, decode packet 2 with FEC, then empty FEC -> PLC.
+        let mut out0 = Vec::new();
+        assert_eq!(trait_codec.decode(&packets[0], &mut out0).unwrap(), spc * 2);
+
+        let mut out_fec = Vec::new();
+        assert_eq!(
+            trait_codec.decode_fec(&packets[2], &mut out_fec).unwrap(),
+            spc * 2
+        );
+
+        let mut out_empty_fec = Vec::new();
+        assert_eq!(
+            trait_codec.decode_fec(&[], &mut out_empty_fec).unwrap(),
+            spc * 2
+        );
+
+        // Reset must restore deterministic state across identical inputs.
+        trait_codec.reset();
+        let mut pkt_a = Vec::new();
+        let pcm0 = sine_stereo_frame(spc, 440.0, 0);
+        trait_codec.encode(&pcm0, &mut pkt_a).unwrap();
+
+        trait_codec.reset();
+        let mut pkt_b = Vec::new();
+        trait_codec.encode(&pcm0, &mut pkt_b).unwrap();
+        assert_eq!(pkt_a, pkt_b);
+    }
+
+    #[cfg(feature = "opus")]
+    #[test]
+    fn opus_application_audio_vs_low_delay_snr() {
+        for profile in [
+            AudioProfile::OpusBalanced,
+            AudioProfile::OpusLowLatency,
+            AudioProfile::OpusLowBandwidth,
+        ] {
+            let (ld_lag, ld_corr, ld_snr_l, ld_snr_r) =
+                measure_opus_snr(profile, opus2::Application::LowDelay);
+            let (au_lag, au_corr, au_snr_l, au_snr_r) =
+                measure_opus_snr(profile, opus2::Application::Audio);
+            eprintln!(
+                "SNR benchmark {profile:?}: LowDelay(lag={ld_lag}, corr={ld_corr:.4}, snr_l={ld_snr_l:.2}dB, snr_r={ld_snr_r:.2}dB) vs Audio(lag={au_lag}, corr={au_corr:.4}, snr_l={au_snr_l:.2}dB, snr_r={au_snr_r:.2}dB)"
+            );
+            assert!(
+                ld_corr > 0.99 && ld_snr_l > 22.0 && ld_snr_r > 22.0,
+                "LowDelay regression for {profile:?}: corr={ld_corr:.4}, snr_l={ld_snr_l:.2}, snr_r={ld_snr_r:.2}"
+            );
+            assert!(au_corr.is_finite() && au_snr_l.is_finite() && au_snr_r.is_finite());
         }
     }
 }
