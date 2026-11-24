@@ -527,8 +527,16 @@ impl DriftController {
         Self {
             target_ms: target,
             ema_alpha: alpha,
-            kp: if kp.is_finite() { kp.max(0.0) } else { DEFAULT_DRIFT_KP },
-            ki: if ki.is_finite() { ki.max(0.0) } else { DEFAULT_DRIFT_KI },
+            kp: if kp.is_finite() {
+                kp.max(0.0)
+            } else {
+                DEFAULT_DRIFT_KP
+            },
+            ki: if ki.is_finite() {
+                ki.max(0.0)
+            } else {
+                DEFAULT_DRIFT_KI
+            },
             max_integral: DEFAULT_DRIFT_MAX_INTEGRAL,
             max_offset: DEFAULT_DRIFT_MAX_OFFSET,
             max_slew_per_sec: if max_slew_per_sec.is_finite() {
@@ -939,7 +947,9 @@ mod tests {
         // Bit-exact passthrough when src_rate == dst_rate && rate_adjust == 1.0.
         let mut exact = PlaybackResampler::new(48_000, 48_000);
         assert!((exact.rate_adjust() - 1.0).abs() <= f64::EPSILON);
-        let input: Vec<i16> = (0..400).map(|i| ((i * 53 - 10_000) % 20_000) as i16).collect();
+        let input: Vec<i16> = (0..400)
+            .map(|i| ((i * 53 - 10_000) % 20_000) as i16)
+            .collect();
         let mut q = VecDeque::from(input.clone());
         let mut out = vec![0i16; 400];
         exact.write_frames(&mut q, 2, 2, 200, 100, false, |idx, s| out[idx] = s);
@@ -996,8 +1006,16 @@ mod tests {
         for _ in 0..2_000 {
             ctrl.update(500.0, 0.020);
         }
-        assert!((ctrl.ratio() - 1.005).abs() <= 1e-12, "got {}", ctrl.ratio());
-        assert!((ctrl.integral - 0.002).abs() <= 1e-12, "got {}", ctrl.integral);
+        assert!(
+            (ctrl.ratio() - 1.005).abs() <= 1e-12,
+            "got {}",
+            ctrl.ratio()
+        );
+        assert!(
+            (ctrl.integral - 0.002).abs() <= 1e-12,
+            "got {}",
+            ctrl.integral
+        );
 
         // Reset restores unity ratio and target_ms.
         ctrl.reset();
@@ -1009,9 +1027,17 @@ mod tests {
             ctrl.update(0.0, 0.020);
         }
         assert!(ctrl.ratio() < 1.0);
-        assert!((ctrl.integral + 0.002).abs() <= 1e-12, "got {}", ctrl.integral);
+        assert!(
+            (ctrl.integral + 0.002).abs() <= 1e-12,
+            "got {}",
+            ctrl.integral
+        );
         // With target_ms = 40, P = -0.001 and I = -0.002 => ratio = 0.997.
-        assert!((ctrl.ratio() - 0.997).abs() <= 1e-12, "got {}", ctrl.ratio());
+        assert!(
+            (ctrl.ratio() - 0.997).abs() <= 1e-12,
+            "got {}",
+            ctrl.ratio()
+        );
 
         // With target_ms = 200, err_ms = -200 saturates output ratio at 0.995.
         ctrl.set_target_ms(200.0);
@@ -1019,7 +1045,11 @@ mod tests {
         for _ in 0..2_000 {
             ctrl.update(0.0, 0.020);
         }
-        assert!((ctrl.ratio() - 0.995).abs() <= 1e-12, "got {}", ctrl.ratio());
+        assert!(
+            (ctrl.ratio() - 0.995).abs() <= 1e-12,
+            "got {}",
+            ctrl.ratio()
+        );
 
         // Custom parameters via with_params.
         let mut custom = DriftController::with_params(30.0, 0.1, 1e-4, 1e-5, 0.01);
@@ -1098,7 +1128,13 @@ mod tests {
         // 1. Bit-transparent passthrough when !initialized && ratio == 1.0.
         let mut r = AdaptiveResampler::new();
         let passthrough_in: Vec<i16> = (0..960 * 2)
-            .map(|i| if i % 2 == 0 { ((i * 19) % 15_000) as i16 } else { -(((i * 23) % 15_000) as i16) })
+            .map(|i| {
+                if i % 2 == 0 {
+                    ((i * 19) % 15_000) as i16
+                } else {
+                    -(((i * 23) % 15_000) as i16)
+                }
+            })
             .collect();
         let mut out = Vec::new();
         r.process_stereo(&passthrough_in, 1.0, &mut out);
@@ -1164,7 +1200,8 @@ mod tests {
         for &cur_ratio in &ratios {
             for f in 0..chunk_frames {
                 let t = (idx as f64) / sr;
-                chunk[f * 2] = (12_000.0 * (2.0 * std::f64::consts::PI * 440.0 * t).sin()).round() as i16;
+                chunk[f * 2] =
+                    (12_000.0 * (2.0 * std::f64::consts::PI * 440.0 * t).sin()).round() as i16;
                 chunk[f * 2 + 1] =
                     (12_000.0 * (2.0 * std::f64::consts::PI * 660.0 * t).sin()).round() as i16;
                 idx += 1;

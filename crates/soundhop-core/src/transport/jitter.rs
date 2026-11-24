@@ -175,6 +175,24 @@ impl JitterBuffer {
         self.push_inner(pcm_frame, true);
     }
 
+    /// Drop one delayed frame from the front of the queue against `concealed_debt`
+    /// (with 2 ms stereo crossfade into the new front) when catching up after a stall.
+    pub fn catchup_concealed_frame(&mut self) -> bool {
+        if self.concealed_debt == 0 || self.queue.len() <= 1 {
+            return false;
+        }
+        if let Some(dropped) = self.queue.pop_front() {
+            self.dropped_overrun += 1;
+            self.concealed_debt -= 1;
+            if let Some(front) = self.queue.front_mut() {
+                crossfade_stereo_in_place(&dropped, front, TRANSITION_RAMP_FRAMES);
+            }
+            true
+        } else {
+            false
+        }
+    }
+
     /// Pop one frame interval from the buffer.
     pub fn pop(&mut self) -> PopOutcome {
         if !self.primed {

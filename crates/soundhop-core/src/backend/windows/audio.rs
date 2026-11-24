@@ -1713,9 +1713,11 @@ mod tests {
             rs_q.push_back(-12_000);
         }
         let mut rs_out = vec![0i16; 150 * 2];
-        assert!(rs.write_frames_checked(&mut rs_q, 2, 2, 150, 100, false, |i, s| {
-            rs_out[i] = s;
-        }));
+        assert!(
+            rs.write_frames_checked(&mut rs_q, 2, 2, 150, 100, false, |i, s| {
+                rs_out[i] = s;
+            })
+        );
         let rs_max_step = rs_out
             .as_chunks::<2>()
             .0

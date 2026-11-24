@@ -585,9 +585,14 @@ pub fn append_log_line_to(path: &Path, level: &str, message: &str, max_bytes: u6
 }
 
 /// Append a timestamped diagnostic line to `log_path()`.
+#[cfg(not(test))]
 pub fn append_log_line(level: &str, message: &str) {
     append_log_line_to(&log_path(), level, message, MAX_LOG_FILE_BYTES);
 }
+
+/// No-op during unit/integration tests so test runs do not pollute user state logs.
+#[cfg(test)]
+pub fn append_log_line(_level: &str, _message: &str) {}
 
 /// Initialize the daemon log file at `log_path()`, rotating if oversized and
 /// writing a startup marker.

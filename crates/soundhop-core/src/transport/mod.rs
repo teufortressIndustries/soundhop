@@ -38,14 +38,17 @@ pub use client::{Sht3ClientConfig, Sht3ClientConnection, Sht3ClientReader, Sht3C
 pub use codec::OpusCodec;
 pub use codec::{create_codec, AudioCodec, AudioProfile, PcmCodec};
 pub use crypto::{AeadSession, EphemeralKeypair, Role, SessionKeys};
-pub use dsp::{apply_gain_buffer, apply_gain_i16, LinearResampler, PlaybackResampler};
+pub use dsp::{
+    apply_gain_buffer, apply_gain_i16, AdaptiveResampler, DriftController, LinearResampler,
+    PlaybackResampler,
+};
 pub use jitter::{JitterBuffer, JitterConfig, JitterStats, PopOutcome};
 #[cfg(target_os = "linux")]
 pub use linux_pcm::{LinuxPcmCapture, LinuxPcmPlayback};
 pub use pcm::{
-    MockPcmCapture, MockPcmPlayback, MockPcmPlaybackHandle, PcmCapture, PcmPlayback,
-    PcmPlaybackFactory, PCM_CHANNELS, PCM_FRAME_SAMPLES_10MS, PCM_FRAME_SAMPLES_20MS,
-    PCM_SAMPLE_RATE,
+    ClockedMockPcmPlayback, ClockedMockPcmPlaybackHandle, MockPcmCapture, MockPcmPlayback,
+    MockPcmPlaybackHandle, PcmCapture, PcmPlayback, PcmPlaybackFactory, PCM_CHANNELS,
+    PCM_FRAME_SAMPLES_10MS, PCM_FRAME_SAMPLES_20MS, PCM_SAMPLE_RATE,
 };
 pub use server::{Sht3Listener, Sht3ServerConfig, Sht3ServerConnection};
 #[cfg(target_os = "windows")]
@@ -89,6 +92,10 @@ const MIN_PLC_HOLDOFF_MS: u64 = 60;
 const BITRATE_UNDERRUN_WINDOW: Duration = Duration::from_secs(2);
 /// Clean delivery window required before stepping Opus bitrate back up.
 const BITRATE_RECOVERY_WINDOW: Duration = Duration::from_secs(15);
+/// Minimum interval between periodic inbound diagnostic log lines.
+const INBOUND_DIAG_LOG_INTERVAL: Duration = Duration::from_secs(10);
+/// Minimum interval between anomaly-triggered inbound diagnostic log lines.
+const INBOUND_DIAG_ANOMALY_COOLDOWN: Duration = Duration::from_secs(2);
 
 /// Result alias for transport operations.
 pub type TransportResult<T> = Result<T, TransportError>;
@@ -1009,9 +1016,31 @@ impl Drop for OutboundSessionHandle {
     }
 }
 
+/// Diagnostic telemetry snapshot for an inbound SHT3 peer session.
+#[derive(Debug, Clone, Default, PartialEq)]
+pub struct InboundPeerDiagnostics {
+    pub audio_frames_received: u64,
+    pub decode_errors: u64,
+    pub jb_underruns: u64,
+    pub jb_overruns: u64,
+    pub jb_plc_frames: u64,
+    pub jb_buffered_ms: u16,
+    pub sink_buffered_ms: Option<f64>,
+    pub sink_target_ms: f64,
+    pub sink_underruns: u64,
+    pub sink_overruns: u64,
+    pub drift_ratio: f64,
+    pub drift_ppm: f64,
+    pub drift_smoothed_fill_ms: f64,
+    pub jitter_us: f64,
+    pub jitter_ms: f64,
+    pub max_inter_arrival_gap_us: u64,
+}
+
 struct ActiveInboundPeer {
     session_id: u64,
     stop_flag: Arc<AtomicBool>,
+    diagnostics: Arc<Mutex<InboundPeerDiagnostics>>,
     worker: Option<JoinHandle<()>>,
 }
 
@@ -1026,6 +1055,7 @@ struct RunningListener {
 pub struct Sht3SessionManager {
     listener: Mutex<Option<RunningListener>>,
     active_peers: Arc<Mutex<HashMap<String, ActiveInboundPeer>>>,
+    last_peer_diagnostics: Arc<Mutex<HashMap<String, InboundPeerDiagnostics>>>,
     next_session_id: Arc<AtomicU64>,
 }
 
@@ -1043,6 +1073,7 @@ impl Sht3SessionManager {
         Self {
             listener: Mutex::new(None),
             active_peers: Arc::new(Mutex::new(HashMap::new())),
+            last_peer_diagnostics: Arc::new(Mutex::new(HashMap::new())),
             next_session_id: Arc::new(AtomicU64::new(1)),
         }
     }
@@ -1080,6 +1111,7 @@ impl Sht3SessionManager {
         let stop_flag = Arc::new(AtomicBool::new(false));
         let stop_c = Arc::clone(&stop_flag);
         let peers_c = Arc::clone(&self.active_peers);
+        let last_diag_c = Arc::clone(&self.last_peer_diagnostics);
         let next_id_c = Arc::clone(&self.next_session_id);
         let inflight_handshakes = Arc::new(AtomicUsize::new(0));
 
@@ -1106,6 +1138,7 @@ impl Sht3SessionManager {
                         let hs_trust = Arc::clone(&handshake_trust);
                         let hs_stop = Arc::clone(&stop_c);
                         let hs_peers = Arc::clone(&peers_c);
+                        let hs_last_diag = Arc::clone(&last_diag_c);
                         let hs_next_id = Arc::clone(&next_id_c);
                         let hs_factory = Arc::clone(&playback_factory);
 
@@ -1135,6 +1168,7 @@ impl Sht3SessionManager {
                                 spawn_inbound_peer(
                                     conn,
                                     &hs_peers,
+                                    &hs_last_diag,
                                     &hs_next_id,
                                     &hs_stop,
                                     &hs_factory,
@@ -1207,6 +1241,22 @@ impl Sht3SessionManager {
             .lock()
             .unwrap_or_else(|e| e.into_inner())
             .len()
+    }
+
+    /// Snapshot of inbound diagnostics for `device_id` (active or most recently closed).
+    pub fn inbound_peer_diagnostics(&self, device_id: &str) -> Option<InboundPeerDiagnostics> {
+        let active_diag = {
+            let guard = self.active_peers.lock().unwrap_or_else(|e| e.into_inner());
+            guard.get(device_id).map(|p| Arc::clone(&p.diagnostics))
+        };
+        if let Some(diag) = active_diag {
+            return Some(diag.lock().unwrap_or_else(|e| e.into_inner()).clone());
+        }
+        self.last_peer_diagnostics
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .get(device_id)
+            .cloned()
     }
 
     /// Start an outbound SHT3 audio streaming session from `capture` to `config.target_addr`.
@@ -1363,6 +1413,110 @@ impl BitrateAdaptation {
     }
 }
 
+fn write_inbound_pcm(
+    playback: &mut dyn PcmPlayback,
+    pcm: &[i16],
+    resampler: &mut AdaptiveResampler,
+    resampled_pcm: &mut Vec<i16>,
+    ratio: f64,
+) -> bool {
+    if playback.buffered_ms().is_some() {
+        resampled_pcm.clear();
+        resampler.process_stereo(pcm, ratio, resampled_pcm);
+        playback.write_frame(resampled_pcm).is_ok()
+    } else {
+        playback.write_frame(pcm).is_ok()
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
+fn snapshot_inbound_diagnostics(
+    jb: &JitterBuffer,
+    playback: &dyn PcmPlayback,
+    drift_ctrl: &DriftController,
+    audio_frames_received: u64,
+    decode_errors: u64,
+    jitter_us: f64,
+    max_inter_arrival_gap_us: u64,
+) -> InboundPeerDiagnostics {
+    let stats = jb.stats();
+    InboundPeerDiagnostics {
+        audio_frames_received,
+        decode_errors,
+        jb_underruns: stats.underruns,
+        jb_overruns: stats.dropped_overrun,
+        jb_plc_frames: stats.plc_frames,
+        jb_buffered_ms: stats.buffered_ms,
+        sink_buffered_ms: playback.buffered_ms(),
+        sink_target_ms: playback.sink_target_ms(),
+        sink_underruns: playback.sink_underruns(),
+        sink_overruns: playback.sink_overruns(),
+        drift_ratio: drift_ctrl.ratio(),
+        drift_ppm: drift_ctrl.ppm(),
+        drift_smoothed_fill_ms: drift_ctrl.smoothed_fill_ms(),
+        jitter_us,
+        jitter_ms: jitter_us / 1000.0,
+        max_inter_arrival_gap_us,
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
+fn maybe_emit_inbound_diag_log(
+    peer_id: &str,
+    diag: &InboundPeerDiagnostics,
+    now: Instant,
+    last_periodic_log_at: &mut Instant,
+    last_anomaly_log_at: &mut Option<Instant>,
+    prev_anomalies: &mut (u64, u64, u64, u64, u64),
+) {
+    let cur_anomalies = (
+        diag.decode_errors,
+        diag.jb_underruns,
+        diag.jb_overruns,
+        diag.sink_underruns,
+        diag.sink_overruns,
+    );
+    let anomaly_increased = cur_anomalies != *prev_anomalies;
+    let periodic_due =
+        now.saturating_duration_since(*last_periodic_log_at) >= INBOUND_DIAG_LOG_INTERVAL;
+    let anomaly_due = anomaly_increased
+        && last_anomaly_log_at
+            .is_none_or(|t| now.saturating_duration_since(t) >= INBOUND_DIAG_ANOMALY_COOLDOWN);
+
+    if !periodic_due && !anomaly_due {
+        return;
+    }
+
+    let level = if anomaly_increased { "WARN" } else { "INFO" };
+    let sink_ms_str = diag
+        .sink_buffered_ms
+        .map_or_else(|| "none".to_string(), |ms| format!("{ms:.1}"));
+    let msg = format!(
+        "sht3_inbound peer={peer_id} frames={} decode_err={} jb_ms={} jb_over={} jb_under={} jb_plc={} sink_ms={sink_ms_str} sink_over={} sink_under={} drift_ppm={:.1} ratio={:.6} jitter_ms={:.2} max_gap_ms={:.2}",
+        diag.audio_frames_received,
+        diag.decode_errors,
+        diag.jb_buffered_ms,
+        diag.jb_overruns,
+        diag.jb_underruns,
+        diag.jb_plc_frames,
+        diag.sink_overruns,
+        diag.sink_underruns,
+        diag.drift_ppm,
+        diag.drift_ratio,
+        diag.jitter_ms,
+        (diag.max_inter_arrival_gap_us as f64) / 1000.0,
+    );
+    crate::util::append_log_line(level, &msg);
+
+    *prev_anomalies = cur_anomalies;
+    if periodic_due {
+        *last_periodic_log_at = now;
+    }
+    if anomaly_due {
+        *last_anomaly_log_at = Some(now);
+    }
+}
+
 #[allow(clippy::too_many_arguments)]
 fn maybe_pace_inbound_plc(
     jb: &mut JitterBuffer,
@@ -1370,6 +1524,9 @@ fn maybe_pace_inbound_plc(
     playback: &mut dyn PcmPlayback,
     conn: &mut Sht3ServerConnection,
     out_pcm: &mut Vec<i16>,
+    resampled_pcm: &mut Vec<i16>,
+    resampler: &mut AdaptiveResampler,
+    drift_ratio: f64,
     audio_frames_received: u64,
     last_audio_at: Option<Instant>,
     last_pace_at: &mut Option<Instant>,
@@ -1392,7 +1549,9 @@ fn maybe_pace_inbound_plc(
     }
 
     out_pcm.clear();
-    if jb.pop_with_codec(codec, out_pcm).is_ok() && playback.write_frame(out_pcm).is_err() {
+    if jb.pop_with_codec(codec, out_pcm).is_ok()
+        && !write_inbound_pcm(playback, out_pcm, resampler, resampled_pcm, drift_ratio)
+    {
         return false;
     }
     *last_pace_at = Some(now);
@@ -1410,9 +1569,11 @@ fn maybe_pace_inbound_plc(
     true
 }
 
+#[allow(clippy::too_many_arguments)]
 fn spawn_inbound_peer(
     mut conn: Sht3ServerConnection,
     active_peers: &Arc<Mutex<HashMap<String, ActiveInboundPeer>>>,
+    last_peer_diagnostics: &Arc<Mutex<HashMap<String, InboundPeerDiagnostics>>>,
     next_session_id: &Arc<AtomicU64>,
     manager_stop: &Arc<AtomicBool>,
     playback_factory: &PcmPlaybackFactory,
@@ -1435,6 +1596,11 @@ fn spawn_inbound_peer(
 
     let session_id = next_session_id.fetch_add(1, Ordering::Relaxed);
     let peer_stop = Arc::new(AtomicBool::new(false));
+    let diagnostics = Arc::new(Mutex::new(InboundPeerDiagnostics {
+        sink_target_ms: playback.sink_target_ms(),
+        drift_ratio: 1.0,
+        ..InboundPeerDiagnostics::default()
+    }));
 
     // Replace any pre-existing session for the same device_id.
     let previous = {
@@ -1451,6 +1617,8 @@ fn spawn_inbound_peer(
     let peer_stop_c = Arc::clone(&peer_stop);
     let manager_stop_c = Arc::clone(manager_stop);
     let peers_c = Arc::clone(active_peers);
+    let last_diag_c = Arc::clone(last_peer_diagnostics);
+    let diagnostics_c = Arc::clone(&diagnostics);
     let peer_id_c = peer_id.clone();
 
     let worker = thread::spawn(move || {
@@ -1460,15 +1628,32 @@ fn spawn_inbound_peer(
             ..JitterConfig::default()
         });
         let frame_samples = codec.interleaved_samples_per_frame();
-        let frame_interval = Duration::from_millis(u64::from(audio_params.frame_ms.max(1)));
+        let frame_ms_u16 = u16::from(audio_params.frame_ms.max(1));
+        let frame_dt_secs = f64::from(frame_ms_u16) / 1000.0;
+        let nominal_interval_us = u64::from(frame_ms_u16) * 1000;
+        let frame_interval = Duration::from_millis(u64::from(frame_ms_u16));
         let plc_holdoff =
             Duration::from_millis(u64::from(audio_params.jitter_ms).max(MIN_PLC_HOLDOFF_MS));
+        let initial_steady_cushion = jb.effective_target_frames().saturating_sub(1);
+        let initial_target_ms = f64::from(
+            (initial_steady_cushion * usize::from(frame_ms_u16)).min(usize::from(u16::MAX)) as u16,
+        ) + playback.sink_target_ms();
+        let mut drift_ctrl = DriftController::new(initial_target_ms);
+        let mut resampler = AdaptiveResampler::new();
         let mut decoded_pcm = Vec::with_capacity(frame_samples);
         let mut out_pcm = Vec::with_capacity(frame_samples);
+        let mut resampled_pcm = Vec::with_capacity(frame_samples + 16);
         let mut audio_frames_received: u64 = 0;
+        let mut decode_errors: u64 = 0;
         let mut last_audio_at: Option<Instant> = None;
+        let mut last_arrival_at: Option<Instant> = None;
         let mut last_pace_at: Option<Instant> = None;
         let mut prev_underruns: u64 = 0;
+        let mut jitter_us: f64 = 0.0;
+        let mut max_inter_arrival_gap_us: u64 = 0;
+        let mut last_periodic_log_at = Instant::now();
+        let mut last_anomaly_log_at: Option<Instant> = None;
+        let mut prev_anomalies: (u64, u64, u64, u64, u64) = (0, 0, 0, 0, 0);
         let mut bitrate_ctrl = (audio_params.codec == CodecId::Opus)
             .then(|| BitrateAdaptation::new(audio_params.bitrate_kbps));
         let mut clean_close = false;
@@ -1482,18 +1667,42 @@ fn spawn_inbound_peer(
                     }
                     match frame.header.frame_type {
                         FrameType::AudioOpus | FrameType::AudioPcm => {
+                            let now = Instant::now();
                             if frame.header.flags & FLAG_DISCONTINUITY != 0 {
                                 jb.reset();
                                 codec.reset();
+                                drift_ctrl.reset();
+                                resampler.reset();
                                 prev_underruns = jb.stats().underruns;
-                                last_pace_at = None;
+                                last_arrival_at = None;
                             }
+                            if let Some(prev_at) = last_arrival_at {
+                                let gap_us = now
+                                    .saturating_duration_since(prev_at)
+                                    .as_micros()
+                                    .min(u128::from(u64::MAX))
+                                    as u64;
+                                if gap_us > max_inter_arrival_gap_us {
+                                    max_inter_arrival_gap_us = gap_us;
+                                }
+                                let d_us = (gap_us as f64 - nominal_interval_us as f64).abs();
+                                jitter_us += (d_us - jitter_us) / 16.0;
+                            }
+                            last_arrival_at = Some(now);
+
                             decoded_pcm.clear();
-                            if codec.decode(&frame.payload, &mut decoded_pcm).is_err() {
-                                continue;
+                            let decode_ok = codec.decode(&frame.payload, &mut decoded_pcm).is_ok();
+                            if !decode_ok {
+                                decode_errors += 1;
+                                decoded_pcm.clear();
+                                if codec.decode_plc(&mut decoded_pcm).is_err()
+                                    || decoded_pcm.is_empty()
+                                {
+                                    decoded_pcm.resize(frame_samples, 0);
+                                }
                             }
                             audio_frames_received += 1;
-                            last_audio_at = Some(Instant::now());
+                            last_audio_at = Some(now);
                             last_pace_at = None;
 
                             jb.push_realtime(std::mem::take(&mut decoded_pcm));
@@ -1501,14 +1710,39 @@ fn spawn_inbound_peer(
 
                             if jb.is_primed() {
                                 let steady_cushion = jb.effective_target_frames().saturating_sub(1);
+                                let target_ms = f64::from(
+                                    (steady_cushion * usize::from(frame_ms_u16))
+                                        .min(usize::from(u16::MAX))
+                                        as u16,
+                                ) + playback.sink_target_ms();
+                                drift_ctrl.set_target_ms(target_ms);
                                 let mut write_failed = false;
                                 while jb.stats().buffered_frames > steady_cushion {
+                                    if jb.concealed_debt() > 0
+                                        && playback.buffered_ms().is_some_and(|ms| {
+                                            ms >= playback.sink_target_ms() * 0.75
+                                        })
+                                        && jb.catchup_concealed_frame()
+                                    {
+                                        continue;
+                                    }
                                     out_pcm.clear();
                                     match jb.pop_with_codec(&mut *codec, &mut out_pcm) {
                                         Ok(_) => {
-                                            if playback.write_frame(&out_pcm).is_err() {
+                                            if !write_inbound_pcm(
+                                                &mut *playback,
+                                                &out_pcm,
+                                                &mut resampler,
+                                                &mut resampled_pcm,
+                                                drift_ctrl.ratio(),
+                                            ) {
                                                 write_failed = true;
                                                 break;
+                                            }
+                                            if let Some(sink_ms) = playback.buffered_ms() {
+                                                let total_ms =
+                                                    f64::from(jb.stats().buffered_ms) + sink_ms;
+                                                drift_ctrl.update(total_ms, frame_dt_secs);
                                             }
                                         }
                                         Err(_) => break,
@@ -1519,10 +1753,12 @@ fn spawn_inbound_peer(
                                 }
                             }
 
-                            if let Some(ref mut ctrl) = bitrate_ctrl {
-                                if let Some(new_kbps) = ctrl.on_clean_frame(Instant::now()) {
-                                    let _ =
-                                        conn.send_control(&ControlMessage::BitrateHint(new_kbps));
+                            if decode_ok {
+                                if let Some(ref mut ctrl) = bitrate_ctrl {
+                                    if let Some(new_kbps) = ctrl.on_clean_frame(now) {
+                                        let _ = conn
+                                            .send_control(&ControlMessage::BitrateHint(new_kbps));
+                                    }
                                 }
                             }
                         }
@@ -1554,6 +1790,9 @@ fn spawn_inbound_peer(
                                 &mut *playback,
                                 &mut conn,
                                 &mut out_pcm,
+                                &mut resampled_pcm,
+                                &mut resampler,
+                                drift_ctrl.ratio(),
                                 audio_frames_received,
                                 last_audio_at,
                                 &mut last_pace_at,
@@ -1568,11 +1807,23 @@ fn spawn_inbound_peer(
                         FrameType::Ping => {
                             if let Ok(ping) = PingPayload::decode(&frame.payload) {
                                 let stats = jb.stats();
+                                let sink_ms_u64 = playback
+                                    .buffered_ms()
+                                    .filter(|ms| ms.is_finite() && *ms >= 0.0)
+                                    .map_or(0u64, |ms| ms.round() as u64);
+                                let jitter_buf_ms = u64::from(stats.buffered_ms)
+                                    .saturating_add(sink_ms_u64)
+                                    .min(u64::from(u16::MAX))
+                                    as u16;
+                                let dropped_frames = stats
+                                    .dropped_overrun
+                                    .saturating_add(playback.sink_overruns())
+                                    .min(u64::from(u32::MAX))
+                                    as u32;
                                 let pong = PongPayload {
                                     client_time_us: ping.client_time_us,
-                                    jitter_buf_ms: stats.buffered_ms,
-                                    dropped_frames: stats.dropped_overrun.min(u64::from(u32::MAX))
-                                        as u32,
+                                    jitter_buf_ms,
+                                    dropped_frames,
                                 };
                                 if conn.send_pong(&pong).is_err() {
                                     break;
@@ -1584,6 +1835,9 @@ fn spawn_inbound_peer(
                                 &mut *playback,
                                 &mut conn,
                                 &mut out_pcm,
+                                &mut resampled_pcm,
+                                &mut resampler,
+                                drift_ctrl.ratio(),
                                 audio_frames_received,
                                 last_audio_at,
                                 &mut last_pace_at,
@@ -1611,6 +1865,9 @@ fn spawn_inbound_peer(
                         &mut *playback,
                         &mut conn,
                         &mut out_pcm,
+                        &mut resampled_pcm,
+                        &mut resampler,
+                        drift_ctrl.ratio(),
                         audio_frames_received,
                         last_audio_at,
                         &mut last_pace_at,
@@ -1624,6 +1881,25 @@ fn spawn_inbound_peer(
                 }
                 Err(_) => break,
             }
+
+            let diag = snapshot_inbound_diagnostics(
+                &jb,
+                &*playback,
+                &drift_ctrl,
+                audio_frames_received,
+                decode_errors,
+                jitter_us,
+                max_inter_arrival_gap_us,
+            );
+            maybe_emit_inbound_diag_log(
+                &peer_id_c,
+                &diag,
+                Instant::now(),
+                &mut last_periodic_log_at,
+                &mut last_anomaly_log_at,
+                &mut prev_anomalies,
+            );
+            *diagnostics_c.lock().unwrap_or_else(|e| e.into_inner()) = diag;
         }
 
         // On clean client close (not revocation), flush any remaining buffered jitter frames.
@@ -1635,7 +1911,13 @@ fn spawn_inbound_peer(
                 out_pcm.clear();
                 match jb.pop_with_codec(&mut *codec, &mut out_pcm) {
                     Ok(_) => {
-                        if playback.write_frame(&out_pcm).is_err() {
+                        if !write_inbound_pcm(
+                            &mut *playback,
+                            &out_pcm,
+                            &mut resampler,
+                            &mut resampled_pcm,
+                            drift_ctrl.ratio(),
+                        ) {
                             break;
                         }
                     }
@@ -1647,6 +1929,21 @@ fn spawn_inbound_peer(
             // Give loopback peers a brief window to read FrameType::Close before closing the socket.
             thread::sleep(Duration::from_millis(5));
         }
+
+        let final_diag = snapshot_inbound_diagnostics(
+            &jb,
+            &*playback,
+            &drift_ctrl,
+            audio_frames_received,
+            decode_errors,
+            jitter_us,
+            max_inter_arrival_gap_us,
+        );
+        *diagnostics_c.lock().unwrap_or_else(|e| e.into_inner()) = final_diag.clone();
+        last_diag_c
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .insert(peer_id_c.clone(), final_diag);
 
         // Drop playback and connection before removing map entry.
         drop(playback);
@@ -1667,6 +1964,7 @@ fn spawn_inbound_peer(
         ActiveInboundPeer {
             session_id,
             stop_flag: peer_stop,
+            diagnostics,
             worker: Some(worker),
         },
     );
@@ -2651,5 +2949,459 @@ mod tests {
             ctrl.on_clean_frame(t_last_err + Duration::from_secs(75)),
             None
         );
+    }
+
+    struct VirtualClockedPlayback {
+        inner: ClockedMockPcmPlayback,
+        nominal_frames_per_tick: usize,
+    }
+
+    impl VirtualClockedPlayback {
+        fn new(inner: ClockedMockPcmPlayback, nominal_frames_per_tick: usize) -> Self {
+            Self {
+                inner,
+                nominal_frames_per_tick,
+            }
+        }
+    }
+
+    impl PcmPlayback for VirtualClockedPlayback {
+        fn write_frame(&mut self, samples: &[i16]) -> TransportResult<()> {
+            self.inner
+                .drain_samples_for_frames(self.nominal_frames_per_tick);
+            self.inner.write_frame(samples)
+        }
+
+        fn set_volume(&self, pct: u8) {
+            self.inner.set_volume(pct);
+        }
+
+        fn set_mute(&self, muted: bool) {
+            self.inner.set_mute(muted);
+        }
+
+        fn volume(&self) -> u8 {
+            self.inner.volume()
+        }
+
+        fn is_muted(&self) -> bool {
+            self.inner.is_muted()
+        }
+
+        fn buffered_ms(&self) -> Option<f64> {
+            self.inner.buffered_ms()
+        }
+
+        fn sink_target_ms(&self) -> f64 {
+            self.inner.sink_target_ms()
+        }
+
+        fn sink_underruns(&self) -> u64 {
+            self.inner.sink_underruns()
+        }
+
+        fn sink_overruns(&self) -> u64 {
+            self.inner.sink_overruns()
+        }
+    }
+
+    struct StereoToneCapture {
+        sample_idx: usize,
+        total_frames: usize,
+        frames_emitted: usize,
+        freq_l_hz: f64,
+        freq_r_hz: f64,
+        ping_after_frame: Option<usize>,
+        ping_tx: Option<mpsc::Sender<()>>,
+    }
+
+    impl PcmCapture for StereoToneCapture {
+        fn read_frame(&mut self, buf: &mut [i16]) -> TransportResult<usize> {
+            if self.frames_emitted >= self.total_frames {
+                return Ok(0);
+            }
+            if let Some(trigger) = self.ping_after_frame {
+                if self.frames_emitted == trigger {
+                    if let Some(tx) = self.ping_tx.take() {
+                        let _ = tx.send(());
+                    }
+                }
+            }
+            let spc = buf.len() / 2;
+            for i in 0..spc {
+                let t = (self.sample_idx + i) as f64 / f64::from(PCM_SAMPLE_RATE);
+                buf[i * 2] =
+                    ((2.0 * std::f64::consts::PI * self.freq_l_hz * t).sin() * 12_000.0) as i16;
+                buf[i * 2 + 1] =
+                    ((2.0 * std::f64::consts::PI * self.freq_r_hz * t).sin() * 12_000.0) as i16;
+            }
+            self.sample_idx += spc;
+            self.frames_emitted += 1;
+            Ok(spc * 2)
+        }
+    }
+
+    fn quadrature_tone_metrics(
+        samples: &[i16],
+        channel_offset: usize,
+        freq_hz: f64,
+        effective_sample_rate_hz: f64,
+    ) -> (f64, f64) {
+        let ch: Vec<f64> = samples
+            .iter()
+            .skip(channel_offset)
+            .step_by(2)
+            .map(|&s| f64::from(s))
+            .collect();
+        let end = ch.len().saturating_sub(960);
+        let start = end.saturating_sub(48_000);
+        let slice = &ch[start..end];
+        let omega = 2.0 * std::f64::consts::PI * freq_hz / effective_sample_rate_hz;
+
+        let mut sc = 0.0f64;
+        let mut ss = 0.0f64;
+        let mut cc = 0.0f64;
+        let mut ss_norm = 0.0f64;
+        let mut cs = 0.0f64;
+        for (i, &y) in slice.iter().enumerate() {
+            let angle = omega * (i as f64);
+            let c = angle.cos();
+            let s = angle.sin();
+            sc += y * c;
+            ss += y * s;
+            cc += c * c;
+            ss_norm += s * s;
+            cs += c * s;
+        }
+        let det = cc * ss_norm - cs * cs;
+        let a = (sc * ss_norm - ss * cs) / det;
+        let b = (ss * cc - sc * cs) / det;
+
+        let mut sig_pow = 0.0f64;
+        let mut err_pow = 0.0f64;
+        let mut dot = 0.0f64;
+        let mut y_pow = 0.0f64;
+        for (i, &y) in slice.iter().enumerate() {
+            let angle = omega * (i as f64);
+            let fit = a * angle.cos() + b * angle.sin();
+            let err = y - fit;
+            sig_pow += fit * fit;
+            err_pow += err * err;
+            dot += y * fit;
+            y_pow += y * y;
+        }
+        let corr = dot / ((y_pow.sqrt() * sig_pow.sqrt()) + 1e-12);
+        let snr_db = 10.0 * (sig_pow / (err_pow + 1e-12)).log10();
+        (corr, snr_db)
+    }
+
+    #[test]
+    fn hypothesis_1_drift_reproduction_and_closed_loop_compensation() {
+        // Part 1: Fixed-rate (ratio = 1.0) into ClockedMockPcmPlayback drifts into underruns/overruns.
+        for &skew_ppm in &[500.0_f64, -500.0_f64] {
+            let dac_rate_hz = f64::from(PCM_SAMPLE_RATE) / (1.0 + skew_ppm * 1e-6);
+            let (pb, handle) = ClockedMockPcmPlayback::pair(dac_rate_hz);
+            let mut vpb = VirtualClockedPlayback::new(pb.with_record_output(false), 960);
+            let frame = vec![4_000i16; PCM_FRAME_SAMPLES_20MS];
+            for _ in 0..14_000 {
+                vpb.write_frame(&frame).unwrap();
+            }
+            if skew_ppm > 0.0 {
+                assert!(
+                    handle.overruns() > 0,
+                    "expected fixed-rate overrun at +{skew_ppm} ppm"
+                );
+            } else {
+                assert!(
+                    handle.underruns() > 0,
+                    "expected fixed-rate underrun at {skew_ppm} ppm"
+                );
+            }
+        }
+
+        // Part 2: Closed-loop Sht3SessionManager with DriftController + AdaptiveResampler
+        // locks buffer fill cleanly across +/-200 ppm for PCM (and Opus when enabled).
+        let mut profiles = vec![(AudioProfile::PcmLossless, 20_000usize, 45.0_f64)];
+        #[cfg(feature = "opus")]
+        profiles.push((AudioProfile::OpusBalanced, 15_000usize, 20.0_f64));
+
+        for (profile, total_frames, min_snr_db) in profiles {
+            for &skew_ppm in &[200.0_f64, -200.0_f64] {
+                let skew = skew_ppm * 1e-6;
+                let dac_rate_hz = f64::from(PCM_SAMPLE_RATE) / (1.0 + skew);
+                let spc = profile.frame_samples_per_channel();
+
+                let k_pair = [0xD1; 32];
+                let trust = Arc::new(InMemoryTrustStore::new());
+                let peer_id = "h1-sender";
+                trust.insert(peer_id, k_pair);
+
+                let sink_handle: Arc<Mutex<Option<ClockedMockPcmPlaybackHandle>>> =
+                    Arc::new(Mutex::new(None));
+                let sink_handle_c = Arc::clone(&sink_handle);
+                let factory: PcmPlaybackFactory = Arc::new(move |_peer| {
+                    let (pb, h) = ClockedMockPcmPlayback::pair(dac_rate_hz);
+                    *sink_handle_c.lock().unwrap() = Some(h);
+                    Ok(Box::new(VirtualClockedPlayback::new(pb, spc)))
+                });
+
+                let manager = Sht3SessionManager::new();
+                let addr = manager
+                    .start_listener(
+                        "127.0.0.1:0".parse().unwrap(),
+                        Sht3ServerConfig::new("h1-receiver"),
+                        trust,
+                        factory,
+                    )
+                    .unwrap();
+
+                let (ping_tx, ping_rx) = mpsc::channel();
+                let capture = Box::new(StereoToneCapture {
+                    sample_idx: 0,
+                    total_frames,
+                    frames_emitted: 0,
+                    freq_l_hz: 440.0,
+                    freq_r_hz: 660.0,
+                    ping_after_frame: Some(total_frames - 50),
+                    ping_tx: Some(ping_tx),
+                });
+                let cfg = OutboundConfig::new(peer_id, addr, k_pair)
+                    .with_profile(profile)
+                    .with_jitter_ms(40)
+                    .with_ping_interval(Duration::from_millis(25));
+                let session = manager.start_outbound(cfg, capture).unwrap();
+                let _ = ping_rx.recv_timeout(Duration::from_secs(10));
+                let _ = session.request_ping();
+                session.join();
+
+                let h = sink_handle.lock().unwrap().clone().unwrap();
+                assert!(wait_until(Duration::from_secs(2), || h.is_closed()));
+
+                assert_eq!(
+                    h.underruns(),
+                    0,
+                    "{profile:?} @ {skew_ppm} ppm had sink underruns"
+                );
+                assert_eq!(
+                    h.overruns(),
+                    0,
+                    "{profile:?} @ {skew_ppm} ppm had sink overruns"
+                );
+                assert!(
+                    (h.buffered_ms() - h.target_ms()).abs() < 2.5,
+                    "{profile:?} @ {skew_ppm} ppm final sink fill {:.2} ms missed target {:.2} ms",
+                    h.buffered_ms(),
+                    h.target_ms()
+                );
+
+                let diag = manager
+                    .inbound_peer_diagnostics(peer_id)
+                    .expect("missing inbound diagnostics");
+                assert_eq!(diag.audio_frames_received, total_frames as u64);
+                assert_eq!(diag.decode_errors, 0);
+                assert!(
+                    (diag.drift_ppm - skew_ppm).abs() < 25.0,
+                    "{profile:?} @ {skew_ppm} ppm converged to {:.2} ppm",
+                    diag.drift_ppm
+                );
+
+                let out = h.output_samples();
+                let eff_rate = f64::from(PCM_SAMPLE_RATE) / diag.drift_ratio;
+                let (corr_l, snr_l) = quadrature_tone_metrics(&out, 0, 440.0, eff_rate);
+                let (corr_r, snr_r) = quadrature_tone_metrics(&out, 1, 660.0, eff_rate);
+                assert!(
+                    corr_l > 0.99 && snr_l > min_snr_db,
+                    "{profile:?} @ {skew_ppm} ppm L fidelity low: corr={corr_l:.5}, snr={snr_l:.2} dB"
+                );
+                assert!(
+                    corr_r > 0.99 && snr_r > min_snr_db,
+                    "{profile:?} @ {skew_ppm} ppm R fidelity low: corr={corr_r:.5}, snr={snr_r:.2} dB"
+                );
+            }
+        }
+    }
+
+    #[cfg(feature = "opus")]
+    #[test]
+    fn hypothesis_2_stall_burst_with_clocked_sink_triggers_plc_and_records_jitter_spike() {
+        let k_pair = [0xD2; 32];
+        let trust = Arc::new(InMemoryTrustStore::new());
+        let peer_id = "h2-stall-sender";
+        trust.insert(peer_id, k_pair);
+
+        let sink_handle: Arc<Mutex<Option<ClockedMockPcmPlaybackHandle>>> =
+            Arc::new(Mutex::new(None));
+        let sink_handle_c = Arc::clone(&sink_handle);
+        let factory: PcmPlaybackFactory = Arc::new(move |_peer| {
+            let (pb, h) = ClockedMockPcmPlayback::pair(f64::from(PCM_SAMPLE_RATE));
+            *sink_handle_c.lock().unwrap() = Some(h);
+            Ok(Box::new(pb.with_realtime_clock()))
+        });
+
+        let manager = Sht3SessionManager::new();
+        let addr = manager
+            .start_listener(
+                "127.0.0.1:0".parse().unwrap(),
+                Sht3ServerConfig::new("h2-receiver"),
+                trust,
+                factory,
+            )
+            .unwrap();
+
+        let (post_burst_tx, post_burst_rx) = mpsc::channel::<()>();
+        let mut ping_sent = false;
+        let capture = Box::new(StallBurstCapture::new().with_hook(move |idx| {
+            if idx == 18 && !ping_sent {
+                ping_sent = true;
+                let _ = post_burst_tx.send(());
+            }
+        }));
+
+        let cfg = OutboundConfig::new(peer_id, addr, k_pair)
+            .with_profile(AudioProfile::OpusBalanced)
+            .with_jitter_ms(40);
+        let session = manager.start_outbound(cfg, capture).unwrap();
+
+        assert!(post_burst_rx.recv_timeout(Duration::from_secs(3)).is_ok());
+        session.request_ping().unwrap();
+        assert!(wait_until(Duration::from_secs(1), || {
+            session.telemetry().pongs_received >= 1
+        }));
+        let mid_telemetry = session.telemetry();
+        // Total buffered_ms = jb_ms (~20-40 after cushion bump) + sink_ms (~40-80) <= 140 ms
+        // (well below 200 ms stall + burst inflation).
+        assert!(
+            mid_telemetry.jitter_buf_ms <= 140,
+            "total jitter+sink latency inflated after burst: {} ms",
+            mid_telemetry.jitter_buf_ms
+        );
+
+        session.join();
+        let h = sink_handle.lock().unwrap().clone().unwrap();
+        assert!(wait_until(Duration::from_secs(2), || h.is_closed()));
+        assert_eq!(h.overruns(), 0, "clocked sink overflowed on burst");
+
+        let diag = manager
+            .inbound_peer_diagnostics(peer_id)
+            .expect("missing inbound diagnostics");
+        assert!(
+            diag.jb_buffered_ms <= 40,
+            "jitter buffer stayed inflated after recovery: {} ms",
+            diag.jb_buffered_ms
+        );
+        assert!(
+            diag.sink_buffered_ms.is_some_and(|ms| ms <= 90.0),
+            "clocked sink fill stayed inflated: {:?}",
+            diag.sink_buffered_ms
+        );
+        assert!(
+            diag.jb_plc_frames > 0,
+            "expected Opus PLC frames during 200ms stall"
+        );
+        assert!(
+            diag.max_inter_arrival_gap_us >= 150_000,
+            "expected >=150ms arrival gap spike, got {} us",
+            diag.max_inter_arrival_gap_us
+        );
+        assert!(
+            diag.jitter_ms > 5.0,
+            "expected RFC 3550 jitter spike > 5ms, got {:.2} ms",
+            diag.jitter_ms
+        );
+    }
+
+    #[test]
+    fn hypothesis_3_decode_error_triggers_plc_fallback_without_dropping_cadence() {
+        let mut profiles = vec![(AudioProfile::PcmLossless, vec![0xAAu8, 0xBBu8])];
+        #[cfg(feature = "opus")]
+        profiles.push((AudioProfile::OpusBalanced, vec![0x03u8]));
+
+        for (profile, bad_payload) in profiles {
+            let k_pair = [0xD3; 32];
+            let trust = Arc::new(InMemoryTrustStore::new());
+            let peer_id = "h3-corrupt-sender";
+            trust.insert(peer_id, k_pair);
+
+            let rx_handle_slot: Arc<Mutex<Option<MockPcmPlaybackHandle>>> =
+                Arc::new(Mutex::new(None));
+            let rx_c = Arc::clone(&rx_handle_slot);
+            let factory: PcmPlaybackFactory = Arc::new(move |_peer| {
+                let (play, handle) = MockPcmPlayback::pair();
+                *rx_c.lock().unwrap() = Some(handle);
+                Ok(Box::new(play))
+            });
+
+            let manager = Sht3SessionManager::new();
+            let addr = manager
+                .start_listener(
+                    "127.0.0.1:0".parse().unwrap(),
+                    Sht3ServerConfig::new("h3-receiver"),
+                    trust,
+                    factory,
+                )
+                .unwrap();
+
+            let params = profile.to_audio_params(40);
+            let mut client = Sht3ClientConnection::connect(
+                addr,
+                Sht3ClientConfig::new(peer_id, params),
+                &k_pair,
+            )
+            .unwrap();
+            let mut encoder = create_codec(&params).unwrap();
+            let spc = profile.frame_samples_per_channel();
+            let frame_type = profile.frame_type();
+
+            let total_frames = 12usize;
+            let mut encoded = Vec::new();
+            let mut pcm = vec![0i16; spc * 2];
+            for f_idx in 0..total_frames {
+                let ts = (f_idx * spc) as u32;
+                if f_idx == 5 {
+                    client.send_audio(frame_type, 0, ts, &bad_payload).unwrap();
+                } else {
+                    for i in 0..spc {
+                        let t = (f_idx * spc + i) as f64 / f64::from(PCM_SAMPLE_RATE);
+                        let s = ((2.0 * std::f64::consts::PI * 440.0 * t).sin() * 14_000.0) as i16;
+                        pcm[i * 2] = s;
+                        pcm[i * 2 + 1] = -s;
+                    }
+                    encoded.clear();
+                    encoder.encode(&pcm, &mut encoded).unwrap();
+                    client.send_audio(frame_type, 0, ts, &encoded).unwrap();
+                }
+            }
+            client.send_close().unwrap();
+
+            let rx_handle = wait_until(Duration::from_secs(2), || {
+                rx_handle_slot
+                    .lock()
+                    .unwrap()
+                    .as_ref()
+                    .is_some_and(|h| h.is_closed())
+            });
+            assert!(rx_handle, "{profile:?} receiver did not close cleanly");
+
+            let handle = rx_handle_slot.lock().unwrap().clone().unwrap();
+            assert_eq!(
+                handle.frame_count(),
+                total_frames,
+                "{profile:?} lost frame cadence on decode error"
+            );
+
+            let diag = manager
+                .inbound_peer_diagnostics(peer_id)
+                .expect("missing inbound diagnostics");
+            assert_eq!(diag.decode_errors, 1);
+            assert_eq!(diag.audio_frames_received, total_frames as u64);
+
+            if profile.codec_id() == CodecId::Opus {
+                let frames = handle.frames();
+                assert!(
+                    !crate::transport::codec::is_digital_silence(&frames[5], 10),
+                    "expected non-silent Opus PLC fallback on corrupted slot 5"
+                );
+            }
+        }
     }
 }

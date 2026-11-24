@@ -701,6 +701,22 @@ impl PcmPlayback for LinuxPcmPlayback {
     fn is_muted(&self) -> bool {
         self.muted.load(Ordering::Acquire)
     }
+
+    fn buffered_ms(&self) -> Option<f64> {
+        Self::buffered_ms(self)
+    }
+
+    fn sink_target_ms(&self) -> f64 {
+        Self::sink_target_ms(self)
+    }
+
+    fn sink_underruns(&self) -> u64 {
+        Self::sink_underruns(self)
+    }
+
+    fn sink_overruns(&self) -> u64 {
+        Self::sink_overruns(self)
+    }
 }
 
 impl Drop for LinuxPcmPlayback {
@@ -900,7 +916,9 @@ fn push_to_ring(
         state.ring.extend(new_samples.iter().copied());
     }
 
-    atomics.ring_samples.store(state.ring.len(), Ordering::Release);
+    atomics
+        .ring_samples
+        .store(state.ring.len(), Ordering::Release);
 }
 
 fn build_respawn_command(spawner: &mut PlaybackSpawner) -> Option<Command> {
@@ -1223,9 +1241,10 @@ fn respawn_writer_child(
     let misaligned = rem % BYTES_PER_STEREO_FRAME;
     if misaligned != 0 {
         *staging_pos += misaligned;
-        atomics
-            .staging_bytes
-            .store(staging.len().saturating_sub(*staging_pos), Ordering::Release);
+        atomics.staging_bytes.store(
+            staging.len().saturating_sub(*staging_pos),
+            Ordering::Release,
+        );
     }
 
     true
@@ -1785,11 +1804,17 @@ mod tests {
 
         slow_play.write_frame(&frame).unwrap();
         let b1 = slow_play.buffered_ms().unwrap();
-        assert!((b1 - 20.0).abs() < 0.5, "after 1 frame expected ~20 ms, got {b1}");
+        assert!(
+            (b1 - 20.0).abs() < 0.5,
+            "after 1 frame expected ~20 ms, got {b1}"
+        );
 
         slow_play.write_frame(&frame).unwrap();
         let b2 = slow_play.buffered_ms().unwrap();
-        assert!((b2 - 40.0).abs() < 0.5, "after 2 frames expected ~40 ms, got {b2}");
+        assert!(
+            (b2 - 40.0).abs() < 0.5,
+            "after 2 frames expected ~40 ms, got {b2}"
+        );
 
         for _ in 0..5 {
             std::thread::sleep(Duration::from_millis(20));

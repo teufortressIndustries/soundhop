@@ -1133,7 +1133,10 @@ mod tests {
         let (pairs, remainder) = out.as_chunks::<2>();
         assert!(remainder.is_empty());
         for pair in pairs {
-            assert_eq!(pair[0], -pair[1], "stereo L/R alignment broken across overrun");
+            assert_eq!(
+                pair[0], -pair[1],
+                "stereo L/R alignment broken across overrun"
+            );
         }
     }
 

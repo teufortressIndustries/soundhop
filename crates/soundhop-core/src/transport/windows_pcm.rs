@@ -273,6 +273,22 @@ impl PcmPlayback for WindowsPcmPlayback {
     fn is_muted(&self) -> bool {
         self.muted.load(Ordering::Acquire)
     }
+
+    fn buffered_ms(&self) -> Option<f64> {
+        Self::buffered_ms(self)
+    }
+
+    fn sink_target_ms(&self) -> f64 {
+        Self::sink_target_ms(self)
+    }
+
+    fn sink_underruns(&self) -> u64 {
+        Self::sink_underruns(self)
+    }
+
+    fn sink_overruns(&self) -> u64 {
+        Self::sink_overruns(self)
+    }
 }
 
 impl Drop for WindowsPcmPlayback {
