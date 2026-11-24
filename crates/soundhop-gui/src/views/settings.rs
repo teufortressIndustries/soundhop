@@ -10,6 +10,13 @@ use crate::widgets::{
     secondary_button, section_header, segmented_control, selectable_card, toggle_switch,
 };
 
+const AUDIO_PROFILE_OPTIONS: &[(&str, &str)] = &[
+    ("opus-balanced", "Balanced (Opus 128k)"),
+    ("opus-low-latency", "Low Latency (Opus 10ms)"),
+    ("opus-low-bandwidth", "Wi-Fi Saver (Opus 64k)"),
+    ("pcm-lossless", "Lossless (Uncompressed PCM)"),
+];
+
 pub struct SettingsViewState {
     pub device_name: String,
     pub pairing_code_input: String,
@@ -646,6 +653,51 @@ pub fn render(
         "settings_advanced_drawer",
         "Advanced Audio, Network & Diagnostics",
         |ui| {
+            // Audio Codec & Quality (SHT3)
+            ui.label(
+                RichText::new("Audio Codec & Quality (SHT3)")
+                    .color(pal.text)
+                    .size(13.5)
+                    .strong(),
+            );
+            ui.label(
+                RichText::new(
+                    "Opus compresses and protects encrypted streams over Wi-Fi; Lossless sends raw 48 kHz stereo PCM.",
+                )
+                .color(pal.text_muted)
+                .size(12.0),
+            );
+            ui.add_space(6.0);
+            let current_profile = snap.config.audio.profile.as_str();
+            let selected_label = AUDIO_PROFILE_OPTIONS
+                .iter()
+                .find(|(key, _)| *key == current_profile)
+                .map(|(_, label)| *label)
+                .unwrap_or(current_profile);
+            let mut chosen = snap.config.audio.profile.clone();
+            egui::ComboBox::from_id_salt("settings_audio_profile_combo")
+                .selected_text(selected_label)
+                .show_ui(ui, |ui| {
+                    for (key, label) in AUDIO_PROFILE_OPTIONS {
+                        ui.selectable_value(&mut chosen, (*key).to_string(), *label);
+                    }
+                });
+            if chosen != snap.config.audio.profile {
+                let chosen_label = AUDIO_PROFILE_OPTIONS
+                    .iter()
+                    .find(|(key, _)| *key == chosen)
+                    .map(|(_, label)| *label)
+                    .unwrap_or(chosen.as_str());
+                backend.send(GuiCommand::SaveConfigPatch {
+                    patch: serde_json::json!({ "audio": { "profile": chosen } }),
+                    toast: Some(format!("Audio profile set to {chosen_label}.")),
+                });
+            }
+
+            ui.add_space(10.0);
+            ui.separator();
+            ui.add_space(8.0);
+
             // Latency Presets
             ui.label(
                 RichText::new("Audio Sync & Buffer Latency")
@@ -926,4 +978,19 @@ pub fn render(
             }
         },
     );
+}
+
+#[cfg(test)]
+mod tests {
+    use super::AUDIO_PROFILE_OPTIONS;
+    use soundhop_core::config::VALID_AUDIO_PROFILES;
+
+    #[test]
+    fn audio_profile_options_match_valid_audio_profiles() {
+        let keys: Vec<&str> = AUDIO_PROFILE_OPTIONS.iter().map(|(k, _)| *k).collect();
+        assert_eq!(keys, VALID_AUDIO_PROFILES);
+        for (_, label) in AUDIO_PROFILE_OPTIONS {
+            assert!(!label.is_empty());
+        }
+    }
 }
