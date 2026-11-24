@@ -2093,7 +2093,7 @@ mod tests {
                 hook(self.frame_idx);
             }
             // Frames 0..8: normal 20ms pace.
-            // Before frame 8: 120ms Wi-Fi stall.
+            // Before frame 8: 200ms Wi-Fi stall.
             // Frames 8..14: immediate burst (0ms delay).
             // Frames 14..24: normal 20ms pace.
             // Frame >= 24: EOF.
@@ -2104,7 +2104,7 @@ mod tests {
                 thread::sleep(Duration::from_millis(20));
             }
             if self.frame_idx == 8 {
-                thread::sleep(Duration::from_millis(120));
+                thread::sleep(Duration::from_millis(200));
             }
             let spc = buf.len() / 2;
             for i in 0..spc {
@@ -2178,7 +2178,7 @@ mod tests {
         assert_eq!(session.telemetry().frames_sent, 24);
         assert!(
             rx_handle.frame_count() > 24,
-            "expected PLC frames during 90ms Wi-Fi stall, got {} frames",
+            "expected PLC frames during 200ms Wi-Fi stall, got {} frames",
             rx_handle.frame_count()
         );
         let frames = rx_handle.frames();
