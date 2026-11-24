@@ -1,5 +1,5 @@
 //! Standalone audio DSP helpers for the SHT3 transport pipeline:
-//! gain/mute scaling and persistent-phase linear resamplers.
+//! gain/mute scaling, persistent-phase resamplers, and adaptive clock-drift compensation.
 
 use std::collections::VecDeque;
 
@@ -370,6 +370,7 @@ impl LinearResampler {
 pub struct PlaybackResampler {
     src_rate: u32,
     dst_rate: u32,
+    rate_adjust: f64,
     phase: f64,
     prev: (i16, i16),
     next: (i16, i16),
@@ -381,11 +382,24 @@ impl PlaybackResampler {
         Self {
             src_rate: src_rate.max(1),
             dst_rate: dst_rate.max(1),
+            rate_adjust: 1.0,
             phase: 0.0,
             prev: (0, 0),
             next: (0, 0),
             initialized: false,
         }
+    }
+
+    /// Set a fine multiplicative rate adjustment factor around `1.0` for clock-drift compensation.
+    pub fn set_rate_adjust(&mut self, ratio: f64) {
+        if ratio.is_finite() {
+            self.rate_adjust = ratio.clamp(0.5, 2.0);
+        }
+    }
+
+    /// Current multiplicative rate adjustment factor.
+    pub fn rate_adjust(&self) -> f64 {
+        self.rate_adjust
     }
 
     pub fn reset(&mut self) {
@@ -407,7 +421,10 @@ impl PlaybackResampler {
         mut write_sample: F,
     ) {
         let dst_channels = dst_channels.max(1);
-        if self.src_rate == self.dst_rate {
+        if self.src_rate == self.dst_rate
+            && (self.rate_adjust - 1.0).abs() <= 1e-9
+            && !self.initialized
+        {
             for f in 0..out_frames {
                 let (raw_l, raw_r) = pop_frame_pair(buf, src_channels);
                 let l = apply_gain_i16(raw_l, volume_pct, muted);
@@ -423,7 +440,7 @@ impl PlaybackResampler {
             self.initialized = true;
         }
 
-        let step = f64::from(self.src_rate) / f64::from(self.dst_rate);
+        let step = (f64::from(self.src_rate) / f64::from(self.dst_rate)) * self.rate_adjust;
         for f in 0..out_frames {
             let interp_l = lerp_i16(self.prev.0, self.next.0, self.phase);
             let interp_r = lerp_i16(self.prev.1, self.next.1, self.phase);
@@ -438,6 +455,318 @@ impl PlaybackResampler {
                 self.next = pop_frame_pair(buf, src_channels);
             }
         }
+    }
+}
+
+/// Default EMA smoothing factor for buffer fill error in [`DriftController`].
+pub const DEFAULT_DRIFT_EMA_ALPHA: f64 = 0.05;
+/// Default proportional gain (`ratio` offset per ms of smoothed fill error).
+pub const DEFAULT_DRIFT_KP: f64 = 2.5e-5;
+/// Default integral gain (`ratio` offset per `ms * sec` of smoothed fill error).
+pub const DEFAULT_DRIFT_KI: f64 = 2.0e-6;
+/// Anti-windup clamp on the integral term (`±2000 ppm`).
+pub const DEFAULT_DRIFT_MAX_INTEGRAL: f64 = 0.002;
+/// Maximum allowed resampling ratio deviation from `1.0` (`±5000 ppm`).
+pub const DEFAULT_DRIFT_MAX_OFFSET: f64 = 0.005;
+/// Maximum ratio slew rate (`50e-6` per `20 ms` step = `2.5e-3` per second).
+pub const DEFAULT_DRIFT_MAX_SLEW_PER_SEC: f64 = 50e-6 / 0.020;
+
+/// Adaptive PI clock-drift controller for SHT3 audio playback buffering.
+///
+/// Tracks `err_ms = smoothed_fill_ms - target_ms` and outputs a slew-rate-limited
+/// resampling ratio around `1.0`:
+/// - `measured_ms > target_ms` (sender faster than receiver DAC): `ratio > 1.0`,
+///   advancing input phase faster to drain excess buffer.
+/// - `measured_ms < target_ms` (sender slower than receiver DAC): `ratio < 1.0`,
+///   advancing input phase slower to replenish the buffer.
+#[derive(Debug, Clone)]
+pub struct DriftController {
+    target_ms: f64,
+    ema_alpha: f64,
+    kp: f64,
+    ki: f64,
+    max_integral: f64,
+    max_offset: f64,
+    max_slew_per_sec: f64,
+    smoothed_fill_ms: f64,
+    has_measurement: bool,
+    integral: f64,
+    ratio: f64,
+}
+
+impl DriftController {
+    /// Create a [`DriftController`] targeting `target_ms` with default PI/EMA/slew parameters.
+    pub fn new(target_ms: f64) -> Self {
+        Self::with_params(
+            target_ms,
+            DEFAULT_DRIFT_EMA_ALPHA,
+            DEFAULT_DRIFT_KP,
+            DEFAULT_DRIFT_KI,
+            DEFAULT_DRIFT_MAX_SLEW_PER_SEC,
+        )
+    }
+
+    /// Create a [`DriftController`] with explicit EMA, PI, and slew-rate parameters.
+    pub fn with_params(
+        target_ms: f64,
+        ema_alpha: f64,
+        kp: f64,
+        ki: f64,
+        max_slew_per_sec: f64,
+    ) -> Self {
+        let target = if target_ms.is_finite() {
+            target_ms.max(0.0)
+        } else {
+            40.0
+        };
+        let alpha = if ema_alpha.is_finite() {
+            ema_alpha.clamp(1e-6, 1.0)
+        } else {
+            DEFAULT_DRIFT_EMA_ALPHA
+        };
+        Self {
+            target_ms: target,
+            ema_alpha: alpha,
+            kp: if kp.is_finite() { kp.max(0.0) } else { DEFAULT_DRIFT_KP },
+            ki: if ki.is_finite() { ki.max(0.0) } else { DEFAULT_DRIFT_KI },
+            max_integral: DEFAULT_DRIFT_MAX_INTEGRAL,
+            max_offset: DEFAULT_DRIFT_MAX_OFFSET,
+            max_slew_per_sec: if max_slew_per_sec.is_finite() {
+                max_slew_per_sec.max(0.0)
+            } else {
+                DEFAULT_DRIFT_MAX_SLEW_PER_SEC
+            },
+            smoothed_fill_ms: target,
+            has_measurement: false,
+            integral: 0.0,
+            ratio: 1.0,
+        }
+    }
+
+    /// Feed a new buffer fill measurement (`measured_ms`) after `dt_secs` elapsed
+    /// and return the updated slew-rate-limited resampling `ratio`.
+    pub fn update(&mut self, measured_ms: f64, dt_secs: f64) -> f64 {
+        if !measured_ms.is_finite() {
+            return self.ratio;
+        }
+        let measured = measured_ms.max(0.0);
+        if !self.has_measurement {
+            self.smoothed_fill_ms = measured;
+            self.has_measurement = true;
+        } else {
+            self.smoothed_fill_ms += self.ema_alpha * (measured - self.smoothed_fill_ms);
+        }
+
+        if !dt_secs.is_finite() || dt_secs <= 0.0 {
+            return self.ratio;
+        }
+
+        let err_ms = self.smoothed_fill_ms - self.target_ms;
+        self.integral = (self.integral + self.ki * err_ms * dt_secs)
+            .clamp(-self.max_integral, self.max_integral);
+
+        let min_ratio = 1.0 - self.max_offset;
+        let max_ratio = 1.0 + self.max_offset;
+        let target_ratio = (1.0 + self.kp * err_ms + self.integral).clamp(min_ratio, max_ratio);
+
+        let max_delta = self.max_slew_per_sec * dt_secs;
+        let delta = (target_ratio - self.ratio).clamp(-max_delta, max_delta);
+        self.ratio = (self.ratio + delta).clamp(min_ratio, max_ratio);
+        self.ratio
+    }
+
+    /// Current resampling ratio (`1.0` = nominal).
+    #[inline]
+    pub fn ratio(&self) -> f64 {
+        self.ratio
+    }
+
+    /// Current clock-drift estimate in parts per million (`(ratio - 1.0) * 1e6`).
+    #[inline]
+    pub fn ppm(&self) -> f64 {
+        (self.ratio - 1.0) * 1_000_000.0
+    }
+
+    /// Current EMA-smoothed buffer fill level in milliseconds.
+    #[inline]
+    pub fn smoothed_fill_ms(&self) -> f64 {
+        self.smoothed_fill_ms
+    }
+
+    /// Configured target buffer fill level in milliseconds.
+    #[inline]
+    pub fn target_ms(&self) -> f64 {
+        self.target_ms
+    }
+
+    /// Update the target buffer fill level in milliseconds.
+    pub fn set_target_ms(&mut self, target_ms: f64) {
+        if target_ms.is_finite() {
+            self.target_ms = target_ms.max(0.0);
+        }
+    }
+
+    /// Reset smoothed fill, PI integrator, and output ratio back to `1.0`.
+    pub fn reset(&mut self) {
+        self.smoothed_fill_ms = self.target_ms;
+        self.has_measurement = false;
+        self.integral = 0.0;
+        self.ratio = 1.0;
+    }
+}
+
+#[inline]
+fn catmull_rom_i16(y0: i16, y1: i16, y2: i16, y3: i16, t: f64) -> i16 {
+    let p0 = f64::from(y0);
+    let p1 = f64::from(y1);
+    let p2 = f64::from(y2);
+    let p3 = f64::from(y3);
+    let t2 = t * t;
+    let t3 = t2 * t;
+    let val = 0.5
+        * ((2.0 * p1)
+            + (-p0 + p2) * t
+            + (2.0 * p0 - 5.0 * p1 + 4.0 * p2 - p3) * t2
+            + (-p0 + 3.0 * p1 - 3.0 * p2 + p3) * t3);
+    val.round().clamp(f64::from(i16::MIN), f64::from(i16::MAX)) as i16
+}
+
+/// Stateful 4-point Catmull-Rom cubic stereo resampler (`i16` interleaved stereo in/out).
+///
+/// Maintains a 4-frame stereo history and fractional `phase` wrapped into `[0.0, 1.0)`
+/// on every output frame. Performs bit-transparent passthrough when
+/// `!initialized && (ratio - 1.0).abs() <= 1e-9`, while updating its tail history
+/// so transitions to active resampling are seamless and click-free.
+#[derive(Debug, Clone)]
+pub struct AdaptiveResampler {
+    history: [(i16, i16); 4],
+    has_history: bool,
+    frame_pos: i64,
+    phase: f64,
+    initialized: bool,
+}
+
+impl Default for AdaptiveResampler {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+impl AdaptiveResampler {
+    /// Create a new [`AdaptiveResampler`] in bit-transparent passthrough state.
+    pub fn new() -> Self {
+        Self {
+            history: [(0, 0); 4],
+            has_history: false,
+            frame_pos: 0,
+            phase: 0.0,
+            initialized: false,
+        }
+    }
+
+    /// Reset history, fractional phase, and initialization state.
+    pub fn reset(&mut self) {
+        self.history = [(0, 0); 4];
+        self.has_history = false;
+        self.frame_pos = 0;
+        self.phase = 0.0;
+        self.initialized = false;
+    }
+
+    /// Current fractional sample phase in `[0.0, 1.0)`.
+    #[inline]
+    pub fn phase(&self) -> f64 {
+        self.phase
+    }
+
+    #[inline]
+    fn frame_at(&self, usable_input: &[i16], idx: i64) -> (i16, i16) {
+        if idx < 0 {
+            let hist_idx = (4 + idx).clamp(0, 3) as usize;
+            self.history[hist_idx]
+        } else {
+            let i = (idx as usize) * 2;
+            (usable_input[i], usable_input[i + 1])
+        }
+    }
+
+    fn update_history(&mut self, usable_input: &[i16]) {
+        let n_frames = usable_input.len() / 2;
+        if n_frames >= 4 {
+            let start = (n_frames - 4) * 2;
+            for i in 0..4 {
+                self.history[i] = (usable_input[start + i * 2], usable_input[start + i * 2 + 1]);
+            }
+            self.has_history = true;
+        } else {
+            for f in 0..n_frames {
+                let frame = (usable_input[f * 2], usable_input[f * 2 + 1]);
+                if !self.has_history {
+                    self.history = [frame; 4];
+                    self.has_history = true;
+                } else {
+                    self.history.rotate_left(1);
+                    self.history[3] = frame;
+                }
+            }
+        }
+    }
+
+    /// Process interleaved stereo `i16` `input` at the given `ratio` and append output
+    /// interleaved stereo `i16` samples to `out`.
+    pub fn process_stereo(&mut self, input: &[i16], ratio: f64, out: &mut Vec<i16>) {
+        let n_frames = input.len() / 2;
+        if n_frames == 0 {
+            return;
+        }
+        let usable = n_frames * 2;
+        let step = if ratio.is_finite() {
+            ratio.clamp(0.25, 4.0)
+        } else {
+            1.0
+        };
+
+        if !self.initialized && (step - 1.0).abs() <= 1e-9 {
+            out.extend_from_slice(&input[..usable]);
+            self.update_history(&input[..usable]);
+            return;
+        }
+
+        if !self.has_history {
+            self.history = [(input[0], input[1]); 4];
+        }
+        self.initialized = true;
+
+        let est_frames = ((n_frames as f64) / step).ceil() as usize + 4;
+        out.reserve(est_frames * 2);
+
+        let limit = n_frames as i64;
+        while self.frame_pos + 2 < limit {
+            let idx = self.frame_pos;
+            let f0 = self.frame_at(&input[..usable], idx - 1);
+            let f1 = self.frame_at(&input[..usable], idx);
+            let f2 = self.frame_at(&input[..usable], idx + 1);
+            let f3 = self.frame_at(&input[..usable], idx + 2);
+
+            out.push(catmull_rom_i16(f0.0, f1.0, f2.0, f3.0, self.phase));
+            out.push(catmull_rom_i16(f0.1, f1.1, f2.1, f3.1, self.phase));
+
+            let next_phase = self.phase + step;
+            let advance = next_phase.floor() as i64;
+            let mut rem = next_phase - (advance as f64);
+            let mut extra = 0i64;
+            if rem >= 1.0 {
+                rem -= 1.0;
+                extra = 1;
+            } else if rem < 0.0 {
+                rem = 0.0;
+            }
+            self.phase = rem;
+            self.frame_pos += advance + extra;
+        }
+
+        self.update_history(&input[..usable]);
+        self.frame_pos -= limit;
     }
 }
 
@@ -603,5 +932,300 @@ mod tests {
         let mut out2 = vec![0i16; 160];
         r.write_frames(&mut q2, 2, 2, 80, 100, false, |idx, s| out2[idx] = s);
         assert_eq!(out1, out2);
+    }
+
+    #[test]
+    fn playback_resampler_rate_adjust_preserves_unity_and_adjusts_consumption() {
+        // Bit-exact passthrough when src_rate == dst_rate && rate_adjust == 1.0.
+        let mut exact = PlaybackResampler::new(48_000, 48_000);
+        assert!((exact.rate_adjust() - 1.0).abs() <= f64::EPSILON);
+        let input: Vec<i16> = (0..400).map(|i| ((i * 53 - 10_000) % 20_000) as i16).collect();
+        let mut q = VecDeque::from(input.clone());
+        let mut out = vec![0i16; 400];
+        exact.write_frames(&mut q, 2, 2, 200, 100, false, |idx, s| out[idx] = s);
+        assert_eq!(out, input);
+        assert!(q.is_empty());
+
+        // Fast rate_adjust (> 1.0) consumes more source samples per output frame.
+        let mut fast = PlaybackResampler::new(48_000, 48_000);
+        fast.set_rate_adjust(1.005);
+        assert!((fast.rate_adjust() - 1.005).abs() <= 1e-12);
+        let mut q_fast = VecDeque::from(vec![0i16; 4_000]);
+        let mut out_fast = vec![0i16; 2_000];
+        fast.write_frames(&mut q_fast, 2, 2, 1_000, 100, false, |idx, s| {
+            out_fast[idx] = s
+        });
+        let consumed_fast_frames = (4_000 - q_fast.len()) / 2;
+        assert!(
+            consumed_fast_frames > 1_000,
+            "expected > 1000 consumed frames, got {consumed_fast_frames}"
+        );
+
+        // Slow rate_adjust (< 1.0) consumes fewer source samples per output frame.
+        let mut slow = PlaybackResampler::new(48_000, 48_000);
+        slow.set_rate_adjust(0.995);
+        let mut q_slow = VecDeque::from(vec![0i16; 4_000]);
+        let mut out_slow = vec![0i16; 2_000];
+        slow.write_frames(&mut q_slow, 2, 2, 1_000, 100, false, |idx, s| {
+            out_slow[idx] = s
+        });
+        let consumed_slow_frames = (4_000 - q_slow.len()) / 2;
+        assert!(
+            consumed_slow_frames < 1_000,
+            "expected < 1000 consumed frames, got {consumed_slow_frames}"
+        );
+    }
+
+    #[test]
+    fn drift_controller_sign_slew_clamps_and_reset() {
+        let mut ctrl = DriftController::new(40.0);
+        assert!((ctrl.target_ms() - 40.0).abs() <= f64::EPSILON);
+        assert!((ctrl.ratio() - 1.0).abs() <= f64::EPSILON);
+        assert!((ctrl.ppm()).abs() <= f64::EPSILON);
+
+        // Excess fill (measured > target) => ratio > 1.0; slew-limited to <= 50e-6 per 20 ms.
+        let r1 = ctrl.update(100.0, 0.020);
+        assert!(r1 > 1.0, "expected ratio > 1.0, got {r1}");
+        assert!(
+            (r1 - 1.0) <= 50e-6 + 1e-12,
+            "slew exceeded 50e-6 per 20ms: {}",
+            r1 - 1.0
+        );
+
+        // Large sustained positive error clamps ratio at 1.005 and integral at +0.002.
+        for _ in 0..2_000 {
+            ctrl.update(500.0, 0.020);
+        }
+        assert!((ctrl.ratio() - 1.005).abs() <= 1e-12, "got {}", ctrl.ratio());
+        assert!((ctrl.integral - 0.002).abs() <= 1e-12, "got {}", ctrl.integral);
+
+        // Reset restores unity ratio and target_ms.
+        ctrl.reset();
+        assert!((ctrl.ratio() - 1.0).abs() <= f64::EPSILON);
+        assert!((ctrl.smoothed_fill_ms() - 40.0).abs() <= f64::EPSILON);
+
+        // Deficit fill (measured < target) => ratio < 1.0; integral clamps at -0.002.
+        for _ in 0..2_000 {
+            ctrl.update(0.0, 0.020);
+        }
+        assert!(ctrl.ratio() < 1.0);
+        assert!((ctrl.integral + 0.002).abs() <= 1e-12, "got {}", ctrl.integral);
+        // With target_ms = 40, P = -0.001 and I = -0.002 => ratio = 0.997.
+        assert!((ctrl.ratio() - 0.997).abs() <= 1e-12, "got {}", ctrl.ratio());
+
+        // With target_ms = 200, err_ms = -200 saturates output ratio at 0.995.
+        ctrl.set_target_ms(200.0);
+        assert!((ctrl.target_ms() - 200.0).abs() <= f64::EPSILON);
+        for _ in 0..2_000 {
+            ctrl.update(0.0, 0.020);
+        }
+        assert!((ctrl.ratio() - 0.995).abs() <= 1e-12, "got {}", ctrl.ratio());
+
+        // Custom parameters via with_params.
+        let mut custom = DriftController::with_params(30.0, 0.1, 1e-4, 1e-5, 0.01);
+        assert!(custom.update(50.0, 0.020) > 1.0);
+    }
+
+    #[test]
+    fn drift_controller_closed_loop_converges_plus_minus_200_ppm() {
+        for &skew_ppm in &[200.0_f64, -200.0_f64] {
+            let target_ms = 40.0_f64;
+            let max_ms = 160.0_f64;
+            let dt_secs = 0.020_f64;
+            let frames_per_step = 960_usize; // 20 ms @ 48 kHz
+            let sample_rate = 48_000.0_f64;
+            let skew = skew_ppm * 1e-6;
+            // Sender delivers 960 frames per 20 ms sender tick; DAC consumes at 48k / (1 + skew).
+            let dac_frames_per_step = (frames_per_step as f64) / (1.0 + skew);
+
+            let mut ctrl = DriftController::new(target_ms);
+            let mut resampler = AdaptiveResampler::new();
+            let mut buffered_frames: f64 = target_ms * 48.0; // 1920 frames
+            let mut underruns = 0u64;
+            let mut overruns = 0u64;
+
+            let mut input = vec![0i16; frames_per_step * 2];
+            let mut out = Vec::with_capacity(frames_per_step * 2 + 16);
+
+            let mut sample_idx = 0usize;
+            for _step in 0..30_000 {
+                for f in 0..frames_per_step {
+                    let t = (sample_idx as f64) / sample_rate;
+                    let l = ((2.0 * std::f64::consts::PI * 440.0 * t).sin() * 12_000.0) as i16;
+                    let r = ((2.0 * std::f64::consts::PI * 660.0 * t).sin() * 12_000.0) as i16;
+                    input[f * 2] = l;
+                    input[f * 2 + 1] = r;
+                    sample_idx += 1;
+                }
+
+                let measured_ms = buffered_frames / 48.0;
+                let ratio = ctrl.update(measured_ms, dt_secs);
+
+                out.clear();
+                resampler.process_stereo(&input, ratio, &mut out);
+                let produced_frames = (out.len() / 2) as f64;
+
+                buffered_frames += produced_frames;
+                if buffered_frames > max_ms * 48.0 {
+                    overruns += 1;
+                    buffered_frames = max_ms * 48.0;
+                }
+
+                buffered_frames -= dac_frames_per_step;
+                if buffered_frames < 0.0 {
+                    underruns += 1;
+                    buffered_frames = 0.0;
+                }
+            }
+
+            let final_fill_ms = buffered_frames / 48.0;
+            let final_ppm = ctrl.ppm();
+            assert_eq!(underruns, 0, "skew {skew_ppm} ppm caused underruns");
+            assert_eq!(overruns, 0, "skew {skew_ppm} ppm caused overruns");
+            assert!(
+                (final_fill_ms - target_ms).abs() < 0.5,
+                "skew {skew_ppm} ppm final fill {final_fill_ms:.3} ms did not converge to {target_ms} ms"
+            );
+            assert!(
+                (final_ppm - skew_ppm).abs() <= 10.0,
+                "skew {skew_ppm} ppm converged to {final_ppm:.3} ppm (outside ±10 ppm)"
+            );
+        }
+    }
+
+    #[test]
+    fn adaptive_resampler_passthrough_and_multitone_snr_and_sweep_continuity() {
+        // 1. Bit-transparent passthrough when !initialized && ratio == 1.0.
+        let mut r = AdaptiveResampler::new();
+        let passthrough_in: Vec<i16> = (0..960 * 2)
+            .map(|i| if i % 2 == 0 { ((i * 19) % 15_000) as i16 } else { -(((i * 23) % 15_000) as i16) })
+            .collect();
+        let mut out = Vec::new();
+        r.process_stereo(&passthrough_in, 1.0, &mut out);
+        assert_eq!(out, passthrough_in);
+
+        // 2. Multi-tone stereo SNR > 65 dB.
+        let mut r_snr = AdaptiveResampler::new();
+        let sr = 48_000.0_f64;
+        let total_in_frames = 4_800usize;
+        let ratio = 1.0005_f64;
+        let tone_l = |t: f64| -> f64 {
+            10_000.0 * (2.0 * std::f64::consts::PI * 440.0 * t).sin()
+                + 6_000.0 * (2.0 * std::f64::consts::PI * 1320.0 * t).sin()
+        };
+        let tone_r = |t: f64| -> f64 {
+            10_000.0 * (2.0 * std::f64::consts::PI * 660.0 * t).sin()
+                + 6_000.0 * (2.0 * std::f64::consts::PI * 1980.0 * t).sin()
+        };
+
+        let mut stereo_in = Vec::with_capacity(total_in_frames * 2);
+        for n in 0..total_in_frames {
+            let t = (n as f64) / sr;
+            stereo_in.push(tone_l(t).round() as i16);
+            stereo_in.push(tone_r(t).round() as i16);
+        }
+
+        let mut snr_out = Vec::new();
+        for chunk in stereo_in.chunks(480 * 2) {
+            r_snr.process_stereo(chunk, ratio, &mut snr_out);
+        }
+
+        let out_frames = snr_out.len() / 2;
+        assert!(out_frames > 4_000);
+        let mut sig_pow_l = 0.0_f64;
+        let mut err_pow_l = 0.0_f64;
+        let mut sig_pow_r = 0.0_f64;
+        let mut err_pow_r = 0.0_f64;
+        for k in 10..(out_frames - 10) {
+            let t = ((k as f64) * ratio) / sr;
+            let ref_l = tone_l(t);
+            let ref_r = tone_r(t);
+            let dl = f64::from(snr_out[k * 2]) - ref_l;
+            let dr = f64::from(snr_out[k * 2 + 1]) - ref_r;
+            sig_pow_l += ref_l * ref_l;
+            err_pow_l += dl * dl;
+            sig_pow_r += ref_r * ref_r;
+            err_pow_r += dr * dr;
+        }
+        let snr_l = 10.0 * (sig_pow_l / err_pow_l).log10();
+        let snr_r = 10.0 * (sig_pow_r / err_pow_r).log10();
+        assert!(snr_l > 65.0, "Left SNR {snr_l:.2} dB <= 65 dB");
+        assert!(snr_r > 65.0, "Right SNR {snr_r:.2} dB <= 65 dB");
+
+        // 3. Click-free continuity across passthrough -> active -> ratio sweep across 1.0.
+        let mut r_sweep = AdaptiveResampler::new();
+        let mut sweep_out = Vec::new();
+        let ratios = [
+            1.0, 1.0, 1.0002, 1.0005, 1.001, 1.0, 0.999, 0.9985, 1.0, 1.0003,
+        ];
+        let chunk_frames = 960usize;
+        let mut chunk = vec![0i16; chunk_frames * 2];
+        let mut idx = 0usize;
+        for &cur_ratio in &ratios {
+            for f in 0..chunk_frames {
+                let t = (idx as f64) / sr;
+                chunk[f * 2] = (12_000.0 * (2.0 * std::f64::consts::PI * 440.0 * t).sin()).round() as i16;
+                chunk[f * 2 + 1] =
+                    (12_000.0 * (2.0 * std::f64::consts::PI * 660.0 * t).sin()).round() as i16;
+                idx += 1;
+            }
+            r_sweep.process_stereo(&chunk, cur_ratio, &mut sweep_out);
+        }
+
+        let sweep_frames = sweep_out.len() / 2;
+        let max_step_l = (2.0 * std::f64::consts::PI * 440.0 / sr) * 12_000.0 * 1.05 + 10.0;
+        let max_step_r = (2.0 * std::f64::consts::PI * 660.0 / sr) * 12_000.0 * 1.05 + 10.0;
+        for f in 1..sweep_frames {
+            let dl = (i32::from(sweep_out[f * 2]) - i32::from(sweep_out[(f - 1) * 2])).abs() as f64;
+            let dr = (i32::from(sweep_out[f * 2 + 1]) - i32::from(sweep_out[(f - 1) * 2 + 1])).abs()
+                as f64;
+            assert!(
+                dl <= max_step_l,
+                "click detected on L at frame {f}: delta={dl:.1} > {max_step_l:.1}"
+            );
+            assert!(
+                dr <= max_step_r,
+                "click detected on R at frame {f}: delta={dr:.1} > {max_step_r:.1}"
+            );
+        }
+    }
+
+    #[test]
+    fn adaptive_resampler_5m_frames_precision_and_no_lr_swap() {
+        let mut r = AdaptiveResampler::new();
+        let ratio = 1.000_197_f64;
+        let chunk_frames = 1_000usize;
+        let num_chunks = 5_000usize; // 5_000_000 stereo frames total
+        let mut chunk = vec![0i16; chunk_frames * 2];
+        for f in 0..chunk_frames {
+            chunk[f * 2] = 10_000;
+            chunk[f * 2 + 1] = -10_000;
+        }
+
+        let mut out = Vec::with_capacity(chunk_frames * 2 + 16);
+        let mut total_out_frames = 0usize;
+        for _ in 0..num_chunks {
+            out.clear();
+            r.process_stereo(&chunk, ratio, &mut out);
+            assert!(
+                (0.0..1.0).contains(&r.phase()),
+                "phase out of [0.0, 1.0): {}",
+                r.phase()
+            );
+            let (pairs, rem) = out.as_chunks::<2>();
+            assert!(rem.is_empty());
+            for &[l, r] in pairs {
+                assert_eq!(l, 10_000, "L channel corrupted or swapped");
+                assert_eq!(r, -10_000, "R channel corrupted or swapped");
+            }
+            total_out_frames += out.len() / 2;
+        }
+
+        let expected_frames = (5_000_000.0_f64 / ratio).round() as isize;
+        let diff = (total_out_frames as isize - expected_frames).abs();
+        assert!(
+            diff <= 3,
+            "5M-frame drift too large: produced {total_out_frames}, expected ~{expected_frames}"
+        );
     }
 }
