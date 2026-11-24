@@ -1,20 +1,41 @@
 //! Linux PulseAudio/PipeWire PCM capture (`parec` / `pacat --record`) and playback (`pacat`)
 //! bridges for the SHT3 audio transport pipeline.
 
+use std::collections::VecDeque;
 use std::io::{ErrorKind, Read, Write};
 use std::os::unix::io::{AsRawFd, RawFd};
 use std::os::unix::process::CommandExt;
 use std::process::{Child, ChildStdin, ChildStdout, Command, Stdio};
-use std::sync::atomic::{AtomicBool, AtomicU8, Ordering};
-use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, AtomicU64, AtomicU8, AtomicUsize, Ordering};
+use std::sync::{Arc, Condvar, Mutex};
+use std::thread::{self, JoinHandle};
 use std::time::{Duration, Instant};
 
+#[cfg(test)]
 use crate::transport::dsp::apply_gain_i16;
+use crate::transport::dsp::{
+    crossfade_stereo_in_place, fade_in_stereo_in_place, fade_out_stereo_in_place, GainRamp,
+};
 use crate::transport::pcm::{PcmCapture, PcmPlayback, PCM_CHANNELS, PCM_SAMPLE_RATE};
 use crate::transport::{TransportError, TransportResult};
 
 const DEFAULT_LATENCY_MS: u32 = 20;
-const DEFAULT_PLAYBACK_LATENCY_MS: u32 = 60;
+const DEFAULT_PLAYBACK_LATENCY_MS: u32 = 30;
+const DEFAULT_SINK_TARGET_MS: f64 = 40.0;
+const STEREO_FRAMES_PER_MS: usize = (PCM_SAMPLE_RATE as usize) / 1000;
+const BYTES_PER_STEREO_FRAME: usize = (PCM_CHANNELS as usize) * 2;
+const BYTES_PER_MS: f64 = (STEREO_FRAMES_PER_MS * BYTES_PER_STEREO_FRAME) as f64;
+const RING_CAPACITY_FRAMES: usize = 160 * STEREO_FRAMES_PER_MS;
+const RING_CAPACITY_SAMPLES: usize = RING_CAPACITY_FRAMES * 2;
+const OVERRUN_CROSSFADE_FRAMES: usize = 96;
+const UNDERRUN_RAMP_FRAMES: usize = 96;
+const CAPTURE_DECLICK_RAMP_FRAMES: usize = 96;
+const PLAYBACK_PIPE_SIZE_BYTES: libc::c_int = 8192;
+const WRITER_CHUNK_SAMPLES: usize = 1024;
+const WRITER_POLL_SLICE_MS: i32 = 10;
+const WRITER_IDLE_POLL_INTERVAL: Duration = Duration::from_millis(3);
+const PIPE_UNDERRUN_THRESHOLD_BYTES: usize = UNDERRUN_RAMP_FRAMES * BYTES_PER_STEREO_FRAME;
+const MAX_PLAYBACK_RESPAWN_ATTEMPTS: usize = 3;
 const CAPTURE_POLL_TIMEOUT: Duration = Duration::from_millis(45);
 const CAPTURE_POLL_SLICE_MS: i32 = 10;
 const MAX_CAPTURE_RESPAWN_ATTEMPTS: usize = 3;
@@ -45,6 +66,7 @@ pub struct LinuxPcmCapture {
     leftover_len: usize,
     stop_flag: Option<Arc<AtomicBool>>,
     discontinuity: bool,
+    need_fade_in: bool,
 }
 
 impl LinuxPcmCapture {
@@ -97,6 +119,7 @@ impl LinuxPcmCapture {
             leftover_len: 0,
             stop_flag: None,
             discontinuity: false,
+            need_fade_in: false,
         })
     }
 
@@ -261,6 +284,18 @@ impl PcmCapture for LinuxPcmCapture {
             }
             let samples = usable / 2;
             decode_le_samples(&self.byte_buf[..usable], &mut buf[..samples]);
+            if samples > 0 && samples < buf.len() {
+                if self.need_fade_in {
+                    fade_in_stereo_in_place(&mut buf[..samples], CAPTURE_DECLICK_RAMP_FRAMES);
+                }
+                fade_out_stereo_in_place(&mut buf[..samples], CAPTURE_DECLICK_RAMP_FRAMES);
+                self.need_fade_in = true;
+            } else if samples == 0 {
+                self.need_fade_in = true;
+            } else if self.need_fade_in {
+                fade_in_stereo_in_place(&mut buf[..samples], CAPTURE_DECLICK_RAMP_FRAMES);
+                self.need_fade_in = false;
+            }
             buf[samples..].fill(0);
             return Ok(buf.len());
         }
@@ -271,6 +306,10 @@ impl PcmCapture for LinuxPcmCapture {
             self.leftover_len = 1;
         }
         decode_le_samples(&self.byte_buf[..samples * 2], &mut buf[..samples]);
+        if self.need_fade_in && samples > 0 {
+            fade_in_stereo_in_place(&mut buf[..samples], CAPTURE_DECLICK_RAMP_FRAMES);
+            self.need_fade_in = false;
+        }
         Ok(samples)
     }
 }
@@ -337,24 +376,69 @@ enum PlaybackSpawner {
     Custom(Box<dyn FnMut() -> Command + Send>),
 }
 
+#[cfg(test)]
+struct SyncPlayback {
+    spawner: PlaybackSpawner,
+    child: Child,
+    stdin: Option<ChildStdin>,
+    current_gain: f32,
+    byte_buf: Vec<u8>,
+}
+
+struct PlaybackQueueState {
+    ring: VecDeque<i16>,
+    primed: bool,
+    in_underrun: bool,
+    need_fade_in: bool,
+    overruns: u64,
+    underruns: u64,
+    stop: bool,
+    drain_before_stop: bool,
+    failed: bool,
+}
+
+struct PlaybackAtomics {
+    ring_samples: AtomicUsize,
+    staging_bytes: AtomicUsize,
+    underruns: AtomicU64,
+    overruns: AtomicU64,
+}
+
+struct AsyncPlayback {
+    queue: Arc<(Mutex<PlaybackQueueState>, Condvar)>,
+    atomics: Arc<PlaybackAtomics>,
+    pipe_fd: Arc<Mutex<Option<RawFd>>>,
+    stop_flag: Arc<AtomicBool>,
+    writer: Option<JoinHandle<()>>,
+    gain_ramp: GainRamp,
+    ramp_buf: Vec<i16>,
+}
+
+enum PlaybackBackend {
+    #[cfg(test)]
+    Sync(SyncPlayback),
+    Async(AsyncPlayback),
+}
+
 /// Plays 48 kHz stereo S16LE PCM to PulseAudio/PipeWire via `pacat --playback`,
 /// applying smooth software gain ramping and automatic `BrokenPipe` recovery.
+///
+/// For `pacat` playback, a bounded stereo ring buffer and background non-blocking
+/// pipe writer thread (`O_NONBLOCK` + `poll(POLLOUT)` + bounded `F_SETPIPE_SZ`)
+/// prevent kernel pipe bloat and caller blocking while exposing live fill depth
+/// via [`Self::buffered_ms`].
 ///
 /// The child `pacat` process is terminated and reaped automatically on [`Drop`].
 pub struct LinuxPcmPlayback {
     sink: Option<String>,
     latency_ms: u32,
-    spawner: PlaybackSpawner,
-    child: Child,
-    stdin: Option<ChildStdin>,
     volume_pct: Arc<AtomicU8>,
     muted: Arc<AtomicBool>,
-    current_gain: f32,
-    byte_buf: Vec<u8>,
+    backend: PlaybackBackend,
 }
 
 impl LinuxPcmPlayback {
-    /// Spawn `pacat --playback --raw --format=s16le --rate=48000 --channels=2 --latency-msec=60`.
+    /// Spawn `pacat --playback --raw --format=s16le --rate=48000 --channels=2 --latency-msec=30`.
     pub fn spawn() -> TransportResult<Self> {
         Self::spawn_for_sink(None, DEFAULT_PLAYBACK_LATENCY_MS)
     }
@@ -363,7 +447,7 @@ impl LinuxPcmPlayback {
     pub fn spawn_for_sink(sink: Option<&str>, latency_ms: u32) -> TransportResult<Self> {
         let sink_owned = sink.map(str::to_string);
         let cmd = build_pacat_command(sink_owned.as_deref(), latency_ms);
-        Self::spawn_internal(
+        Self::spawn_async_internal(
             sink_owned.clone(),
             latency_ms,
             PlaybackSpawner::Pacat {
@@ -376,7 +460,7 @@ impl LinuxPcmPlayback {
 
     #[cfg(test)]
     fn spawn_command(cmd: Command) -> TransportResult<Self> {
-        Self::spawn_internal(
+        Self::spawn_sync_internal(
             None,
             DEFAULT_PLAYBACK_LATENCY_MS,
             PlaybackSpawner::None,
@@ -389,7 +473,7 @@ impl LinuxPcmPlayback {
         mut make_cmd: impl FnMut() -> Command + Send + 'static,
     ) -> TransportResult<Self> {
         let cmd = make_cmd();
-        Self::spawn_internal(
+        Self::spawn_sync_internal(
             None,
             DEFAULT_PLAYBACK_LATENCY_MS,
             PlaybackSpawner::Custom(Box::new(make_cmd)),
@@ -397,7 +481,31 @@ impl LinuxPcmPlayback {
         )
     }
 
-    fn spawn_internal(
+    #[cfg(test)]
+    fn spawn_async_command(cmd: Command) -> TransportResult<Self> {
+        Self::spawn_async_internal(
+            None,
+            DEFAULT_PLAYBACK_LATENCY_MS,
+            PlaybackSpawner::None,
+            cmd,
+        )
+    }
+
+    #[cfg(test)]
+    fn spawn_async_with_spawner(
+        mut make_cmd: impl FnMut() -> Command + Send + 'static,
+    ) -> TransportResult<Self> {
+        let cmd = make_cmd();
+        Self::spawn_async_internal(
+            None,
+            DEFAULT_PLAYBACK_LATENCY_MS,
+            PlaybackSpawner::Custom(Box::new(make_cmd)),
+            cmd,
+        )
+    }
+
+    #[cfg(test)]
+    fn spawn_sync_internal(
         sink: Option<String>,
         latency_ms: u32,
         spawner: PlaybackSpawner,
@@ -407,25 +515,225 @@ impl LinuxPcmPlayback {
         Ok(Self {
             sink,
             latency_ms,
-            spawner,
-            child,
-            stdin: Some(stdin),
             volume_pct: Arc::new(AtomicU8::new(100)),
             muted: Arc::new(AtomicBool::new(false)),
-            current_gain: 1.0,
-            byte_buf: Vec::new(),
+            backend: PlaybackBackend::Sync(SyncPlayback {
+                spawner,
+                child,
+                stdin: Some(stdin),
+                current_gain: 1.0,
+                byte_buf: Vec::new(),
+            }),
         })
     }
 
-    fn try_respawn(&mut self) -> TransportResult<bool> {
-        let cmd = match &mut self.spawner {
+    fn spawn_async_internal(
+        sink: Option<String>,
+        latency_ms: u32,
+        spawner: PlaybackSpawner,
+        cmd: Command,
+    ) -> TransportResult<Self> {
+        let (mut child, stdin) = spawn_playback_child(cmd)?;
+        if let Err(err) = configure_playback_pipe(stdin.as_raw_fd()) {
+            drop(stdin);
+            let _ = child.kill();
+            let _ = child.wait();
+            return Err(TransportError::Io(err));
+        }
+
+        let pipe_fd = Arc::new(Mutex::new(Some(stdin.as_raw_fd())));
+        let queue = Arc::new((
+            Mutex::new(PlaybackQueueState {
+                ring: VecDeque::with_capacity(RING_CAPACITY_SAMPLES),
+                primed: false,
+                in_underrun: false,
+                need_fade_in: false,
+                overruns: 0,
+                underruns: 0,
+                stop: false,
+                drain_before_stop: false,
+                failed: false,
+            }),
+            Condvar::new(),
+        ));
+        let atomics = Arc::new(PlaybackAtomics {
+            ring_samples: AtomicUsize::new(0),
+            staging_bytes: AtomicUsize::new(0),
+            underruns: AtomicU64::new(0),
+            overruns: AtomicU64::new(0),
+        });
+        let stop_flag = Arc::new(AtomicBool::new(false));
+
+        let q_c = Arc::clone(&queue);
+        let a_c = Arc::clone(&atomics);
+        let fd_c = Arc::clone(&pipe_fd);
+        let stop_c = Arc::clone(&stop_flag);
+        let writer = thread::Builder::new()
+            .name("soundhop-linux-pcm-writer".to_string())
+            .spawn(move || {
+                playback_writer_loop(spawner, child, stdin, q_c, a_c, fd_c, stop_c);
+            })
+            .map_err(|err| {
+                // If thread creation fails, ensure fd/child are cleaned up cleanly.
+                *pipe_fd.lock().unwrap_or_else(|e| e.into_inner()) = None;
+                TransportError::Io(err)
+            })?;
+
+        Ok(Self {
+            sink,
+            latency_ms,
+            volume_pct: Arc::new(AtomicU8::new(100)),
+            muted: Arc::new(AtomicBool::new(false)),
+            backend: PlaybackBackend::Async(AsyncPlayback {
+                queue,
+                atomics,
+                pipe_fd,
+                stop_flag,
+                writer: Some(writer),
+                gain_ramp: GainRamp::with_initial(100, false)
+                    .with_ramp_frames(GAIN_RAMP_MAX_FRAMES),
+                ramp_buf: Vec::new(),
+            }),
+        })
+    }
+
+    /// Configured target PulseAudio/PipeWire sink name, if any.
+    pub fn sink(&self) -> Option<&str> {
+        self.sink.as_deref()
+    }
+
+    /// Configured playback latency in milliseconds.
+    pub fn latency_ms(&self) -> u32 {
+        self.latency_ms
+    }
+
+    /// Estimated total audio buffered across the user ring and unread kernel pipe bytes (ms).
+    ///
+    /// Returns `None` for synchronous test spawners (`None` / `Custom`).
+    pub fn buffered_ms(&self) -> Option<f64> {
+        match &self.backend {
             #[cfg(test)]
-            PlaybackSpawner::None => return Ok(false),
-            PlaybackSpawner::Pacat { sink, latency_ms } => {
-                build_pacat_command(sink.as_deref(), *latency_ms)
+            PlaybackBackend::Sync(_) => None,
+            PlaybackBackend::Async(async_pb) => {
+                let ring_bytes = async_pb.atomics.ring_samples.load(Ordering::Acquire) * 2;
+                let staging_bytes = async_pb.atomics.staging_bytes.load(Ordering::Acquire);
+                let pipe_unread = query_pipe_unread_locked(&async_pb.pipe_fd);
+                let total_bytes = ring_bytes + staging_bytes + pipe_unread;
+                Some((total_bytes as f64) / BYTES_PER_MS)
             }
+        }
+    }
+
+    /// Target prebuffer depth in milliseconds (`40.0 ms`).
+    pub fn sink_target_ms(&self) -> f64 {
+        DEFAULT_SINK_TARGET_MS
+    }
+
+    /// Cumulative playback underrun events (ring + pipe drained dry after priming).
+    pub fn sink_underruns(&self) -> u64 {
+        match &self.backend {
             #[cfg(test)]
-            PlaybackSpawner::Custom(f) => f(),
+            PlaybackBackend::Sync(_) => 0,
+            PlaybackBackend::Async(async_pb) => async_pb.atomics.underruns.load(Ordering::Acquire),
+        }
+    }
+
+    /// Cumulative playback ring overrun drops (with 2 ms stereo crossfade).
+    pub fn sink_overruns(&self) -> u64 {
+        match &self.backend {
+            #[cfg(test)]
+            PlaybackBackend::Sync(_) => 0,
+            PlaybackBackend::Async(async_pb) => async_pb.atomics.overruns.load(Ordering::Acquire),
+        }
+    }
+
+    #[cfg(test)]
+    fn finish_for_test(&mut self) {
+        match &mut self.backend {
+            PlaybackBackend::Sync(sync_pb) => {
+                drop(sync_pb.stdin.take());
+                let _ = sync_pb.child.wait();
+            }
+            PlaybackBackend::Async(async_pb) => {
+                let (lock, cv) = &*async_pb.queue;
+                {
+                    let mut state = lock.lock().unwrap_or_else(|e| e.into_inner());
+                    state.primed = true;
+                    state.drain_before_stop = true;
+                    state.stop = true;
+                    cv.notify_all();
+                }
+                if let Some(writer) = async_pb.writer.take() {
+                    let _ = writer.join();
+                }
+            }
+        }
+    }
+}
+
+impl PcmPlayback for LinuxPcmPlayback {
+    fn write_frame(&mut self, samples: &[i16]) -> TransportResult<()> {
+        if samples.is_empty() {
+            return Ok(());
+        }
+        let vol = u32::from(self.volume_pct.load(Ordering::Acquire)).min(150);
+        let muted = self.muted.load(Ordering::Acquire);
+
+        match &mut self.backend {
+            #[cfg(test)]
+            PlaybackBackend::Sync(sync_pb) => sync_pb.write_frame(samples, vol, muted),
+            PlaybackBackend::Async(async_pb) => async_pb.write_frame(samples, vol, muted),
+        }
+    }
+
+    fn set_volume(&self, pct: u8) {
+        self.volume_pct.store(pct.min(150), Ordering::Release);
+    }
+
+    fn set_mute(&self, muted: bool) {
+        self.muted.store(muted, Ordering::Release);
+    }
+
+    fn volume(&self) -> u8 {
+        self.volume_pct.load(Ordering::Acquire)
+    }
+
+    fn is_muted(&self) -> bool {
+        self.muted.load(Ordering::Acquire)
+    }
+}
+
+impl Drop for LinuxPcmPlayback {
+    fn drop(&mut self) {
+        match &mut self.backend {
+            #[cfg(test)]
+            PlaybackBackend::Sync(sync_pb) => {
+                // Close stdin first so child observes EOF, then force-kill and reap.
+                drop(sync_pb.stdin.take());
+                let _ = sync_pb.child.kill();
+                let _ = sync_pb.child.wait();
+            }
+            PlaybackBackend::Async(async_pb) => {
+                async_pb.stop_flag.store(true, Ordering::Release);
+                let (lock, cv) = &*async_pb.queue;
+                {
+                    let mut state = lock.lock().unwrap_or_else(|e| e.into_inner());
+                    state.stop = true;
+                    cv.notify_all();
+                }
+                if let Some(writer) = async_pb.writer.take() {
+                    let _ = writer.join();
+                }
+            }
+        }
+    }
+}
+
+#[cfg(test)]
+impl SyncPlayback {
+    fn try_respawn(&mut self) -> TransportResult<bool> {
+        let Some(cmd) = build_respawn_command(&mut self.spawner) else {
+            return Ok(false);
         };
 
         drop(self.stdin.take());
@@ -438,28 +746,11 @@ impl LinuxPcmPlayback {
         Ok(true)
     }
 
-    /// Configured target PulseAudio/PipeWire sink name, if any.
-    pub fn sink(&self) -> Option<&str> {
-        self.sink.as_deref()
-    }
-
-    /// Configured playback latency in milliseconds.
-    pub fn latency_ms(&self) -> u32 {
-        self.latency_ms
-    }
-}
-
-impl PcmPlayback for LinuxPcmPlayback {
-    fn write_frame(&mut self, samples: &[i16]) -> TransportResult<()> {
-        if samples.is_empty() {
-            return Ok(());
-        }
+    fn write_frame(&mut self, samples: &[i16], vol: u32, muted: bool) -> TransportResult<()> {
         if self.stdin.is_none() {
             return Err(TransportError::Closed);
         }
 
-        let vol = u32::from(self.volume_pct.load(Ordering::Acquire)).min(150);
-        let muted = self.muted.load(Ordering::Acquire);
         encode_ramped_s16le(
             samples,
             vol,
@@ -488,31 +779,463 @@ impl PcmPlayback for LinuxPcmPlayback {
             Err(e) => Err(TransportError::Io(e)),
         }
     }
+}
 
-    fn set_volume(&self, pct: u8) {
-        self.volume_pct.store(pct.min(150), Ordering::Release);
-    }
+impl AsyncPlayback {
+    fn write_frame(&mut self, samples: &[i16], vol: u32, muted: bool) -> TransportResult<()> {
+        let aligned_len = samples.len() & !1;
+        if aligned_len == 0 {
+            return Ok(());
+        }
 
-    fn set_mute(&self, muted: bool) {
-        self.muted.store(muted, Ordering::Release);
-    }
+        self.ramp_buf.clear();
+        self.ramp_buf.extend_from_slice(&samples[..aligned_len]);
+        self.gain_ramp.apply(&mut self.ramp_buf, 2, vol, muted);
 
-    fn volume(&self) -> u8 {
-        self.volume_pct.load(Ordering::Acquire)
-    }
+        let (lock, cv) = &*self.queue;
+        let mut state = lock.lock().unwrap_or_else(|e| e.into_inner());
+        if state.failed || state.stop {
+            return Err(TransportError::Closed);
+        }
 
-    fn is_muted(&self) -> bool {
-        self.muted.load(Ordering::Acquire)
+        push_to_ring(&mut state, &mut self.ramp_buf, &self.atomics);
+
+        if !state.primed {
+            let ring_bytes = state.ring.len() * 2;
+            let staging_bytes = self.atomics.staging_bytes.load(Ordering::Acquire);
+            let pipe_unread = query_pipe_unread_locked(&self.pipe_fd);
+            let target_bytes = (DEFAULT_SINK_TARGET_MS * BYTES_PER_MS).round() as usize;
+            if ring_bytes + staging_bytes + pipe_unread >= target_bytes {
+                state.primed = true;
+            }
+        }
+
+        cv.notify_one();
+        Ok(())
     }
 }
 
-impl Drop for LinuxPcmPlayback {
-    fn drop(&mut self) {
-        // Close stdin first so pacat observes EOF, then force-kill and reap.
-        drop(self.stdin.take());
-        let _ = self.child.kill();
-        let _ = self.child.wait();
+fn push_to_ring(
+    state: &mut PlaybackQueueState,
+    new_samples: &mut [i16],
+    atomics: &PlaybackAtomics,
+) {
+    if new_samples.is_empty() {
+        return;
     }
+    if state.need_fade_in {
+        fade_in_stereo_in_place(new_samples, UNDERRUN_RAMP_FRAMES);
+        state.need_fade_in = false;
+        state.in_underrun = false;
+    }
+
+    let total = state.ring.len() + new_samples.len();
+    if total > RING_CAPACITY_SAMPLES {
+        let overflow = (total - RING_CAPACITY_SAMPLES) & !1;
+        let max_fade_samples = OVERRUN_CROSSFADE_FRAMES * 2;
+        let mut from_tail = [0i16; OVERRUN_CROSSFADE_FRAMES * 2];
+
+        if overflow < state.ring.len() {
+            let remaining = state.ring.len() - overflow;
+            let tail_len = max_fade_samples.min(overflow).min(remaining) & !1;
+            // Blend from the head of the dropped span (continuous with audio already sent
+            // to the pipe) into the new front of the ring buffer.
+            for (slot, src) in from_tail[..tail_len]
+                .iter_mut()
+                .zip(state.ring.range(..tail_len))
+            {
+                *slot = *src;
+            }
+            state.ring.drain(..overflow);
+
+            if tail_len >= 2 {
+                let mut head_buf = [0i16; OVERRUN_CROSSFADE_FRAMES * 2];
+                for (slot, src) in head_buf[..tail_len]
+                    .iter_mut()
+                    .zip(state.ring.range(..tail_len))
+                {
+                    *slot = *src;
+                }
+                crossfade_stereo_in_place(
+                    &from_tail[..tail_len],
+                    &mut head_buf[..tail_len],
+                    tail_len / 2,
+                );
+                for (dst, &val) in state
+                    .ring
+                    .iter_mut()
+                    .take(tail_len)
+                    .zip(&head_buf[..tail_len])
+                {
+                    *dst = val;
+                }
+            }
+            state.ring.extend(new_samples.iter().copied());
+        } else {
+            let tail_len = max_fade_samples.min(state.ring.len()) & !1;
+            for (slot, src) in from_tail[..tail_len]
+                .iter_mut()
+                .zip(state.ring.range(..tail_len))
+            {
+                *slot = *src;
+            }
+            state.ring.clear();
+            let keep_start = (new_samples.len() - RING_CAPACITY_SAMPLES) & !1;
+            if tail_len >= 2 {
+                let blend_len = tail_len.min(new_samples.len() - keep_start) & !1;
+                if blend_len >= 2 {
+                    crossfade_stereo_in_place(
+                        &from_tail[..tail_len],
+                        &mut new_samples[keep_start..keep_start + blend_len],
+                        blend_len / 2,
+                    );
+                }
+            }
+            state.ring.extend(new_samples[keep_start..].iter().copied());
+        }
+
+        state.overruns += 1;
+        atomics.overruns.store(state.overruns, Ordering::Release);
+    } else {
+        state.ring.extend(new_samples.iter().copied());
+    }
+
+    atomics.ring_samples.store(state.ring.len(), Ordering::Release);
+}
+
+fn build_respawn_command(spawner: &mut PlaybackSpawner) -> Option<Command> {
+    match spawner {
+        #[cfg(test)]
+        PlaybackSpawner::None => None,
+        PlaybackSpawner::Pacat { sink, latency_ms } => {
+            Some(build_pacat_command(sink.as_deref(), *latency_ms))
+        }
+        #[cfg(test)]
+        PlaybackSpawner::Custom(f) => Some(f()),
+    }
+}
+
+fn configure_playback_pipe(fd: RawFd) -> std::io::Result<()> {
+    set_nonblocking(fd)?;
+    // Tighten kernel pipe size (~42.7 ms at 48 kHz stereo s16le) to avoid 64 KB bloat.
+    let _ = unsafe { libc::fcntl(fd, libc::F_SETPIPE_SZ, PLAYBACK_PIPE_SIZE_BYTES) };
+    Ok(())
+}
+
+fn query_pipe_unread_bytes(fd: RawFd) -> usize {
+    let mut unread: libc::c_int = 0;
+    let rc = unsafe { libc::ioctl(fd, libc::FIONREAD as _, &mut unread) };
+    if rc == 0 && unread > 0 {
+        unread as usize
+    } else {
+        0
+    }
+}
+
+fn query_pipe_unread_locked(pipe_fd: &Mutex<Option<RawFd>>) -> usize {
+    let guard = pipe_fd.lock().unwrap_or_else(|e| e.into_inner());
+    match *guard {
+        Some(fd) => query_pipe_unread_bytes(fd),
+        None => 0,
+    }
+}
+
+fn encode_i16_slice_to_le_bytes(samples: &[i16], out: &mut Vec<u8>) {
+    out.clear();
+    out.reserve(samples.len() * 2);
+    for &s in samples {
+        out.extend_from_slice(&s.to_le_bytes());
+    }
+}
+
+fn drain_ring_samples_into_bytes(
+    ring: &mut VecDeque<i16>,
+    count: usize,
+    scratch: &mut Vec<i16>,
+    out: &mut Vec<u8>,
+) {
+    scratch.clear();
+    scratch.reserve(count);
+    for _ in 0..count {
+        if let Some(s) = ring.pop_front() {
+            scratch.push(s);
+        }
+    }
+    encode_i16_slice_to_le_bytes(scratch, out);
+}
+
+#[allow(clippy::too_many_arguments)]
+fn playback_writer_loop(
+    mut spawner: PlaybackSpawner,
+    mut child: Child,
+    stdin: ChildStdin,
+    queue: Arc<(Mutex<PlaybackQueueState>, Condvar)>,
+    atomics: Arc<PlaybackAtomics>,
+    pipe_fd: Arc<Mutex<Option<RawFd>>>,
+    stop_flag: Arc<AtomicBool>,
+) {
+    let mut stdin = Some(stdin);
+    let mut staging: Vec<u8> = Vec::with_capacity(WRITER_CHUNK_SAMPLES * 2);
+    let mut staging_pos: usize = 0;
+    let mut scratch_i16: Vec<i16> = Vec::with_capacity(WRITER_CHUNK_SAMPLES);
+    let mut consecutive_respawns: usize = 0;
+    let mut drain_on_exit = false;
+
+    'outer: loop {
+        if staging_pos >= staging.len() {
+            staging.clear();
+            staging_pos = 0;
+
+            let (lock, cv) = &*queue;
+            let mut state = lock.lock().unwrap_or_else(|e| e.into_inner());
+
+            loop {
+                if state.stop {
+                    drain_on_exit = state.drain_before_stop;
+                    if drain_on_exit && !state.ring.is_empty() {
+                        let count = state.ring.len().min(WRITER_CHUNK_SAMPLES);
+                        drain_ring_samples_into_bytes(
+                            &mut state.ring,
+                            count,
+                            &mut scratch_i16,
+                            &mut staging,
+                        );
+                        atomics
+                            .ring_samples
+                            .store(state.ring.len(), Ordering::Release);
+                        atomics
+                            .staging_bytes
+                            .store(staging.len(), Ordering::Release);
+                        break;
+                    }
+                    break 'outer;
+                }
+
+                if !state.primed {
+                    state = cv.wait(state).unwrap_or_else(|e| e.into_inner());
+                    continue;
+                }
+
+                let lookahead_samples = if state.in_underrun {
+                    0
+                } else {
+                    UNDERRUN_RAMP_FRAMES * 2
+                };
+
+                if state.ring.len() > lookahead_samples {
+                    let count = (state.ring.len() - lookahead_samples).min(WRITER_CHUNK_SAMPLES);
+                    drain_ring_samples_into_bytes(
+                        &mut state.ring,
+                        count,
+                        &mut scratch_i16,
+                        &mut staging,
+                    );
+                    atomics
+                        .ring_samples
+                        .store(state.ring.len(), Ordering::Release);
+                    atomics
+                        .staging_bytes
+                        .store(staging.len(), Ordering::Release);
+                    break;
+                }
+
+                if state.in_underrun {
+                    state = cv.wait(state).unwrap_or_else(|e| e.into_inner());
+                    continue;
+                }
+
+                let pipe_unread = query_pipe_unread_locked(&pipe_fd);
+                if pipe_unread <= PIPE_UNDERRUN_THRESHOLD_BYTES {
+                    // Ring + pipe drained dry after priming: fade out remaining lookahead tail.
+                    let remaining = state.ring.len();
+                    if remaining >= 2 {
+                        scratch_i16.clear();
+                        scratch_i16.extend(state.ring.drain(..));
+                        fade_out_stereo_in_place(&mut scratch_i16, UNDERRUN_RAMP_FRAMES);
+                        encode_i16_slice_to_le_bytes(&scratch_i16, &mut staging);
+                    } else {
+                        state.ring.clear();
+                    }
+                    state.in_underrun = true;
+                    state.need_fade_in = true;
+                    state.underruns += 1;
+                    atomics.ring_samples.store(0, Ordering::Release);
+                    atomics
+                        .staging_bytes
+                        .store(staging.len(), Ordering::Release);
+                    atomics.underruns.store(state.underruns, Ordering::Release);
+                    if !staging.is_empty() {
+                        break;
+                    }
+                } else {
+                    let (guard, _) = cv
+                        .wait_timeout(state, WRITER_IDLE_POLL_INTERVAL)
+                        .unwrap_or_else(|e| e.into_inner());
+                    state = guard;
+                }
+            }
+        }
+
+        while staging_pos < staging.len() {
+            if stop_flag.load(Ordering::Acquire) {
+                break 'outer;
+            }
+
+            let write_res = {
+                let _fd_guard = pipe_fd.lock().unwrap_or_else(|e| e.into_inner());
+                let res = match stdin.as_mut() {
+                    Some(pipe_in) => pipe_in.write(&staging[staging_pos..]),
+                    None => break 'outer,
+                };
+                if let Ok(n) = res {
+                    if n > 0 {
+                        staging_pos += n;
+                        atomics.staging_bytes.fetch_sub(n, Ordering::Release);
+                        consecutive_respawns = 0;
+                    }
+                }
+                res
+            };
+
+            match write_res {
+                Ok(0) => {
+                    // Treat zero-byte write on pipe as broken pipe.
+                    if !respawn_writer_child(
+                        &mut spawner,
+                        &mut child,
+                        &mut stdin,
+                        &pipe_fd,
+                        &stop_flag,
+                        &mut consecutive_respawns,
+                        &mut staging,
+                        &mut staging_pos,
+                        &atomics,
+                    ) {
+                        mark_writer_failed(&queue);
+                        break 'outer;
+                    }
+                }
+                Ok(_) => {}
+                Err(e) if e.kind() == ErrorKind::Interrupted => continue,
+                Err(e) if e.kind() == ErrorKind::WouldBlock => {
+                    let Some(fd) = stdin.as_ref().map(AsRawFd::as_raw_fd) else {
+                        break 'outer;
+                    };
+                    let mut pfd = libc::pollfd {
+                        fd,
+                        events: libc::POLLOUT,
+                        revents: 0,
+                    };
+                    let rc = unsafe { libc::poll(&mut pfd, 1, WRITER_POLL_SLICE_MS) };
+                    if rc < 0 {
+                        let err = std::io::Error::last_os_error();
+                        if err.kind() == ErrorKind::Interrupted {
+                            continue;
+                        }
+                        mark_writer_failed(&queue);
+                        break 'outer;
+                    }
+                }
+                Err(e) if e.kind() == ErrorKind::BrokenPipe => {
+                    if !respawn_writer_child(
+                        &mut spawner,
+                        &mut child,
+                        &mut stdin,
+                        &pipe_fd,
+                        &stop_flag,
+                        &mut consecutive_respawns,
+                        &mut staging,
+                        &mut staging_pos,
+                        &atomics,
+                    ) {
+                        mark_writer_failed(&queue);
+                        break 'outer;
+                    }
+                }
+                Err(_) => {
+                    mark_writer_failed(&queue);
+                    break 'outer;
+                }
+            }
+        }
+    }
+
+    *pipe_fd.lock().unwrap_or_else(|e| e.into_inner()) = None;
+    atomics.staging_bytes.store(0, Ordering::Release);
+    drop(stdin.take());
+    if !drain_on_exit {
+        let _ = child.kill();
+    }
+    let _ = child.wait();
+}
+
+#[allow(clippy::too_many_arguments)]
+fn respawn_writer_child(
+    spawner: &mut PlaybackSpawner,
+    child: &mut Child,
+    stdin: &mut Option<ChildStdin>,
+    pipe_fd: &Mutex<Option<RawFd>>,
+    stop_flag: &AtomicBool,
+    consecutive_respawns: &mut usize,
+    staging: &mut [u8],
+    staging_pos: &mut usize,
+    atomics: &PlaybackAtomics,
+) -> bool {
+    if *consecutive_respawns >= MAX_PLAYBACK_RESPAWN_ATTEMPTS || stop_flag.load(Ordering::Acquire) {
+        return false;
+    }
+    let Some(cmd) = build_respawn_command(spawner) else {
+        return false;
+    };
+
+    *pipe_fd.lock().unwrap_or_else(|e| e.into_inner()) = None;
+    drop(stdin.take());
+    let _ = child.kill();
+    let _ = child.wait();
+
+    if *consecutive_respawns > 0 {
+        let deadline = Instant::now() + RESPAWN_BACKOFF;
+        while Instant::now() < deadline {
+            if stop_flag.load(Ordering::Acquire) {
+                return false;
+            }
+            thread::sleep(Duration::from_millis(10));
+        }
+    }
+
+    let Ok((mut new_child, new_stdin)) = spawn_playback_child(cmd) else {
+        return false;
+    };
+    if configure_playback_pipe(new_stdin.as_raw_fd()).is_err() {
+        drop(new_stdin);
+        let _ = new_child.kill();
+        let _ = new_child.wait();
+        return false;
+    }
+
+    *pipe_fd.lock().unwrap_or_else(|e| e.into_inner()) = Some(new_stdin.as_raw_fd());
+    *child = new_child;
+    *stdin = Some(new_stdin);
+    *consecutive_respawns += 1;
+
+    // Re-align remaining staging bytes to a stereo frame boundary for the fresh child.
+    let rem = staging.len().saturating_sub(*staging_pos);
+    let misaligned = rem % BYTES_PER_STEREO_FRAME;
+    if misaligned != 0 {
+        *staging_pos += misaligned;
+        atomics
+            .staging_bytes
+            .store(staging.len().saturating_sub(*staging_pos), Ordering::Release);
+    }
+
+    true
+}
+
+fn mark_writer_failed(queue: &(Mutex<PlaybackQueueState>, Condvar)) {
+    let (lock, cv) = queue;
+    let mut state = lock.lock().unwrap_or_else(|e| e.into_inner());
+    state.failed = true;
+    cv.notify_all();
 }
 
 fn spawn_playback_child(mut cmd: Command) -> TransportResult<(Child, ChildStdin)> {
@@ -562,6 +1285,7 @@ fn select_capture_program(
     }
 }
 
+#[cfg(test)]
 #[inline]
 fn target_gain_factor(volume_pct: u32, muted: bool) -> f32 {
     if muted || volume_pct == 0 {
@@ -571,6 +1295,7 @@ fn target_gain_factor(volume_pct: u32, muted: bool) -> f32 {
     }
 }
 
+#[cfg(test)]
 #[inline]
 fn scale_sample_f32(sample: i16, gain: f32) -> i16 {
     if gain <= 0.0 {
@@ -581,6 +1306,7 @@ fn scale_sample_f32(sample: i16, gain: f32) -> i16 {
         .clamp(f32::from(i16::MIN), f32::from(i16::MAX)) as i16
 }
 
+#[cfg(test)]
 fn encode_ramped_s16le(
     samples: &[i16],
     volume_pct: u32,
@@ -755,8 +1481,7 @@ mod tests {
         play.write_frame(&[1000, -2000]).unwrap();
 
         // Close stdin and wait for cat to flush before reading output file.
-        drop(play.stdin.take());
-        let _ = play.child.wait();
+        play.finish_for_test();
 
         let bytes = std::fs::read(&out_path).unwrap();
         let samples: Vec<i16> = bytes
@@ -894,8 +1619,7 @@ mod tests {
         let dc_frame = vec![10_000i16; 64];
         play.write_frame(&dc_frame).unwrap();
 
-        drop(play.stdin.take());
-        let _ = play.child.wait();
+        play.finish_for_test();
 
         let bytes = std::fs::read(&out_path).unwrap();
         let samples: Vec<i16> = bytes
@@ -949,8 +1673,7 @@ mod tests {
         play.write_frame(&payload).unwrap();
         assert_eq!(count.load(Ordering::SeqCst), 2);
 
-        drop(play.stdin.take());
-        let _ = play.child.wait();
+        play.finish_for_test();
 
         let bytes = std::fs::read(&out_path).unwrap();
         let samples: Vec<i16> = bytes
@@ -960,5 +1683,258 @@ mod tests {
             .map(|&pair| i16::from_le_bytes(pair))
             .collect();
         assert_eq!(samples, payload);
+    }
+
+    #[test]
+    fn linux_playback_sync_spawner_reports_none_buffered_ms() {
+        let mut cmd = Command::new("/bin/sh");
+        cmd.arg("-c").arg("cat >/dev/null");
+        let play = LinuxPcmPlayback::spawn_command(cmd).unwrap();
+        assert_eq!(play.buffered_ms(), None);
+        assert_eq!(play.sink_target_ms(), 40.0);
+        assert_eq!(play.sink_underruns(), 0);
+        assert_eq!(play.sink_overruns(), 0);
+    }
+
+    #[test]
+    fn linux_playback_async_ring_buffer_nonblocking_overrun_crossfades_step_waveform() {
+        let dir = tempfile::tempdir().unwrap();
+        let out_path = dir.path().join("overrun.raw");
+
+        // Delay reading for 180 ms so the 8 KB pipe and 160 ms ring buffer saturate and overflow,
+        // then drain everything cleanly into out_path.
+        let mut cmd = Command::new("/bin/sh");
+        cmd.arg("-c")
+            .arg(format!("sleep 0.18 && cat > '{}'", out_path.display()));
+
+        let mut play = LinuxPcmPlayback::spawn_async_command(cmd).unwrap();
+        assert_eq!(play.sink_target_ms(), 40.0);
+        assert_eq!(play.buffered_ms(), Some(0.0));
+
+        // 20 ms frame = 1920 interleaved stereo samples (960 stereo frames).
+        let pos_frame = vec![10_000i16; 1920];
+        let neg_ring_frame = vec![-10_000i16; RING_CAPACITY_SAMPLES];
+
+        // Fill pipe (~42 ms) + ring (160 ms) completely with +10_000 while reader sleeps.
+        let t0 = Instant::now();
+        for _ in 0..4 {
+            play.write_frame(&pos_frame).unwrap();
+        }
+        // Let the writer thread saturate the 8 KB kernel pipe with +10_000 first.
+        std::thread::sleep(Duration::from_millis(15));
+        for _ in 0..8 {
+            play.write_frame(&pos_frame).unwrap();
+        }
+
+        // Push a full 160 ms (-10_000) frame while reader is still sleeping:
+        // write_frame must remain non-blocking, drop the entire +10_000 ring, and crossfade
+        // +10_000 into -10_000 across 96 stereo frames (2 ms).
+        play.write_frame(&neg_ring_frame).unwrap();
+        let push_elapsed = t0.elapsed();
+        assert!(
+            push_elapsed < Duration::from_millis(80),
+            "write_frame blocked caller thread: {push_elapsed:?}"
+        );
+        assert!(
+            play.sink_overruns() > 0,
+            "expected overrun count > 0, got {}",
+            play.sink_overruns()
+        );
+        assert!(
+            play.buffered_ms().unwrap() > 160.0,
+            "expected ring + pipe buffered_ms > 160 ms, got {:?}",
+            play.buffered_ms()
+        );
+
+        play.finish_for_test();
+
+        let bytes = std::fs::read(&out_path).unwrap();
+        let samples: Vec<i16> = bytes
+            .as_chunks::<2>()
+            .0
+            .iter()
+            .map(|&pair| i16::from_le_bytes(pair))
+            .collect();
+
+        // Find the transition between +10_000 and -10_000 in left channel and verify
+        // there is no abrupt 20_000 single-frame step discontinuity.
+        let left: Vec<i16> = samples.iter().step_by(2).copied().collect();
+        assert!(left.contains(&10_000));
+        assert!(left.contains(&-10_000));
+        let max_step = left
+            .windows(2)
+            .map(|w| (i32::from(w[0]) - i32::from(w[1])).abs())
+            .max()
+            .unwrap_or(0);
+        assert!(
+            max_step < 1_000,
+            "expected smooth overrun crossfade (< 1000 delta/sample), got max_step={max_step}"
+        );
+    }
+
+    #[test]
+    fn linux_playback_buffered_ms_tracks_paced_reader_and_underruns() {
+        // 1. Paced slow reader subprocess (reads 3840 bytes every 45 ms while sender writes
+        // every 20 ms): buffered_ms() rises past sink_target_ms (40 ms).
+        let mut slow_cmd = Command::new("python3");
+        slow_cmd.arg("-c").arg(
+            "import sys,time\nwhile True:\n d=sys.stdin.buffer.read(3840)\n if not d: break\n time.sleep(0.045)",
+        );
+        let mut slow_play = LinuxPcmPlayback::spawn_async_command(slow_cmd).unwrap();
+        let frame = vec![4_000i16; 1920]; // 20 ms
+
+        slow_play.write_frame(&frame).unwrap();
+        let b1 = slow_play.buffered_ms().unwrap();
+        assert!((b1 - 20.0).abs() < 0.5, "after 1 frame expected ~20 ms, got {b1}");
+
+        slow_play.write_frame(&frame).unwrap();
+        let b2 = slow_play.buffered_ms().unwrap();
+        assert!((b2 - 40.0).abs() < 0.5, "after 2 frames expected ~40 ms, got {b2}");
+
+        for _ in 0..5 {
+            std::thread::sleep(Duration::from_millis(20));
+            slow_play.write_frame(&frame).unwrap();
+        }
+        let b_after = slow_play.buffered_ms().unwrap();
+        assert!(
+            b_after > 55.0,
+            "expected buffered_ms to rise above target 40 ms against slow reader, got {b_after}"
+        );
+        drop(slow_play);
+
+        // 2. Fast reader: drains pipe dry after priming, fading out tail, counting underrun,
+        // and fading in head on recovery.
+        let dir = tempfile::tempdir().unwrap();
+        let out_path = dir.path().join("underrun.raw");
+        let mut fast_cmd = Command::new("/bin/sh");
+        fast_cmd
+            .arg("-c")
+            .arg(format!("cat > '{}'", out_path.display()));
+        let mut fast_play = LinuxPcmPlayback::spawn_async_command(fast_cmd).unwrap();
+
+        let tone = vec![8_000i16; 1920];
+        fast_play.write_frame(&tone).unwrap();
+        fast_play.write_frame(&tone).unwrap();
+
+        // Wait briefly for cat to drain the pipe dry and writer to detect underrun.
+        let deadline = Instant::now() + Duration::from_millis(300);
+        while fast_play.sink_underruns() == 0 && Instant::now() < deadline {
+            std::thread::sleep(Duration::from_millis(5));
+        }
+        assert!(
+            fast_play.sink_underruns() >= 1,
+            "expected underrun after draining dry"
+        );
+        assert!(
+            fast_play.buffered_ms().unwrap() < 1.0,
+            "expected buffered_ms ~0 after underrun, got {:?}",
+            fast_play.buffered_ms()
+        );
+
+        // Recovery frame should fade in smoothly from 0.
+        fast_play.write_frame(&tone).unwrap();
+        fast_play.finish_for_test();
+
+        let bytes = std::fs::read(&out_path).unwrap();
+        let samples: Vec<i16> = bytes
+            .as_chunks::<2>()
+            .0
+            .iter()
+            .map(|&pair| i16::from_le_bytes(pair))
+            .collect();
+        // 3 frames = 5760 samples. Around sample 3840 (boundary between frame 2 tail and frame 3 head),
+        // samples should fade down to 0 then fade back up from 0.
+        assert_eq!(samples.len(), 5760);
+        assert_eq!(samples[3838], 0);
+        assert_eq!(samples[3839], 0);
+        assert_eq!(samples[3840], 0);
+        assert_eq!(samples[3841], 0);
+        assert_eq!(samples[5758], 8_000);
+    }
+
+    #[test]
+    fn linux_playback_async_recovers_from_broken_pipe() {
+        let dir = tempfile::tempdir().unwrap();
+        let out_path = dir.path().join("async_recovered.raw");
+        let out_path_c = out_path.clone();
+        let count = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let count_c = Arc::clone(&count);
+
+        let mut play = LinuxPcmPlayback::spawn_async_with_spawner(move || {
+            let n = count_c.fetch_add(1, Ordering::SeqCst);
+            let mut cmd = Command::new("/bin/sh");
+            if n == 0 {
+                cmd.arg("-c").arg("exit 0");
+            } else {
+                cmd.arg("-c")
+                    .arg(format!("cat > '{}'", out_path_c.display()));
+            }
+            cmd
+        })
+        .unwrap();
+
+        std::thread::sleep(Duration::from_millis(30));
+
+        // Write 2 x 20 ms frames to prime and trigger write -> BrokenPipe -> respawn.
+        let frame = vec![1234i16; 1920];
+        play.write_frame(&frame).unwrap();
+        play.write_frame(&frame).unwrap();
+        play.finish_for_test();
+
+        assert_eq!(count.load(Ordering::SeqCst), 2);
+        let bytes = std::fs::read(&out_path).unwrap();
+        let samples: Vec<i16> = bytes
+            .as_chunks::<2>()
+            .0
+            .iter()
+            .map(|&pair| i16::from_le_bytes(pair))
+            .collect();
+        assert_eq!(samples.len(), 3840);
+        assert!(samples.iter().all(|&s| s == 1234));
+    }
+
+    #[test]
+    fn linux_capture_partial_timeout_fades_out_tail_and_fades_in_recovery() {
+        // Emit 400 samples (200 stereo frames = 800 bytes) of +10_000/-10_000, pause 60 ms
+        // (triggering the 45 ms read timeout mid-frame), then emit 1920 samples (3840 bytes)
+        // of +10_000/-10_000.
+        let mut cmd = Command::new("python3");
+        cmd.arg("-c").arg(
+            "import sys,time; f=b'\\x10\\x27\\xf0\\xd8'; sys.stdout.buffer.write(f*200); sys.stdout.buffer.flush(); time.sleep(0.06); sys.stdout.buffer.write(f*960); sys.stdout.buffer.flush()",
+        );
+        let mut cap = LinuxPcmCapture::spawn_command("partial.monitor".into(), cmd).unwrap();
+
+        let mut buf1 = vec![999i16; 1920];
+        let mut n1 = cap.read_frame(&mut buf1).unwrap();
+        // Skip initial zero-fill if python3 interpreter startup itself exceeded 45 ms.
+        while n1 > 0 && buf1.iter().all(|&s| s == 0) {
+            n1 = cap.read_frame(&mut buf1).unwrap();
+        }
+        assert_eq!(n1, 1920);
+        // Leading partial samples retain original amplitude.
+        assert_eq!(buf1[0], 10_000);
+        assert_eq!(buf1[1], -10_000);
+        // Trailing partial samples fade smoothly down to zero before the zero-filled tail.
+        assert!(buf1[210].abs() < 10_000);
+        assert_eq!(buf1[398], 0);
+        assert_eq!(buf1[399], 0);
+        assert!(buf1[400..].iter().all(|&s| s == 0));
+
+        // Next live frame after timeout must fade in smoothly from 0 back to full scale.
+        let mut buf2 = vec![0i16; 1920];
+        let mut n2 = cap.read_frame(&mut buf2).unwrap();
+        while n2 > 0 && buf2.iter().all(|&s| s == 0) {
+            n2 = cap.read_frame(&mut buf2).unwrap();
+        }
+        assert_eq!(n2, 1920);
+        assert_eq!(buf2[0], 0);
+        assert_eq!(buf2[1], 0);
+        assert!(
+            buf2[96] > 4_000 && buf2[96] < 6_000,
+            "midpoint fade-in got {}",
+            buf2[96]
+        );
+        assert_eq!(buf2[192], 10_000);
+        assert_eq!(buf2[193], -10_000);
     }
 }

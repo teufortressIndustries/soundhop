@@ -2,12 +2,15 @@
 //! with cross-platform mock fallbacks so unit tests run on both Linux and Windows.
 
 use std::collections::VecDeque;
-use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 use std::thread::{self, JoinHandle};
 use std::time::Duration;
 
 const MAX_PLAYBACK_BUFFER_SAMPLES: usize = 96_000; // 1.0s @ 48kHz stereo
+const OVERRUN_CROSSFADE_FRAMES: usize = 96; // 2 ms @ 48 kHz
+const UNDERRUN_TAIL_FADE_FRAMES: usize = 64; // ~1.33 ms @ 48 kHz
+const RESUME_FADE_IN_FRAMES: usize = 64; // ~1.33 ms @ 48 kHz
 const RECONNECT_INITIAL_BACKOFF_MS: u64 = 100;
 const RECONNECT_MAX_BACKOFF_MS: u64 = 1_000;
 
@@ -152,6 +155,16 @@ pub struct PlaybackResampler {
     prev: (i16, i16),
     next: (i16, i16),
     initialized: bool,
+    prebuffer_samples: usize,
+    smooth_underruns: bool,
+    primed: bool,
+    last_emitted: (i16, i16),
+    tail_pos: usize,
+    tail_total: usize,
+    tail_start: (i16, i16),
+    fade_in_pos: usize,
+    fade_in_total: usize,
+    fade_in_start: (i16, i16),
 }
 
 impl PlaybackResampler {
@@ -163,7 +176,25 @@ impl PlaybackResampler {
             prev: (0, 0),
             next: (0, 0),
             initialized: false,
+            prebuffer_samples: 0,
+            smooth_underruns: false,
+            primed: false,
+            last_emitted: (0, 0),
+            tail_pos: 0,
+            tail_total: 0,
+            tail_start: (0, 0),
+            fade_in_pos: 0,
+            fade_in_total: 0,
+            fade_in_start: (0, 0),
         }
+    }
+
+    /// Create a resampler with optional prebuffering and click-free underrun tail fade-out / resume fade-in.
+    pub fn with_prebuffer(src_rate: u32, dst_rate: u32, prebuffer_samples: usize) -> Self {
+        let mut resampler = Self::new(src_rate, dst_rate);
+        resampler.prebuffer_samples = prebuffer_samples;
+        resampler.smooth_underruns = true;
+        resampler
     }
 
     #[allow(clippy::too_many_arguments)]
@@ -175,40 +206,201 @@ impl PlaybackResampler {
         out_frames: usize,
         volume_pct: u32,
         muted: bool,
-        mut write_sample: F,
+        write_sample: F,
     ) {
+        let _ = self.write_frames_checked(
+            buf,
+            src_channels,
+            dst_channels,
+            out_frames,
+            volume_pct,
+            muted,
+            write_sample,
+        );
+    }
+
+    /// Fill `out_frames` from `buf`, returning `true` if a primed buffer ran empty (underrun).
+    #[allow(clippy::too_many_arguments)]
+    pub fn write_frames_checked<F: FnMut(usize, i16)>(
+        &mut self,
+        buf: &mut VecDeque<i16>,
+        src_channels: usize,
+        dst_channels: usize,
+        out_frames: usize,
+        volume_pct: u32,
+        muted: bool,
+        mut write_sample: F,
+    ) -> bool {
         let dst_channels = dst_channels.max(1);
+        if !self.smooth_underruns {
+            if self.src_rate == self.dst_rate {
+                for f in 0..out_frames {
+                    let (raw_l, raw_r) = pop_frame_pair(buf, src_channels);
+                    let l = apply_gain_i16(raw_l, volume_pct, muted);
+                    let r = apply_gain_i16(raw_r, volume_pct, muted);
+                    write_stereo_to_channels(f, dst_channels, l, r, &mut write_sample);
+                }
+                return false;
+            }
+
+            if !self.initialized {
+                self.prev = pop_frame_pair(buf, src_channels);
+                self.next = pop_frame_pair(buf, src_channels);
+                self.initialized = true;
+            }
+
+            let step = f64::from(self.src_rate) / f64::from(self.dst_rate);
+            for f in 0..out_frames {
+                let interp_l = lerp_i16(self.prev.0, self.next.0, self.phase);
+                let interp_r = lerp_i16(self.prev.1, self.next.1, self.phase);
+                let l = apply_gain_i16(interp_l, volume_pct, muted);
+                let r = apply_gain_i16(interp_r, volume_pct, muted);
+                write_stereo_to_channels(f, dst_channels, l, r, &mut write_sample);
+
+                self.phase += step;
+                while self.phase >= 1.0 {
+                    self.phase -= 1.0;
+                    self.prev = self.next;
+                    self.next = pop_frame_pair(buf, src_channels);
+                }
+            }
+            return false;
+        }
+
+        if !self.primed {
+            let min_ready = if self.prebuffer_samples > 0 {
+                self.prebuffer_samples
+            } else {
+                src_channels.max(1)
+            };
+            if buf.len() >= min_ready {
+                self.primed = true;
+                self.fade_in_start = self.last_emitted;
+                self.fade_in_pos = 0;
+                self.fade_in_total = RESUME_FADE_IN_FRAMES;
+                self.tail_pos = 0;
+                self.tail_total = 0;
+            } else {
+                for f in 0..out_frames {
+                    let (raw_l, raw_r) = self.next_tail_or_silence();
+                    let l = apply_gain_i16(raw_l, volume_pct, muted);
+                    let r = apply_gain_i16(raw_r, volume_pct, muted);
+                    write_stereo_to_channels(f, dst_channels, l, r, &mut write_sample);
+                }
+                return false;
+            }
+        }
+
+        let mut underrun_occurred = false;
         if self.src_rate == self.dst_rate {
             for f in 0..out_frames {
-                let (raw_l, raw_r) = pop_frame_pair(buf, src_channels);
+                let (raw_l, raw_r) = if self.primed {
+                    if buf.is_empty() {
+                        self.trigger_underrun();
+                        underrun_occurred = true;
+                        self.next_tail_or_silence()
+                    } else {
+                        let raw = pop_frame_pair(buf, src_channels);
+                        self.apply_resume_fade(raw)
+                    }
+                } else {
+                    self.next_tail_or_silence()
+                };
                 let l = apply_gain_i16(raw_l, volume_pct, muted);
                 let r = apply_gain_i16(raw_r, volume_pct, muted);
                 write_stereo_to_channels(f, dst_channels, l, r, &mut write_sample);
             }
-            return;
+            return underrun_occurred;
         }
 
         if !self.initialized {
-            self.prev = pop_frame_pair(buf, src_channels);
-            self.next = pop_frame_pair(buf, src_channels);
-            self.initialized = true;
+            if buf.is_empty() {
+                self.trigger_underrun();
+                underrun_occurred = true;
+            } else {
+                self.prev = pop_frame_pair(buf, src_channels);
+                self.next = if buf.is_empty() {
+                    self.prev
+                } else {
+                    pop_frame_pair(buf, src_channels)
+                };
+                self.phase = 0.0;
+                self.initialized = true;
+            }
         }
 
         let step = f64::from(self.src_rate) / f64::from(self.dst_rate);
         for f in 0..out_frames {
-            let interp_l = lerp_i16(self.prev.0, self.next.0, self.phase);
-            let interp_r = lerp_i16(self.prev.1, self.next.1, self.phase);
-            let l = apply_gain_i16(interp_l, volume_pct, muted);
-            let r = apply_gain_i16(interp_r, volume_pct, muted);
-            write_stereo_to_channels(f, dst_channels, l, r, &mut write_sample);
+            let (raw_l, raw_r) = if self.primed {
+                let interp_l = lerp_i16(self.prev.0, self.next.0, self.phase);
+                let interp_r = lerp_i16(self.prev.1, self.next.1, self.phase);
+                let pair = self.apply_resume_fade((interp_l, interp_r));
 
-            self.phase += step;
-            while self.phase >= 1.0 {
-                self.phase -= 1.0;
-                self.prev = self.next;
-                self.next = pop_frame_pair(buf, src_channels);
-            }
+                self.phase += step;
+                while self.phase >= 1.0 {
+                    self.phase -= 1.0;
+                    self.prev = self.next;
+                    if buf.is_empty() {
+                        if f + 1 < out_frames {
+                            self.trigger_underrun();
+                            underrun_occurred = true;
+                        } else {
+                            self.initialized = false;
+                            self.phase = 0.0;
+                        }
+                        break;
+                    }
+                    self.next = pop_frame_pair(buf, src_channels);
+                }
+                pair
+            } else {
+                self.next_tail_or_silence()
+            };
+            let l = apply_gain_i16(raw_l, volume_pct, muted);
+            let r = apply_gain_i16(raw_r, volume_pct, muted);
+            write_stereo_to_channels(f, dst_channels, l, r, &mut write_sample);
         }
+        underrun_occurred
+    }
+
+    fn trigger_underrun(&mut self) {
+        self.primed = false;
+        self.initialized = false;
+        self.phase = 0.0;
+        self.tail_start = self.last_emitted;
+        self.tail_pos = 0;
+        self.tail_total = UNDERRUN_TAIL_FADE_FRAMES;
+        self.fade_in_pos = 0;
+        self.fade_in_total = 0;
+    }
+
+    fn next_tail_or_silence(&mut self) -> (i16, i16) {
+        if self.tail_pos < self.tail_total {
+            self.tail_pos += 1;
+            let t = (self.tail_pos as f64) / ((self.tail_total + 1) as f64);
+            let l = lerp_i16(self.tail_start.0, 0, t);
+            let r = lerp_i16(self.tail_start.1, 0, t);
+            self.last_emitted = (l, r);
+            (l, r)
+        } else {
+            self.last_emitted = (0, 0);
+            (0, 0)
+        }
+    }
+
+    fn apply_resume_fade(&mut self, raw: (i16, i16)) -> (i16, i16) {
+        let out = if self.fade_in_pos < self.fade_in_total {
+            self.fade_in_pos += 1;
+            let t = (self.fade_in_pos as f64) / ((self.fade_in_total + 1) as f64);
+            (
+                lerp_i16(self.fade_in_start.0, raw.0, t),
+                lerp_i16(self.fade_in_start.1, raw.1, t),
+            )
+        } else {
+            raw
+        };
+        self.last_emitted = out;
+        out
     }
 }
 
@@ -286,10 +478,13 @@ pub struct WindowsPlayer {
     pub sample_rate: u32,
     pub channels: u8,
     max_buffer_samples: usize,
+    prebuffer_samples: usize,
     closed: Arc<AtomicBool>,
     buffer: Arc<Mutex<VecDeque<i16>>>,
     volume_pct: Arc<AtomicU32>,
     muted: Arc<AtomicBool>,
+    underruns: Arc<AtomicU64>,
+    overruns: Arc<AtomicU64>,
     worker: Mutex<Option<JoinHandle<()>>>,
 }
 
@@ -321,12 +516,39 @@ impl WindowsPlayer {
             sample_rate,
             channels,
             max_buffer_samples: MAX_PLAYBACK_BUFFER_SAMPLES,
+            prebuffer_samples: 0,
             closed: Arc::new(AtomicBool::new(false)),
             buffer: Arc::new(Mutex::new(VecDeque::with_capacity(16_384))),
             volume_pct,
             muted,
+            underruns: Arc::new(AtomicU64::new(0)),
+            overruns: Arc::new(AtomicU64::new(0)),
             worker: Mutex::new(None),
         }
+    }
+
+    /// Require `prebuffer_samples` interleaved samples before playout begins draining.
+    pub fn with_prebuffer_samples(mut self, prebuffer_samples: usize) -> Self {
+        let ch = usize::from(self.channels.max(1));
+        let aligned = prebuffer_samples - (prebuffer_samples % ch);
+        self.prebuffer_samples = aligned.min(self.max_buffer_samples);
+        self
+    }
+
+    pub fn prebuffer_samples(&self) -> usize {
+        self.prebuffer_samples
+    }
+
+    pub fn buffered_samples(&self) -> usize {
+        self.buffer.lock().unwrap_or_else(|e| e.into_inner()).len()
+    }
+
+    pub fn underruns(&self) -> u64 {
+        self.underruns.load(Ordering::Relaxed)
+    }
+
+    pub fn overruns(&self) -> u64 {
+        self.overruns.load(Ordering::Relaxed)
     }
 
     pub fn set_volume(&self, volume_pct: u32) {
@@ -355,10 +577,23 @@ impl WindowsPlayer {
         let buffer = Arc::clone(&self.buffer);
         let volume_pct = Arc::clone(&self.volume_pct);
         let muted = Arc::clone(&self.muted);
+        let underruns = Arc::clone(&self.underruns);
         let src_rate = self.sample_rate.max(8_000);
         let src_channels = self.channels.max(1) as usize;
+        let prebuffer_samples = self.prebuffer_samples;
+        let max_buffer_samples = self.max_buffer_samples;
         *guard = Some(thread::spawn(move || {
-            run_playback_worker(closed, buffer, volume_pct, muted, src_rate, src_channels);
+            run_playback_worker(
+                closed,
+                buffer,
+                volume_pct,
+                muted,
+                underruns,
+                src_rate,
+                src_channels,
+                prebuffer_samples,
+                max_buffer_samples,
+            );
         }));
     }
 
@@ -367,16 +602,60 @@ impl WindowsPlayer {
             return;
         }
         let mut buf = self.buffer.lock().unwrap_or_else(|e| e.into_inner());
+        let ch = usize::from(self.channels.max(1));
         let incoming_samples = pcm_data.len() / 2;
+        let mut dropped_tail: Vec<i16> = Vec::new();
+        let mut counted_overrun = false;
+
         if buf.len() + incoming_samples > self.max_buffer_samples {
             let overflow = (buf.len() + incoming_samples) - self.max_buffer_samples;
             let drop_n = overflow.min(buf.len());
             // Keep channel alignment when dropping frames
-            let aligned_drop = drop_n - (drop_n % self.channels.max(1) as usize);
-            buf.drain(..aligned_drop);
+            let aligned_drop = drop_n - (drop_n % ch);
+            if aligned_drop > 0 {
+                self.overruns.fetch_add(1, Ordering::Relaxed);
+                counted_overrun = true;
+                let xfade_samples = aligned_drop.min(OVERRUN_CROSSFADE_FRAMES * ch);
+                let tail_start = aligned_drop - xfade_samples;
+                dropped_tail.extend(buf.range(tail_start..aligned_drop).copied());
+                buf.drain(..aligned_drop);
+            }
         }
         for &pair in pcm_data.as_chunks::<2>().0 {
             buf.push_back(i16::from_le_bytes(pair));
+        }
+        if buf.len() > self.max_buffer_samples {
+            let excess = buf.len() - self.max_buffer_samples;
+            let aligned_excess = excess.div_ceil(ch) * ch;
+            let drop_n = aligned_excess.min(buf.len());
+            let aligned_drop = drop_n - (drop_n % ch);
+            if aligned_drop > 0 {
+                if !counted_overrun {
+                    self.overruns.fetch_add(1, Ordering::Relaxed);
+                }
+                if dropped_tail.is_empty() {
+                    let xfade_samples = aligned_drop.min(OVERRUN_CROSSFADE_FRAMES * ch);
+                    let tail_start = aligned_drop - xfade_samples;
+                    dropped_tail.extend(buf.range(tail_start..aligned_drop).copied());
+                }
+                buf.drain(..aligned_drop);
+            }
+        }
+        if !dropped_tail.is_empty() {
+            let blend_frames = (dropped_tail.len() / ch).min(buf.len() / ch);
+            if blend_frames > 0 {
+                let tail_offset = dropped_tail.len() - blend_frames * ch;
+                let denom = (blend_frames + 1) as f64;
+                for f in 0..blend_frames {
+                    let t = (f + 1) as f64 / denom;
+                    for c in 0..ch {
+                        let idx = f * ch + c;
+                        let old_s = dropped_tail[tail_offset + idx];
+                        let new_s = buf[idx];
+                        buf[idx] = lerp_i16(old_s, new_s, t);
+                    }
+                }
+            }
         }
     }
 
@@ -412,13 +691,17 @@ fn pop_frame_pair(buf: &mut VecDeque<i16>, src_channels: usize) -> (i16, i16) {
 }
 
 #[cfg(all(windows, not(test)))]
+#[allow(clippy::too_many_arguments)]
 fn run_playback_worker(
     closed: Arc<AtomicBool>,
     buffer: Arc<Mutex<VecDeque<i16>>>,
     volume_pct: Arc<AtomicU32>,
     muted: Arc<AtomicBool>,
+    underruns: Arc<AtomicU64>,
     src_rate: u32,
     src_channels: usize,
+    prebuffer_samples: usize,
+    _max_buffer_samples: usize,
 ) {
     use cpal::traits::{DeviceTrait, HostTrait, StreamTrait};
     use cpal::{SampleFormat, StreamConfig};
@@ -455,8 +738,10 @@ fn run_playback_worker(
                 let buf_c = Arc::clone(&buffer);
                 let vol_c = Arc::clone(&volume_pct);
                 let mute_c = Arc::clone(&muted);
+                let underruns_c = Arc::clone(&underruns);
                 let err_flag = Arc::clone(&stream_broken);
-                let mut resampler = PlaybackResampler::new(src_rate, dst_rate);
+                let mut resampler =
+                    PlaybackResampler::with_prebuffer(src_rate, dst_rate, prebuffer_samples);
                 device
                     .build_output_stream(
                         &config,
@@ -464,7 +749,7 @@ fn run_playback_worker(
                             let vol = vol_c.load(Ordering::Relaxed);
                             let is_muted = mute_c.load(Ordering::Relaxed);
                             let mut guard = buf_c.lock().unwrap_or_else(|e| e.into_inner());
-                            resampler.write_frames(
+                            if resampler.write_frames_checked(
                                 &mut guard,
                                 src_channels,
                                 dst_channels,
@@ -474,7 +759,9 @@ fn run_playback_worker(
                                 |idx, s| {
                                     data[idx] = f32::from(s) / 32768.0;
                                 },
-                            );
+                            ) {
+                                underruns_c.fetch_add(1, Ordering::Relaxed);
+                            }
                         },
                         move |_| err_flag.store(true, Ordering::SeqCst),
                         None,
@@ -485,8 +772,10 @@ fn run_playback_worker(
                 let buf_c = Arc::clone(&buffer);
                 let vol_c = Arc::clone(&volume_pct);
                 let mute_c = Arc::clone(&muted);
+                let underruns_c = Arc::clone(&underruns);
                 let err_flag = Arc::clone(&stream_broken);
-                let mut resampler = PlaybackResampler::new(src_rate, dst_rate);
+                let mut resampler =
+                    PlaybackResampler::with_prebuffer(src_rate, dst_rate, prebuffer_samples);
                 device
                     .build_output_stream(
                         &config,
@@ -494,7 +783,7 @@ fn run_playback_worker(
                             let vol = vol_c.load(Ordering::Relaxed);
                             let is_muted = mute_c.load(Ordering::Relaxed);
                             let mut guard = buf_c.lock().unwrap_or_else(|e| e.into_inner());
-                            resampler.write_frames(
+                            if resampler.write_frames_checked(
                                 &mut guard,
                                 src_channels,
                                 dst_channels,
@@ -504,7 +793,9 @@ fn run_playback_worker(
                                 |idx, s| {
                                     data[idx] = s;
                                 },
-                            );
+                            ) {
+                                underruns_c.fetch_add(1, Ordering::Relaxed);
+                            }
                         },
                         move |_| err_flag.store(true, Ordering::SeqCst),
                         None,
@@ -515,8 +806,10 @@ fn run_playback_worker(
                 let buf_c = Arc::clone(&buffer);
                 let vol_c = Arc::clone(&volume_pct);
                 let mute_c = Arc::clone(&muted);
+                let underruns_c = Arc::clone(&underruns);
                 let err_flag = Arc::clone(&stream_broken);
-                let mut resampler = PlaybackResampler::new(src_rate, dst_rate);
+                let mut resampler =
+                    PlaybackResampler::with_prebuffer(src_rate, dst_rate, prebuffer_samples);
                 device
                     .build_output_stream(
                         &config,
@@ -524,7 +817,7 @@ fn run_playback_worker(
                             let vol = vol_c.load(Ordering::Relaxed);
                             let is_muted = mute_c.load(Ordering::Relaxed);
                             let mut guard = buf_c.lock().unwrap_or_else(|e| e.into_inner());
-                            resampler.write_frames(
+                            if resampler.write_frames_checked(
                                 &mut guard,
                                 src_channels,
                                 dst_channels,
@@ -534,7 +827,9 @@ fn run_playback_worker(
                                 |idx, s| {
                                     data[idx] = (i32::from(s) + 32768) as u16;
                                 },
-                            );
+                            ) {
+                                underruns_c.fetch_add(1, Ordering::Relaxed);
+                            }
                         },
                         move |_| err_flag.store(true, Ordering::SeqCst),
                         None,
@@ -600,24 +895,66 @@ fn drain_stale_buffer(buffer: &Mutex<VecDeque<i16>>) {
 }
 
 #[cfg(any(not(windows), test))]
+#[allow(clippy::too_many_arguments)]
 fn run_playback_worker(
     closed: Arc<AtomicBool>,
     buffer: Arc<Mutex<VecDeque<i16>>>,
     _volume_pct: Arc<AtomicU32>,
     _muted: Arc<AtomicBool>,
-    _src_rate: u32,
-    _src_channels: usize,
+    underruns: Arc<AtomicU64>,
+    src_rate: u32,
+    src_channels: usize,
+    prebuffer_samples: usize,
+    max_buffer_samples: usize,
 ) {
-    run_fallback_drain(closed, buffer);
+    run_fallback_drain(
+        closed,
+        buffer,
+        underruns,
+        src_rate,
+        src_channels,
+        prebuffer_samples,
+        max_buffer_samples,
+    );
 }
 
 #[cfg(any(not(windows), test))]
-fn run_fallback_drain(closed: Arc<AtomicBool>, buffer: Arc<Mutex<VecDeque<i16>>>) {
+fn run_fallback_drain(
+    closed: Arc<AtomicBool>,
+    buffer: Arc<Mutex<VecDeque<i16>>>,
+    underruns: Arc<AtomicU64>,
+    src_rate: u32,
+    src_channels: usize,
+    prebuffer_samples: usize,
+    max_buffer_samples: usize,
+) {
+    let ch = src_channels.max(1);
+    let drain_step = ((src_rate as usize * ch) / 50)
+        .max(ch)
+        .min(max_buffer_samples.max(ch));
+    let mut primed = false;
     while !closed.load(Ordering::SeqCst) {
         {
             let mut g = buffer.lock().unwrap_or_else(|e| e.into_inner());
-            let drain_n = g.len().min(1_920);
-            g.drain(..drain_n);
+            if !primed {
+                let min_ready = if prebuffer_samples > 0 {
+                    prebuffer_samples
+                } else {
+                    ch
+                };
+                if g.len() >= min_ready {
+                    primed = true;
+                }
+            }
+            if primed {
+                if g.len() >= drain_step {
+                    g.drain(..drain_step);
+                } else {
+                    g.clear();
+                    underruns.fetch_add(1, Ordering::Relaxed);
+                    primed = false;
+                }
+            }
         }
         thread::sleep(Duration::from_millis(20));
     }
@@ -1225,5 +1562,170 @@ mod tests {
         let mut muted_out = vec![123i16; 2 * 2];
         r.write_frames(&mut muted_q, 1, 2, 2, 100, true, |i, s| muted_out[i] = s);
         assert_eq!(muted_out, vec![0, 0, 0, 0]);
+    }
+
+    fn encode_stereo_bytes(frames: &[(i16, i16)]) -> Vec<u8> {
+        let mut bytes = Vec::with_capacity(frames.len() * 4);
+        for &(l, r) in frames {
+            bytes.extend_from_slice(&l.to_le_bytes());
+            bytes.extend_from_slice(&r.to_le_bytes());
+        }
+        bytes
+    }
+
+    #[test]
+    fn test_windows_player_overrun_crossfade_on_step_waveform() {
+        // 200 stereo frames = 400 samples max buffer
+        let player = WindowsPlayer::with_max_buffer_samples(48_000, 2, 400);
+        let mut initial = vec![(10_000i16, -10_000i16); 100];
+        initial.extend(vec![(-10_000i16, 10_000i16); 100]);
+        player.write(&encode_stereo_bytes(&initial));
+        assert_eq!(player.buffered_samples(), 400);
+        assert_eq!(player.overruns(), 0);
+
+        // Overflow by 100 frames: drops the (10_000, -10_000) region and crossfades
+        // its tail (96 frames) into the (-10_000, 10_000) front.
+        let extra = vec![(-10_000i16, 10_000i16); 100];
+        player.write(&encode_stereo_bytes(&extra));
+        assert_eq!(player.buffered_samples(), 400);
+        assert_eq!(player.overruns(), 1);
+
+        let buf = player.buffer.lock().unwrap();
+        let frames: Vec<(i16, i16)> = buf
+            .iter()
+            .copied()
+            .collect::<Vec<_>>()
+            .as_chunks::<2>()
+            .0
+            .iter()
+            .map(|&p| (p[0], p[1]))
+            .collect();
+        assert_eq!(frames.len(), 200);
+        // Crossfade starts near (10_000, -10_000) and arrives at (-10_000, 10_000) by frame 96
+        assert!(frames[0].0 > 9_500 && frames[0].1 < -9_500);
+        assert!(frames[95].0 < -9_500 && frames[95].1 > 9_500);
+        assert_eq!(frames[96], (-10_000, 10_000));
+
+        let max_step_l = frames[..100]
+            .windows(2)
+            .map(|w| (i32::from(w[1].0) - i32::from(w[0].0)).abs())
+            .max()
+            .unwrap_or(0);
+        assert!(
+            max_step_l < 300,
+            "step click should be smoothed by crossfade: max_step_l={max_step_l}"
+        );
+    }
+
+    #[test]
+    fn test_windows_player_prebuffering_and_underrun_counters() {
+        let player =
+            WindowsPlayer::with_max_buffer_samples(48_000, 2, 19_200).with_prebuffer_samples(3_840);
+        assert_eq!(player.prebuffer_samples(), 3_840);
+        assert_eq!(player.buffered_samples(), 0);
+        assert_eq!(player.underruns(), 0);
+        assert_eq!(player.overruns(), 0);
+
+        player.start();
+        let frame_20ms = encode_stereo_bytes(&vec![(2_000, -2_000); 960]);
+
+        // Below 3_840 prebuffer: stays buffered and counts 0 underruns.
+        player.write(&frame_20ms);
+        thread::sleep(Duration::from_millis(60));
+        assert_eq!(player.buffered_samples(), 1_920);
+        assert_eq!(player.underruns(), 0);
+
+        // Reaching 3_840 primes playout; worker drains and then records 1 underrun when empty.
+        player.write(&frame_20ms);
+        thread::sleep(Duration::from_millis(120));
+        assert_eq!(player.buffered_samples(), 0);
+        assert_eq!(player.underruns(), 1);
+    }
+
+    #[test]
+    fn test_playback_resampler_prebuffer_underrun_fade_out_and_resume_fade_in() {
+        let mut r = PlaybackResampler::with_prebuffer(48_000, 48_000, 400); // 200 stereo frames
+        let mut queue = VecDeque::new();
+        for _ in 0..100 {
+            queue.push_back(20_000);
+            queue.push_back(-20_000);
+        }
+
+        // Below prebuffer: emits silence, does not consume queue, no underrun.
+        let mut block = vec![777i16; 100 * 2];
+        let underrun = r.write_frames_checked(&mut queue, 2, 2, 100, 100, false, |i, s| {
+            block[i] = s;
+        });
+        assert!(!underrun);
+        assert_eq!(queue.len(), 200);
+        assert!(block.iter().all(|&s| s == 0));
+
+        // Fill up to prebuffer (200 frames): primes and fades in over RESUME_FADE_IN_FRAMES.
+        for _ in 0..100 {
+            queue.push_back(20_000);
+            queue.push_back(-20_000);
+        }
+        let underrun = r.write_frames_checked(&mut queue, 2, 2, 100, 100, false, |i, s| {
+            block[i] = s;
+        });
+        assert!(!underrun);
+        assert_eq!(queue.len(), 200);
+        assert!(block[0] > 0 && block[0] < 1_000);
+        assert_eq!(block[198], 20_000);
+        assert_eq!(block[199], -20_000);
+
+        // Request 150 frames when only 100 remain -> underrun at frame 100, smooth tail fade-out.
+        let mut tail_block = vec![0i16; 150 * 2];
+        let underrun = r.write_frames_checked(&mut queue, 2, 2, 150, 100, false, |i, s| {
+            tail_block[i] = s;
+        });
+        assert!(underrun);
+        assert!(queue.is_empty());
+        assert_eq!(tail_block[198], 20_000);
+        assert!(tail_block[200] < 20_000 && tail_block[200] > 19_000);
+        assert!(tail_block[298] < 5_000 && tail_block[298] > 0);
+        let tail_max_step = tail_block[198..]
+            .as_chunks::<2>()
+            .0
+            .windows(2)
+            .map(|w| (i32::from(w[1][0]) - i32::from(w[0][0])).abs())
+            .max()
+            .unwrap_or(0);
+        assert!(
+            tail_max_step < 400,
+            "underrun tail fade-out must be click-free: tail_max_step={tail_max_step}"
+        );
+
+        // Subsequent empty callback while re-priming finishes tail to zero and does not double-count.
+        let mut post_block = vec![777i16; 64 * 2];
+        let underrun2 = r.write_frames_checked(&mut queue, 2, 2, 64, 100, false, |i, s| {
+            post_block[i] = s;
+        });
+        assert!(!underrun2);
+        assert_eq!(post_block[126], 0);
+        assert_eq!(post_block[127], 0);
+
+        // Resampled path (44.1k -> 48k) also smooths underruns and re-primes cleanly.
+        let mut rs = PlaybackResampler::with_prebuffer(44_100, 48_000, 200);
+        let mut rs_q = VecDeque::new();
+        for _ in 0..100 {
+            rs_q.push_back(12_000);
+            rs_q.push_back(-12_000);
+        }
+        let mut rs_out = vec![0i16; 150 * 2];
+        assert!(rs.write_frames_checked(&mut rs_q, 2, 2, 150, 100, false, |i, s| {
+            rs_out[i] = s;
+        }));
+        let rs_max_step = rs_out
+            .as_chunks::<2>()
+            .0
+            .windows(2)
+            .map(|w| (i32::from(w[1][0]) - i32::from(w[0][0])).abs())
+            .max()
+            .unwrap_or(0);
+        assert!(
+            rs_max_step < 400,
+            "resampled underrun must be click-free: rs_max_step={rs_max_step}"
+        );
     }
 }

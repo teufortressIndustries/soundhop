@@ -16,6 +16,12 @@ const MAX_CAPTURE_QUEUE_SAMPLES: usize = (PCM_SAMPLE_RATE as usize) * (PCM_CHANN
 const CAPTURE_WAIT_STEP: Duration = Duration::from_millis(35);
 /// Cap SHT3 playback ring buffer at 200 ms of 48 kHz stereo audio (`48000 * 2 * 0.2 = 19_200`).
 const SHT3_MAX_PLAYBACK_BUFFER_SAMPLES: usize = 19_200;
+/// Prebuffer 40 ms of 48 kHz stereo audio (`48000 * 2 * 0.04 = 3_840` samples) before playout.
+const SHT3_PREBUFFER_SAMPLES: usize = 3_840;
+/// Target playback prebuffer fill in milliseconds matching [`SHT3_PREBUFFER_SAMPLES`].
+const SHT3_PLAYBACK_TARGET_MS: f64 = 40.0;
+/// Stereo frames over which partial capture timeouts are faded out before zero-fill.
+const CAPTURE_TIMEOUT_FADE_FRAMES: usize = 64;
 /// Maximum stereo frames (~4 ms @ 48 kHz) over which volume/mute transitions are ramped.
 const GAIN_RAMP_MAX_FRAMES: usize = 192;
 
@@ -136,6 +142,18 @@ fn read_capture_queue_into(guard: &mut VecDeque<i16>, buf: &mut [i16]) -> Transp
     for slot in buf.iter_mut().take(aligned) {
         *slot = guard.pop_front().unwrap_or(0);
     }
+    if aligned >= CAPTURE_TIMEOUT_FADE_FRAMES * ch {
+        let fade_samples = CAPTURE_TIMEOUT_FADE_FRAMES * ch;
+        let fade_start = aligned - fade_samples;
+        let denom = CAPTURE_TIMEOUT_FADE_FRAMES as f32;
+        for frame_idx in 0..CAPTURE_TIMEOUT_FADE_FRAMES {
+            let gain = 1.0 - ((frame_idx + 1) as f32 / denom);
+            let base = fade_start + frame_idx * ch;
+            for c in 0..ch {
+                buf[base + c] = scale_sample_f32(buf[base + c], gain);
+            }
+        }
+    }
     buf[aligned..].fill(0);
     Ok(buf.len())
 }
@@ -154,16 +172,18 @@ pub struct WindowsPcmPlayback {
     muted: Arc<AtomicBool>,
     current_gain: f32,
     byte_buf: Vec<u8>,
+    target_ms: f64,
 }
 
 impl WindowsPcmPlayback {
-    /// Create and start a 48 kHz stereo [`WindowsPlayer`] capped at 200 ms for SHT3 playback.
+    /// Create and start a 48 kHz stereo [`WindowsPlayer`] capped at 200 ms with 40 ms prebuffering.
     pub fn start() -> Self {
         let player = WindowsPlayer::with_max_buffer_samples(
             PCM_SAMPLE_RATE,
             PCM_CHANNELS,
             SHT3_MAX_PLAYBACK_BUFFER_SAMPLES,
-        );
+        )
+        .with_prebuffer_samples(SHT3_PREBUFFER_SAMPLES);
         player.start();
         Self {
             player,
@@ -171,6 +191,7 @@ impl WindowsPcmPlayback {
             muted: Arc::new(AtomicBool::new(false)),
             current_gain: 1.0,
             byte_buf: Vec::with_capacity(3_840),
+            target_ms: SHT3_PLAYBACK_TARGET_MS,
         }
     }
 
@@ -178,6 +199,9 @@ impl WindowsPcmPlayback {
     pub fn from_player(player: WindowsPlayer) -> Self {
         let vol = (player.volume().min(150)) as u8;
         let muted = player.is_muted();
+        let samples_per_ms =
+            f64::from(player.sample_rate.max(1)) * f64::from(player.channels.max(1)) / 1000.0;
+        let target_ms = (player.prebuffer_samples() as f64) / samples_per_ms;
         // Keep the underlying player at unity so gain ramping is applied once without double-scaling.
         player.set_volume(100);
         player.set_mute(false);
@@ -188,7 +212,31 @@ impl WindowsPcmPlayback {
             muted: Arc::new(AtomicBool::new(muted)),
             current_gain: target_gain_factor(u32::from(vol), muted),
             byte_buf: Vec::with_capacity(3_840),
+            target_ms,
         }
+    }
+
+    /// Current playback buffer fill in milliseconds.
+    pub fn buffered_ms(&self) -> Option<f64> {
+        let samples_per_ms = f64::from(self.player.sample_rate.max(1))
+            * f64::from(self.player.channels.max(1))
+            / 1000.0;
+        Some((self.player.buffered_samples() as f64) / samples_per_ms)
+    }
+
+    /// Target playback buffer fill in milliseconds.
+    pub fn sink_target_ms(&self) -> f64 {
+        self.target_ms
+    }
+
+    /// Total playback buffer underruns observed by the underlying [`WindowsPlayer`].
+    pub fn sink_underruns(&self) -> u64 {
+        self.player.underruns()
+    }
+
+    /// Total playback buffer overruns observed by the underlying [`WindowsPlayer`].
+    pub fn sink_overruns(&self) -> u64 {
+        self.player.overruns()
     }
 }
 
@@ -368,5 +416,73 @@ mod tests {
         assert!(play.is_muted());
         play.write_frame(&[10_000, -10_000, 10_000, -10_000])
             .unwrap();
+    }
+
+    #[test]
+    fn idle_timeout_fades_out_when_aligned_at_least_128_samples() {
+        let mut guard = VecDeque::from(vec![10_000i16, -10_000].repeat(96)); // 192 samples
+        let mut buf = [999i16; 384];
+        let n = read_capture_queue_into(&mut guard, &mut buf).unwrap();
+        assert_eq!(n, 384);
+        assert!(guard.is_empty());
+
+        // First 32 frames (64 samples) remain untouched
+        assert_eq!(buf[0], 10_000);
+        assert_eq!(buf[1], -10_000);
+        assert_eq!(buf[62], 10_000);
+        assert_eq!(buf[63], -10_000);
+
+        // Last 64 frames of the aligned region fade smoothly to zero
+        assert!(buf[64] < 10_000 && buf[64] > 9_000);
+        assert_eq!(buf[190], 0);
+        assert_eq!(buf[191], 0);
+        assert!(buf[192..].iter().all(|&s| s == 0));
+
+        let max_step_l = buf
+            .as_chunks::<2>()
+            .0
+            .windows(2)
+            .map(|w| (i32::from(w[1][0]) - i32::from(w[0][0])).abs())
+            .max()
+            .unwrap_or(0);
+        assert!(
+            max_step_l < 300,
+            "expected smooth capture timeout fade-out, max_step_l={max_step_l}"
+        );
+    }
+
+    #[test]
+    fn windows_playback_prebuffers_40ms_and_exposes_metrics() {
+        let mut play = WindowsPcmPlayback::start();
+        assert_eq!(play.sink_target_ms(), 40.0);
+        assert_eq!(play.buffered_ms(), Some(0.0));
+        assert_eq!(play.sink_underruns(), 0);
+        assert_eq!(play.sink_overruns(), 0);
+
+        // One 20 ms frame (1_920 samples) is below the 40 ms prebuffer, so it stays buffered.
+        let frame_20ms = vec![1_000i16; 1_920];
+        play.write_frame(&frame_20ms).unwrap();
+        std::thread::sleep(Duration::from_millis(60));
+        assert_eq!(play.buffered_ms(), Some(20.0));
+        assert_eq!(play.sink_underruns(), 0);
+
+        // Second 20 ms frame primes the 40 ms prebuffer; worker then drains and hits underrun.
+        play.write_frame(&frame_20ms).unwrap();
+        std::thread::sleep(Duration::from_millis(120));
+        assert_eq!(play.buffered_ms(), Some(0.0));
+        assert_eq!(play.sink_underruns(), 1);
+        assert_eq!(play.sink_overruns(), 0);
+    }
+
+    #[test]
+    fn windows_playback_from_player_reports_overruns_and_buffered_ms() {
+        let player = WindowsPlayer::with_max_buffer_samples(48_000, 2, 1_920);
+        let mut play = WindowsPcmPlayback::from_player(player);
+        assert_eq!(play.sink_target_ms(), 0.0);
+        // Single 40 ms write into a 20 ms-capped player deterministically overflows.
+        let frame_40ms = vec![500i16; 3_840];
+        play.write_frame(&frame_40ms).unwrap();
+        assert_eq!(play.sink_overruns(), 1);
+        assert!(play.buffered_ms().is_some_and(|ms| ms <= 20.0));
     }
 }
