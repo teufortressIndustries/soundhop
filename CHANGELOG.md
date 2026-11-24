@@ -7,6 +7,28 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [2.5.0] - 2026-11-24
+
+### Added
+- **Control Center GUI**: Added an SHT3 audio quality/latency profile selector in Advanced Settings (`opus-balanced`, `opus-low-latency`, `opus-low-bandwidth`, `pcm-lossless`).
+- **Congestion Adaptation & Session Supervision**: Added SHT3 `BitrateHint` feedback for adaptive Opus payload rate control, proactive session rekeying, and multi-peer SHT3 controller/zombie supervision with live telemetry synchronization.
+
+### Changed
+- **Full-Duplex SHT3 Engine & Handshake Hardening**: Split transport AEAD and TCP stream halves (`into_split()`) with wire-buffer reuse, socket timeouts, bounded concurrent server handshakes, and outbound reconnect backoff honoring `disconnect_grace_s`.
+- **Real-Time Opus & Audio DSP**: Upgraded Opus FEC/reset handling, real-time Opus PLC, adaptive jitter cushion, and stereo gain-ramping / de-clicking DSP across discontinuity boundaries.
+
+### Fixed
+- **Linux & Windows PCM Bridges**: Hardened Linux `parec` / `O_NONBLOCK` capture and Windows WASAPI idle-silence handling and gain ramping against stalls and audio clicks.
+
+## [2.4.1] - 2026-11-20
+
+### Added
+- Two-way mutual SAS verification during Pairing v2 and removal of the legacy PIN pairing card.
+
+### Fixed
+- Enabled `mousiki` `fixed_point` decoding to eliminate Opus decoder distortion.
+- Aligned `parec` capture latency to the active profile `frame_ms`, enforced atomic frame writes with partial-read timeout safety, and added SHT3 volume synchronization.
+
 ## [2.4.0] - 2026-11-20
 
 ### Added
@@ -83,7 +105,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - PIN/PSK HMAC pairing and trusted-LAN security modes.
 - Interactive terminal UI (TUI), native system tray, and live telemetry.
 
-[Unreleased]: https://github.com/teufortressIndustries/soundhop/compare/v2.4.0...HEAD
+[Unreleased]: https://github.com/teufortressIndustries/soundhop/compare/v2.5.0...HEAD
+[2.5.0]: https://github.com/teufortressIndustries/soundhop/compare/v2.4.1...v2.5.0
+[2.4.1]: https://github.com/teufortressIndustries/soundhop/compare/v2.4.0...v2.4.1
 [2.4.0]: https://github.com/teufortressIndustries/soundhop/compare/v2.3.1...v2.4.0
 [2.3.1]: https://github.com/teufortressIndustries/soundhop/compare/v2.3.0...v2.3.1
 [2.3.0]: https://github.com/teufortressIndustries/soundhop/compare/v2.2.0...v2.3.0
