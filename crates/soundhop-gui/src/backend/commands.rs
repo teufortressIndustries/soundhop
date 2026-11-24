@@ -888,59 +888,13 @@ impl WorkerState {
 
     fn handle_quit_all(&mut self) {
         let _ = self.controller.android_session.stop();
-
-        stop_systemd_service_if_active();
-
-        if ipc_is_running(None) {
-            let _ = ipc_request(
-                "android_stop",
-                serde_json::json!({}),
-                None,
-                Duration::from_secs(2),
-            );
-            let _ = ipc_request("stop", serde_json::json!({}), None, Duration::from_secs(2));
-        }
-
-        terminate_peer_soundhop_processes(&["tray", "daemon"]);
+        let _ = soundhop_core::service::quit_all_soundhop(None);
 
         self.quit_flag
             .store(true, std::sync::atomic::Ordering::SeqCst);
         if let Some(ref ctx) = self.ctx {
             ctx.send_viewport_cmd(eframe::egui::ViewportCommand::Close);
             ctx.request_repaint();
-        }
-    }
-}
-
-pub(crate) fn stop_systemd_service_if_active() {
-    #[cfg(target_os = "linux")]
-    {
-        let active = soundhop_core::service::status()
-            .get("active")
-            .and_then(|v| v.as_bool())
-            .unwrap_or(false);
-        if active {
-            let _ = std::process::Command::new("systemctl")
-                .args(["--user", "stop", "soundhop.service"])
-                .status();
-        }
-    }
-}
-
-pub(crate) fn terminate_peer_soundhop_processes(kinds: &[&str]) {
-    let self_pid = u64::from(std::process::id());
-    for kind in kinds {
-        if let Some(info) = soundhop_core::util::read_instance_lock_info(kind) {
-            if let Some(pid) = info.pid {
-                if pid != self_pid {
-                    let _ = soundhop_core::ipc::terminate_process(pid);
-                }
-            }
-        }
-        if let Some(pid) = soundhop_core::ipc::find_soundhop_process_with_arg(kind) {
-            if pid != self_pid {
-                let _ = soundhop_core::ipc::terminate_process(pid);
-            }
         }
     }
 }

@@ -16,7 +16,6 @@ use soundhop_core::controller::Controller;
 use crate::{lock_or_recover, read_or_recover, write_or_recover};
 
 pub use commands::GuiCommand;
-pub(crate) use commands::{stop_systemd_service_if_active, terminate_peer_soundhop_processes};
 pub use snapshot::{security_friendly_label, AppStreamView, GuiSnapshot, GuiToast, PeerView};
 
 use commands::is_mutating_command;

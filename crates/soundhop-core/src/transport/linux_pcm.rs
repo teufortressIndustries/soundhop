@@ -565,7 +565,7 @@ impl LinuxPcmPlayback {
             .spawn(move || {
                 // Spawn pacat inside the long-lived writer thread so PR_SET_PDEATHSIG
                 // tracks the writer thread lifetime rather than a short-lived handshake thread.
-                set_pdeathsig_linux(&mut cmd);
+                crate::util::set_parent_death_signal(&mut cmd);
                 let (mut child, stdin) = match spawn_playback_child(cmd) {
                     Ok(pair) => pair,
                     Err(err) => {
@@ -1245,7 +1245,7 @@ fn respawn_writer_child(
         }
     }
 
-    set_pdeathsig_linux(&mut cmd);
+    crate::util::set_parent_death_signal(&mut cmd);
     let Ok((mut new_child, new_stdin)) = spawn_playback_child(cmd) else {
         return false;
     };
@@ -1281,26 +1281,6 @@ fn mark_writer_failed(queue: &(Mutex<PlaybackQueueState>, Condvar)) {
     state.failed = true;
     cv.notify_all();
 }
-
-#[cfg(target_os = "linux")]
-fn set_pdeathsig_linux(cmd: &mut Command) {
-    use std::os::unix::process::CommandExt;
-    let parent_pid = unsafe { libc::getpid() };
-    unsafe {
-        cmd.pre_exec(move || {
-            if libc::prctl(libc::PR_SET_PDEATHSIG, libc::SIGKILL) == -1 {
-                return Err(std::io::Error::last_os_error());
-            }
-            if libc::getppid() != parent_pid {
-                libc::raise(libc::SIGKILL);
-            }
-            Ok(())
-        });
-    }
-}
-
-#[cfg(not(target_os = "linux"))]
-fn set_pdeathsig_linux(_cmd: &mut Command) {}
 
 fn spawn_playback_child(mut cmd: Command) -> TransportResult<(Child, ChildStdin)> {
     cmd.stdin(Stdio::piped())

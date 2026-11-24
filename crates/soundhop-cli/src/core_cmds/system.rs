@@ -2,7 +2,6 @@
 
 use std::io;
 use std::sync::Arc;
-use std::time::Duration;
 
 use clap::CommandFactory;
 use clap_complete::{generate, shells};
@@ -10,7 +9,6 @@ use soundhop_core::constants::{PROTOCOL_VERSION, VERSION};
 use soundhop_core::controller::Controller;
 use soundhop_core::daemon::Daemon;
 use soundhop_core::firewall::{detect as detect_firewall, open_ports};
-use soundhop_core::ipc::{is_reachable as ipc_is_reachable, request as ipc_request};
 use soundhop_core::service::{
     install as install_service, restart_service, start_service, status as service_status,
     stop_service, sync_appimage_paths_if_installed, uninstall as uninstall_service,
@@ -178,42 +176,18 @@ pub fn handle_daemon(verbose: bool, json_out: bool) -> i32 {
 }
 
 pub fn handle_stop(controller: &Arc<Controller>, json_out: bool) -> i32 {
-    #[cfg(target_os = "linux")]
-    {
-        if service_status()
-            .get("active")
-            .and_then(|v| v.as_bool())
-            .unwrap_or(false)
-        {
-            let _ = stop_service();
-        }
-    }
-    let mut stopped_daemon = false;
-    if ipc_is_reachable(None)
-        && ipc_request("stop", serde_json::json!({}), None, Duration::from_secs(3)).is_ok()
-    {
-        stopped_daemon = true;
-    }
+    let quit_res = soundhop_core::service::quit_all_soundhop(None);
+    let stopped_daemon = quit_res
+        .get("daemon_stopped")
+        .and_then(|v| v.as_bool())
+        .unwrap_or(false);
     let _ = controller.disconnect(false, None, true, Some(false), true, true);
-    let self_pid = u64::from(std::process::id());
-    for kind in ["tray", "gui"] {
-        if let Some(info) = soundhop_core::util::read_instance_lock_info(kind) {
-            if let Some(pid) = info.pid {
-                if pid != self_pid {
-                    let _ = soundhop_core::ipc::terminate_process(pid);
-                }
-            }
-        }
-        if let Some(pid) = soundhop_core::ipc::find_soundhop_process_with_arg(kind) {
-            if pid != self_pid {
-                let _ = soundhop_core::ipc::terminate_process(pid);
-            }
-        }
-    }
     if json_out {
         print_json(&serde_json::json!({
             "stopped_daemon": stopped_daemon,
             "disconnected": true,
+            "service_stopped": quit_res.get("service_stopped").and_then(|v| v.as_bool()).unwrap_or(false),
+            "terminated_pids": quit_res.get("terminated_pids").cloned().unwrap_or_else(|| serde_json::json!([])),
         }));
     } else {
         ok("Stopped SoundHop daemon and disconnected active audio sessions.");

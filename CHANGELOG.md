@@ -7,6 +7,20 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [2.6.0] - 2026-11-25
+
+### Added
+- **Closed-Loop SHT3 Clock-Drift Compensation**: Added `DriftController` (EMA-smoothed PI controller with slew-rate limiting) and `AdaptiveResampler` (4-point Catmull-Rom cubic stereo resampler), plus RFC 3550 jitter diagnostics.
+- **Unified Zero-Orphan Quit SoundHop**: Added `quit_all_soundhop` across System Tray, Control Center GUI (`GuiCommand::QuitAll`), and `soundhop stop` CLI to cleanly tear down `soundhop.service`, daemon IPC, and peer SoundHop processes without leaving orphan children.
+
+### Changed
+- **Non-Blocking PCM Playback & PLC Fallback**: Upgraded `LinuxPcmPlayback` with a non-blocking 8 KB-pipe writer and `WindowsPcmPlayback` with a 40 ms prebuffered ring buffer, click-free overrun/underrun fades, and Opus decode-error PLC fallback.
+- **Linux Wayland/KDE/GNOME Clean Shutdown & Process Hygiene**: Added `SIGTERM`/`SIGHUP` handling, occluded Wayland viewport wake (`< 50 ms`), synchronous `on_exit` teardown, `systemd --user` `graphical-session.target` + `KillMode=mixed` + `Slice=background.slice`, `PR_SET_PDEATHSIG` + process-group child hygiene (`parec`, `pacat`, `pactl subscribe`, `scrcpy`), and duplicate `parec` elimination.
+- **DSP & S16LE Encoder Deduplication**: Deduplicated DSP resamplers and gain-ramped S16LE encoders across `soundhop-core`.
+
+### Fixed
+- **Linux Remote Audio & mDNS Advertising**: Fixed `LinuxAudioBackend` `cookie_path_override` propagation in remote `pactl_call` and `send_mic_to_remote`, and fixed live mDNS unregistration/re-registration in `DiscoveryManager::set_advertising`.
+
 ## [2.5.0] - 2026-11-24
 
 ### Added
@@ -105,7 +119,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - PIN/PSK HMAC pairing and trusted-LAN security modes.
 - Interactive terminal UI (TUI), native system tray, and live telemetry.
 
-[Unreleased]: https://github.com/teufortressIndustries/soundhop/compare/v2.5.0...HEAD
+[Unreleased]: https://github.com/teufortressIndustries/soundhop/compare/v2.6.0...HEAD
+[2.6.0]: https://github.com/teufortressIndustries/soundhop/compare/v2.5.0...v2.6.0
 [2.5.0]: https://github.com/teufortressIndustries/soundhop/compare/v2.4.1...v2.5.0
 [2.4.1]: https://github.com/teufortressIndustries/soundhop/compare/v2.4.0...v2.4.1
 [2.4.0]: https://github.com/teufortressIndustries/soundhop/compare/v2.3.1...v2.4.0

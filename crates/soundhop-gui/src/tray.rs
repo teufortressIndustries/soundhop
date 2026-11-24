@@ -1760,23 +1760,12 @@ pub fn run_tray(verbose: bool) -> Result<i32, String> {
     }
 
     running.store(false, Ordering::SeqCst);
-    let external_daemon = is_external_daemon(&daemon);
     daemon.request_stop();
     drop(cmd_tx);
     let _ = worker_handle.join();
     daemon.shutdown();
     if quit_all_requested.load(Ordering::SeqCst) {
-        crate::backend::stop_systemd_service_if_active();
-        if external_daemon {
-            let _ = ipc_request(
-                "android_stop",
-                serde_json::json!({}),
-                None,
-                Duration::from_secs(2),
-            );
-            let _ = ipc_request("stop", serde_json::json!({}), None, Duration::from_secs(2));
-        }
-        crate::backend::terminate_peer_soundhop_processes(&["gui"]);
+        let _ = soundhop_core::service::quit_all_soundhop(None);
     }
     Ok(0)
 }

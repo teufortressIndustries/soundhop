@@ -1452,4 +1452,71 @@ mod tests {
             }
         }
     }
+
+    fn collect_repo_files(dir: &Path, out: &mut Vec<PathBuf>) {
+        let Ok(entries) = fs::read_dir(dir) else {
+            return;
+        };
+        for entry in entries.flatten() {
+            let path = entry.path();
+            let name = entry.file_name();
+            let name_str = name.to_string_lossy();
+            if name_str == ".git" || name_str == "target" {
+                continue;
+            }
+            if path.is_dir() {
+                collect_repo_files(&path, out);
+            } else if path.is_file() {
+                out.push(path);
+            }
+        }
+    }
+
+    #[test]
+    fn repo_has_no_mojibake_and_versions_match() {
+        let root = find_repo_root().expect("find repo root");
+        let expected = read_workspace_version(&root).expect("read workspace version");
+        let drifts = check_versions(&root, expected);
+        assert!(
+            drifts.is_empty(),
+            "expected zero version drifts on live repo, found: {drifts:?}"
+        );
+
+        let exts = [
+            "rs", "toml", "sh", "desktop", "xml", "spec", "iss", "yaml", "json",
+        ];
+        // Construct forbidden CP1252-UTF8 mojibake sequences via escapes so this file itself stays clean.
+        let forbidden = [
+            ("\u{00e2}\u{20ac}", "CP1252 UTF-8 U+00E2 U+20AC mojibake"),
+            ("\u{00e2}\u{0153}", "CP1252 UTF-8 U+00E2 U+0153 mojibake"),
+            ("\u{00e2}\u{2020}", "CP1252 UTF-8 U+00E2 U+2020 mojibake"),
+            ("\u{fffd}", "Unicode replacement character U+FFFD"),
+        ];
+
+        let mut files = Vec::new();
+        collect_repo_files(&root, &mut files);
+        let mut violations = Vec::new();
+
+        for path in files {
+            let Some(ext) = path.extension().and_then(|e| e.to_str()) else {
+                continue;
+            };
+            if !exts.contains(&ext) {
+                continue;
+            }
+            let content = fs::read_to_string(&path)
+                .unwrap_or_else(|e| panic!("failed to read {}: {e}", path.display()));
+            for (needle, label) in forbidden {
+                if content.contains(needle) {
+                    violations.push(format!("{} contains {label}", path.display()));
+                }
+            }
+        }
+
+        assert!(
+            violations.is_empty(),
+            "mojibake check failed:\n{}",
+            violations.join("\n")
+        );
+    }
 }
