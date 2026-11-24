@@ -2050,6 +2050,7 @@ mod tests {
         stop_cap.store(true, Ordering::Release);
     }
 
+    #[cfg(feature = "opus")]
     struct StallBurstCapture {
         frame_idx: usize,
         sample_idx: usize,
@@ -2057,6 +2058,7 @@ mod tests {
         mid_stream_hook: Option<Box<dyn FnMut(usize) + Send>>,
     }
 
+    #[cfg(feature = "opus")]
     impl StallBurstCapture {
         fn new() -> Self {
             Self {
@@ -2073,6 +2075,7 @@ mod tests {
         }
     }
 
+    #[cfg(feature = "opus")]
     impl PcmCapture for StallBurstCapture {
         fn attach_stop_flag(&mut self, stop_flag: Arc<AtomicBool>) {
             self.stop_flag = Some(stop_flag);
@@ -2090,7 +2093,7 @@ mod tests {
                 hook(self.frame_idx);
             }
             // Frames 0..8: normal 20ms pace.
-            // Before frame 8: 90ms Wi-Fi stall.
+            // Before frame 8: 120ms Wi-Fi stall.
             // Frames 8..14: immediate burst (0ms delay).
             // Frames 14..24: normal 20ms pace.
             // Frame >= 24: EOF.
@@ -2443,6 +2446,7 @@ mod tests {
         drop(stalled_sockets);
     }
 
+    #[cfg(feature = "opus")]
     struct MultiToneCapture {
         sample_idx: usize,
         pace: Duration,
@@ -2450,6 +2454,7 @@ mod tests {
         discontinuity: Arc<AtomicBool>,
     }
 
+    #[cfg(feature = "opus")]
     impl MultiToneCapture {
         fn new(pace: Duration, discontinuity: Arc<AtomicBool>) -> Self {
             Self {
@@ -2461,6 +2466,7 @@ mod tests {
         }
     }
 
+    #[cfg(feature = "opus")]
     impl PcmCapture for MultiToneCapture {
         fn attach_stop_flag(&mut self, stop_flag: Arc<AtomicBool>) {
             self.stop_flag = Some(stop_flag);
