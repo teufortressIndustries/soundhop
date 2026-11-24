@@ -4,7 +4,6 @@
 use std::collections::VecDeque;
 use std::io::{ErrorKind, Read, Write};
 use std::os::unix::io::{AsRawFd, RawFd};
-use std::os::unix::process::CommandExt;
 use std::process::{Child, ChildStdin, ChildStdout, Command, Stdio};
 use std::sync::atomic::{AtomicBool, AtomicU64, AtomicU8, AtomicUsize, Ordering};
 use std::sync::{Arc, Condvar, Mutex};
@@ -12,7 +11,8 @@ use std::thread::{self, JoinHandle};
 use std::time::{Duration, Instant};
 
 #[cfg(test)]
-use crate::transport::dsp::apply_gain_i16;
+#[cfg(test)]
+use crate::transport::dsp::encode_ramped_s16le;
 use crate::transport::dsp::{
     crossfade_stereo_in_place, fade_in_stereo_in_place, fade_out_stereo_in_place, GainRamp,
 };
@@ -344,8 +344,7 @@ fn set_nonblocking(fd: RawFd) -> std::io::Result<()> {
 fn spawn_capture_child(mut cmd: Command) -> TransportResult<(Child, ChildStdout)> {
     cmd.stdin(Stdio::null())
         .stdout(Stdio::piped())
-        .stderr(Stdio::null())
-        .process_group(0);
+        .stderr(Stdio::null());
     crate::util::close_fds_pre_exec(&mut cmd);
 
     let mut child = cmd.spawn()?;
@@ -531,17 +530,9 @@ impl LinuxPcmPlayback {
         sink: Option<String>,
         latency_ms: u32,
         spawner: PlaybackSpawner,
-        cmd: Command,
+        mut cmd: Command,
     ) -> TransportResult<Self> {
-        let (mut child, stdin) = spawn_playback_child(cmd)?;
-        if let Err(err) = configure_playback_pipe(stdin.as_raw_fd()) {
-            drop(stdin);
-            let _ = child.kill();
-            let _ = child.wait();
-            return Err(TransportError::Io(err));
-        }
-
-        let pipe_fd = Arc::new(Mutex::new(Some(stdin.as_raw_fd())));
+        let pipe_fd = Arc::new(Mutex::new(None));
         let queue = Arc::new((
             Mutex::new(PlaybackQueueState {
                 ring: VecDeque::with_capacity(RING_CAPACITY_SAMPLES),
@@ -564,6 +555,7 @@ impl LinuxPcmPlayback {
         });
         let stop_flag = Arc::new(AtomicBool::new(false));
 
+        let (init_tx, init_rx) = std::sync::mpsc::sync_channel::<TransportResult<()>>(1);
         let q_c = Arc::clone(&queue);
         let a_c = Arc::clone(&atomics);
         let fd_c = Arc::clone(&pipe_fd);
@@ -571,13 +563,45 @@ impl LinuxPcmPlayback {
         let writer = thread::Builder::new()
             .name("soundhop-linux-pcm-writer".to_string())
             .spawn(move || {
+                // Spawn pacat inside the long-lived writer thread so PR_SET_PDEATHSIG
+                // tracks the writer thread lifetime rather than a short-lived handshake thread.
+                set_pdeathsig_linux(&mut cmd);
+                let (mut child, stdin) = match spawn_playback_child(cmd) {
+                    Ok(pair) => pair,
+                    Err(err) => {
+                        let _ = init_tx.send(Err(err));
+                        return;
+                    }
+                };
+                if let Err(err) = configure_playback_pipe(stdin.as_raw_fd()) {
+                    drop(stdin);
+                    let _ = child.kill();
+                    let _ = child.wait();
+                    let _ = init_tx.send(Err(TransportError::Io(err)));
+                    return;
+                }
+                *fd_c.lock().unwrap_or_else(|e| e.into_inner()) = Some(stdin.as_raw_fd());
+                let _ = init_tx.send(Ok(()));
                 playback_writer_loop(spawner, child, stdin, q_c, a_c, fd_c, stop_c);
             })
             .map_err(|err| {
-                // If thread creation fails, ensure fd/child are cleaned up cleanly.
                 *pipe_fd.lock().unwrap_or_else(|e| e.into_inner()) = None;
                 TransportError::Io(err)
             })?;
+
+        match init_rx.recv() {
+            Ok(Ok(())) => {}
+            Ok(Err(err)) => {
+                let _ = writer.join();
+                return Err(err);
+            }
+            Err(_) => {
+                let _ = writer.join();
+                return Err(TransportError::Io(std::io::Error::other(
+                    "playback writer thread exited before initializing pacat",
+                )));
+            }
+        }
 
         Ok(Self {
             sink,
@@ -1202,7 +1226,7 @@ fn respawn_writer_child(
     if *consecutive_respawns >= MAX_PLAYBACK_RESPAWN_ATTEMPTS || stop_flag.load(Ordering::Acquire) {
         return false;
     }
-    let Some(cmd) = build_respawn_command(spawner) else {
+    let Some(mut cmd) = build_respawn_command(spawner) else {
         return false;
     };
 
@@ -1221,6 +1245,7 @@ fn respawn_writer_child(
         }
     }
 
+    set_pdeathsig_linux(&mut cmd);
     let Ok((mut new_child, new_stdin)) = spawn_playback_child(cmd) else {
         return false;
     };
@@ -1257,11 +1282,30 @@ fn mark_writer_failed(queue: &(Mutex<PlaybackQueueState>, Condvar)) {
     cv.notify_all();
 }
 
+#[cfg(target_os = "linux")]
+fn set_pdeathsig_linux(cmd: &mut Command) {
+    use std::os::unix::process::CommandExt;
+    let parent_pid = unsafe { libc::getpid() };
+    unsafe {
+        cmd.pre_exec(move || {
+            if libc::prctl(libc::PR_SET_PDEATHSIG, libc::SIGKILL) == -1 {
+                return Err(std::io::Error::last_os_error());
+            }
+            if libc::getppid() != parent_pid {
+                libc::raise(libc::SIGKILL);
+            }
+            Ok(())
+        });
+    }
+}
+
+#[cfg(not(target_os = "linux"))]
+fn set_pdeathsig_linux(_cmd: &mut Command) {}
+
 fn spawn_playback_child(mut cmd: Command) -> TransportResult<(Child, ChildStdin)> {
     cmd.stdin(Stdio::piped())
         .stdout(Stdio::null())
-        .stderr(Stdio::null())
-        .process_group(0);
+        .stderr(Stdio::null());
     crate::util::close_fds_pre_exec(&mut cmd);
 
     let mut child = cmd.spawn()?;
@@ -1302,84 +1346,6 @@ fn select_capture_program(
     } else {
         ("pacat", pacat_record_args(monitor_source, latency_ms))
     }
-}
-
-#[cfg(test)]
-#[inline]
-fn target_gain_factor(volume_pct: u32, muted: bool) -> f32 {
-    if muted || volume_pct == 0 {
-        0.0
-    } else {
-        (volume_pct.min(150) as f32) / 100.0
-    }
-}
-
-#[cfg(test)]
-#[inline]
-fn scale_sample_f32(sample: i16, gain: f32) -> i16 {
-    if gain <= 0.0 {
-        return 0;
-    }
-    (f32::from(sample) * gain)
-        .round()
-        .clamp(f32::from(i16::MIN), f32::from(i16::MAX)) as i16
-}
-
-#[cfg(test)]
-fn encode_ramped_s16le(
-    samples: &[i16],
-    volume_pct: u32,
-    muted: bool,
-    current_gain: &mut f32,
-    out: &mut Vec<u8>,
-) {
-    out.clear();
-    out.reserve(samples.len() * 2);
-
-    let target = target_gain_factor(volume_pct, muted);
-    if *current_gain == target {
-        if muted || volume_pct == 0 {
-            out.resize(samples.len() * 2, 0);
-        } else if volume_pct == 100 {
-            for &s in samples {
-                out.extend_from_slice(&s.to_le_bytes());
-            }
-        } else {
-            for &s in samples {
-                let scaled = apply_gain_i16(s, volume_pct, false);
-                out.extend_from_slice(&scaled.to_le_bytes());
-            }
-        }
-        return;
-    }
-
-    let start = *current_gain;
-    let stereo_frames = samples.len() / 2;
-    if stereo_frames == 0 {
-        let scaled = scale_sample_f32(samples[0], target);
-        out.extend_from_slice(&scaled.to_le_bytes());
-        *current_gain = target;
-        return;
-    }
-
-    let ramp_frames = stereo_frames.min(GAIN_RAMP_MAX_FRAMES);
-    for (frame_idx, pair) in samples.as_chunks::<2>().0.iter().enumerate() {
-        let gain = if frame_idx < ramp_frames {
-            let t = (frame_idx + 1) as f32 / (ramp_frames as f32);
-            start + (target - start) * t
-        } else {
-            target
-        };
-        let l = scale_sample_f32(pair[0], gain);
-        let r = scale_sample_f32(pair[1], gain);
-        out.extend_from_slice(&l.to_le_bytes());
-        out.extend_from_slice(&r.to_le_bytes());
-    }
-    if !samples.len().is_multiple_of(2) {
-        let s = scale_sample_f32(samples[samples.len() - 1], target);
-        out.extend_from_slice(&s.to_le_bytes());
-    }
-    *current_gain = target;
 }
 
 fn parec_args(monitor_source: &str, latency_ms: u32) -> Vec<String> {

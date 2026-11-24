@@ -704,6 +704,7 @@ pub struct DiscoveryManager {
     udp_thread: Mutex<Option<JoinHandle<()>>>,
     mdns_daemon: Mutex<Option<ServiceDaemon>>,
     mdns_thread: Mutex<Option<JoinHandle<()>>>,
+    mdns_fullname: Mutex<Option<String>>,
 }
 
 impl DiscoveryManager {
@@ -737,7 +738,34 @@ impl DiscoveryManager {
             udp_thread: Mutex::new(None),
             mdns_daemon: Mutex::new(None),
             mdns_thread: Mutex::new(None),
+            mdns_fullname: Mutex::new(None),
         }
+    }
+
+    fn build_mdns_service_info(&self) -> Option<ServiceInfo> {
+        let id_prefix: String = self.device_id.chars().take(6).collect();
+        let instance_name = format!("{}-{}", slugify(&self.name, 20), id_prefix);
+        let host_fqdn = format!("{instance_name}.local.");
+        let addrs = local_addresses(false);
+        let ip_str = addrs.first().map(|s| s.as_str()).unwrap_or("");
+        let props_owned = build_mdns_txt_properties_v3(
+            &self.device_id,
+            &self.name,
+            &self.security,
+            current_platform(),
+            &self.v3_meta,
+        );
+        let props_refs: Vec<(&str, &str)> =
+            props_owned.iter().map(|(k, v)| (*k, v.as_str())).collect();
+        ServiceInfo::new(
+            MDNS_SERVICE_TYPE,
+            &instance_name,
+            &host_fqdn,
+            ip_str,
+            self.audio_port,
+            &props_refs[..],
+        )
+        .ok()
     }
 
     pub fn with_v3_meta(mut self, v3_meta: BeaconV3Meta) -> Self {
@@ -891,28 +919,9 @@ impl DiscoveryManager {
             match ServiceDaemon::new() {
                 Ok(mdns) => {
                     if advertising {
-                        let id_prefix: String = self.device_id.chars().take(6).collect();
-                        let instance_name = format!("{}-{}", slugify(&self.name, 20), id_prefix);
-                        let host_fqdn = format!("{instance_name}.local.");
-                        let addrs = local_addresses(false);
-                        let ip_str = addrs.first().map(|s| s.as_str()).unwrap_or("");
-                        let props_owned = build_mdns_txt_properties_v3(
-                            &self.device_id,
-                            &self.name,
-                            &self.security,
-                            current_platform(),
-                            &self.v3_meta,
-                        );
-                        let props_refs: Vec<(&str, &str)> =
-                            props_owned.iter().map(|(k, v)| (*k, v.as_str())).collect();
-                        if let Ok(info) = ServiceInfo::new(
-                            MDNS_SERVICE_TYPE,
-                            &instance_name,
-                            &host_fqdn,
-                            ip_str,
-                            self.audio_port,
-                            &props_refs[..],
-                        ) {
+                        if let Some(info) = self.build_mdns_service_info() {
+                            *lock_or_recover(&self.mdns_fullname) =
+                                Some(info.get_fullname().to_string());
                             let _ = mdns.register(info);
                         }
                     }
@@ -952,7 +961,25 @@ impl DiscoveryManager {
     }
 
     pub fn set_advertising(&self, enabled: bool) {
-        self.advertising.store(enabled, Ordering::SeqCst);
+        self.advertising.store(enabled, Ordering::Relaxed);
+        {
+            let mdns_guard = lock_or_recover(&self.mdns_daemon);
+            if let Some(ref mdns) = *mdns_guard {
+                if !enabled {
+                    if let Some(fullname) = lock_or_recover(&self.mdns_fullname).take() {
+                        let _ = mdns.unregister(&fullname);
+                    }
+                } else {
+                    let mut fullname_guard = lock_or_recover(&self.mdns_fullname);
+                    if fullname_guard.is_none() {
+                        if let Some(info) = self.build_mdns_service_info() {
+                            *fullname_guard = Some(info.get_fullname().to_string());
+                            let _ = mdns.register(info);
+                        }
+                    }
+                }
+            }
+        }
         if enabled {
             self.probe();
         }
@@ -994,6 +1021,7 @@ impl DiscoveryManager {
         if let Some(h) = lock_or_recover(&self.udp_thread).take() {
             let _ = h.join();
         }
+        *lock_or_recover(&self.mdns_fullname) = None;
         if let Some(mdns) = lock_or_recover(&self.mdns_daemon).take() {
             let _ = mdns.shutdown();
         }
@@ -1293,5 +1321,46 @@ mod tests {
         .unwrap();
         let parsed_meta = parse_mdns_v3_metadata(&info);
         assert_eq!(parsed_meta, meta);
+    }
+
+    #[test]
+    fn test_set_advertising_unregisters_and_reregisters_mdns() {
+        let mgr = DiscoveryManager::new(
+            "dev-mdns-toggle".to_string(),
+            "Toggle Rig".to_string(),
+            4713,
+            47777,
+            "trusted-lan".to_string(),
+            None,
+            5.0,
+            false,
+            true,
+        );
+        let _warnings = mgr.start(true);
+        let has_daemon = lock_or_recover(&mgr.mdns_daemon).is_some();
+        if has_daemon {
+            let initial_fullname = lock_or_recover(&mgr.mdns_fullname).clone();
+            assert!(
+                initial_fullname.is_some(),
+                "start(true) should record mdns_fullname when mDNS daemon starts"
+            );
+
+            mgr.set_advertising(false);
+            assert!(
+                lock_or_recover(&mgr.mdns_fullname).is_none(),
+                "set_advertising(false) should clear mdns_fullname"
+            );
+            assert!(!mgr.advertising.load(Ordering::Relaxed));
+
+            mgr.set_advertising(true);
+            assert_eq!(
+                lock_or_recover(&mgr.mdns_fullname).clone(),
+                initial_fullname,
+                "set_advertising(true) should re-register and restore mdns_fullname"
+            );
+            assert!(mgr.advertising.load(Ordering::Relaxed));
+        }
+        mgr.stop();
+        assert!(lock_or_recover(&mgr.mdns_fullname).is_none());
     }
 }
