@@ -92,6 +92,11 @@ impl Controller {
             .latency_ms
             .map(|ms| ms.clamp(10, 500) as u16)
             .unwrap_or(40);
+        let reconnect_secs = if cfg.connection.disconnect_grace_s.is_finite() {
+            cfg.connection.disconnect_grace_s.clamp(0.0, 3600.0)
+        } else {
+            0.0
+        };
         OutboundConfig::new(
             cfg.device.id.clone(),
             SocketAddr::new(target_ip, v3_port),
@@ -99,6 +104,7 @@ impl Controller {
         )
         .with_profile(profile)
         .with_jitter_ms(jitter_ms)
+        .with_reconnect_window(Duration::from_secs_f64(reconnect_secs))
     }
 
     fn resolved_v3_port(cfg: &Config, meta: &BeaconV3Meta) -> u16 {

@@ -23,17 +23,17 @@ pub mod server;
 pub mod windows_pcm;
 pub mod wire;
 
-use std::collections::HashMap;
+use std::collections::{HashMap, VecDeque};
 use std::io::ErrorKind;
 use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr, TcpStream};
-use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU16, AtomicU64, AtomicUsize, Ordering};
 use std::sync::{mpsc, Arc, Mutex, RwLock};
 use std::thread::{self, JoinHandle};
 use std::time::{Duration, Instant};
 
 use thiserror::Error;
 
-pub use client::{Sht3ClientConfig, Sht3ClientConnection};
+pub use client::{Sht3ClientConfig, Sht3ClientConnection, Sht3ClientReader, Sht3ClientWriter};
 #[cfg(feature = "opus")]
 pub use codec::OpusCodec;
 pub use codec::{create_codec, AudioCodec, AudioProfile, PcmCodec};
@@ -75,8 +75,20 @@ pub const MAX_FRAMES_PER_KEY: u64 = 1 << 24;
 const MAX_MANAGED_INBOUND_IO_TIMEOUT: Duration = Duration::from_millis(150);
 /// Default outbound control/pong read timeout.
 const DEFAULT_OUTBOUND_IO_TIMEOUT: Duration = Duration::from_millis(200);
+/// Upper bound for the dedicated outbound reader's socket poll timeout so stop/reconnect joins stay snappy.
+const MAX_OUTBOUND_READER_TIMEOUT: Duration = Duration::from_millis(50);
 /// Default interval between outbound `Ping` telemetry probes.
 const DEFAULT_PING_INTERVAL: Duration = Duration::from_millis(500);
+/// Maximum concurrent in-flight SHT3 server handshakes accepted before dropping excess raw sockets.
+const MAX_INFLIGHT_HANDSHAKES: usize = 8;
+/// Rekey proactively once directional AEAD budget falls to this many frames remaining.
+const PROACTIVE_REKEY_FRAMES_REMAINING: u64 = 100;
+/// Minimum holdoff before an idle primed jitter buffer emits PLC frames.
+const MIN_PLC_HOLDOFF_MS: u64 = 60;
+/// Rolling window for detecting inbound underrun spikes.
+const BITRATE_UNDERRUN_WINDOW: Duration = Duration::from_secs(2);
+/// Clean delivery window required before stepping Opus bitrate back up.
+const BITRATE_RECOVERY_WINDOW: Duration = Duration::from_secs(15);
 
 /// Result alias for transport operations.
 pub type TransportResult<T> = Result<T, TransportError>;
@@ -189,6 +201,7 @@ pub struct OutboundConfig {
     pub jitter_ms: u16,
     pub ping_interval: Duration,
     pub io_timeout: Option<Duration>,
+    pub reconnect_window: Duration,
 }
 
 impl OutboundConfig {
@@ -212,6 +225,7 @@ impl OutboundConfig {
             jitter_ms: 40,
             ping_interval: DEFAULT_PING_INTERVAL,
             io_timeout: Some(DEFAULT_OUTBOUND_IO_TIMEOUT),
+            reconnect_window: Duration::ZERO,
         }
     }
 
@@ -227,6 +241,11 @@ impl OutboundConfig {
 
     pub fn with_ping_interval(mut self, interval: Duration) -> Self {
         self.ping_interval = interval;
+        self
+    }
+
+    pub fn with_reconnect_window(mut self, window: Duration) -> Self {
+        self.reconnect_window = window;
         self
     }
 }
@@ -250,6 +269,268 @@ pub struct OutboundSessionHandle {
     worker: Mutex<Option<JoinHandle<()>>>,
 }
 
+struct OutboundReaderHandle {
+    conn_stop: Arc<AtomicBool>,
+    conn_broken: Arc<AtomicBool>,
+    fatal_error: Arc<AtomicBool>,
+    join: Option<JoinHandle<()>>,
+}
+
+impl OutboundReaderHandle {
+    fn stop_and_join(&mut self) {
+        self.conn_stop.store(true, Ordering::Release);
+        if let Some(handle) = self.join.take() {
+            let _ = handle.join();
+        }
+    }
+}
+
+struct OutboundReaderShared {
+    session_stop: Arc<AtomicBool>,
+    remote_closed: Arc<AtomicBool>,
+    pending_bitrate_kbps: Arc<AtomicU16>,
+    telemetry: Arc<Mutex<StreamTelemetry>>,
+    start_instant: Instant,
+    read_timeout: Duration,
+}
+
+fn spawn_outbound_reader(
+    mut reader: Sht3ClientReader,
+    shared: &OutboundReaderShared,
+) -> OutboundReaderHandle {
+    let conn_stop = Arc::new(AtomicBool::new(false));
+    let conn_broken = Arc::new(AtomicBool::new(false));
+    let fatal_error = Arc::new(AtomicBool::new(false));
+
+    let _ = reader.set_read_timeout(Some(shared.read_timeout));
+
+    let session_stop = Arc::clone(&shared.session_stop);
+    let remote_closed = Arc::clone(&shared.remote_closed);
+    let pending_bitrate_kbps = Arc::clone(&shared.pending_bitrate_kbps);
+    let telemetry = Arc::clone(&shared.telemetry);
+    let start_instant = shared.start_instant;
+    let conn_stop_c = Arc::clone(&conn_stop);
+    let conn_broken_c = Arc::clone(&conn_broken);
+    let fatal_error_c = Arc::clone(&fatal_error);
+
+    let join = thread::spawn(move || loop {
+        match reader.recv_frame() {
+            Ok(frame) => {
+                match frame.header.frame_type {
+                    FrameType::Pong => {
+                        if let Ok(pong) = PongPayload::decode(&frame.payload) {
+                            let now_us = start_instant
+                                .elapsed()
+                                .as_micros()
+                                .min(u128::from(u64::MAX))
+                                as u64;
+                            let rtt_us = now_us.saturating_sub(pong.client_time_us);
+                            let mut t = telemetry.lock().unwrap_or_else(|e| e.into_inner());
+                            t.rtt_us = rtt_us;
+                            t.jitter_buf_ms = pong.jitter_buf_ms;
+                            t.dropped_frames = pong.dropped_frames;
+                            t.pongs_received += 1;
+                        }
+                    }
+                    FrameType::Control => {
+                        if let Ok(msg) = ControlMessage::decode(&frame.payload) {
+                            match msg {
+                                ControlMessage::VolumeState { volume, muted } => {
+                                    let mut t = telemetry.lock().unwrap_or_else(|e| e.into_inner());
+                                    t.remote_volume = volume;
+                                    t.remote_muted = muted;
+                                }
+                                ControlMessage::BitrateHint(kbps) => {
+                                    pending_bitrate_kbps
+                                        .store(kbps.clamp(16, 510), Ordering::Release);
+                                }
+                                ControlMessage::SetVolume(_)
+                                | ControlMessage::SetMute(_)
+                                | ControlMessage::DelayOffsetMs(_) => {}
+                            }
+                        }
+                    }
+                    FrameType::Close => {
+                        remote_closed.store(true, Ordering::Release);
+                        break;
+                    }
+                    FrameType::AudioOpus | FrameType::AudioPcm | FrameType::Ping => {}
+                }
+                if session_stop.load(Ordering::Acquire) {
+                    break;
+                }
+            }
+            Err(TransportError::Io(ref e))
+                if matches!(e.kind(), ErrorKind::WouldBlock | ErrorKind::TimedOut) =>
+            {
+                if session_stop.load(Ordering::Acquire) || conn_stop_c.load(Ordering::Acquire) {
+                    break;
+                }
+            }
+            Err(TransportError::Wire(_))
+            | Err(TransportError::Crypto(_))
+            | Err(TransportError::PayloadTooLarge { .. }) => {
+                fatal_error_c.store(true, Ordering::Release);
+                break;
+            }
+            Err(_) => {
+                conn_broken_c.store(true, Ordering::Release);
+                break;
+            }
+        }
+    });
+
+    OutboundReaderHandle {
+        conn_stop,
+        conn_broken,
+        fatal_error,
+        join: Some(join),
+    }
+}
+
+fn drain_capture_until(
+    capture: &mut dyn PcmCapture,
+    pcm_buf: &mut [i16],
+    deadline: Instant,
+    stop_flag: &AtomicBool,
+) -> bool {
+    while Instant::now() < deadline {
+        if stop_flag.load(Ordering::Acquire) {
+            return false;
+        }
+        let step_start = Instant::now();
+        match capture.read_frame(pcm_buf) {
+            Ok(0) | Err(_) => return false,
+            Ok(_) => {
+                let _ = capture.take_discontinuity();
+            }
+        }
+        if step_start.elapsed() < Duration::from_millis(2) {
+            let remaining = deadline.saturating_duration_since(Instant::now());
+            if !remaining.is_zero() {
+                thread::sleep(remaining.min(Duration::from_millis(10)));
+            }
+        }
+    }
+    !stop_flag.load(Ordering::Acquire)
+}
+
+#[allow(clippy::too_many_arguments)]
+fn try_reconnect_outbound(
+    reason_rekey: bool,
+    config: &OutboundConfig,
+    client_cfg: &Sht3ClientConfig,
+    capture: &mut dyn PcmCapture,
+    pcm_buf: &mut [i16],
+    codec: &mut dyn AudioCodec,
+    last_requested_volume: Option<u8>,
+    last_requested_mute: Option<bool>,
+    old_writer: Option<Sht3ClientWriter>,
+    reader_handle: &mut OutboundReaderHandle,
+    reader_shared: &OutboundReaderShared,
+) -> Option<(Sht3ClientWriter, OutboundReaderHandle)> {
+    if reason_rekey {
+        if let Some(mut w) = old_writer {
+            let _ = w.send_close();
+        }
+    } else {
+        drop(old_writer);
+    }
+
+    // Drain any buffered frames (such as FrameType::Close) before checking remote_closed.
+    reader_handle.stop_and_join();
+
+    if reader_shared.session_stop.load(Ordering::Acquire)
+        || reader_shared.remote_closed.load(Ordering::Acquire)
+        || reader_handle.fatal_error.load(Ordering::Acquire)
+    {
+        return None;
+    }
+
+    let window = if reason_rekey {
+        config.reconnect_window.max(Duration::from_secs(3))
+    } else {
+        config.reconnect_window
+    };
+    if window.is_zero() {
+        return None;
+    }
+
+    let deadline = Instant::now() + window;
+    let mut backoff = if reason_rekey {
+        Duration::ZERO
+    } else {
+        Duration::from_millis(100)
+    };
+
+    loop {
+        if !backoff.is_zero() {
+            let wait_until = (Instant::now() + backoff).min(deadline);
+            if !drain_capture_until(capture, pcm_buf, wait_until, &reader_shared.session_stop) {
+                return None;
+            }
+        }
+
+        let now = Instant::now();
+        if now >= deadline || reader_shared.session_stop.load(Ordering::Acquire) {
+            return None;
+        }
+
+        let mut attempt_cfg = client_cfg.clone();
+        let remaining = deadline.saturating_duration_since(now);
+        attempt_cfg.connect_timeout = attempt_cfg
+            .connect_timeout
+            .min(remaining.max(Duration::from_millis(100)));
+
+        match Sht3ClientConnection::connect(config.target_addr, attempt_cfg, &config.k_pair) {
+            Ok(conn) => {
+                let Ok((mut new_writer, new_reader)) = conn.into_split() else {
+                    return None;
+                };
+                codec.reset();
+
+                let mut ctrl_io_err = false;
+                if let Some(vol) = last_requested_volume {
+                    match new_writer.send_control(&ControlMessage::SetVolume(vol)) {
+                        Ok(()) => {}
+                        Err(TransportError::Io(_)) => ctrl_io_err = true,
+                        Err(_) => return None,
+                    }
+                }
+                if !ctrl_io_err {
+                    if let Some(muted) = last_requested_mute {
+                        match new_writer.send_control(&ControlMessage::SetMute(muted)) {
+                            Ok(()) => {}
+                            Err(TransportError::Io(_)) => ctrl_io_err = true,
+                            Err(_) => return None,
+                        }
+                    }
+                }
+                if !ctrl_io_err {
+                    let new_reader_handle = spawn_outbound_reader(new_reader, reader_shared);
+                    return Some((new_writer, new_reader_handle));
+                }
+            }
+            Err(
+                TransportError::AuthRejected(_)
+                | TransportError::UnsupportedProfile(_)
+                | TransportError::Wire(_)
+                | TransportError::Crypto(_)
+                | TransportError::PayloadTooLarge { .. },
+            ) => {
+                return None;
+            }
+            Err(_) => {}
+        }
+
+        backoff = if backoff.is_zero() {
+            Duration::from_millis(100)
+        } else {
+            (backoff * 2).min(Duration::from_secs(1))
+        };
+    }
+}
+
 impl OutboundSessionHandle {
     /// Connect to the target SHT3 listener and start streaming PCM from `capture`.
     pub fn start(
@@ -257,13 +538,13 @@ impl OutboundSessionHandle {
         mut capture: Box<dyn PcmCapture>,
     ) -> TransportResult<Self> {
         let mut client_cfg = Sht3ClientConfig::new(
-            config.client_device_id,
+            config.client_device_id.clone(),
             config.profile.to_audio_params(config.jitter_ms),
         );
         client_cfg.io_timeout = config.io_timeout;
 
-        let mut conn =
-            Sht3ClientConnection::connect(config.target_addr, client_cfg, &config.k_pair)?;
+        let conn =
+            Sht3ClientConnection::connect(config.target_addr, client_cfg.clone(), &config.k_pair)?;
         let audio_params = *conn.audio_params();
         let server_device_id = conn.server_device_id().to_string();
         let initial_volume = conn.initial_volume();
@@ -278,7 +559,13 @@ impl OutboundSessionHandle {
         let frame_spc = codec.frame_samples_per_channel() as u32;
 
         let stop_flag = Arc::new(AtomicBool::new(false));
+        capture.attach_stop_flag(Arc::clone(&stop_flag));
+
+        let (initial_writer, initial_reader) = conn.into_split()?;
+
         let running = Arc::new(AtomicBool::new(true));
+        let remote_closed = Arc::new(AtomicBool::new(false));
+        let pending_bitrate_kbps = Arc::new(AtomicU16::new(0));
         let telemetry = Arc::new(Mutex::new(StreamTelemetry {
             remote_volume: initial_volume,
             remote_muted: initial_muted,
@@ -287,49 +574,163 @@ impl OutboundSessionHandle {
         }));
         let (cmd_tx, cmd_rx) = mpsc::channel::<OutboundCommand>();
 
+        let start_instant = Instant::now();
+        let reader_timeout = config
+            .io_timeout
+            .unwrap_or(DEFAULT_OUTBOUND_IO_TIMEOUT)
+            .min(MAX_OUTBOUND_READER_TIMEOUT);
+        let reader_shared = OutboundReaderShared {
+            session_stop: Arc::clone(&stop_flag),
+            remote_closed: Arc::clone(&remote_closed),
+            pending_bitrate_kbps: Arc::clone(&pending_bitrate_kbps),
+            telemetry: Arc::clone(&telemetry),
+            start_instant,
+            read_timeout: reader_timeout,
+        };
+        let mut reader_handle = spawn_outbound_reader(initial_reader, &reader_shared);
+
         let stop_c = Arc::clone(&stop_flag);
         let running_c = Arc::clone(&running);
         let telemetry_c = Arc::clone(&telemetry);
         let ping_interval = config.ping_interval;
 
         let worker = thread::spawn(move || {
-            let start_instant = Instant::now();
+            let mut writer_opt = Some(initial_writer);
             let mut last_ping_at: Option<Instant> = None;
             let mut pcm_buf = vec![0i16; frame_samples];
             let mut encoded_buf = Vec::with_capacity(MAX_PAYLOAD_LEN);
             let mut timestamp_samples: u32 = 0;
+            let mut pending_discontinuity = false;
+            let mut last_requested_volume: Option<u8> = None;
+            let mut last_requested_mute: Option<bool> = None;
 
-            'stream: while !stop_c.load(Ordering::Acquire) {
+            'stream: while !stop_c.load(Ordering::Acquire)
+                && !remote_closed.load(Ordering::Acquire)
+                && !reader_handle.fatal_error.load(Ordering::Acquire)
+            {
+                if reader_handle.conn_broken.load(Ordering::Acquire) {
+                    let Some((new_writer, new_reader_handle)) = try_reconnect_outbound(
+                        false,
+                        &config,
+                        &client_cfg,
+                        capture.as_mut(),
+                        &mut pcm_buf,
+                        codec.as_mut(),
+                        last_requested_volume,
+                        last_requested_mute,
+                        writer_opt.take(),
+                        &mut reader_handle,
+                        &reader_shared,
+                    ) else {
+                        break 'stream;
+                    };
+                    writer_opt = Some(new_writer);
+                    reader_handle = new_reader_handle;
+                    pending_discontinuity = true;
+                }
+
                 // Drain pending control/ping commands before encoding the next frame.
                 while let Ok(cmd) = cmd_rx.try_recv() {
                     match cmd {
                         OutboundCommand::Control(msg) => {
-                            if conn.send_control(&msg).is_err() {
-                                break 'stream;
+                            match msg {
+                                ControlMessage::SetVolume(v) => last_requested_volume = Some(v),
+                                ControlMessage::SetMute(m) => last_requested_mute = Some(m),
+                                _ => {}
                             }
-                            if matches!(
-                                msg,
-                                ControlMessage::SetVolume(_) | ControlMessage::SetMute(_)
-                            ) && !poll_outbound_reply(
-                                &mut conn,
-                                &telemetry_c,
-                                start_instant,
-                                false,
-                            ) {
-                                break 'stream;
+                            let send_res = match writer_opt.as_mut() {
+                                Some(w) => w.send_control(&msg),
+                                None => break 'stream,
+                            };
+                            if let Err(err) = send_res {
+                                if matches!(err, TransportError::Io(_)) {
+                                    let Some((new_writer, new_reader_handle)) =
+                                        try_reconnect_outbound(
+                                            false,
+                                            &config,
+                                            &client_cfg,
+                                            capture.as_mut(),
+                                            &mut pcm_buf,
+                                            codec.as_mut(),
+                                            last_requested_volume,
+                                            last_requested_mute,
+                                            writer_opt.take(),
+                                            &mut reader_handle,
+                                            &reader_shared,
+                                        )
+                                    else {
+                                        break 'stream;
+                                    };
+                                    writer_opt = Some(new_writer);
+                                    reader_handle = new_reader_handle;
+                                    pending_discontinuity = true;
+                                    // Re-send non-volume/mute control if it failed mid-disconnect.
+                                    if !matches!(
+                                        msg,
+                                        ControlMessage::SetVolume(_) | ControlMessage::SetMute(_)
+                                    ) {
+                                        if let Some(w) = writer_opt.as_mut() {
+                                            if w.send_control(&msg).is_err() {
+                                                break 'stream;
+                                            }
+                                        }
+                                    }
+                                } else {
+                                    break 'stream;
+                                }
                             }
                         }
                         OutboundCommand::Ping => {
-                            if !exchange_ping(&mut conn, &telemetry_c, start_instant) {
-                                break 'stream;
+                            let now_us = start_instant
+                                .elapsed()
+                                .as_micros()
+                                .min(u128::from(u64::MAX))
+                                as u64;
+                            let send_res = match writer_opt.as_mut() {
+                                Some(w) => w.send_ping(&PingPayload {
+                                    client_time_us: now_us,
+                                }),
+                                None => break 'stream,
+                            };
+                            match send_res {
+                                Ok(()) => {
+                                    last_ping_at = Some(Instant::now());
+                                }
+                                Err(TransportError::Io(_)) => {
+                                    let Some((new_writer, new_reader_handle)) =
+                                        try_reconnect_outbound(
+                                            false,
+                                            &config,
+                                            &client_cfg,
+                                            capture.as_mut(),
+                                            &mut pcm_buf,
+                                            codec.as_mut(),
+                                            last_requested_volume,
+                                            last_requested_mute,
+                                            writer_opt.take(),
+                                            &mut reader_handle,
+                                            &reader_shared,
+                                        )
+                                    else {
+                                        break 'stream;
+                                    };
+                                    writer_opt = Some(new_writer);
+                                    reader_handle = new_reader_handle;
+                                    pending_discontinuity = true;
+                                }
+                                Err(_) => break 'stream,
                             }
-                            last_ping_at = Some(Instant::now());
                         }
                         OutboundCommand::Stop => {
                             stop_c.store(true, Ordering::Release);
                             break 'stream;
                         }
                     }
+                }
+
+                let hint = pending_bitrate_kbps.swap(0, Ordering::AcqRel);
+                if hint > 0 {
+                    let _ = codec.set_bitrate_kbps(hint);
                 }
 
                 let n = match capture.read_frame(&mut pcm_buf) {
@@ -341,22 +742,89 @@ impl OutboundSessionHandle {
                             .pongs_received
                             > 0;
                         if !has_pong {
-                            let _ = exchange_ping(&mut conn, &telemetry_c, start_instant);
+                            if let Some(w) = writer_opt.as_mut() {
+                                let now_us = start_instant
+                                    .elapsed()
+                                    .as_micros()
+                                    .min(u128::from(u64::MAX))
+                                    as u64;
+                                if w.send_ping(&PingPayload {
+                                    client_time_us: now_us,
+                                })
+                                .is_ok()
+                                {
+                                    let pong_deadline = Instant::now() + Duration::from_millis(500);
+                                    while Instant::now() < pong_deadline {
+                                        let pongs = telemetry_c
+                                            .lock()
+                                            .unwrap_or_else(|e| e.into_inner())
+                                            .pongs_received;
+                                        if pongs > 0
+                                            || remote_closed.load(Ordering::Acquire)
+                                            || reader_handle.conn_broken.load(Ordering::Acquire)
+                                            || reader_handle.fatal_error.load(Ordering::Acquire)
+                                            || stop_c.load(Ordering::Acquire)
+                                        {
+                                            break;
+                                        }
+                                        thread::sleep(Duration::from_millis(2));
+                                    }
+                                }
+                            }
                         }
-                        let _ = conn.send_close();
+                        if let Some(mut w) = writer_opt.take() {
+                            let _ = w.send_close();
+                        }
                         break 'stream;
                     }
                     Ok(n) => n,
                     Err(_) => break 'stream,
                 };
 
-                if stop_c.load(Ordering::Acquire) {
-                    let _ = conn.send_close();
+                if stop_c.load(Ordering::Acquire)
+                    || remote_closed.load(Ordering::Acquire)
+                    || reader_handle.fatal_error.load(Ordering::Acquire)
+                {
                     break 'stream;
+                }
+
+                if capture.take_discontinuity() {
+                    codec.reset();
+                    pending_discontinuity = true;
+                }
+
+                let hint = pending_bitrate_kbps.swap(0, Ordering::AcqRel);
+                if hint > 0 {
+                    let _ = codec.set_bitrate_kbps(hint);
                 }
 
                 if n < frame_samples {
                     pcm_buf[n..frame_samples].fill(0);
+                }
+
+                // Proactive rekey before directional AEAD frame limit is exhausted.
+                if writer_opt
+                    .as_ref()
+                    .is_some_and(|w| w.frames_remaining() <= PROACTIVE_REKEY_FRAMES_REMAINING)
+                {
+                    let Some((new_writer, new_reader_handle)) = try_reconnect_outbound(
+                        true,
+                        &config,
+                        &client_cfg,
+                        capture.as_mut(),
+                        &mut pcm_buf,
+                        codec.as_mut(),
+                        last_requested_volume,
+                        last_requested_mute,
+                        writer_opt.take(),
+                        &mut reader_handle,
+                        &reader_shared,
+                    ) else {
+                        break 'stream;
+                    };
+                    writer_opt = Some(new_writer);
+                    reader_handle = new_reader_handle;
+                    pending_discontinuity = true;
                 }
 
                 encoded_buf.clear();
@@ -364,19 +832,49 @@ impl OutboundSessionHandle {
                     break 'stream;
                 };
 
-                if conn
-                    .send_audio(frame_type, 0, timestamp_samples, &encoded_buf)
-                    .is_err()
-                    || conn.flush().is_err()
-                {
-                    break 'stream;
-                }
-                timestamp_samples = timestamp_samples.wrapping_add(frame_spc);
-
-                {
-                    let mut t = telemetry_c.lock().unwrap_or_else(|e| e.into_inner());
-                    t.frames_sent += 1;
-                    t.bytes_sent += pkt_len as u64;
+                let flags = if pending_discontinuity {
+                    FLAG_DISCONTINUITY
+                } else {
+                    0
+                };
+                let send_res = match writer_opt.as_mut() {
+                    Some(w) => w
+                        .send_audio(frame_type, flags, timestamp_samples, &encoded_buf)
+                        .and_then(|()| w.flush()),
+                    None => break 'stream,
+                };
+                match send_res {
+                    Ok(()) => {
+                        pending_discontinuity = false;
+                        timestamp_samples = timestamp_samples.wrapping_add(frame_spc);
+                        {
+                            let mut t = telemetry_c.lock().unwrap_or_else(|e| e.into_inner());
+                            t.frames_sent += 1;
+                            t.bytes_sent += pkt_len as u64;
+                        }
+                    }
+                    Err(TransportError::Io(_)) => {
+                        let Some((new_writer, new_reader_handle)) = try_reconnect_outbound(
+                            false,
+                            &config,
+                            &client_cfg,
+                            capture.as_mut(),
+                            &mut pcm_buf,
+                            codec.as_mut(),
+                            last_requested_volume,
+                            last_requested_mute,
+                            writer_opt.take(),
+                            &mut reader_handle,
+                            &reader_shared,
+                        ) else {
+                            break 'stream;
+                        };
+                        writer_opt = Some(new_writer);
+                        reader_handle = new_reader_handle;
+                        pending_discontinuity = true;
+                        continue 'stream;
+                    }
+                    Err(_) => break 'stream,
                 }
 
                 let should_ping = match last_ping_at {
@@ -390,17 +888,43 @@ impl OutboundSessionHandle {
                         .elapsed()
                         .as_micros()
                         .min(u128::from(u64::MAX)) as u64;
-                    let _ = conn.send_ping(&PingPayload {
-                        client_time_us: now_us,
-                    });
-                    let _ = poll_outbound_reply_nonblocking(&mut conn, &telemetry_c, start_instant);
+                    if let Some(w) = writer_opt.as_mut() {
+                        if let Err(TransportError::Io(_)) = w.send_ping(&PingPayload {
+                            client_time_us: now_us,
+                        }) {
+                            let Some((new_writer, new_reader_handle)) = try_reconnect_outbound(
+                                false,
+                                &config,
+                                &client_cfg,
+                                capture.as_mut(),
+                                &mut pcm_buf,
+                                codec.as_mut(),
+                                last_requested_volume,
+                                last_requested_mute,
+                                writer_opt.take(),
+                                &mut reader_handle,
+                                &reader_shared,
+                            ) else {
+                                break 'stream;
+                            };
+                            writer_opt = Some(new_writer);
+                            reader_handle = new_reader_handle;
+                            pending_discontinuity = true;
+                        }
+                    }
                     last_ping_at = Some(Instant::now());
                 }
             }
 
-            if stop_c.load(Ordering::Acquire) {
-                let _ = conn.send_close();
+            if stop_c.load(Ordering::Acquire) && !remote_closed.load(Ordering::Acquire) {
+                if let Some(mut w) = writer_opt.take() {
+                    let _ = w.send_close();
+                }
+            } else {
+                drop(writer_opt.take());
             }
+
+            reader_handle.stop_and_join();
 
             running_c.store(false, Ordering::Release);
             let mut t = telemetry_c.lock().unwrap_or_else(|e| e.into_inner());
@@ -485,91 +1009,6 @@ impl Drop for OutboundSessionHandle {
     }
 }
 
-fn exchange_ping(
-    conn: &mut Sht3ClientConnection,
-    telemetry: &Arc<Mutex<StreamTelemetry>>,
-    start_instant: Instant,
-) -> bool {
-    let now_us = start_instant
-        .elapsed()
-        .as_micros()
-        .min(u128::from(u64::MAX)) as u64;
-    if conn
-        .send_ping(&PingPayload {
-            client_time_us: now_us,
-        })
-        .is_err()
-    {
-        return false;
-    }
-    poll_outbound_reply(conn, telemetry, start_instant, true)
-}
-
-fn poll_outbound_reply_nonblocking(
-    conn: &mut Sht3ClientConnection,
-    telemetry: &Arc<Mutex<StreamTelemetry>>,
-    start_instant: Instant,
-) -> bool {
-    let _ = conn.set_read_timeout(Some(Duration::from_millis(2)));
-    let ok = poll_outbound_reply(conn, telemetry, start_instant, true);
-    let _ = conn.set_read_timeout(Some(DEFAULT_OUTBOUND_IO_TIMEOUT));
-    ok
-}
-
-/// Read reply frame(s) from the server after sending a `Ping` or `Control` message.
-/// Returns `false` if the server closed or failed the connection.
-fn poll_outbound_reply(
-    conn: &mut Sht3ClientConnection,
-    telemetry: &Arc<Mutex<StreamTelemetry>>,
-    start_instant: Instant,
-    expect_pong: bool,
-) -> bool {
-    for _ in 0..4 {
-        match conn.recv_frame() {
-            Ok(frame) => match frame.header.frame_type {
-                FrameType::Pong => {
-                    if let Ok(pong) = PongPayload::decode(&frame.payload) {
-                        let now_us = start_instant
-                            .elapsed()
-                            .as_micros()
-                            .min(u128::from(u64::MAX)) as u64;
-                        let rtt_us = now_us.saturating_sub(pong.client_time_us);
-                        let mut t = telemetry.lock().unwrap_or_else(|e| e.into_inner());
-                        t.rtt_us = rtt_us;
-                        t.jitter_buf_ms = pong.jitter_buf_ms;
-                        t.dropped_frames = pong.dropped_frames;
-                        t.pongs_received += 1;
-                    }
-                    if expect_pong {
-                        return true;
-                    }
-                }
-                FrameType::Control => {
-                    if let Ok(ControlMessage::VolumeState { volume, muted }) =
-                        ControlMessage::decode(&frame.payload)
-                    {
-                        let mut t = telemetry.lock().unwrap_or_else(|e| e.into_inner());
-                        t.remote_volume = volume;
-                        t.remote_muted = muted;
-                    }
-                    if !expect_pong {
-                        return true;
-                    }
-                }
-                FrameType::Close => return false,
-                _ => {}
-            },
-            Err(TransportError::Io(ref e))
-                if matches!(e.kind(), ErrorKind::WouldBlock | ErrorKind::TimedOut) =>
-            {
-                return true;
-            }
-            Err(_) => return false,
-        }
-    }
-    true
-}
-
 struct ActiveInboundPeer {
     session_id: u64,
     stop_flag: Arc<AtomicBool>,
@@ -632,6 +1071,8 @@ impl Sht3SessionManager {
         );
         let initial_volume = config.initial_volume;
         let initial_muted = config.initial_muted;
+        let handshake_config = Arc::new(config.clone());
+        let handshake_trust = Arc::clone(&trust);
 
         let listener = Sht3Listener::bind(addr, config, trust)?;
         let local_addr = listener.local_addr()?;
@@ -640,30 +1081,78 @@ impl Sht3SessionManager {
         let stop_c = Arc::clone(&stop_flag);
         let peers_c = Arc::clone(&self.active_peers);
         let next_id_c = Arc::clone(&self.next_session_id);
+        let inflight_handshakes = Arc::new(AtomicUsize::new(0));
 
         let accept_thread = thread::spawn(move || {
             while !stop_c.load(Ordering::Acquire) {
-                match listener.accept() {
-                    Ok(conn) => {
+                match listener.accept_raw() {
+                    Ok((stream, _peer_addr)) => {
                         if stop_c.load(Ordering::Acquire) {
-                            drop(conn);
+                            drop(stream);
                             break;
                         }
-                        spawn_inbound_peer(
-                            conn,
-                            &peers_c,
-                            &next_id_c,
-                            &stop_c,
-                            &playback_factory,
-                            initial_volume,
-                            initial_muted,
-                        );
+                        if inflight_handshakes
+                            .try_update(Ordering::AcqRel, Ordering::Acquire, |cur| {
+                                (cur < MAX_INFLIGHT_HANDSHAKES).then_some(cur + 1)
+                            })
+                            .is_err()
+                        {
+                            drop(stream);
+                            continue;
+                        }
+
+                        let hs_counter = Arc::clone(&inflight_handshakes);
+                        let hs_cfg = Arc::clone(&handshake_config);
+                        let hs_trust = Arc::clone(&handshake_trust);
+                        let hs_stop = Arc::clone(&stop_c);
+                        let hs_peers = Arc::clone(&peers_c);
+                        let hs_next_id = Arc::clone(&next_id_c);
+                        let hs_factory = Arc::clone(&playback_factory);
+
+                        thread::spawn(move || {
+                            struct HandshakeSlotGuard(Arc<AtomicUsize>);
+                            impl Drop for HandshakeSlotGuard {
+                                fn drop(&mut self) {
+                                    self.0.fetch_sub(1, Ordering::Release);
+                                }
+                            }
+                            let _slot_guard = HandshakeSlotGuard(hs_counter);
+
+                            let sock_handle = stream.try_clone().ok();
+                            let Ok(conn) =
+                                Sht3Listener::handshake_arc(stream, &hs_cfg, hs_trust.as_ref())
+                            else {
+                                return;
+                            };
+
+                            let frame_timeout = Duration::from_millis(u64::from(
+                                conn.audio_params().frame_ms.max(1),
+                            ))
+                            .min(hs_cfg.io_timeout.unwrap_or(MAX_MANAGED_INBOUND_IO_TIMEOUT))
+                            .min(MAX_MANAGED_INBOUND_IO_TIMEOUT);
+                            if let Some(sock) = sock_handle {
+                                let _ = sock.set_read_timeout(Some(frame_timeout));
+                                drop(sock);
+                            }
+
+                            if !hs_stop.load(Ordering::Acquire) {
+                                spawn_inbound_peer(
+                                    conn,
+                                    &hs_peers,
+                                    &hs_next_id,
+                                    &hs_stop,
+                                    &hs_factory,
+                                    initial_volume,
+                                    initial_muted,
+                                );
+                            }
+                        });
                     }
                     Err(_) => {
                         if stop_c.load(Ordering::Acquire) {
                             break;
                         }
-                        // Auth failure, malformed handshake, or transient socket error: keep listening.
+                        // Transient accept error: keep listening.
                     }
                 }
             }
@@ -781,6 +1270,150 @@ fn wake_socket_addr(addr: SocketAddr) -> SocketAddr {
     }
 }
 
+struct BitrateAdaptation {
+    nominal_kbps: u16,
+    current_kbps: u16,
+    underrun_times: VecDeque<Instant>,
+    last_underrun_at: Option<Instant>,
+    last_step_up_at: Option<Instant>,
+    underrun_window: Duration,
+    recovery_window: Duration,
+}
+
+impl BitrateAdaptation {
+    fn new(nominal_kbps: u16) -> Self {
+        let clamped = nominal_kbps.clamp(32, 510);
+        Self {
+            nominal_kbps: clamped,
+            current_kbps: clamped,
+            underrun_times: VecDeque::with_capacity(8),
+            last_underrun_at: None,
+            last_step_up_at: None,
+            underrun_window: BITRATE_UNDERRUN_WINDOW,
+            recovery_window: BITRATE_RECOVERY_WINDOW,
+        }
+    }
+
+    fn step_down_kbps(current: u16) -> u16 {
+        if current > 128 {
+            128
+        } else if current > 96 {
+            96
+        } else if current > 64 {
+            64
+        } else if current > 48 {
+            48
+        } else {
+            32
+        }
+    }
+
+    fn step_up_kbps(current: u16, nominal: u16) -> u16 {
+        let next = if current < 48 {
+            48
+        } else if current < 64 {
+            64
+        } else if current < 96 {
+            96
+        } else if current < 128 {
+            128
+        } else {
+            nominal
+        };
+        next.min(nominal)
+    }
+
+    fn on_underruns(&mut self, now: Instant, count: u64) -> Option<u16> {
+        if count == 0 {
+            return None;
+        }
+        self.last_underrun_at = Some(now);
+        self.last_step_up_at = None;
+        for _ in 0..count.min(16) {
+            self.underrun_times.push_back(now);
+        }
+        while self
+            .underrun_times
+            .front()
+            .is_some_and(|&t| now.saturating_duration_since(t) > self.underrun_window)
+        {
+            self.underrun_times.pop_front();
+        }
+        if self.underrun_times.len() >= 3 {
+            self.underrun_times.clear();
+            let next = Self::step_down_kbps(self.current_kbps);
+            if next < self.current_kbps {
+                self.current_kbps = next;
+                return Some(next);
+            }
+        }
+        None
+    }
+
+    fn on_clean_frame(&mut self, now: Instant) -> Option<u16> {
+        if self.current_kbps >= self.nominal_kbps {
+            return None;
+        }
+        let anchor = self.last_step_up_at.or(self.last_underrun_at)?;
+        if now.saturating_duration_since(anchor) >= self.recovery_window {
+            let next = Self::step_up_kbps(self.current_kbps, self.nominal_kbps);
+            self.last_step_up_at = Some(now);
+            if next > self.current_kbps {
+                self.current_kbps = next;
+                return Some(next);
+            }
+        }
+        None
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
+fn maybe_pace_inbound_plc(
+    jb: &mut JitterBuffer,
+    codec: &mut dyn AudioCodec,
+    playback: &mut dyn PcmPlayback,
+    conn: &mut Sht3ServerConnection,
+    out_pcm: &mut Vec<i16>,
+    audio_frames_received: u64,
+    last_audio_at: Option<Instant>,
+    last_pace_at: &mut Option<Instant>,
+    plc_holdoff: Duration,
+    frame_interval: Duration,
+    prev_underruns: &mut u64,
+    bitrate_ctrl: &mut Option<BitrateAdaptation>,
+) -> bool {
+    let min_frames = (jb.effective_target_frames() * 2) as u64;
+    if !jb.is_primed()
+        || audio_frames_received < min_frames
+        || !last_audio_at.is_some_and(|t| t.elapsed() >= plc_holdoff)
+    {
+        return true;
+    }
+
+    let now = Instant::now();
+    if last_pace_at.is_some_and(|t| now.saturating_duration_since(t) < frame_interval) {
+        return true;
+    }
+
+    out_pcm.clear();
+    if jb.pop_with_codec(codec, out_pcm).is_ok() && playback.write_frame(out_pcm).is_err() {
+        return false;
+    }
+    *last_pace_at = Some(now);
+
+    let cur_underruns = jb.stats().underruns;
+    if cur_underruns > *prev_underruns {
+        let delta = cur_underruns - *prev_underruns;
+        *prev_underruns = cur_underruns;
+        if let Some(ref mut ctrl) = bitrate_ctrl {
+            if let Some(new_kbps) = ctrl.on_underruns(now, delta) {
+                let _ = conn.send_control(&ControlMessage::BitrateHint(new_kbps));
+            }
+        }
+    }
+    true
+}
+
 fn spawn_inbound_peer(
     mut conn: Sht3ServerConnection,
     active_peers: &Arc<Mutex<HashMap<String, ActiveInboundPeer>>>,
@@ -830,7 +1463,18 @@ fn spawn_inbound_peer(
             frame_ms: audio_params.frame_ms,
             ..JitterConfig::default()
         });
-        let mut decoded_pcm = Vec::with_capacity(codec.interleaved_samples_per_frame());
+        let frame_samples = codec.interleaved_samples_per_frame();
+        let frame_interval = Duration::from_millis(u64::from(audio_params.frame_ms.max(1)));
+        let plc_holdoff =
+            Duration::from_millis(u64::from(audio_params.jitter_ms).max(MIN_PLC_HOLDOFF_MS));
+        let mut decoded_pcm = Vec::with_capacity(frame_samples);
+        let mut out_pcm = Vec::with_capacity(frame_samples);
+        let mut audio_frames_received: u64 = 0;
+        let mut last_audio_at: Option<Instant> = None;
+        let mut last_pace_at: Option<Instant> = None;
+        let mut prev_underruns: u64 = 0;
+        let mut bitrate_ctrl = (audio_params.codec == CodecId::Opus)
+            .then(|| BitrateAdaptation::new(audio_params.bitrate_kbps));
         let mut clean_close = false;
 
         while !peer_stop_c.load(Ordering::Acquire) && !manager_stop_c.load(Ordering::Acquire) {
@@ -844,26 +1488,45 @@ fn spawn_inbound_peer(
                         FrameType::AudioOpus | FrameType::AudioPcm => {
                             if frame.header.flags & FLAG_DISCONTINUITY != 0 {
                                 jb.reset();
+                                codec.reset();
+                                prev_underruns = jb.stats().underruns;
+                                last_pace_at = None;
                             }
                             decoded_pcm.clear();
                             if codec.decode(&frame.payload, &mut decoded_pcm).is_err() {
                                 continue;
                             }
-                            jb.push(decoded_pcm.clone());
+                            audio_frames_received += 1;
+                            last_audio_at = Some(Instant::now());
+                            last_pace_at = None;
+
+                            jb.push_realtime(std::mem::take(&mut decoded_pcm));
+                            decoded_pcm.reserve(frame_samples);
+
                             if jb.is_primed() {
+                                let steady_cushion = jb.effective_target_frames().saturating_sub(1);
                                 let mut write_failed = false;
-                                while jb.stats().buffered_frames > 0 {
-                                    if let PopOutcome::Frame(frame) = jb.pop() {
-                                        if playback.write_frame(&frame).is_err() {
-                                            write_failed = true;
-                                            break;
+                                while jb.stats().buffered_frames > steady_cushion {
+                                    out_pcm.clear();
+                                    match jb.pop_with_codec(&mut *codec, &mut out_pcm) {
+                                        Ok(_) => {
+                                            if playback.write_frame(&out_pcm).is_err() {
+                                                write_failed = true;
+                                                break;
+                                            }
                                         }
-                                    } else {
-                                        break;
+                                        Err(_) => break,
                                     }
                                 }
                                 if write_failed {
                                     break;
+                                }
+                            }
+
+                            if let Some(ref mut ctrl) = bitrate_ctrl {
+                                if let Some(new_kbps) = ctrl.on_clean_frame(Instant::now()) {
+                                    let _ =
+                                        conn.send_control(&ControlMessage::BitrateHint(new_kbps));
                                 }
                             }
                         }
@@ -889,6 +1552,22 @@ fn spawn_inbound_peer(
                                     | ControlMessage::DelayOffsetMs(_) => {}
                                 }
                             }
+                            if !maybe_pace_inbound_plc(
+                                &mut jb,
+                                &mut *codec,
+                                &mut *playback,
+                                &mut conn,
+                                &mut out_pcm,
+                                audio_frames_received,
+                                last_audio_at,
+                                &mut last_pace_at,
+                                plc_holdoff,
+                                frame_interval,
+                                &mut prev_underruns,
+                                &mut bitrate_ctrl,
+                            ) {
+                                break;
+                            }
                         }
                         FrameType::Ping => {
                             if let Ok(ping) = PingPayload::decode(&frame.payload) {
@@ -903,6 +1582,22 @@ fn spawn_inbound_peer(
                                     break;
                                 }
                             }
+                            if !maybe_pace_inbound_plc(
+                                &mut jb,
+                                &mut *codec,
+                                &mut *playback,
+                                &mut conn,
+                                &mut out_pcm,
+                                audio_frames_received,
+                                last_audio_at,
+                                &mut last_pace_at,
+                                plc_holdoff,
+                                frame_interval,
+                                &mut prev_underruns,
+                                &mut bitrate_ctrl,
+                            ) {
+                                break;
+                            }
                         }
                         FrameType::Close => {
                             clean_close = true;
@@ -914,7 +1609,22 @@ fn spawn_inbound_peer(
                 Err(TransportError::Io(ref e))
                     if matches!(e.kind(), ErrorKind::WouldBlock | ErrorKind::TimedOut) =>
                 {
-                    continue;
+                    if !maybe_pace_inbound_plc(
+                        &mut jb,
+                        &mut *codec,
+                        &mut *playback,
+                        &mut conn,
+                        &mut out_pcm,
+                        audio_frames_received,
+                        last_audio_at,
+                        &mut last_pace_at,
+                        plc_holdoff,
+                        frame_interval,
+                        &mut prev_underruns,
+                        &mut bitrate_ctrl,
+                    ) {
+                        break;
+                    }
                 }
                 Err(_) => break,
             }
@@ -925,17 +1635,21 @@ fn spawn_inbound_peer(
             && !peer_stop_c.load(Ordering::Acquire)
             && !manager_stop_c.load(Ordering::Acquire)
         {
-            while jb.stats().buffered_frames > 0 {
-                if let PopOutcome::Frame(frame) = jb.pop() {
-                    if playback.write_frame(&frame).is_err() {
-                        break;
+            while jb.is_primed() && jb.stats().buffered_frames > 0 {
+                out_pcm.clear();
+                match jb.pop_with_codec(&mut *codec, &mut out_pcm) {
+                    Ok(_) => {
+                        if playback.write_frame(&out_pcm).is_err() {
+                            break;
+                        }
                     }
-                } else {
-                    break;
+                    Err(_) => break,
                 }
             }
-        } else if peer_stop_c.load(Ordering::Acquire) {
+        } else if peer_stop_c.load(Ordering::Acquire) && !manager_stop_c.load(Ordering::Acquire) {
             let _ = conn.send_close();
+            // Give loopback peers a brief window to read FrameType::Close before closing the socket.
+            thread::sleep(Duration::from_millis(5));
         }
 
         // Drop playback and connection before removing map entry.
@@ -1159,7 +1873,7 @@ mod tests {
             let search_end = in_l.len() - spc * 2;
             let mut best_lag = 0usize;
             let mut best_corr = -1.0f64;
-            for lag in 0..300usize {
+            for lag in 0..800usize {
                 let mut dot = 0.0f64;
                 let mut ei = 0.0f64;
                 let mut eo = 0.0f64;
@@ -1334,5 +2048,606 @@ mod tests {
         assert!(matches!(retry_err, TransportError::AuthRejected(_)));
 
         stop_cap.store(true, Ordering::Release);
+    }
+
+    struct StallBurstCapture {
+        frame_idx: usize,
+        sample_idx: usize,
+        stop_flag: Option<Arc<AtomicBool>>,
+        mid_stream_hook: Option<Box<dyn FnMut(usize) + Send>>,
+    }
+
+    impl StallBurstCapture {
+        fn new() -> Self {
+            Self {
+                frame_idx: 0,
+                sample_idx: 0,
+                stop_flag: None,
+                mid_stream_hook: None,
+            }
+        }
+
+        fn with_hook(mut self, hook: impl FnMut(usize) + Send + 'static) -> Self {
+            self.mid_stream_hook = Some(Box::new(hook));
+            self
+        }
+    }
+
+    impl PcmCapture for StallBurstCapture {
+        fn attach_stop_flag(&mut self, stop_flag: Arc<AtomicBool>) {
+            self.stop_flag = Some(stop_flag);
+        }
+
+        fn read_frame(&mut self, buf: &mut [i16]) -> TransportResult<usize> {
+            if self
+                .stop_flag
+                .as_ref()
+                .is_some_and(|f| f.load(Ordering::Acquire))
+            {
+                return Ok(0);
+            }
+            if let Some(ref mut hook) = self.mid_stream_hook {
+                hook(self.frame_idx);
+            }
+            // Frames 0..8: normal 20ms pace.
+            // Before frame 8: 90ms Wi-Fi stall.
+            // Frames 8..14: immediate burst (0ms delay).
+            // Frames 14..24: normal 20ms pace.
+            // Frame >= 24: EOF.
+            if self.frame_idx >= 24 {
+                return Ok(0);
+            }
+            if self.frame_idx < 8 || self.frame_idx >= 14 {
+                thread::sleep(Duration::from_millis(20));
+            }
+            if self.frame_idx == 8 {
+                thread::sleep(Duration::from_millis(120));
+            }
+            let spc = buf.len() / 2;
+            for i in 0..spc {
+                let t = (self.sample_idx + i) as f64 / f64::from(PCM_SAMPLE_RATE);
+                let s = ((2.0 * std::f64::consts::PI * 440.0 * t).sin() * 14_000.0) as i16;
+                buf[i * 2] = s;
+                buf[i * 2 + 1] = -s;
+            }
+            self.sample_idx += spc;
+            self.frame_idx += 1;
+            Ok(spc * 2)
+        }
+    }
+
+    #[cfg(feature = "opus")]
+    #[test]
+    fn wifi_stall_triggers_opus_plc_and_recovers_without_latency_inflation() {
+        let k_pair = [0xC1; 32];
+        let trust = Arc::new(InMemoryTrustStore::new());
+        trust.insert("stall-sender", k_pair);
+
+        let playback_handle: Arc<Mutex<Option<MockPcmPlaybackHandle>>> = Arc::new(Mutex::new(None));
+        let handle_c = Arc::clone(&playback_handle);
+        let factory: PcmPlaybackFactory = Arc::new(move |_peer_id| {
+            let (play, handle) = MockPcmPlayback::pair();
+            *handle_c.lock().unwrap() = Some(handle);
+            Ok(Box::new(play))
+        });
+
+        let manager = Sht3SessionManager::new();
+        let addr = manager
+            .start_listener(
+                "127.0.0.1:0".parse().unwrap(),
+                Sht3ServerConfig::new("stall-receiver"),
+                trust,
+                factory,
+            )
+            .unwrap();
+
+        let (post_burst_tx, post_burst_rx) = mpsc::channel::<()>();
+        let mut ping_sent_flag = false;
+        let capture = Box::new(StallBurstCapture::new().with_hook(move |idx| {
+            if idx == 18 && !ping_sent_flag {
+                ping_sent_flag = true;
+                let _ = post_burst_tx.send(());
+            }
+        }));
+
+        let out_cfg = OutboundConfig::new("stall-sender", addr, k_pair)
+            .with_profile(AudioProfile::OpusBalanced)
+            .with_jitter_ms(40);
+        let session = manager.start_outbound(out_cfg, capture).unwrap();
+
+        // Trigger a telemetry ping during post-burst recovery to verify jitter depth stayed bounded.
+        assert!(post_burst_rx.recv_timeout(Duration::from_secs(3)).is_ok());
+        session.request_ping().unwrap();
+        assert!(wait_until(Duration::from_secs(1), || {
+            session.telemetry().pongs_received >= 1
+        }));
+        let mid_telemetry = session.telemetry();
+        assert!(
+            mid_telemetry.jitter_buf_ms <= 40,
+            "jitter buffer permanently inflated after burst: {} ms",
+            mid_telemetry.jitter_buf_ms
+        );
+
+        session.join();
+        let rx_handle = playback_handle.lock().unwrap().clone().unwrap();
+        assert!(wait_until(Duration::from_secs(2), || rx_handle.is_closed()));
+
+        assert_eq!(session.telemetry().frames_sent, 24);
+        assert!(
+            rx_handle.frame_count() > 24,
+            "expected PLC frames during 90ms Wi-Fi stall, got {} frames",
+            rx_handle.frame_count()
+        );
+        let frames = rx_handle.frames();
+        assert!(
+            !crate::transport::codec::is_digital_silence(&frames[8], 10),
+            "PLC frame emitted during stall was digital silence"
+        );
+    }
+
+    #[cfg(feature = "opus")]
+    #[test]
+    fn live_server_restart_mid_stream_seamlessly_reconnects_and_resumes() {
+        let k_pair = [0xC2; 32];
+        let trust = Arc::new(InMemoryTrustStore::new());
+        trust.insert("reconnect-sender", k_pair);
+
+        let rx1_slot: Arc<Mutex<Option<MockPcmPlaybackHandle>>> = Arc::new(Mutex::new(None));
+        let rx1_c = Arc::clone(&rx1_slot);
+        let factory1: PcmPlaybackFactory = Arc::new(move |_peer_id| {
+            let (play, handle) = MockPcmPlayback::pair();
+            *rx1_c.lock().unwrap() = Some(handle);
+            Ok(Box::new(play))
+        });
+
+        let manager1 = Sht3SessionManager::new();
+        let addr = manager1
+            .start_listener(
+                "127.0.0.1:0".parse().unwrap(),
+                Sht3ServerConfig::new("restart-receiver"),
+                Arc::clone(&trust) as Arc<dyn TrustLookup>,
+                factory1,
+            )
+            .unwrap();
+
+        let stop_cap = Arc::new(AtomicBool::new(false));
+        let capture = Box::new(
+            MockPcmCapture::sine_wave(440.0, None)
+                .with_pace(Duration::from_millis(10))
+                .with_stop_flag(Arc::clone(&stop_cap)),
+        );
+        let out_cfg = OutboundConfig::new("reconnect-sender", addr, k_pair)
+            .with_profile(AudioProfile::OpusBalanced)
+            .with_jitter_ms(40)
+            .with_reconnect_window(Duration::from_secs(3));
+
+        let session = manager1.start_outbound(out_cfg, capture).unwrap();
+        assert!(wait_until(Duration::from_secs(2), || {
+            rx1_slot
+                .lock()
+                .unwrap()
+                .as_ref()
+                .is_some_and(|h| h.frame_count() >= 4)
+        }));
+
+        session.set_volume(67).unwrap();
+        session.set_mute(true).unwrap();
+        let rx1 = rx1_slot.lock().unwrap().clone().unwrap();
+        assert!(wait_until(Duration::from_secs(2), || {
+            rx1.volume() == 67 && rx1.is_muted()
+        }));
+
+        // Drop listener (simulating abrupt server restart without FrameType::Close).
+        drop(manager1);
+        thread::sleep(Duration::from_millis(120));
+        assert!(
+            session.is_running(),
+            "outbound session dropped prematurely inside reconnect_window"
+        );
+
+        // Restart listener on the exact same port.
+        let rx2_slot: Arc<Mutex<Option<MockPcmPlaybackHandle>>> = Arc::new(Mutex::new(None));
+        let rx2_c = Arc::clone(&rx2_slot);
+        let factory2: PcmPlaybackFactory = Arc::new(move |_peer_id| {
+            let (play, handle) = MockPcmPlayback::pair();
+            *rx2_c.lock().unwrap() = Some(handle);
+            Ok(Box::new(play))
+        });
+
+        let manager2 = Sht3SessionManager::new();
+        manager2
+            .start_listener(
+                addr,
+                Sht3ServerConfig::new("restart-receiver"),
+                Arc::clone(&trust) as Arc<dyn TrustLookup>,
+                factory2,
+            )
+            .unwrap();
+
+        assert!(wait_until(Duration::from_secs(3), || {
+            manager2.inbound_peer_count() == 1
+                && rx2_slot
+                    .lock()
+                    .unwrap()
+                    .as_ref()
+                    .is_some_and(|h| h.frame_count() >= 6)
+        }));
+        assert!(session.is_running());
+
+        let rx2 = rx2_slot.lock().unwrap().clone().unwrap();
+        assert!(wait_until(Duration::from_secs(2), || {
+            rx2.volume() == 67 && rx2.is_muted()
+        }));
+        assert!(
+            rx2.total_energy() > 100_000,
+            "resumed Opus stream after reconnect had unexpectedly low energy"
+        );
+
+        stop_cap.store(true, Ordering::Release);
+        session.stop();
+    }
+
+    #[test]
+    fn revoked_or_explicitly_closed_peer_stops_immediately_despite_reconnect_window() {
+        // Case A: explicit disconnect_peer (FrameType::Close) terminates immediately even while trusted.
+        let k_pair = [0xC3; 32];
+        let trust = Arc::new(InMemoryTrustStore::new());
+        trust.insert("close-peer", k_pair);
+
+        let rx_slot: Arc<Mutex<Option<MockPcmPlaybackHandle>>> = Arc::new(Mutex::new(None));
+        let rx_c = Arc::clone(&rx_slot);
+        let factory: PcmPlaybackFactory = Arc::new(move |_peer_id| {
+            let (play, handle) = MockPcmPlayback::pair();
+            *rx_c.lock().unwrap() = Some(handle);
+            Ok(Box::new(play))
+        });
+
+        let manager = Sht3SessionManager::new();
+        let addr = manager
+            .start_listener(
+                "127.0.0.1:0".parse().unwrap(),
+                Sht3ServerConfig::new("strict-srv"),
+                Arc::clone(&trust) as Arc<dyn TrustLookup>,
+                factory.clone(),
+            )
+            .unwrap();
+
+        let stop_cap_a = Arc::new(AtomicBool::new(false));
+        let cap_a = Box::new(
+            MockPcmCapture::sine_wave(440.0, None)
+                .with_pace(Duration::from_millis(10))
+                .with_stop_flag(Arc::clone(&stop_cap_a)),
+        );
+        let cfg_a = OutboundConfig::new("close-peer", addr, k_pair)
+            .with_profile(AudioProfile::PcmLossless)
+            .with_reconnect_window(Duration::from_secs(5));
+        let session_a = manager.start_outbound(cfg_a, cap_a).unwrap();
+
+        assert!(wait_until(Duration::from_secs(2), || {
+            rx_slot
+                .lock()
+                .unwrap()
+                .as_ref()
+                .is_some_and(|h| h.frame_count() >= 2)
+        }));
+
+        let close_start = Instant::now();
+        assert!(manager.disconnect_peer("close-peer"));
+        assert!(wait_until(Duration::from_secs(1), || !session_a.is_running()));
+        assert!(
+            close_start.elapsed() < Duration::from_secs(1),
+            "FrameType::Close should abort immediately without waiting 5s reconnect_window, took {:?}",
+            close_start.elapsed()
+        );
+        assert_eq!(manager.inbound_peer_count(), 0);
+        stop_cap_a.store(true, Ordering::Release);
+
+        // Case B: revoked peer hits AuthRejected on reconnect attempt and aborts immediately.
+        trust.insert("revoked-midstream", k_pair);
+        *rx_slot.lock().unwrap() = None;
+        let stop_cap_b = Arc::new(AtomicBool::new(false));
+        let cap_b = Box::new(
+            MockPcmCapture::sine_wave(440.0, None)
+                .with_pace(Duration::from_millis(10))
+                .with_stop_flag(Arc::clone(&stop_cap_b)),
+        );
+        let cfg_b = OutboundConfig::new("revoked-midstream", addr, k_pair)
+            .with_profile(AudioProfile::PcmLossless)
+            .with_reconnect_window(Duration::from_secs(5));
+        let session_b = manager.start_outbound(cfg_b, cap_b).unwrap();
+        assert!(wait_until(Duration::from_secs(2), || {
+            rx_slot
+                .lock()
+                .unwrap()
+                .as_ref()
+                .is_some_and(|h| h.frame_count() >= 2)
+        }));
+
+        trust.remove("revoked-midstream");
+        manager.stop_listener();
+        manager
+            .start_listener(
+                addr,
+                Sht3ServerConfig::new("strict-srv"),
+                Arc::clone(&trust) as Arc<dyn TrustLookup>,
+                factory,
+            )
+            .unwrap();
+
+        let revoke_start = Instant::now();
+        assert!(wait_until(Duration::from_millis(1500), || {
+            !session_b.is_running()
+        }));
+        assert!(
+            revoke_start.elapsed() < Duration::from_millis(1500),
+            "AuthRejected should abort immediately without waiting 5s reconnect_window, took {:?}",
+            revoke_start.elapsed()
+        );
+        stop_cap_b.store(true, Ordering::Release);
+    }
+
+    #[test]
+    fn stalled_half_open_socket_does_not_block_legitimate_peer() {
+        use std::io::Write;
+
+        let k_pair = [0xC4; 32];
+        let trust = Arc::new(InMemoryTrustStore::new());
+        trust.insert("legit-peer", k_pair);
+
+        let rx_slot: Arc<Mutex<Option<MockPcmPlaybackHandle>>> = Arc::new(Mutex::new(None));
+        let rx_c = Arc::clone(&rx_slot);
+        let factory: PcmPlaybackFactory = Arc::new(move |_peer_id| {
+            let (play, handle) = MockPcmPlayback::pair();
+            *rx_c.lock().unwrap() = Some(handle);
+            Ok(Box::new(play))
+        });
+
+        let manager = Sht3SessionManager::new();
+        let addr = manager
+            .start_listener(
+                "127.0.0.1:0".parse().unwrap(),
+                Sht3ServerConfig::new("concurrent-hs-server"),
+                trust,
+                factory,
+            )
+            .unwrap();
+
+        // Open 3 stalled half-open sockets that send partial magic and never finish ClientHello.
+        let mut stalled_sockets = Vec::new();
+        for _ in 0..3 {
+            let mut s = TcpStream::connect(addr).unwrap();
+            s.write_all(b"SHT3").unwrap();
+            s.flush().unwrap();
+            stalled_sockets.push(s);
+        }
+        thread::sleep(Duration::from_millis(30));
+
+        // Legitimate peer must connect, handshake, and finish streaming in < 500ms.
+        let start = Instant::now();
+        let capture = Box::new(MockPcmCapture::sine_wave(440.0, Some(5)));
+        let cfg =
+            OutboundConfig::new("legit-peer", addr, k_pair).with_profile(AudioProfile::PcmLossless);
+        let session = manager.start_outbound(cfg, capture).unwrap();
+        session.join();
+
+        let rx = rx_slot.lock().unwrap().clone().unwrap();
+        assert!(wait_until(Duration::from_millis(450), || rx.is_closed()));
+        let elapsed = start.elapsed();
+        assert!(
+            elapsed < Duration::from_millis(500),
+            "stalled sockets delayed legitimate peer: {:?}",
+            elapsed
+        );
+        assert_eq!(rx.frame_count(), 5);
+
+        drop(stalled_sockets);
+    }
+
+    struct MultiToneCapture {
+        sample_idx: usize,
+        pace: Duration,
+        stop_flag: Option<Arc<AtomicBool>>,
+        discontinuity: Arc<AtomicBool>,
+    }
+
+    impl MultiToneCapture {
+        fn new(pace: Duration, discontinuity: Arc<AtomicBool>) -> Self {
+            Self {
+                sample_idx: 0,
+                pace,
+                stop_flag: None,
+                discontinuity,
+            }
+        }
+    }
+
+    impl PcmCapture for MultiToneCapture {
+        fn attach_stop_flag(&mut self, stop_flag: Arc<AtomicBool>) {
+            self.stop_flag = Some(stop_flag);
+        }
+
+        fn take_discontinuity(&mut self) -> bool {
+            self.discontinuity.swap(false, Ordering::AcqRel)
+        }
+
+        fn read_frame(&mut self, buf: &mut [i16]) -> TransportResult<usize> {
+            if self
+                .stop_flag
+                .as_ref()
+                .is_some_and(|f| f.load(Ordering::Acquire))
+            {
+                return Ok(0);
+            }
+            thread::sleep(self.pace);
+            if self
+                .stop_flag
+                .as_ref()
+                .is_some_and(|f| f.load(Ordering::Acquire))
+            {
+                return Ok(0);
+            }
+            let spc = buf.len() / 2;
+            for i in 0..spc {
+                let t = (self.sample_idx + i) as f64 / f64::from(PCM_SAMPLE_RATE);
+                let l = (8000.0 * (2.0 * std::f64::consts::PI * 110.0 * t).sin()
+                    + 6000.0 * (2.0 * std::f64::consts::PI * 660.0 * t).sin()
+                    + 3500.0 * (2.0 * std::f64::consts::PI * 2640.0 * t).cos()
+                    + 2500.0 * (2.0 * std::f64::consts::PI * 4186.0 * t).sin())
+                .clamp(-32000.0, 32000.0) as i16;
+                let r = (8000.0 * (2.0 * std::f64::consts::PI * 147.0 * t).sin()
+                    + 5500.0 * (2.0 * std::f64::consts::PI * 880.0 * t).cos()
+                    + 3000.0 * (2.0 * std::f64::consts::PI * 3520.0 * t).sin())
+                .clamp(-32000.0, 32000.0) as i16;
+                buf[i * 2] = l;
+                buf[i * 2 + 1] = r;
+            }
+            self.sample_idx += spc;
+            Ok(spc * 2)
+        }
+    }
+
+    #[cfg(feature = "opus")]
+    #[test]
+    fn dynamic_bitrate_hint_lowers_and_restores_opus_payload_rate() {
+        let k_pair = [0xC5; 32];
+        let trust = Arc::new(InMemoryTrustStore::new());
+        trust.insert("bitrate-sender", k_pair);
+
+        let listener = Sht3Listener::bind(
+            "127.0.0.1:0".parse().unwrap(),
+            Sht3ServerConfig::new("bitrate-receiver"),
+            trust,
+        )
+        .unwrap();
+        let addr = listener.local_addr().unwrap();
+
+        let saw_discontinuity = Arc::new(AtomicBool::new(false));
+        let saw_disc_c = Arc::clone(&saw_discontinuity);
+
+        let server = thread::spawn(move || {
+            let mut conn = listener.accept().unwrap();
+
+            fn next_audio_len(conn: &mut Sht3ServerConnection, saw_disc: &AtomicBool) -> usize {
+                loop {
+                    let frame = conn.recv_frame().unwrap();
+                    if frame.header.frame_type == FrameType::AudioOpus {
+                        if frame.header.flags & FLAG_DISCONTINUITY != 0 {
+                            saw_disc.store(true, Ordering::Release);
+                        }
+                        return frame.payload.len();
+                    }
+                }
+            }
+
+            // Warmup & baseline @ 128 kbps.
+            for _ in 0..5 {
+                let _ = next_audio_len(&mut conn, &saw_disc_c);
+            }
+            let baseline_sum: usize = (0..15)
+                .map(|_| next_audio_len(&mut conn, &saw_disc_c))
+                .sum();
+
+            // Lower bitrate to 32 kbps via ControlMessage::BitrateHint.
+            conn.send_control(&ControlMessage::BitrateHint(32)).unwrap();
+            for _ in 0..10 {
+                let _ = next_audio_len(&mut conn, &saw_disc_c);
+            }
+            let low_sum: usize = (0..15)
+                .map(|_| next_audio_len(&mut conn, &saw_disc_c))
+                .sum();
+
+            // Restore bitrate back to 128 kbps.
+            conn.send_control(&ControlMessage::BitrateHint(128))
+                .unwrap();
+            for _ in 0..10 {
+                let _ = next_audio_len(&mut conn, &saw_disc_c);
+            }
+            let restored_sum: usize = (0..15)
+                .map(|_| next_audio_len(&mut conn, &saw_disc_c))
+                .sum();
+
+            (baseline_sum, low_sum, restored_sum)
+        });
+
+        let disc_flag = Arc::new(AtomicBool::new(true));
+        let capture = Box::new(MultiToneCapture::new(
+            Duration::from_millis(5),
+            Arc::clone(&disc_flag),
+        ));
+        let cfg = OutboundConfig::new("bitrate-sender", addr, k_pair)
+            .with_profile(AudioProfile::OpusBalanced);
+        let session = OutboundSessionHandle::start(cfg, capture).unwrap();
+
+        let (baseline_sum, low_sum, restored_sum) = server.join().unwrap();
+        session.stop();
+
+        assert!(
+            saw_discontinuity.load(Ordering::Acquire),
+            "expected FLAG_DISCONTINUITY on frame after capture discontinuity"
+        );
+        assert!(
+            low_sum * 2 < baseline_sum,
+            "BitrateHint(32) did not substantially lower payload bytes: baseline={baseline_sum}, low={low_sum}"
+        );
+        assert!(
+            restored_sum > low_sum * 2,
+            "BitrateHint(128) did not restore payload bytes: low={low_sum}, restored={restored_sum}"
+        );
+    }
+
+    #[test]
+    fn bitrate_adaptation_steps_down_on_burst_and_recovers_after_clean_window() {
+        let mut ctrl = BitrateAdaptation::new(128);
+        let t0 = Instant::now();
+
+        assert_eq!(ctrl.on_underruns(t0, 1), None);
+        assert_eq!(ctrl.on_underruns(t0 + Duration::from_millis(50), 1), None);
+        assert_eq!(
+            ctrl.on_underruns(t0 + Duration::from_millis(100), 1),
+            Some(96)
+        );
+        assert_eq!(
+            ctrl.on_underruns(t0 + Duration::from_millis(300), 3),
+            Some(64)
+        );
+        assert_eq!(
+            ctrl.on_underruns(t0 + Duration::from_millis(500), 3),
+            Some(48)
+        );
+        assert_eq!(
+            ctrl.on_underruns(t0 + Duration::from_millis(700), 3),
+            Some(32)
+        );
+        // Floor at 32 kbps.
+        assert_eq!(ctrl.on_underruns(t0 + Duration::from_millis(900), 3), None);
+
+        // Must not step up before 15s of clean delivery.
+        let t_last_err = t0 + Duration::from_millis(900);
+        assert_eq!(
+            ctrl.on_clean_frame(t_last_err + Duration::from_secs(10)),
+            None
+        );
+
+        // Steps up 32 -> 48 -> 64 -> 96 -> 128 across 15s clean intervals.
+        assert_eq!(
+            ctrl.on_clean_frame(t_last_err + Duration::from_secs(15)),
+            Some(48)
+        );
+        assert_eq!(
+            ctrl.on_clean_frame(t_last_err + Duration::from_secs(30)),
+            Some(64)
+        );
+        assert_eq!(
+            ctrl.on_clean_frame(t_last_err + Duration::from_secs(45)),
+            Some(96)
+        );
+        assert_eq!(
+            ctrl.on_clean_frame(t_last_err + Duration::from_secs(60)),
+            Some(128)
+        );
+        assert_eq!(
+            ctrl.on_clean_frame(t_last_err + Duration::from_secs(75)),
+            None
+        );
     }
 }
