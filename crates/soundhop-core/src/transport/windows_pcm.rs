@@ -6,7 +6,8 @@ use std::sync::atomic::{AtomicBool, AtomicU8, Ordering};
 use std::sync::{Arc, Condvar, Mutex};
 use std::time::{Duration, Instant};
 
-use crate::backend::windows::audio::{apply_gain_i16, WindowsLoopbackRecorder, WindowsPlayer};
+use crate::backend::windows::audio::{WindowsLoopbackRecorder, WindowsPlayer};
+use crate::transport::dsp::{encode_ramped_s16le, scale_sample_f32, target_gain_factor};
 use crate::transport::pcm::{PcmCapture, PcmPlayback, PCM_CHANNELS, PCM_SAMPLE_RATE};
 use crate::transport::{TransportError, TransportResult};
 
@@ -23,7 +24,6 @@ const SHT3_PLAYBACK_TARGET_MS: f64 = 40.0;
 /// Stereo frames over which partial capture timeouts are faded out before zero-fill.
 const CAPTURE_TIMEOUT_FADE_FRAMES: usize = 64;
 /// Maximum stereo frames (~4 ms @ 48 kHz) over which volume/mute transitions are ramped.
-const GAIN_RAMP_MAX_FRAMES: usize = 192;
 
 /// Pull-based [`PcmCapture`] adapter over [`WindowsLoopbackRecorder`] (48 kHz stereo S16LE).
 pub struct WindowsPcmCapture {
@@ -295,81 +295,6 @@ impl Drop for WindowsPcmPlayback {
     fn drop(&mut self) {
         self.player.close();
     }
-}
-
-#[inline]
-fn target_gain_factor(volume_pct: u32, muted: bool) -> f32 {
-    if muted || volume_pct == 0 {
-        0.0
-    } else {
-        (volume_pct.min(150) as f32) / 100.0
-    }
-}
-
-#[inline]
-fn scale_sample_f32(sample: i16, gain: f32) -> i16 {
-    if gain <= 0.0 {
-        return 0;
-    }
-    (f32::from(sample) * gain)
-        .round()
-        .clamp(f32::from(i16::MIN), f32::from(i16::MAX)) as i16
-}
-
-fn encode_ramped_s16le(
-    samples: &[i16],
-    volume_pct: u32,
-    muted: bool,
-    current_gain: &mut f32,
-    out: &mut Vec<u8>,
-) {
-    out.clear();
-    out.reserve(samples.len() * 2);
-
-    let target = target_gain_factor(volume_pct, muted);
-    if *current_gain == target {
-        if muted || volume_pct == 0 {
-            out.resize(samples.len() * 2, 0);
-        } else if volume_pct == 100 {
-            for &s in samples {
-                out.extend_from_slice(&s.to_le_bytes());
-            }
-        } else {
-            for &s in samples {
-                let scaled = apply_gain_i16(s, volume_pct, false);
-                out.extend_from_slice(&scaled.to_le_bytes());
-            }
-        }
-        return;
-    }
-
-    let start = *current_gain;
-    let stereo_frames = samples.len() / 2;
-    if stereo_frames == 0 {
-        let scaled = scale_sample_f32(samples[0], target);
-        out.extend_from_slice(&scaled.to_le_bytes());
-        *current_gain = target;
-        return;
-    }
-
-    let ramp_frames = stereo_frames.min(GAIN_RAMP_MAX_FRAMES);
-    for (frame_idx, pair) in samples.as_chunks::<2>().0.iter().enumerate() {
-        let gain = if frame_idx < ramp_frames {
-            let t = (frame_idx + 1) as f32 / (ramp_frames as f32);
-            start + (target - start) * t
-        } else {
-            target
-        };
-        let l = scale_sample_f32(pair[0], gain);
-        let r = scale_sample_f32(pair[1], gain);
-        out.extend_from_slice(&l.to_le_bytes());
-        out.extend_from_slice(&r.to_le_bytes());
-    }
-    if !samples.len().is_multiple_of(2) {
-        let s = scale_sample_f32(samples[samples.len() - 1], target);
-        out.extend_from_slice(&s.to_le_bytes());
-    }
-    *current_gain = target;
 }
 
 #[cfg(test)]

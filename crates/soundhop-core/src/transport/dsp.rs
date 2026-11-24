@@ -34,6 +34,95 @@ pub fn apply_gain_buffer(samples: &mut [i16], volume_pct: u32, muted: bool) {
 
 /// Default ramp duration in stereo frames (~4 ms at 48 kHz) for [`GainRamp`].
 pub const DEFAULT_GAIN_RAMP_FRAMES: usize = 192;
+/// Linear fade-out duration in stereo frames (~1.33 ms at 48 kHz) on playback underrun.
+pub const UNDERRUN_TAIL_FADE_FRAMES: usize = 64;
+/// Linear fade-in duration in stereo frames (~1.33 ms at 48 kHz) on playback resume.
+pub const RESUME_FADE_IN_FRAMES: usize = 64;
+
+/// Compute linear gain multiplier for `volume_pct` (`0..=150`) and `muted` state.
+#[inline]
+pub fn target_gain_factor(volume_pct: u32, muted: bool) -> f32 {
+    if muted || volume_pct == 0 {
+        0.0
+    } else {
+        (volume_pct.min(150) as f32) / 100.0
+    }
+}
+
+/// Scale a signed 16-bit PCM sample by a linear `gain` multiplier, clamping to `i16`.
+#[inline]
+pub fn scale_sample_f32(sample: i16, gain: f32) -> i16 {
+    if gain <= 0.0 {
+        return 0;
+    }
+    (f32::from(sample) * gain)
+        .round()
+        .clamp(f32::from(i16::MIN), f32::from(i16::MAX)) as i16
+}
+
+/// Encode interleaved `i16` PCM samples as S16LE bytes, smoothly ramping gain from
+/// `*current_gain` to the target `(volume_pct, muted)` over up to [`DEFAULT_GAIN_RAMP_FRAMES`]
+/// stereo frames.
+pub fn encode_ramped_s16le(
+    samples: &[i16],
+    volume_pct: u32,
+    muted: bool,
+    current_gain: &mut f32,
+    out: &mut Vec<u8>,
+) {
+    out.clear();
+    out.reserve(samples.len() * 2);
+
+    let target = target_gain_factor(volume_pct, muted);
+    if *current_gain == target {
+        if muted || volume_pct == 0 {
+            out.resize(samples.len() * 2, 0);
+        } else if volume_pct == 100 {
+            for &s in samples {
+                out.extend_from_slice(&s.to_le_bytes());
+            }
+        } else {
+            for &s in samples {
+                let scaled = apply_gain_i16(s, volume_pct, false);
+                out.extend_from_slice(&scaled.to_le_bytes());
+            }
+        }
+        return;
+    }
+
+    if samples.is_empty() {
+        *current_gain = target;
+        return;
+    }
+
+    let start = *current_gain;
+    let stereo_frames = samples.len() / 2;
+    if stereo_frames == 0 {
+        let scaled = scale_sample_f32(samples[0], target);
+        out.extend_from_slice(&scaled.to_le_bytes());
+        *current_gain = target;
+        return;
+    }
+
+    let ramp_frames = stereo_frames.min(DEFAULT_GAIN_RAMP_FRAMES);
+    for (frame_idx, pair) in samples.as_chunks::<2>().0.iter().enumerate() {
+        let gain = if frame_idx < ramp_frames {
+            let t = (frame_idx + 1) as f32 / (ramp_frames as f32);
+            start + (target - start) * t
+        } else {
+            target
+        };
+        let l = scale_sample_f32(pair[0], gain);
+        let r = scale_sample_f32(pair[1], gain);
+        out.extend_from_slice(&l.to_le_bytes());
+        out.extend_from_slice(&r.to_le_bytes());
+    }
+    if !samples.len().is_multiple_of(2) {
+        let s = scale_sample_f32(samples[samples.len() - 1], target);
+        out.extend_from_slice(&s.to_le_bytes());
+    }
+    *current_gain = target;
+}
 
 /// Stateful smooth gain/mute interpolator that linearly ramps gain over ~4 ms
 /// (`192` stereo frames @ 48 kHz) on target changes while staying bit-transparent
@@ -254,7 +343,7 @@ pub fn fade_in_stereo_in_place(samples: &mut [i16], ramp_frames: usize) {
 }
 
 #[inline]
-fn lerp_i16(a: i16, b: i16, t: f64) -> i16 {
+pub(crate) fn lerp_i16(a: i16, b: i16, t: f64) -> i16 {
     let v = f64::from(a) + (f64::from(b) - f64::from(a)) * t;
     v.round().clamp(f64::from(i16::MIN), f64::from(i16::MAX)) as i16
 }
@@ -375,6 +464,16 @@ pub struct PlaybackResampler {
     prev: (i16, i16),
     next: (i16, i16),
     initialized: bool,
+    prebuffer_samples: usize,
+    smooth_underruns: bool,
+    primed: bool,
+    last_emitted: (i16, i16),
+    tail_pos: usize,
+    tail_total: usize,
+    tail_start: (i16, i16),
+    fade_in_pos: usize,
+    fade_in_total: usize,
+    fade_in_start: (i16, i16),
 }
 
 impl PlaybackResampler {
@@ -387,7 +486,25 @@ impl PlaybackResampler {
             prev: (0, 0),
             next: (0, 0),
             initialized: false,
+            prebuffer_samples: 0,
+            smooth_underruns: false,
+            primed: false,
+            last_emitted: (0, 0),
+            tail_pos: 0,
+            tail_total: 0,
+            tail_start: (0, 0),
+            fade_in_pos: 0,
+            fade_in_total: 0,
+            fade_in_start: (0, 0),
         }
+    }
+
+    /// Create a resampler with optional prebuffering and click-free underrun tail fade-out / resume fade-in.
+    pub fn with_prebuffer(src_rate: u32, dst_rate: u32, prebuffer_samples: usize) -> Self {
+        let mut resampler = Self::new(src_rate, dst_rate);
+        resampler.prebuffer_samples = prebuffer_samples;
+        resampler.smooth_underruns = true;
+        resampler
     }
 
     /// Set a fine multiplicative rate adjustment factor around `1.0` for clock-drift compensation.
@@ -407,6 +524,19 @@ impl PlaybackResampler {
         self.prev = (0, 0);
         self.next = (0, 0);
         self.initialized = false;
+        self.primed = false;
+        self.last_emitted = (0, 0);
+        self.tail_pos = 0;
+        self.tail_total = 0;
+        self.tail_start = (0, 0);
+        self.fade_in_pos = 0;
+        self.fade_in_total = 0;
+        self.fade_in_start = (0, 0);
+    }
+
+    #[inline]
+    fn is_unity_rate(&self) -> bool {
+        self.src_rate == self.dst_rate && (self.rate_adjust - 1.0).abs() <= 1e-9
     }
 
     #[allow(clippy::too_many_arguments)]
@@ -418,43 +548,203 @@ impl PlaybackResampler {
         out_frames: usize,
         volume_pct: u32,
         muted: bool,
-        mut write_sample: F,
+        write_sample: F,
     ) {
+        let _ = self.write_frames_checked(
+            buf,
+            src_channels,
+            dst_channels,
+            out_frames,
+            volume_pct,
+            muted,
+            write_sample,
+        );
+    }
+
+    /// Fill `out_frames` from `buf`, returning `true` if a primed buffer ran empty (underrun).
+    #[allow(clippy::too_many_arguments)]
+    pub fn write_frames_checked<F: FnMut(usize, i16)>(
+        &mut self,
+        buf: &mut VecDeque<i16>,
+        src_channels: usize,
+        dst_channels: usize,
+        out_frames: usize,
+        volume_pct: u32,
+        muted: bool,
+        mut write_sample: F,
+    ) -> bool {
         let dst_channels = dst_channels.max(1);
-        if self.src_rate == self.dst_rate
-            && (self.rate_adjust - 1.0).abs() <= 1e-9
-            && !self.initialized
-        {
+        let unity_rate = self.is_unity_rate();
+
+        if !self.smooth_underruns {
+            if unity_rate && !self.initialized {
+                for f in 0..out_frames {
+                    let (raw_l, raw_r) = pop_frame_pair(buf, src_channels);
+                    let l = apply_gain_i16(raw_l, volume_pct, muted);
+                    let r = apply_gain_i16(raw_r, volume_pct, muted);
+                    write_stereo_to_channels(f, dst_channels, l, r, &mut write_sample);
+                }
+                return false;
+            }
+
+            if !self.initialized {
+                self.prev = pop_frame_pair(buf, src_channels);
+                self.next = pop_frame_pair(buf, src_channels);
+                self.initialized = true;
+            }
+
+            let step = (f64::from(self.src_rate) / f64::from(self.dst_rate)) * self.rate_adjust;
             for f in 0..out_frames {
-                let (raw_l, raw_r) = pop_frame_pair(buf, src_channels);
+                let interp_l = lerp_i16(self.prev.0, self.next.0, self.phase);
+                let interp_r = lerp_i16(self.prev.1, self.next.1, self.phase);
+                let l = apply_gain_i16(interp_l, volume_pct, muted);
+                let r = apply_gain_i16(interp_r, volume_pct, muted);
+                write_stereo_to_channels(f, dst_channels, l, r, &mut write_sample);
+
+                self.phase += step;
+                while self.phase >= 1.0 {
+                    self.phase -= 1.0;
+                    self.prev = self.next;
+                    self.next = pop_frame_pair(buf, src_channels);
+                }
+            }
+            return false;
+        }
+
+        if !self.primed {
+            let min_ready = if self.prebuffer_samples > 0 {
+                self.prebuffer_samples
+            } else {
+                src_channels.max(1)
+            };
+            if buf.len() >= min_ready {
+                self.primed = true;
+                self.fade_in_start = self.last_emitted;
+                self.fade_in_pos = 0;
+                self.fade_in_total = RESUME_FADE_IN_FRAMES;
+                self.tail_pos = 0;
+                self.tail_total = 0;
+            } else {
+                for f in 0..out_frames {
+                    let (raw_l, raw_r) = self.next_tail_or_silence();
+                    let l = apply_gain_i16(raw_l, volume_pct, muted);
+                    let r = apply_gain_i16(raw_r, volume_pct, muted);
+                    write_stereo_to_channels(f, dst_channels, l, r, &mut write_sample);
+                }
+                return false;
+            }
+        }
+
+        let mut underrun_occurred = false;
+        if unity_rate && !self.initialized {
+            for f in 0..out_frames {
+                let (raw_l, raw_r) = if self.primed {
+                    if buf.is_empty() {
+                        self.trigger_underrun();
+                        underrun_occurred = true;
+                        self.next_tail_or_silence()
+                    } else {
+                        let raw = pop_frame_pair(buf, src_channels);
+                        self.apply_resume_fade(raw)
+                    }
+                } else {
+                    self.next_tail_or_silence()
+                };
                 let l = apply_gain_i16(raw_l, volume_pct, muted);
                 let r = apply_gain_i16(raw_r, volume_pct, muted);
                 write_stereo_to_channels(f, dst_channels, l, r, &mut write_sample);
             }
-            return;
+            return underrun_occurred;
         }
 
         if !self.initialized {
-            self.prev = pop_frame_pair(buf, src_channels);
-            self.next = pop_frame_pair(buf, src_channels);
-            self.initialized = true;
+            if buf.is_empty() {
+                self.trigger_underrun();
+                underrun_occurred = true;
+            } else {
+                self.prev = pop_frame_pair(buf, src_channels);
+                self.next = if buf.is_empty() {
+                    self.prev
+                } else {
+                    pop_frame_pair(buf, src_channels)
+                };
+                self.phase = 0.0;
+                self.initialized = true;
+            }
         }
 
         let step = (f64::from(self.src_rate) / f64::from(self.dst_rate)) * self.rate_adjust;
         for f in 0..out_frames {
-            let interp_l = lerp_i16(self.prev.0, self.next.0, self.phase);
-            let interp_r = lerp_i16(self.prev.1, self.next.1, self.phase);
-            let l = apply_gain_i16(interp_l, volume_pct, muted);
-            let r = apply_gain_i16(interp_r, volume_pct, muted);
-            write_stereo_to_channels(f, dst_channels, l, r, &mut write_sample);
+            let (raw_l, raw_r) = if self.primed {
+                let interp_l = lerp_i16(self.prev.0, self.next.0, self.phase);
+                let interp_r = lerp_i16(self.prev.1, self.next.1, self.phase);
+                let pair = self.apply_resume_fade((interp_l, interp_r));
 
-            self.phase += step;
-            while self.phase >= 1.0 {
-                self.phase -= 1.0;
-                self.prev = self.next;
-                self.next = pop_frame_pair(buf, src_channels);
-            }
+                self.phase += step;
+                while self.phase >= 1.0 {
+                    self.phase -= 1.0;
+                    self.prev = self.next;
+                    if buf.is_empty() {
+                        if f + 1 < out_frames {
+                            self.trigger_underrun();
+                            underrun_occurred = true;
+                        } else {
+                            self.initialized = false;
+                            self.phase = 0.0;
+                        }
+                        break;
+                    }
+                    self.next = pop_frame_pair(buf, src_channels);
+                }
+                pair
+            } else {
+                self.next_tail_or_silence()
+            };
+            let l = apply_gain_i16(raw_l, volume_pct, muted);
+            let r = apply_gain_i16(raw_r, volume_pct, muted);
+            write_stereo_to_channels(f, dst_channels, l, r, &mut write_sample);
         }
+        underrun_occurred
+    }
+
+    fn trigger_underrun(&mut self) {
+        self.primed = false;
+        self.initialized = false;
+        self.phase = 0.0;
+        self.tail_start = self.last_emitted;
+        self.tail_pos = 0;
+        self.tail_total = UNDERRUN_TAIL_FADE_FRAMES;
+        self.fade_in_pos = 0;
+        self.fade_in_total = 0;
+    }
+
+    fn next_tail_or_silence(&mut self) -> (i16, i16) {
+        if self.tail_pos < self.tail_total {
+            self.tail_pos += 1;
+            let t = (self.tail_pos as f64) / ((self.tail_total + 1) as f64);
+            let l = lerp_i16(self.tail_start.0, 0, t);
+            let r = lerp_i16(self.tail_start.1, 0, t);
+            self.last_emitted = (l, r);
+            (l, r)
+        } else {
+            self.last_emitted = (0, 0);
+            (0, 0)
+        }
+    }
+
+    fn apply_resume_fade(&mut self, raw: (i16, i16)) -> (i16, i16) {
+        let out = if self.fade_in_pos < self.fade_in_total {
+            self.fade_in_pos += 1;
+            let t = (self.fade_in_pos as f64) / ((self.fade_in_total + 1) as f64);
+            (
+                lerp_i16(self.fade_in_start.0, raw.0, t),
+                lerp_i16(self.fade_in_start.1, raw.1, t),
+            )
+        } else {
+            raw
+        };
+        self.last_emitted = out;
+        out
     }
 }
 
@@ -779,13 +1069,13 @@ impl AdaptiveResampler {
 }
 
 #[inline]
-fn pop_frame_pair(buf: &mut VecDeque<i16>, src_channels: usize) -> (i16, i16) {
+pub(crate) fn pop_frame_pair(buf: &mut VecDeque<i16>, src_channels: usize) -> (i16, i16) {
     if src_channels <= 1 {
         let s = buf.pop_front().unwrap_or(0);
         (s, s)
     } else {
         let l = buf.pop_front().unwrap_or(0);
-        let r = buf.pop_front().unwrap_or(0);
+        let r = buf.pop_front().unwrap_or(l);
         for _ in 2..src_channels {
             let _ = buf.pop_front();
         }

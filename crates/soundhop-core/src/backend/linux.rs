@@ -99,7 +99,7 @@ impl LinuxAudioBackend {
         env_map.insert("LC_ALL".to_string(), "C".to_string());
         env_map.insert("LANG".to_string(), "C".to_string());
         if args.contains(&"-s") {
-            let cookie_file = soundhop_cookie_path();
+            let cookie_file = self.cookie_path();
             if cookie_file.exists() {
                 env_map.insert(
                     "PULSE_COOKIE".to_string(),
@@ -1093,7 +1093,7 @@ impl AudioBackend for LinuxAudioBackend {
             "channels=2".to_string(),
             "format=s16le".to_string(),
         ];
-        let cookie_file = soundhop_cookie_path();
+        let cookie_file = self.cookie_path();
         if cookie_file.exists() {
             tunnel_args.push(format!("cookie={}", cookie_file.display()));
         }
@@ -1952,5 +1952,109 @@ mod tests {
             let expected = format!("cookie={}", cookie_file.display());
             assert!(load_call.iter().any(|a| a == &expected));
         }
+    }
+
+    #[test]
+    fn test_remote_pactl_call_uses_cookie_path_override() {
+        let dir = tempfile::tempdir().unwrap();
+        let cookie_file = dir.path().join("override-cookie");
+        crate::security::write_pa_cookie(
+            Some(&cookie_file),
+            &crate::security::derive_pa_cookie("pin-remote-pactl"),
+        )
+        .unwrap();
+
+        let recorded_envs = Arc::new(Mutex::new(Vec::<Option<HashMap<String, String>>>::new()));
+        let envs_c = Arc::clone(&recorded_envs);
+        let runner = Arc::new(MockRunner::new(move |call_args, env| {
+            envs_c.lock().unwrap().push(env.cloned());
+            Ok(CommandResult {
+                args: call_args.to_vec(),
+                returncode: 0,
+                stdout: "Default Source: test_src\n".to_string(),
+                stderr: String::new(),
+            })
+        }));
+
+        let backend = LinuxAudioBackend::with_runner_and_cookie_path(runner, cookie_file.clone());
+        backend
+            .pactl_call(&["-s", "192.168.1.50:4713", "info"], true)
+            .unwrap();
+
+        let envs = recorded_envs.lock().unwrap();
+        assert_eq!(envs.len(), 1);
+        let env_map = envs[0].as_ref().expect("env map should be passed");
+        assert_eq!(
+            env_map.get("PULSE_COOKIE").map(String::as_str),
+            Some(cookie_file.to_string_lossy().as_ref())
+        );
+    }
+
+    #[test]
+    fn test_send_mic_to_remote_uses_cookie_path_override() {
+        let dir = tempfile::tempdir().unwrap();
+        let cookie_file = dir.path().join("override-mic-cookie");
+        crate::security::write_pa_cookie(
+            Some(&cookie_file),
+            &crate::security::derive_pa_cookie("pin-send-mic"),
+        )
+        .unwrap();
+
+        let recorded = Arc::new(Mutex::new(Vec::<(
+            Vec<String>,
+            Option<HashMap<String, String>>,
+        )>::new()));
+        let rec_c = Arc::clone(&recorded);
+        let runner = Arc::new(MockRunner::new(move |call_args, env| {
+            rec_c
+                .lock()
+                .unwrap()
+                .push((call_args.to_vec(), env.cloned()));
+            let joined = call_args.join(" ");
+            let stdout = if joined.contains("load-module") {
+                "42\n"
+            } else if joined.contains("list short sinks") {
+                "1\tsoundhop_tx_mic_peera\tmodule-tunnel-sink\ts16le 2ch 48000Hz\tRUNNING\n"
+            } else if joined.contains("info") {
+                "Default Source: alsa_input.remote_default\n"
+            } else {
+                ""
+            };
+            Ok(CommandResult {
+                args: call_args.to_vec(),
+                returncode: 0,
+                stdout: stdout.to_string(),
+                stderr: String::new(),
+            })
+        }));
+
+        let backend = LinuxAudioBackend::with_runner_and_cookie_path(runner, cookie_file.clone());
+        backend
+            .send_mic_to_remote("192.168.1.50", 4713, "PeerA", "alsa_input.local_mic")
+            .unwrap();
+
+        let calls = recorded.lock().unwrap();
+        let expected_cookie = cookie_file.to_string_lossy().into_owned();
+        let remote_calls: Vec<_> = calls
+            .iter()
+            .filter(|(args, _)| args.iter().any(|a| a == "-s"))
+            .collect();
+        assert!(!remote_calls.is_empty());
+        for (args, env) in remote_calls {
+            let env_map = env.as_ref().expect("remote pactl call must pass env");
+            assert_eq!(
+                env_map.get("PULSE_COOKIE").map(String::as_str),
+                Some(expected_cookie.as_str()),
+                "missing PULSE_COOKIE override for {args:?}"
+            );
+        }
+
+        let tunnel_call = calls
+            .iter()
+            .find(|(args, _)| args.iter().any(|a| a == "module-tunnel-sink"))
+            .map(|(args, _)| args)
+            .expect("module-tunnel-sink load call");
+        let expected_arg = format!("cookie={}", cookie_file.display());
+        assert!(tunnel_call.iter().any(|a| a == &expected_arg));
     }
 }
