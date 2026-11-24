@@ -35,6 +35,15 @@ pub trait PcmCapture: Send {
     fn channels(&self) -> u8 {
         PCM_CHANNELS
     }
+
+    /// Attach an external stop flag so blocked `read_frame` calls wake up cleanly on shutdown.
+    fn attach_stop_flag(&mut self, _stop_flag: Arc<AtomicBool>) {}
+
+    /// Return `true` (and clear) if an upstream capture discontinuity occurred
+    /// (for example, after respawning a crashed capture subprocess).
+    fn take_discontinuity(&mut self) -> bool {
+        false
+    }
 }
 
 /// Push-based 48 kHz stereo S16LE PCM audio playback sink for SHT3 inbound streams.
@@ -66,6 +75,15 @@ pub trait PcmPlayback: Send {
     /// Channel count (canonical SHT3 layout is 2-channel interleaved stereo).
     fn channels(&self) -> u8 {
         PCM_CHANNELS
+    }
+
+    /// Attach an external stop flag so blocked `read_frame` calls wake up cleanly on shutdown.
+    fn attach_stop_flag(&mut self, _stop_flag: Arc<AtomicBool>) {}
+
+    /// Return `true` (and clear) if an upstream capture discontinuity occurred
+    /// (for example, after respawning a crashed capture subprocess).
+    fn take_discontinuity(&mut self) -> bool {
+        false
     }
 }
 

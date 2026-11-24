@@ -285,6 +285,7 @@ fn sleep_interruptible(delay: Duration, stop_flag: &AtomicBool) -> bool {
 pub struct WindowsPlayer {
     pub sample_rate: u32,
     pub channels: u8,
+    max_buffer_samples: usize,
     closed: Arc<AtomicBool>,
     buffer: Arc<Mutex<VecDeque<i16>>>,
     volume_pct: Arc<AtomicU32>,
@@ -302,6 +303,14 @@ impl WindowsPlayer {
         )
     }
 
+    pub fn with_max_buffer_samples(sample_rate: u32, channels: u8, max_samples: usize) -> Self {
+        let ch = usize::from(channels.max(1));
+        let aligned = max_samples - (max_samples % ch);
+        let mut player = Self::new(sample_rate, channels);
+        player.max_buffer_samples = aligned.max(ch);
+        player
+    }
+
     pub fn with_volume(
         sample_rate: u32,
         channels: u8,
@@ -311,6 +320,7 @@ impl WindowsPlayer {
         Self {
             sample_rate,
             channels,
+            max_buffer_samples: MAX_PLAYBACK_BUFFER_SAMPLES,
             closed: Arc::new(AtomicBool::new(false)),
             buffer: Arc::new(Mutex::new(VecDeque::with_capacity(16_384))),
             volume_pct,
@@ -358,8 +368,8 @@ impl WindowsPlayer {
         }
         let mut buf = self.buffer.lock().unwrap_or_else(|e| e.into_inner());
         let incoming_samples = pcm_data.len() / 2;
-        if buf.len() + incoming_samples > MAX_PLAYBACK_BUFFER_SAMPLES {
-            let overflow = (buf.len() + incoming_samples) - MAX_PLAYBACK_BUFFER_SAMPLES;
+        if buf.len() + incoming_samples > self.max_buffer_samples {
+            let overflow = (buf.len() + incoming_samples) - self.max_buffer_samples;
             let drop_n = overflow.min(buf.len());
             // Keep channel alignment when dropping frames
             let aligned_drop = drop_n - (drop_n % self.channels.max(1) as usize);
@@ -1096,6 +1106,33 @@ mod tests {
         // Back should be the newest aligned (L, R) pair
         assert_eq!(buf[buf.len() - 2], 2000);
         assert_eq!(buf[buf.len() - 1], -2000);
+    }
+
+    #[test]
+    fn test_windows_player_with_max_buffer_samples_caps_ring_buffer() {
+        let cap = 19_200usize;
+        let player = WindowsPlayer::with_max_buffer_samples(48_000, 2, cap);
+        let mut batch = Vec::with_capacity(cap * 2);
+        for _ in 0..(cap / 2) {
+            batch.extend_from_slice(&300i16.to_le_bytes());
+            batch.extend_from_slice(&(-300i16).to_le_bytes());
+        }
+        player.write(&batch);
+        assert_eq!(player.buffer.lock().unwrap().len(), cap);
+
+        let mut extra = Vec::with_capacity(400);
+        for _ in 0..100 {
+            extra.extend_from_slice(&900i16.to_le_bytes());
+            extra.extend_from_slice(&(-900i16).to_le_bytes());
+        }
+        player.write(&extra);
+
+        let buf = player.buffer.lock().unwrap();
+        assert_eq!(buf.len(), cap);
+        assert_eq!(buf[0], 300);
+        assert_eq!(buf[1], -300);
+        assert_eq!(buf[buf.len() - 2], 900);
+        assert_eq!(buf[buf.len() - 1], -900);
     }
 
     #[test]
