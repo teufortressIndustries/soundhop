@@ -16,6 +16,7 @@ use soundhop_core::controller::Controller;
 use crate::{lock_or_recover, read_or_recover, write_or_recover};
 
 pub use commands::GuiCommand;
+pub(crate) use commands::{stop_systemd_service_if_active, terminate_peer_soundhop_processes};
 pub use snapshot::{security_friendly_label, AppStreamView, GuiSnapshot, GuiToast, PeerView};
 
 use commands::is_mutating_command;
@@ -30,6 +31,7 @@ pub struct GuiBackend {
     mutation_seq: Arc<AtomicU64>,
     active_commands: Arc<AtomicUsize>,
     stop_flag: Arc<AtomicBool>,
+    quit_flag: Arc<AtomicBool>,
     poller_wake: Arc<(Mutex<bool>, Condvar)>,
     cmd_handle: Option<JoinHandle<()>>,
     poller_handle: Option<JoinHandle<()>>,
@@ -57,6 +59,7 @@ impl GuiBackend {
         }
         let (tx, rx) = mpsc::channel::<GuiCommand>();
         let stop_flag = Arc::new(AtomicBool::new(false));
+        let quit_flag = Arc::new(AtomicBool::new(false));
         let onboarding_reopened = Arc::new(AtomicBool::new(false));
         let mutation_seq = Arc::new(AtomicU64::new(0));
         let active_commands = Arc::new(AtomicUsize::new(0));
@@ -73,6 +76,7 @@ impl GuiBackend {
             mutation_seq: Arc::clone(&mutation_seq),
             active_commands: Arc::clone(&active_commands),
             onboarding_reopened: Arc::clone(&onboarding_reopened),
+            quit_flag: Arc::clone(&quit_flag),
             controller_sync_lock: Arc::clone(&controller_sync_lock),
             use_ipc: true,
         };
@@ -86,6 +90,7 @@ impl GuiBackend {
             mutation_seq: Arc::clone(&mutation_seq),
             active_commands: Arc::clone(&active_commands),
             onboarding_reopened: Arc::clone(&onboarding_reopened),
+            quit_flag: Arc::clone(&quit_flag),
             controller_sync_lock,
             use_ipc: true,
         };
@@ -103,13 +108,16 @@ impl GuiBackend {
         });
 
         let stop_poller = Arc::clone(&stop_flag);
+        let quit_poller = Arc::clone(&quit_flag);
+        let poller_ctx = ctx.clone();
         let wake_poller = Arc::clone(&poller_wake);
         let poller_handle = thread::spawn(move || {
-            let _telemetry_monitor = if controller.is_save_enabled() {
-                Some(controller.start_telemetry_monitor())
-            } else {
-                None
-            };
+            let mut telemetry_monitor =
+                if controller.is_save_enabled() && !soundhop_core::ipc::is_running(None) {
+                    Some(controller.start_telemetry_monitor())
+                } else {
+                    None
+                };
 
             poller_worker.refresh_fast(false);
             poller_worker.refresh_peers();
@@ -120,17 +128,39 @@ impl GuiBackend {
             let mut last_fast = Instant::now();
             let mut last_peers = Instant::now();
 
-            while !stop_poller.load(Ordering::Relaxed) {
+            while !stop_poller.load(Ordering::Relaxed)
+                && !soundhop_core::util::signal_stop_requested()
+                && !quit_poller.load(Ordering::Acquire)
+            {
                 let (lock, cvar) = &*wake_poller;
                 let guard = lock_or_recover(lock);
                 if !*guard {
-                    let _ = cvar.wait_timeout(guard, Duration::from_millis(650));
+                    let _ = cvar.wait_timeout(guard, Duration::from_millis(50));
+                }
+                if soundhop_core::util::signal_stop_requested()
+                    || quit_poller.load(Ordering::Acquire)
+                {
+                    if let Some(ref c) = poller_ctx {
+                        c.send_viewport_cmd(egui::ViewportCommand::Close);
+                        c.request_repaint();
+                    }
+                    break;
                 }
                 if stop_poller.load(Ordering::Relaxed) {
                     break;
                 }
 
+                if telemetry_monitor.is_some() && soundhop_core::ipc::is_running(None) {
+                    telemetry_monitor = None;
+                }
+
                 if last_fast.elapsed() >= Duration::from_millis(650) {
+                    if telemetry_monitor.is_none()
+                        && controller.is_save_enabled()
+                        && !soundhop_core::ipc::is_running(None)
+                    {
+                        telemetry_monitor = Some(controller.start_telemetry_monitor());
+                    }
                     poller_worker.refresh_fast(false);
                     poller_worker.request_repaint();
                     last_fast = Instant::now();
@@ -143,6 +173,8 @@ impl GuiBackend {
                     last_peers = Instant::now();
                 }
             }
+
+            drop(telemetry_monitor);
         });
 
         Self {
@@ -153,6 +185,7 @@ impl GuiBackend {
             mutation_seq,
             active_commands,
             stop_flag,
+            quit_flag,
             poller_wake,
             cmd_handle: Some(cmd_handle),
             poller_handle: Some(poller_handle),
@@ -194,10 +227,12 @@ impl GuiBackend {
     pub fn dismiss_toast(&self) {
         lock_or_recover(&self.toasts).clear();
     }
-}
 
-impl Drop for GuiBackend {
-    fn drop(&mut self) {
+    pub fn quit_requested(&self) -> bool {
+        self.quit_flag.load(Ordering::Acquire)
+    }
+
+    pub fn shutdown(&mut self) {
         self.stop_flag.store(true, Ordering::SeqCst);
         self.tx.take();
         {
@@ -206,10 +241,22 @@ impl Drop for GuiBackend {
             *stopped = true;
             cvar.notify_all();
         }
-        // Detach worker threads on drop instead of blocking the UI thread on
-        // in-flight IPC/network/install operations (e.g. 15s firewall or scrcpy download).
-        self.cmd_handle.take();
-        self.poller_handle.take();
+        if let Some(handle) = self.poller_handle.take() {
+            let _ = handle.join();
+        }
+        if self.active_commands.load(Ordering::SeqCst) == 0 {
+            if let Some(handle) = self.cmd_handle.take() {
+                let _ = handle.join();
+            }
+        } else {
+            self.cmd_handle.take();
+        }
+    }
+}
+
+impl Drop for GuiBackend {
+    fn drop(&mut self) {
+        self.shutdown();
     }
 }
 
@@ -286,6 +333,7 @@ pub(super) mod tests {
             mutation_seq: Arc::clone(&mutation_seq),
             active_commands: Arc::clone(&active_commands),
             onboarding_reopened: Arc::new(AtomicBool::new(false)),
+            quit_flag: Arc::new(AtomicBool::new(false)),
             controller_sync_lock: Arc::new(Mutex::new(())),
             use_ipc: false,
         };
@@ -320,6 +368,7 @@ pub(super) mod tests {
             mutation_seq: Arc::new(AtomicU64::new(0)),
             active_commands: Arc::new(AtomicUsize::new(0)),
             stop_flag: Arc::new(AtomicBool::new(false)),
+            quit_flag: Arc::new(AtomicBool::new(false)),
             poller_wake: Arc::new((Mutex::new(false), Condvar::new())),
             cmd_handle: None,
             poller_handle: None,
@@ -342,6 +391,7 @@ pub(super) mod tests {
             mutation_seq: Arc::new(AtomicU64::new(0)),
             active_commands: Arc::new(AtomicUsize::new(0)),
             onboarding_reopened: Arc::new(AtomicBool::new(false)),
+            quit_flag: Arc::new(AtomicBool::new(false)),
             controller_sync_lock: Arc::new(Mutex::new(())),
             use_ipc: false,
         };

@@ -342,6 +342,31 @@ pub fn render(
                 }
             });
         });
+
+        ui.add_space(10.0);
+
+        // System / Background Service
+        ui.horizontal(|ui| {
+            ui.vertical(|ui| {
+                ui.label(
+                    RichText::new("Background Service & Tray")
+                        .color(pal.text)
+                        .size(13.5),
+                );
+                ui.label(
+                    RichText::new(
+                        "Quit SoundHop completely, stopping the background service and system tray.",
+                    )
+                    .color(pal.text_muted)
+                    .size(12.0),
+                );
+            });
+            ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                if danger_button(ui, pal, "Quit SoundHop").clicked() {
+                    backend.send(GuiCommand::QuitAll);
+                }
+            });
+        });
     });
 
     ui.add_space(12.0);

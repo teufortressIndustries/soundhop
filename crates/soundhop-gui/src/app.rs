@@ -61,7 +61,10 @@ pub fn open_control_center_with_toast(
         }
     };
 
+    soundhop_core::util::install_signal_handlers();
+
     let mut viewport = egui::ViewportBuilder::default()
+        .with_app_id("io.github.soundhop")
         .with_inner_size([840.0, 620.0])
         .with_min_inner_size([680.0, 500.0])
         .with_title("SoundHop");
@@ -172,7 +175,15 @@ impl ControlCenterApp {
 }
 
 impl eframe::App for ControlCenterApp {
+    fn on_exit(&mut self, _gl: Option<&eframe::glow::Context>) {
+        self.backend.shutdown();
+    }
+
     fn update(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
+        if soundhop_core::util::signal_stop_requested() || self.backend.quit_requested() {
+            ctx.send_viewport_cmd(egui::ViewportCommand::Close);
+            return;
+        }
         self.ensure_logo_texture(ctx);
         if self.system_dark_hint.is_none() {
             self.system_dark_hint = Some(ctx.style().visuals.dark_mode);
@@ -293,6 +304,14 @@ impl eframe::App for ControlCenterApp {
                                 patch: serde_json::json!({ "ui": { "theme": next_theme } }),
                                 toast: None,
                             });
+                        }
+                        if compact_button(ui, &pal, "Quit")
+                            .on_hover_text(
+                                "Quit SoundHop completely (stops background service and tray)",
+                            )
+                            .clicked()
+                        {
+                            self.backend.send(GuiCommand::QuitAll);
                         }
                     });
 
