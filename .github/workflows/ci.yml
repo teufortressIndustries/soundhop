@@ -68,7 +68,6 @@ jobs:
           done
           [ "$ok" -eq 1 ]
           pkg-config --modversion gstreamer-1.0 gstreamer-audio-1.0 gstreamer-app-1.0 gstreamer-rtp-1.0
-          gst-inspect-1.0 --version
 
       - name: Install GStreamer (MSVC x86_64)
         if: runner.os == 'Windows'
@@ -450,7 +449,6 @@ jobs:
           done
           [ "$ok" -eq 1 ]
           pkg-config --modversion gstreamer-1.0 gstreamer-audio-1.0 gstreamer-app-1.0 gstreamer-rtp-1.0
-          gst-inspect-1.0 --version
 
       - name: Install Rust toolchain
         uses: dtolnay/rust-toolchain@stable
