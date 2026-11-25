@@ -396,7 +396,7 @@ fn run_playback_worker(
                     PlaybackResampler::with_prebuffer(src_rate, dst_rate, prebuffer_samples);
                 device
                     .build_output_stream(
-                        config.clone(),
+                        config,
                         move |data: &mut [f32], _| {
                             let vol = vol_c.load(Ordering::Relaxed);
                             let is_muted = mute_c.load(Ordering::Relaxed);
@@ -431,7 +431,7 @@ fn run_playback_worker(
                     PlaybackResampler::with_prebuffer(src_rate, dst_rate, prebuffer_samples);
                 device
                     .build_output_stream(
-                        config.clone(),
+                        config,
                         move |data: &mut [i16], _| {
                             let vol = vol_c.load(Ordering::Relaxed);
                             let is_muted = mute_c.load(Ordering::Relaxed);
@@ -466,7 +466,7 @@ fn run_playback_worker(
                     PlaybackResampler::with_prebuffer(src_rate, dst_rate, prebuffer_samples);
                 device
                     .build_output_stream(
-                        config.clone(),
+                        config,
                         move |data: &mut [u16], _| {
                             let vol = vol_c.load(Ordering::Relaxed);
                             let is_muted = mute_c.load(Ordering::Relaxed);
@@ -719,7 +719,7 @@ fn open_loopback_stream(
             let mut bytes = Vec::with_capacity(4_096);
             device
                 .build_input_stream(
-                    config.clone(),
+                    config,
                     move |data: &[f32], _| {
                         pairs.clear();
                         for frame in data.chunks_exact(ch) {
@@ -750,7 +750,7 @@ fn open_loopback_stream(
             let mut bytes = Vec::with_capacity(4_096);
             device
                 .build_input_stream(
-                    config.clone(),
+                    config,
                     move |data: &[i16], _| {
                         pairs.clear();
                         for frame in data.chunks_exact(ch) {
@@ -777,7 +777,7 @@ fn open_loopback_stream(
             let mut bytes = Vec::with_capacity(4_096);
             device
                 .build_input_stream(
-                    config.clone(),
+                    config,
                     move |data: &[u16], _| {
                         pairs.clear();
                         for frame in data.chunks_exact(ch) {
