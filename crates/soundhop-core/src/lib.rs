@@ -1,6 +1,7 @@
 //! Core library for SoundHop v2.0.
 
 pub mod android;
+pub mod audio_dsp;
 pub mod backend;
 pub mod config;
 pub mod constants;

@@ -26,12 +26,13 @@ use std::collections::{HashMap, VecDeque};
 use std::io::ErrorKind;
 use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr, TcpStream};
 use std::sync::atomic::{AtomicBool, AtomicU16, AtomicU64, AtomicUsize, Ordering};
-use std::sync::{mpsc, Arc, Mutex, RwLock};
+use std::sync::{mpsc, Arc, Mutex};
 use std::thread::{self, JoinHandle};
 use std::time::{Duration, Instant};
 
 use thiserror::Error;
 
+pub use crate::pairing::{InMemoryTrustStore, TrustLookup};
 pub use client::{Sht3ClientConfig, Sht3ClientConnection, Sht3ClientReader, Sht3ClientWriter};
 #[cfg(feature = "opus")]
 pub use codec::OpusCodec;
@@ -132,45 +133,58 @@ pub enum TransportError {
     Closed,
 }
 
-/// Trust store lookup interface used by the SHT3 server to authenticate paired peers.
-pub trait TrustLookup: Send + Sync {
-    /// Look up the 32-byte pairwise pre-shared key `K_pair` for `device_id`.
-    /// Returns `None` if the peer is unknown or revoked.
-    fn lookup_peer_key(&self, device_id: &str) -> Option<[u8; 32]>;
+/// Narrow abstraction over a running outbound audio stream handle.
+pub trait TransportOutbound: Send + Sync {
+    /// Returns `true` while the outbound streaming worker is still running.
+    fn is_running(&self) -> bool;
+
+    /// Authenticated remote server `device_id`.
+    fn server_device_id(&self) -> &str;
+
+    /// Snapshot live RTT, jitter buffer, drop, and volume telemetry.
+    fn telemetry(&self) -> StreamTelemetry;
+
+    /// Canonical profile name for the negotiated audio stream.
+    fn profile_name(&self) -> &'static str;
+
+    /// Forward a volume change (`0..=150`) to the remote receiver; returns `true` if queued.
+    fn set_volume(&self, pct: u8) -> bool;
+
+    /// Forward a mute state change to the remote receiver; returns `true` if queued.
+    fn set_mute(&self, muted: bool) -> bool;
+
+    /// Trigger an immediate `Ping`/`Pong` telemetry probe; returns `true` if queued.
+    fn request_ping(&self) -> bool;
+
+    /// Request graceful shutdown and join the worker thread.
+    fn stop(&self);
 }
 
-/// Thread-safe in-memory [`TrustLookup`] implementation for tests and lightweight embeds.
-#[derive(Debug, Default)]
-pub struct InMemoryTrustStore {
-    peers: RwLock<HashMap<String, [u8; 32]>>,
-}
+/// Narrow abstraction over an inbound audio transport listener/session engine.
+pub trait AudioTransportEngine: Send + Sync {
+    /// Stable identifier for this transport engine (e.g. `"sht3"`).
+    fn engine_id(&self) -> &'static str;
 
-impl InMemoryTrustStore {
-    pub fn new() -> Self {
-        Self::default()
-    }
+    /// Bind and start the inbound transport listener on `bind_addr`.
+    fn start_listener(
+        &self,
+        bind_addr: SocketAddr,
+        server_device_id: String,
+        trust: Arc<dyn TrustLookup>,
+        playback_factory: PcmPlaybackFactory,
+    ) -> TransportResult<SocketAddr>;
 
-    pub fn insert(&self, device_id: impl Into<String>, k_pair: [u8; 32]) {
-        if let Ok(mut guard) = self.peers.write() {
-            guard.insert(device_id.into(), k_pair);
-        }
-    }
+    /// Stop the inbound listener and disconnect all active inbound peer sessions.
+    fn stop_listener(&self);
 
-    pub fn remove(&self, device_id: &str) -> Option<[u8; 32]> {
-        self.peers
-            .write()
-            .ok()
-            .and_then(|mut guard| guard.remove(device_id))
-    }
-}
+    /// Address the inbound listener is currently bound to, if running.
+    fn listener_addr(&self) -> Option<SocketAddr>;
 
-impl TrustLookup for InMemoryTrustStore {
-    fn lookup_peer_key(&self, device_id: &str) -> Option<[u8; 32]> {
-        self.peers
-            .read()
-            .ok()
-            .and_then(|guard| guard.get(device_id).copied())
-    }
+    /// List `device_id`s of all currently connected inbound peers.
+    fn active_inbound_peers(&self) -> Vec<String>;
+
+    /// Immediately terminate the active inbound stream for `device_id`.
+    fn disconnect_peer(&self, device_id: &str) -> bool;
 }
 
 /// Live telemetry snapshot reported by an outbound SHT3 audio stream.
@@ -269,7 +283,7 @@ pub struct OutboundSessionHandle {
     audio_params: AudioParams,
     stop_flag: Arc<AtomicBool>,
     running: Arc<AtomicBool>,
-    cmd_tx: mpsc::Sender<OutboundCommand>,
+    cmd_tx: Mutex<mpsc::Sender<OutboundCommand>>,
     telemetry: Arc<Mutex<StreamTelemetry>>,
     worker: Mutex<Option<JoinHandle<()>>>,
 }
@@ -941,7 +955,7 @@ impl OutboundSessionHandle {
             audio_params,
             stop_flag,
             running,
-            cmd_tx,
+            cmd_tx: Mutex::new(cmd_tx),
             telemetry,
             worker: Mutex::new(Some(worker)),
         })
@@ -960,6 +974,8 @@ impl OutboundSessionHandle {
     /// Enqueue an arbitrary [`ControlMessage`] to be sent over the encrypted stream.
     pub fn send_control(&self, msg: ControlMessage) -> TransportResult<()> {
         self.cmd_tx
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
             .send(OutboundCommand::Control(msg))
             .map_err(|_| TransportError::Closed)
     }
@@ -967,6 +983,8 @@ impl OutboundSessionHandle {
     /// Trigger an immediate `Ping`/`Pong` telemetry probe.
     pub fn request_ping(&self) -> TransportResult<()> {
         self.cmd_tx
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
             .send(OutboundCommand::Ping)
             .map_err(|_| TransportError::Closed)
     }
@@ -994,7 +1012,11 @@ impl OutboundSessionHandle {
     /// Request graceful shutdown and join the worker thread.
     pub fn stop(&self) {
         self.stop_flag.store(true, Ordering::Release);
-        let _ = self.cmd_tx.send(OutboundCommand::Stop);
+        let _ = self
+            .cmd_tx
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .send(OutboundCommand::Stop);
         if let Some(handle) = self.worker.lock().unwrap_or_else(|e| e.into_inner()).take() {
             let _ = handle.join();
         }
@@ -1005,6 +1027,45 @@ impl OutboundSessionHandle {
         if let Some(handle) = self.worker.lock().unwrap_or_else(|e| e.into_inner()).take() {
             let _ = handle.join();
         }
+    }
+}
+
+impl TransportOutbound for OutboundSessionHandle {
+    fn is_running(&self) -> bool {
+        OutboundSessionHandle::is_running(self)
+    }
+
+    fn server_device_id(&self) -> &str {
+        OutboundSessionHandle::server_device_id(self)
+    }
+
+    fn telemetry(&self) -> StreamTelemetry {
+        OutboundSessionHandle::telemetry(self)
+    }
+
+    fn profile_name(&self) -> &'static str {
+        match AudioProfile::from_audio_params(&self.audio_params).ok() {
+            Some(AudioProfile::OpusBalanced) | None => "opus-balanced",
+            Some(AudioProfile::OpusLowLatency) => "opus-low-latency",
+            Some(AudioProfile::OpusLowBandwidth) => "opus-low-bandwidth",
+            Some(AudioProfile::PcmLossless) => "pcm-lossless",
+        }
+    }
+
+    fn set_volume(&self, pct: u8) -> bool {
+        OutboundSessionHandle::set_volume(self, pct).is_ok()
+    }
+
+    fn set_mute(&self, muted: bool) -> bool {
+        OutboundSessionHandle::set_mute(self, muted).is_ok()
+    }
+
+    fn request_ping(&self) -> bool {
+        OutboundSessionHandle::request_ping(self).is_ok()
+    }
+
+    fn stop(&self) {
+        OutboundSessionHandle::stop(self);
     }
 }
 
@@ -1299,6 +1360,44 @@ impl Sht3SessionManager {
 impl Drop for Sht3SessionManager {
     fn drop(&mut self) {
         self.stop_listener();
+    }
+}
+
+impl AudioTransportEngine for Sht3SessionManager {
+    fn engine_id(&self) -> &'static str {
+        "sht3"
+    }
+
+    fn start_listener(
+        &self,
+        bind_addr: SocketAddr,
+        server_device_id: String,
+        trust: Arc<dyn TrustLookup>,
+        playback_factory: PcmPlaybackFactory,
+    ) -> TransportResult<SocketAddr> {
+        Sht3SessionManager::start_listener(
+            self,
+            bind_addr,
+            Sht3ServerConfig::new(server_device_id),
+            trust,
+            playback_factory,
+        )
+    }
+
+    fn stop_listener(&self) {
+        Sht3SessionManager::stop_listener(self);
+    }
+
+    fn listener_addr(&self) -> Option<SocketAddr> {
+        Sht3SessionManager::listener_addr(self)
+    }
+
+    fn active_inbound_peers(&self) -> Vec<String> {
+        Sht3SessionManager::active_inbound_peers(self)
+    }
+
+    fn disconnect_peer(&self, device_id: &str) -> bool {
+        Sht3SessionManager::disconnect_peer(self, device_id)
     }
 }
 
@@ -3431,5 +3530,61 @@ mod tests {
                 );
             }
         }
+    }
+
+    #[test]
+    fn transport_seam_traits_delegate_cleanly() {
+        let k_pair = [0x99; 32];
+        let trust = Arc::new(InMemoryTrustStore::new());
+        trust.insert("seam-sender", k_pair);
+
+        let factory: PcmPlaybackFactory = Arc::new(move |_peer_id| {
+            let (play, _handle) = MockPcmPlayback::pair();
+            Ok(Box::new(play))
+        });
+
+        let manager = Arc::new(Sht3SessionManager::new());
+        let engine: Arc<dyn AudioTransportEngine> = manager.clone();
+        assert_eq!(engine.engine_id(), "sht3");
+        assert!(engine.listener_addr().is_none());
+
+        let addr = engine
+            .start_listener(
+                "127.0.0.1:0".parse().unwrap(),
+                "seam-receiver".to_string(),
+                trust,
+                factory,
+            )
+            .unwrap();
+        assert_eq!(engine.listener_addr(), Some(addr));
+
+        let capture =
+            Box::new(MockPcmCapture::sine_wave(440.0, None).with_pace(Duration::from_millis(5)));
+        let out_cfg = OutboundConfig::new("seam-sender", addr, k_pair)
+            .with_profile(AudioProfile::PcmLossless)
+            .with_jitter_ms(20);
+        let outbound: Box<dyn TransportOutbound> =
+            Box::new(manager.start_outbound(out_cfg, capture).unwrap());
+
+        assert!(outbound.is_running());
+        assert_eq!(outbound.server_device_id(), "seam-receiver");
+        assert_eq!(outbound.profile_name(), "pcm-lossless");
+        assert!(outbound.set_volume(80));
+        assert!(outbound.set_mute(true));
+        assert!(outbound.request_ping());
+        assert!(wait_until(Duration::from_secs(2), || {
+            engine
+                .active_inbound_peers()
+                .iter()
+                .any(|p| p == "seam-sender")
+                && outbound.telemetry().frames_sent > 0
+        }));
+
+        assert!(engine.disconnect_peer("seam-sender"));
+        outbound.stop();
+        assert!(!outbound.is_running());
+
+        engine.stop_listener();
+        assert!(engine.listener_addr().is_none());
     }
 }

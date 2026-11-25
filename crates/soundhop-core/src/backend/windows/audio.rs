@@ -12,10 +12,10 @@ const OVERRUN_CROSSFADE_FRAMES: usize = 96; // 2 ms @ 48 kHz
 const RECONNECT_INITIAL_BACKOFF_MS: u64 = 100;
 const RECONNECT_MAX_BACKOFF_MS: u64 = 1_000;
 
-use crate::transport::dsp::lerp_i16;
+use crate::audio_dsp::lerp_i16;
 #[cfg(test)]
-use crate::transport::dsp::pop_frame_pair;
-pub use crate::transport::dsp::{apply_gain_i16, LinearResampler, PlaybackResampler};
+use crate::audio_dsp::pop_frame_pair;
+pub use crate::audio_dsp::{apply_gain_i16, LinearResampler, PlaybackResampler};
 
 #[derive(Debug, Clone)]
 pub struct AudioEndpoint {

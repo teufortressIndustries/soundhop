@@ -24,7 +24,6 @@ use thiserror::Error;
 use x25519_dalek::{PublicKey as X25519PublicKey, StaticSecret as X25519StaticSecret};
 use zeroize::{Zeroize, ZeroizeOnDrop};
 
-use crate::transport::TrustLookup;
 use crate::util::{atomic_write, config_dir, lock_or_recover, new_device_id, now_secs};
 
 type HmacSha256 = Hmac<Sha256>;
@@ -295,8 +294,49 @@ impl DeviceIdentity {
 }
 
 // ---------------------------------------------------------------------------
-// TrustedPeer & TrustStore (implements transport::TrustLookup)
+// TrustLookup, InMemoryTrustStore, TrustedPeer & TrustStore
 // ---------------------------------------------------------------------------
+
+/// Trust store lookup interface used by audio transports to authenticate paired peers.
+pub trait TrustLookup: Send + Sync {
+    /// Look up the 32-byte pairwise pre-shared key `K_pair` for `device_id`.
+    /// Returns `None` if the peer is unknown or revoked.
+    fn lookup_peer_key(&self, device_id: &str) -> Option<[u8; 32]>;
+}
+
+/// Thread-safe in-memory [`TrustLookup`] implementation for tests and lightweight embeds.
+#[derive(Debug, Default)]
+pub struct InMemoryTrustStore {
+    peers: RwLock<HashMap<String, [u8; 32]>>,
+}
+
+impl InMemoryTrustStore {
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    pub fn insert(&self, device_id: impl Into<String>, k_pair: [u8; 32]) {
+        if let Ok(mut guard) = self.peers.write() {
+            guard.insert(device_id.into(), k_pair);
+        }
+    }
+
+    pub fn remove(&self, device_id: &str) -> Option<[u8; 32]> {
+        self.peers
+            .write()
+            .ok()
+            .and_then(|mut guard| guard.remove(device_id))
+    }
+}
+
+impl TrustLookup for InMemoryTrustStore {
+    fn lookup_peer_key(&self, device_id: &str) -> Option<[u8; 32]> {
+        self.peers
+            .read()
+            .ok()
+            .and_then(|guard| guard.get(device_id).copied())
+    }
+}
 
 /// A cryptographically paired peer persisted in `State::trusted_peers`.
 #[derive(Clone, Serialize, Deserialize, PartialEq)]
@@ -338,7 +378,7 @@ impl TrustedPeer {
 }
 
 /// Thread-safe trust store backed by [`TrustedPeer`] records, implementing
-/// [`crate::transport::TrustLookup`] for SoundHop Transport v3 authentication.
+/// [`TrustLookup`] for authenticated audio transport peers.
 #[derive(Debug, Default)]
 pub struct TrustStore {
     peers: RwLock<HashMap<String, TrustedPeer>>,
