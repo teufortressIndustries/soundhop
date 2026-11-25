@@ -497,7 +497,7 @@ pub fn quit_all_soundhop(socket_path: Option<&Path>) -> serde_json::Value {
 
     let self_pid = u64::from(std::process::id());
     let mut candidate_pids = std::collections::BTreeSet::new();
-    for name in ["gui", "tray", "daemon"] {
+    for name in ["gui", "tray", "daemon", "tui"] {
         if let Some(pid) = crate::util::read_instance_lock_info(name).and_then(|info| info.pid) {
             candidate_pids.insert(pid);
         }
@@ -516,17 +516,25 @@ pub fn quit_all_soundhop(socket_path: Option<&Path>) -> serde_json::Value {
         }
     }
 
-    // Best-effort wait up to 800 ms for terminated peer PIDs to exit.
+    // Wait up to 2000 ms for terminated peer PIDs to exit gracefully
+    // (unloading PipeWire/PulseAudio modules can exceed 800 ms on powersaver laptops),
+    // then escalate any survivors to SIGKILL / TerminateProcess.
+    let mut force_killed_pids = Vec::new();
     if !terminated_pids.is_empty() {
-        let deadline = std::time::Instant::now() + Duration::from_millis(800);
-        while std::time::Instant::now() < deadline {
-            if terminated_pids
-                .iter()
-                .all(|&pid| !crate::ipc::is_soundhop_process(pid))
-            {
-                break;
+        wait_for_pids_exit(&terminated_pids, Duration::from_millis(2000));
+
+        let remaining: Vec<u64> = terminated_pids
+            .iter()
+            .copied()
+            .filter(|&pid| crate::ipc::is_soundhop_process(pid))
+            .collect();
+        for pid in remaining {
+            if crate::ipc::force_terminate_process(pid) {
+                force_killed_pids.push(pid);
             }
-            std::thread::sleep(Duration::from_millis(25));
+        }
+        if !force_killed_pids.is_empty() {
+            wait_for_pids_exit(&force_killed_pids, Duration::from_millis(200));
         }
     }
 
@@ -535,7 +543,21 @@ pub fn quit_all_soundhop(socket_path: Option<&Path>) -> serde_json::Value {
         "service_stopped": service_stopped,
         "daemon_stopped": daemon_stopped,
         "terminated_pids": terminated_pids,
+        "force_killed_pids": force_killed_pids,
     })
+}
+
+fn wait_for_pids_exit(pids: &[u64], timeout: Duration) {
+    let deadline = std::time::Instant::now() + timeout;
+    while std::time::Instant::now() < deadline {
+        if pids
+            .iter()
+            .all(|&pid| !crate::ipc::is_soundhop_process(pid))
+        {
+            break;
+        }
+        std::thread::sleep(Duration::from_millis(25));
+    }
 }
 
 pub fn install_tray_autostart() -> bool {
@@ -1003,5 +1025,20 @@ mod tests {
             !pids.iter().any(|v| v.as_u64() == Some(self_pid)),
             "quit_all_soundhop must never terminate self"
         );
+        let force_pids = res
+            .get("force_killed_pids")
+            .and_then(|v| v.as_array())
+            .expect("force_killed_pids array");
+        assert!(
+            !force_pids.iter().any(|v| v.as_u64() == Some(self_pid)),
+            "quit_all_soundhop must never force-kill self"
+        );
+    }
+
+    #[test]
+    fn test_wait_for_pids_exit_returns_early_for_non_soundhop_pids() {
+        let start = std::time::Instant::now();
+        wait_for_pids_exit(&[0, u64::MAX], Duration::from_millis(500));
+        assert!(start.elapsed() < Duration::from_millis(200));
     }
 }

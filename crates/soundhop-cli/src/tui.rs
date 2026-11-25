@@ -6,7 +6,7 @@
 //! - Bottom Telemetry Bar: Live Stereo Peak/RMS VU gauge + dBFS + Network RTT/Jitter (`ms`)
 
 use std::collections::HashSet;
-use std::io;
+use std::io::{self, IsTerminal};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
@@ -1075,7 +1075,81 @@ impl Drop for TerminalGuard {
     }
 }
 
+fn ensure_interactive_tty(stdin_is_tty: bool, stdout_is_tty: bool) -> Result<(), String> {
+    if !stdin_is_tty || !stdout_is_tty {
+        return Err(
+            "TUI requires an interactive terminal (stdin and stdout must be TTYs)".to_string(),
+        );
+    }
+    Ok(())
+}
+
+#[cfg(unix)]
+fn fd_hung_up(fd: std::os::unix::io::RawFd) -> bool {
+    if fd < 0 {
+        return true;
+    }
+    let mut pfd = libc::pollfd {
+        fd,
+        events: libc::POLLIN,
+        revents: 0,
+    };
+    let rc = unsafe { libc::poll(&mut pfd, 1, 0) };
+    if rc < 0 {
+        let err = io::Error::last_os_error();
+        return err.kind() != io::ErrorKind::Interrupted;
+    }
+    if rc > 0 && (pfd.revents & (libc::POLLHUP | libc::POLLERR | libc::POLLNVAL)) != 0 {
+        return true;
+    }
+    false
+}
+
+#[cfg(unix)]
+fn stdin_hung_up() -> bool {
+    fd_hung_up(libc::STDIN_FILENO)
+}
+
+#[cfg(not(unix))]
+fn stdin_hung_up() -> bool {
+    false
+}
+
+fn is_terminal_disconnect_error(err: &io::Error) -> bool {
+    if matches!(
+        err.kind(),
+        io::ErrorKind::UnexpectedEof | io::ErrorKind::BrokenPipe | io::ErrorKind::ConnectionReset
+    ) {
+        return true;
+    }
+    #[cfg(unix)]
+    if matches!(
+        err.raw_os_error(),
+        Some(libc::EIO | libc::EBADF | libc::ENXIO)
+    ) {
+        return true;
+    }
+    false
+}
+
+fn should_exit_tui_loop(should_quit: bool, signal_stop: bool, hung_up: bool) -> bool {
+    should_quit || signal_stop || hung_up
+}
+
+/// Returns `Ok(true)` if the TUI loop should exit cleanly, `Ok(false)` to continue
+/// after a transient `EINTR`, or `Err` for fatal I/O errors.
+fn should_break_on_event_error(err: &io::Error) -> Result<bool, String> {
+    if err.kind() == io::ErrorKind::Interrupted {
+        return Ok(signal_stop_requested());
+    }
+    if is_terminal_disconnect_error(err) || signal_stop_requested() || stdin_hung_up() {
+        return Ok(true);
+    }
+    Err(err.to_string())
+}
+
 pub fn run_tui(controller: Arc<Controller>) -> Result<i32, String> {
+    ensure_interactive_tty(io::stdin().is_terminal(), io::stdout().is_terminal())?;
     install_signal_handlers();
     let cfg = lock_or_recover(&controller.config).clone();
     if cfg.sharing.enabled {
@@ -1115,24 +1189,60 @@ pub fn run_tui(controller: Arc<Controller>) -> Result<i32, String> {
     let mut last_tick = Instant::now();
 
     let loop_res: Result<(), String> = (|| {
-        while !tui_state.should_quit && !signal_stop_requested() {
+        while !should_exit_tui_loop(
+            tui_state.should_quit,
+            signal_stop_requested(),
+            stdin_hung_up(),
+        ) {
             terminal
                 .draw(|f| draw_tui(f, &tui_state))
                 .map_err(|e| e.to_string())?;
 
-            if event::poll(Duration::from_millis(50)).map_err(|e| e.to_string())? {
-                if let Event::Key(key) = event::read().map_err(|e| e.to_string())? {
-                    if key.kind == KeyEventKind::Press {
-                        if key.code == KeyCode::Char('c')
-                            && key.modifiers.contains(KeyModifiers::CONTROL)
-                        {
-                            tui_state.should_quit = true;
-                        } else {
-                            tui_state.handle_key(key.code);
-                            let share_now = lock_or_recover(&controller.config).sharing.enabled;
-                            disc.set_advertising(share_now);
-                            tui_state.merge_live_peers(disc.peers());
+            if should_exit_tui_loop(
+                tui_state.should_quit,
+                signal_stop_requested(),
+                stdin_hung_up(),
+            ) {
+                break;
+            }
+
+            match event::poll(Duration::from_millis(50)) {
+                Ok(true) => {
+                    if should_exit_tui_loop(
+                        tui_state.should_quit,
+                        signal_stop_requested(),
+                        stdin_hung_up(),
+                    ) {
+                        break;
+                    }
+                    match event::read() {
+                        Ok(Event::Key(key)) => {
+                            if key.kind == KeyEventKind::Press {
+                                if key.code == KeyCode::Char('c')
+                                    && key.modifiers.contains(KeyModifiers::CONTROL)
+                                {
+                                    tui_state.should_quit = true;
+                                } else {
+                                    tui_state.handle_key(key.code);
+                                    let share_now =
+                                        lock_or_recover(&controller.config).sharing.enabled;
+                                    disc.set_advertising(share_now);
+                                    tui_state.merge_live_peers(disc.peers());
+                                }
+                            }
                         }
+                        Ok(_) => {}
+                        Err(e) => {
+                            if should_break_on_event_error(&e)? {
+                                break;
+                            }
+                        }
+                    }
+                }
+                Ok(false) => {}
+                Err(e) => {
+                    if should_break_on_event_error(&e)? {
+                        break;
                     }
                 }
             }
@@ -1499,5 +1609,55 @@ mod tests {
         assert!(tui_state
             .status_message
             .contains("Denied pairing request from Guest Phone"));
+    }
+
+    #[test]
+    fn test_ensure_interactive_tty_requires_both_ttys() {
+        assert!(ensure_interactive_tty(true, true).is_ok());
+        assert!(ensure_interactive_tty(false, true).is_err());
+        assert!(ensure_interactive_tty(true, false).is_err());
+        assert!(ensure_interactive_tty(false, false).is_err());
+    }
+
+    #[test]
+    fn test_tui_shutdown_and_hangup_exit_conditions() {
+        assert!(!should_exit_tui_loop(false, false, false));
+        assert!(should_exit_tui_loop(true, false, false));
+        assert!(should_exit_tui_loop(false, true, false));
+        assert!(should_exit_tui_loop(false, false, true));
+
+        assert!(is_terminal_disconnect_error(&io::Error::from(
+            io::ErrorKind::UnexpectedEof
+        )));
+        assert!(is_terminal_disconnect_error(&io::Error::from(
+            io::ErrorKind::BrokenPipe
+        )));
+        assert!(!is_terminal_disconnect_error(&io::Error::from(
+            io::ErrorKind::TimedOut
+        )));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn test_fd_hung_up_detects_pipe_close_and_invalid_fd() {
+        let mut fds = [-1; 2];
+        assert_eq!(unsafe { libc::pipe(fds.as_mut_ptr()) }, 0);
+        let read_fd = fds[0];
+        let write_fd = fds[1];
+
+        assert!(!fd_hung_up(read_fd));
+
+        unsafe {
+            libc::close(write_fd);
+        }
+        assert!(fd_hung_up(read_fd));
+
+        unsafe {
+            libc::close(read_fd);
+        }
+        assert!(fd_hung_up(-1));
+        assert!(is_terminal_disconnect_error(&io::Error::from_raw_os_error(
+            libc::EIO
+        )));
     }
 }

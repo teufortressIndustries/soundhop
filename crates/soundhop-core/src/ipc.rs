@@ -378,9 +378,19 @@ pub fn is_process_alive(pid: u64) -> bool {
     }
 }
 
-/// Sends a termination signal to a verified SoundHop process (`SIGTERM` on Unix,
+/// Sends a graceful termination signal to a verified SoundHop process (`SIGTERM` on Unix,
 /// `TerminateProcess` on Windows). Never terminates non-SoundHop PIDs or self.
 pub fn terminate_process(pid: u64) -> bool {
+    terminate_process_impl(pid, false)
+}
+
+/// Force-terminates a verified SoundHop process (`SIGKILL` on Unix,
+/// `TerminateProcess` on Windows). Never terminates non-SoundHop PIDs or self.
+pub fn force_terminate_process(pid: u64) -> bool {
+    terminate_process_impl(pid, true)
+}
+
+fn terminate_process_impl(pid: u64, force: bool) -> bool {
     if !is_soundhop_process(pid) {
         return false;
     }
@@ -389,10 +399,12 @@ pub fn terminate_process(pid: u64) -> bool {
         let Ok(pid_t) = libc::pid_t::try_from(pid) else {
             return false;
         };
-        unsafe { libc::kill(pid_t, libc::SIGTERM) == 0 }
+        let sig = if force { libc::SIGKILL } else { libc::SIGTERM };
+        unsafe { libc::kill(pid_t, sig) == 0 }
     }
     #[cfg(windows)]
     {
+        let _ = force;
         use windows_sys::Win32::Foundation::{CloseHandle, HANDLE};
         use windows_sys::Win32::System::Threading::{
             OpenProcess, TerminateProcess, PROCESS_TERMINATE,
@@ -413,7 +425,7 @@ pub fn terminate_process(pid: u64) -> bool {
     }
     #[cfg(all(not(unix), not(windows)))]
     {
-        let _ = pid;
+        let _ = (pid, force);
         false
     }
 }
@@ -593,5 +605,8 @@ mod tests {
         assert!(!is_soundhop_process(1));
         assert!(!is_process_alive(0));
         assert!(!terminate_process(self_pid));
+        assert!(!force_terminate_process(self_pid));
+        assert!(!force_terminate_process(0));
+        assert!(!force_terminate_process(1));
     }
 }
