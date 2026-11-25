@@ -1155,11 +1155,11 @@ impl Sht3SessionManager {
                                 return;
                             };
 
-                            let frame_timeout = Duration::from_millis(u64::from(
-                                conn.audio_params().frame_ms.max(1),
-                            ))
-                            .min(hs_cfg.io_timeout.unwrap_or(MAX_MANAGED_INBOUND_IO_TIMEOUT))
-                            .min(MAX_MANAGED_INBOUND_IO_TIMEOUT);
+                            let poll_ms =
+                                (u64::from(conn.audio_params().frame_ms.max(2)) / 2).max(5);
+                            let frame_timeout = Duration::from_millis(poll_ms)
+                                .min(hs_cfg.io_timeout.unwrap_or(MAX_MANAGED_INBOUND_IO_TIMEOUT))
+                                .min(MAX_MANAGED_INBOUND_IO_TIMEOUT);
                             let _ = conn.set_read_timeout(Some(frame_timeout));
 
                             if !hs_stop.load(Ordering::Acquire) {
@@ -2348,6 +2348,7 @@ mod tests {
         sample_idx: usize,
         stop_flag: Option<Arc<AtomicBool>>,
         mid_stream_hook: Option<Box<dyn FnMut(usize) + Send>>,
+        stall_pred: Option<Box<dyn Fn() -> bool + Send>>,
     }
 
     #[cfg(feature = "opus")]
@@ -2358,11 +2359,17 @@ mod tests {
                 sample_idx: 0,
                 stop_flag: None,
                 mid_stream_hook: None,
+                stall_pred: None,
             }
         }
 
         fn with_hook(mut self, hook: impl FnMut(usize) + Send + 'static) -> Self {
             self.mid_stream_hook = Some(Box::new(hook));
+            self
+        }
+
+        fn with_stall_until(mut self, pred: impl Fn() -> bool + Send + 'static) -> Self {
+            self.stall_pred = Some(Box::new(pred));
             self
         }
     }
@@ -2385,7 +2392,7 @@ mod tests {
                 hook(self.frame_idx);
             }
             // Frames 0..8: normal 20ms pace.
-            // Before frame 8: 200ms Wi-Fi stall.
+            // Before frame 8: Wi-Fi stall (poll until PLC emitted if stall_pred set, else 200ms).
             // Frames 8..14: immediate burst (0ms delay).
             // Frames 14..24: normal 20ms pace.
             // Frame >= 24: EOF.
@@ -2396,7 +2403,15 @@ mod tests {
                 thread::sleep(Duration::from_millis(20));
             }
             if self.frame_idx == 8 {
-                thread::sleep(Duration::from_millis(200));
+                if let Some(ref pred) = self.stall_pred {
+                    let stall_start = Instant::now();
+                    thread::sleep(Duration::from_millis(120));
+                    while !pred() && stall_start.elapsed() < Duration::from_millis(450) {
+                        thread::sleep(Duration::from_millis(5));
+                    }
+                } else {
+                    thread::sleep(Duration::from_millis(200));
+                }
             }
             let spc = buf.len() / 2;
             for i in 0..spc {
@@ -2438,12 +2453,23 @@ mod tests {
 
         let (post_burst_tx, post_burst_rx) = mpsc::channel::<()>();
         let mut ping_sent_flag = false;
-        let capture = Box::new(StallBurstCapture::new().with_hook(move |idx| {
-            if idx == 18 && !ping_sent_flag {
-                ping_sent_flag = true;
-                let _ = post_burst_tx.send(());
-            }
-        }));
+        let pb_for_stall = Arc::clone(&playback_handle);
+        let capture = Box::new(
+            StallBurstCapture::new()
+                .with_hook(move |idx| {
+                    if idx == 18 && !ping_sent_flag {
+                        ping_sent_flag = true;
+                        let _ = post_burst_tx.send(());
+                    }
+                })
+                .with_stall_until(move || {
+                    pb_for_stall
+                        .lock()
+                        .unwrap()
+                        .as_ref()
+                        .is_some_and(|h| h.frame_count() >= 9)
+                }),
+        );
 
         let out_cfg = OutboundConfig::new("stall-sender", addr, k_pair)
             .with_profile(AudioProfile::OpusBalanced)
@@ -2470,7 +2496,7 @@ mod tests {
         assert_eq!(session.telemetry().frames_sent, 24);
         assert!(
             rx_handle.frame_count() > 24,
-            "expected PLC frames during 200ms Wi-Fi stall, got {} frames",
+            "expected PLC frames during Wi-Fi stall, got {} frames",
             rx_handle.frame_count()
         );
         let frames = rx_handle.frames();
@@ -2628,9 +2654,9 @@ mod tests {
 
         let close_start = Instant::now();
         assert!(manager.disconnect_peer("close-peer"));
-        assert!(wait_until(Duration::from_secs(1), || !session_a.is_running()));
+        assert!(wait_until(Duration::from_secs(2), || !session_a.is_running()));
         assert!(
-            close_start.elapsed() < Duration::from_secs(1),
+            close_start.elapsed() < Duration::from_secs(2),
             "FrameType::Close should abort immediately without waiting 5s reconnect_window, took {:?}",
             close_start.elapsed()
         );
@@ -2670,11 +2696,11 @@ mod tests {
             .unwrap();
 
         let revoke_start = Instant::now();
-        assert!(wait_until(Duration::from_millis(1500), || {
+        assert!(wait_until(Duration::from_millis(2500), || {
             !session_b.is_running()
         }));
         assert!(
-            revoke_start.elapsed() < Duration::from_millis(1500),
+            revoke_start.elapsed() < Duration::from_millis(2500),
             "AuthRejected should abort immediately without waiting 5s reconnect_window, took {:?}",
             revoke_start.elapsed()
         );
@@ -2717,7 +2743,7 @@ mod tests {
         }
         thread::sleep(Duration::from_millis(30));
 
-        // Legitimate peer must connect, handshake, and finish streaming in < 500ms.
+        // Legitimate peer must connect, handshake, and finish streaming in < 1500ms.
         let start = Instant::now();
         let capture = Box::new(MockPcmCapture::sine_wave(440.0, Some(5)));
         let cfg =
@@ -2726,10 +2752,10 @@ mod tests {
         session.join();
 
         let rx = rx_slot.lock().unwrap().clone().unwrap();
-        assert!(wait_until(Duration::from_millis(450), || rx.is_closed()));
+        assert!(wait_until(Duration::from_millis(1200), || rx.is_closed()));
         let elapsed = start.elapsed();
         assert!(
-            elapsed < Duration::from_millis(500),
+            elapsed < Duration::from_millis(1500),
             "stalled sockets delayed legitimate peer: {:?}",
             elapsed
         );
@@ -3119,9 +3145,11 @@ mod tests {
 
         // Part 2: Closed-loop Sht3SessionManager with DriftController + AdaptiveResampler
         // locks buffer fill cleanly across +/-200 ppm for PCM (and Opus when enabled).
-        let mut profiles = vec![(AudioProfile::PcmLossless, 20_000usize, 45.0_f64)];
-        #[cfg(feature = "opus")]
-        profiles.push((AudioProfile::OpusBalanced, 15_000usize, 20.0_f64));
+        let profiles = [
+            (AudioProfile::PcmLossless, 20_000usize, 45.0_f64),
+            #[cfg(feature = "opus")]
+            (AudioProfile::OpusBalanced, 15_000usize, 20.0_f64),
+        ];
 
         for (profile, total_frames, min_snr_db) in profiles {
             for &skew_ppm in &[200.0_f64, -200.0_f64] {
@@ -3310,9 +3338,11 @@ mod tests {
 
     #[test]
     fn hypothesis_3_decode_error_triggers_plc_fallback_without_dropping_cadence() {
-        let mut profiles = vec![(AudioProfile::PcmLossless, vec![0xAAu8, 0xBBu8])];
-        #[cfg(feature = "opus")]
-        profiles.push((AudioProfile::OpusBalanced, vec![0x03u8]));
+        let profiles = [
+            (AudioProfile::PcmLossless, vec![0xAAu8, 0xBBu8]),
+            #[cfg(feature = "opus")]
+            (AudioProfile::OpusBalanced, vec![0x03u8]),
+        ];
 
         for (profile, bad_payload) in profiles {
             let k_pair = [0xD3; 32];

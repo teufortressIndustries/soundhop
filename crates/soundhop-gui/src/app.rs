@@ -207,16 +207,10 @@ impl eframe::App for ControlCenterApp {
         }
         let pal = self.cached_palette;
 
-        let repaint_ms = if snap.audio_active
-            || snap.connected
-            || snap.busy_message.is_some()
-            || !snap.pending_pair_requests.is_empty()
-        {
-            66
-        } else {
-            400
-        };
-        ctx.request_repaint_after(Duration::from_millis(repaint_ms));
+        let minimized = ctx.input(|i| i.viewport().minimized.unwrap_or(false));
+        if !minimized && (snap.audio_active || snap.busy_message.is_some()) {
+            ctx.request_repaint_after(Duration::from_millis(66));
+        }
 
         if snap.show_onboarding {
             if !self.was_showing_onboarding {

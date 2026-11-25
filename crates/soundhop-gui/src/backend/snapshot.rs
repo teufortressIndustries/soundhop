@@ -14,7 +14,7 @@ use soundhop_core::util::{is_own_non_loopback_ip, is_private_address};
 
 use crate::lock_or_recover;
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, PartialEq)]
 pub struct PeerView {
     pub id: String,
     pub name: String,
@@ -49,7 +49,7 @@ impl PeerView {
     }
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct AppStreamView {
     pub app_name: String,
     pub media_name: String,
@@ -669,10 +669,53 @@ impl RefreshUpdate {
         }
     }
 
-    pub(super) fn apply_to(self, guard: &mut GuiSnapshot, onboarding_reopened: bool) {
+    pub(super) fn apply_to(self, guard: &mut GuiSnapshot, onboarding_reopened: bool) -> bool {
+        let mut changed = !guard.hydrated;
         if !guard.hydrated && !onboarding_reopened {
+            changed |= guard.show_onboarding != self.show_onboarding_initial;
             guard.show_onboarding = self.show_onboarding_initial;
         }
+        changed |= guard.daemon_connected != self.daemon_connected
+            || guard.connected != self.connected
+            || guard.multiroom != self.multiroom
+            || guard.connected_peer_id != self.connected_peer_id
+            || guard.connected_name != self.connected_name
+            || guard.connected_host != self.connected_host
+            || guard.connected_port != self.connected_port
+            || guard.connected_duration != self.connected_duration
+            || guard.multiroom_peers.len() != self.multiroom_peers.len()
+            || guard.keep_local != self.keep_local
+            || guard.sharing_enabled != self.sharing_enabled
+            || guard.auto_connect != self.auto_connect
+            || guard.auto_paused != self.auto_paused
+            || guard.volume_level != self.volume_level
+            || guard.volume_muted != self.volume_muted
+            || guard.mic_enabled != self.mic_enabled
+            || guard.mic_direction != self.mic_direction
+            || guard.peers != self.peers
+            || guard.apps != self.apps
+            || guard.audio_active != self.audio_active
+            || (self.audio_active
+                && ((guard.audio_dbfs - self.audio_dbfs).abs() > 0.25
+                    || (guard.audio_peak - self.audio_peak).abs() > 0.01))
+            || guard.rtt_ms != self.rtt_ms
+            || guard.jitter_ms != self.jitter_ms
+            || guard.android_session_active != self.android_session_active
+            || guard.android_session_device != self.android_session_device
+            || guard.listener_security != self.listener_security
+            || guard.paired_peer_count != self.paired_peer_count
+            || guard.trusted_peers.len() != self.trusted_peers.len()
+            || guard.pending_pair_requests.len() != self.pending_pair_requests.len()
+            || guard.audio_profile != self.audio_profile
+            || guard.config.device.name != self.config.device.name
+            || guard.config.ui.theme != self.config.ui.theme
+            || guard.config.sharing.security != self.config.sharing.security
+            || guard.config.sharing.port != self.config.sharing.port
+            || guard.config.discovery.port != self.config.discovery.port
+            || guard.config.discovery.mdns != self.config.discovery.mdns
+            || guard.config.discovery.udp != self.config.discovery.udp
+            || guard.config.routing.default_mode != self.config.routing.default_mode;
+
         guard.hydrated = true;
         guard.daemon_connected = self.daemon_connected;
         guard.config = self.config;
@@ -700,6 +743,7 @@ impl RefreshUpdate {
         guard.rtt_ms = self.rtt_ms;
         guard.jitter_ms = self.jitter_ms;
         if !self.android_history.is_empty() {
+            changed |= guard.android_history.len() != self.android_history.len();
             guard.android_history = self.android_history;
         }
         guard.android_session_active = self.android_session_active;
@@ -709,6 +753,7 @@ impl RefreshUpdate {
         guard.trusted_peers = self.trusted_peers;
         guard.pending_pair_requests = self.pending_pair_requests;
         guard.audio_profile = self.audio_profile;
+        changed
     }
 }
 

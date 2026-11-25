@@ -1677,30 +1677,30 @@ pub fn run_tray(verbose: bool) -> Result<i32, String> {
     let worker_quit_all = Arc::clone(&quit_all_requested);
 
     let worker_handle = std::thread::spawn(move || {
+        const SNAPSHOT_INTERVAL: Duration = Duration::from_secs(4);
         let _ = ui_tx.send(collect_tray_snapshot(&worker_daemon));
-        let mut last_refresh = Instant::now();
+        let mut next_refresh_due = Instant::now() + SNAPSHOT_INTERVAL;
         while worker_running.load(Ordering::Relaxed)
             && !soundhop_core::util::signal_stop_requested()
         {
-            match cmd_rx.recv_timeout(Duration::from_millis(200)) {
+            let wait_dur = next_refresh_due.saturating_duration_since(Instant::now());
+            match cmd_rx.recv_timeout(wait_dur) {
                 Ok(id_str) => {
                     handle_menu_action(&id_str, &worker_daemon, &worker_running, &worker_quit_all);
                     let snap = collect_tray_snapshot(&worker_daemon);
                     let _ = ui_tx.send(snap);
-                    last_refresh = Instant::now();
+                    next_refresh_due = Instant::now() + SNAPSHOT_INTERVAL;
                 }
                 Err(mpsc::RecvTimeoutError::Timeout) => {
-                    if last_refresh.elapsed() >= Duration::from_secs(2) {
-                        let snap = collect_tray_snapshot(&worker_daemon);
-                        if snap.peers.is_empty() {
-                            if let Some(disc) = lock_or_recover(&worker_daemon.discovery).as_ref() {
-                                disc.probe();
-                            }
+                    let snap = collect_tray_snapshot(&worker_daemon);
+                    if snap.peers.is_empty() {
+                        if let Some(disc) = lock_or_recover(&worker_daemon.discovery).as_ref() {
+                            disc.probe();
                         }
-                        let _ = ui_tx.send(snap);
-                        let _ = now_secs();
-                        last_refresh = Instant::now();
                     }
+                    let _ = ui_tx.send(snap);
+                    let _ = now_secs();
+                    next_refresh_due = Instant::now() + SNAPSHOT_INTERVAL;
                 }
                 Err(mpsc::RecvTimeoutError::Disconnected) => break,
             }
@@ -1713,13 +1713,17 @@ pub fn run_tray(verbose: bool) -> Result<i32, String> {
             break;
         }
 
+        let mut had_events = false;
+
         while let Ok(event) = TrayIconEvent::receiver().try_recv() {
+            had_events = true;
             if matches!(event, TrayIconEvent::DoubleClick { .. }) {
                 spawn_self_args(&["--gui-tab", "home"]);
             }
         }
 
         while let Ok(event) = MenuEvent::receiver().try_recv() {
+            had_events = true;
             let id_str = event.id.0;
             if id_str == "quit_tray" {
                 quit_all_requested.store(true, Ordering::SeqCst);
@@ -1738,6 +1742,7 @@ pub fn run_tray(verbose: bool) -> Result<i32, String> {
 
         let mut latest_snap: Option<TrayMenuSnapshot> = None;
         while let Ok(snap) = ui_rx.try_recv() {
+            had_events = true;
             latest_snap = Some(snap);
         }
         if let Some(snap) = latest_snap {
@@ -1756,7 +1761,8 @@ pub fn run_tray(verbose: bool) -> Result<i32, String> {
             }
         }
 
-        std::thread::sleep(Duration::from_millis(30));
+        let sleep_ms = if had_events { 15 } else { 100 };
+        std::thread::sleep(Duration::from_millis(sleep_ms));
     }
 
     running.store(false, Ordering::SeqCst);

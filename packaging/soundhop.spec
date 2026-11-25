@@ -1,5 +1,5 @@
 Name:           soundhop
-Version:        2.6.0
+Version:        2.6.1
 Release:        1%{?dist}
 Summary:        Seamless cross-distro local network audio sharing and multi-room broadcast
 

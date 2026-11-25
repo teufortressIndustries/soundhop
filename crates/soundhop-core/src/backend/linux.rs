@@ -3,6 +3,7 @@
 
 use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
@@ -26,11 +27,46 @@ fn file_sha256(path: &Path) -> Option<[u8; 32]> {
     Some(out)
 }
 
+const INFO_CACHE_TTL: Duration = Duration::from_secs(2);
+const LIST_CACHE_TTL: Duration = Duration::from_millis(750);
+const SUBSCRIBE_FALLBACK_TTL: Duration = Duration::from_secs(15);
+
+struct TtlCache<T> {
+    inner: Mutex<Option<(Instant, T)>>,
+}
+
+impl<T: Clone> TtlCache<T> {
+    fn new() -> Self {
+        Self {
+            inner: Mutex::new(None),
+        }
+    }
+
+    fn get(&self, ttl: Duration) -> Option<T> {
+        let guard = self.inner.lock().unwrap_or_else(|e| e.into_inner());
+        guard
+            .as_ref()
+            .filter(|(ts, _)| ts.elapsed() < ttl)
+            .map(|(_, val)| val.clone())
+    }
+
+    fn set(&self, val: T) {
+        *self.inner.lock().unwrap_or_else(|e| e.into_inner()) = Some((Instant::now(), val));
+    }
+
+    fn clear(&self) {
+        *self.inner.lock().unwrap_or_else(|e| e.into_inner()) = None;
+    }
+}
+
 pub struct LinuxAudioBackend {
     pub pactl: String,
     runner: Arc<dyn ProcessRunner>,
     sleep_fn: Arc<dyn Fn(Duration) + Send + Sync>,
-    info_cache: Mutex<Option<HashMap<String, String>>>,
+    info_cache: TtlCache<HashMap<String, String>>,
+    sinks_cache: TtlCache<Vec<Sink>>,
+    modules_cache: TtlCache<Vec<Module>>,
+    subscribe_active: AtomicBool,
     remote_prev_default_sources: Mutex<HashMap<String, String>>,
     loaded_cookie_hash: Mutex<Option<[u8; 32]>>,
     cookie_path_override: Option<PathBuf>,
@@ -48,7 +84,10 @@ impl LinuxAudioBackend {
             pactl: "pactl".to_string(),
             runner: Arc::new(SystemRunner),
             sleep_fn: Arc::new(std::thread::sleep),
-            info_cache: Mutex::new(None),
+            info_cache: TtlCache::new(),
+            sinks_cache: TtlCache::new(),
+            modules_cache: TtlCache::new(),
+            subscribe_active: AtomicBool::new(false),
             remote_prev_default_sources: Mutex::new(HashMap::new()),
             loaded_cookie_hash: Mutex::new(None),
             cookie_path_override: None,
@@ -60,7 +99,10 @@ impl LinuxAudioBackend {
             pactl: "pactl".to_string(),
             runner,
             sleep_fn: Arc::new(|_| {}),
-            info_cache: Mutex::new(None),
+            info_cache: TtlCache::new(),
+            sinks_cache: TtlCache::new(),
+            modules_cache: TtlCache::new(),
+            subscribe_active: AtomicBool::new(false),
             remote_prev_default_sources: Mutex::new(HashMap::new()),
             loaded_cookie_hash: Mutex::new(None),
             cookie_path_override: None,
@@ -76,10 +118,29 @@ impl LinuxAudioBackend {
             pactl: "pactl".to_string(),
             runner,
             sleep_fn: Arc::new(|_| {}),
-            info_cache: Mutex::new(None),
+            info_cache: TtlCache::new(),
+            sinks_cache: TtlCache::new(),
+            modules_cache: TtlCache::new(),
+            subscribe_active: AtomicBool::new(false),
             remote_prev_default_sources: Mutex::new(HashMap::new()),
             loaded_cookie_hash: Mutex::new(None),
             cookie_path_override: Some(cookie_path),
+        }
+    }
+
+    fn info_cache_ttl(&self) -> Duration {
+        if self.subscribe_active.load(Ordering::Acquire) {
+            SUBSCRIBE_FALLBACK_TTL
+        } else {
+            INFO_CACHE_TTL
+        }
+    }
+
+    fn list_cache_ttl(&self) -> Duration {
+        if self.subscribe_active.load(Ordering::Acquire) {
+            SUBSCRIBE_FALLBACK_TTL
+        } else {
+            LIST_CACHE_TTL
         }
     }
 
@@ -123,12 +184,7 @@ impl LinuxAudioBackend {
 
     pub fn info(&self, refresh: bool) -> Result<HashMap<String, String>, BackendError> {
         if !refresh {
-            if let Some(cached) = self
-                .info_cache
-                .lock()
-                .unwrap_or_else(|e| e.into_inner())
-                .clone()
-            {
+            if let Some(cached) = self.info_cache.get(self.info_cache_ttl()) {
                 return Ok(cached);
             }
         }
@@ -139,7 +195,7 @@ impl LinuxAudioBackend {
                 map.insert(k.trim().to_string(), v.trim().to_string());
             }
         }
-        *self.info_cache.lock().unwrap_or_else(|e| e.into_inner()) = Some(map.clone());
+        self.info_cache.set(map.clone());
         Ok(map)
     }
 
@@ -168,6 +224,7 @@ impl LinuxAudioBackend {
     fn wait_for_sink(&self, name: &str, timeout_secs: f64) -> bool {
         let deadline = Instant::now() + Duration::from_secs_f64(timeout_secs);
         loop {
+            self.sinks_cache.clear();
             if self.sink_exists(name).unwrap_or(false) {
                 return true;
             }
@@ -181,6 +238,7 @@ impl LinuxAudioBackend {
     fn wait_for_sink_gone(&self, name: &str, timeout_secs: f64) -> bool {
         let deadline = Instant::now() + Duration::from_secs_f64(timeout_secs);
         loop {
+            self.sinks_cache.clear();
             if !self.sink_exists(name).unwrap_or(false) {
                 return true;
             }
@@ -279,13 +337,27 @@ impl AudioBackend for LinuxAudioBackend {
         if !self.runner.command_exists(&self.pactl) {
             return false;
         }
-        self.pactl_call(&["info"], false)
-            .map(|r| r.ok())
-            .unwrap_or(false)
+        self.info(false).is_ok()
     }
 
     fn invalidate(&self) {
-        *self.info_cache.lock().unwrap_or_else(|e| e.into_inner()) = None;
+        self.info_cache.clear();
+        self.sinks_cache.clear();
+        self.modules_cache.clear();
+    }
+
+    fn set_subscribe_active(&self, active: bool) {
+        self.subscribe_active.store(active, Ordering::Release);
+        if !active {
+            self.invalidate();
+        }
+    }
+
+    fn invalidate_on_event(&self, line: &str) {
+        let lower = line.to_lowercase();
+        if lower.contains("on sink") || lower.contains("on module") || lower.contains("on server") {
+            self.invalidate();
+        }
     }
 
     fn server_name(&self) -> Result<String, BackendError> {
@@ -327,6 +399,9 @@ impl AudioBackend for LinuxAudioBackend {
     }
 
     fn modules(&self) -> Result<Vec<Module>, BackendError> {
+        if let Some(cached) = self.modules_cache.get(self.list_cache_ttl()) {
+            return Ok(cached);
+        }
         let res = self.pactl_call(&["list", "short", "modules"], true)?;
         let mut out = Vec::new();
         for line in res.stdout.lines() {
@@ -346,10 +421,14 @@ impl AudioBackend for LinuxAudioBackend {
                     .unwrap_or_default(),
             });
         }
+        self.modules_cache.set(out.clone());
         Ok(out)
     }
 
     fn sinks(&self) -> Result<Vec<Sink>, BackendError> {
+        if let Some(cached) = self.sinks_cache.get(self.list_cache_ttl()) {
+            return Ok(cached);
+        }
         let res = self.pactl_call(&["list", "short", "sinks"], true)?;
         let mut out = Vec::new();
         for line in res.stdout.lines() {
@@ -377,6 +456,7 @@ impl AudioBackend for LinuxAudioBackend {
                     .unwrap_or_default(),
             });
         }
+        self.sinks_cache.set(out.clone());
         Ok(out)
     }
 
@@ -581,6 +661,7 @@ impl AudioBackend for LinuxAudioBackend {
         let text = res.stdout.trim();
         for token in text.split_whitespace() {
             if let Ok(id) = token.parse::<u32>() {
+                self.invalidate();
                 return Ok(id);
             }
         }
@@ -603,6 +684,7 @@ impl AudioBackend for LinuxAudioBackend {
                 msg
             }));
         }
+        self.invalidate();
         Ok(true)
     }
 
@@ -684,6 +766,9 @@ impl AudioBackend for LinuxAudioBackend {
                 }
             }
         }
+        if moved > 0 {
+            self.invalidate();
+        }
         Ok(moved)
     }
 
@@ -728,6 +813,9 @@ impl AudioBackend for LinuxAudioBackend {
                 }
             }
         }
+        if moved > 0 {
+            self.invalidate();
+        }
         Ok(moved)
     }
 
@@ -758,6 +846,9 @@ impl AudioBackend for LinuxAudioBackend {
                     }
                 }
             }
+        }
+        if moved > 0 {
+            self.invalidate();
         }
         Ok(moved)
     }
@@ -860,6 +951,7 @@ impl AudioBackend for LinuxAudioBackend {
     }
 
     fn connect_tunnel(&self, params: &TunnelParams<'_>) -> Result<u32, BackendError> {
+        self.invalidate();
         let sink_name = sanitize_sink_name(params.sink_name, 64);
         if self.sink(&sink_name)?.is_some() {
             if let Some(mod_entry) = self.module_for_sink(&sink_name)? {
@@ -961,6 +1053,7 @@ impl AudioBackend for LinuxAudioBackend {
     }
 
     fn connect_tunnel_source(&self, params: &SourceTunnelParams<'_>) -> Result<u32, BackendError> {
+        self.invalidate();
         let source_name = sanitize_sink_name(params.source_name, 64);
         if self.source(&source_name)?.is_some() {
             if let Some(m) = self.module_for_source(&source_name)? {
@@ -1269,6 +1362,7 @@ impl AudioBackend for LinuxAudioBackend {
     fn set_sink_volume(&self, sink_name: &str, volume_percent: u32) {
         let vol = volume_percent.min(150);
         let _ = self.pactl_call(&["set-sink-volume", sink_name, &format!("{vol}%")], false);
+        self.invalidate();
     }
 
     fn get_sink_mute(&self, sink_name: &str) -> bool {
@@ -1283,6 +1377,7 @@ impl AudioBackend for LinuxAudioBackend {
     fn set_sink_mute(&self, sink_name: &str, mute: bool) {
         let val = if mute { "1" } else { "0" };
         let _ = self.pactl_call(&["set-sink-mute", sink_name, val], false);
+        self.invalidate();
     }
 
     fn remote_set_volume(&self, host: &str, port: u16, volume_percent: u32, mute: Option<bool>) {
@@ -2056,5 +2151,96 @@ mod tests {
             .expect("module-tunnel-sink load call");
         let expected_arg = format!("cookie={}", cookie_file.display());
         assert!(tunnel_call.iter().any(|a| a == &expected_arg));
+    }
+
+    #[test]
+    fn test_subscribe_driven_cache_invalidation_and_ttl() {
+        use std::sync::atomic::AtomicUsize;
+
+        let info_calls = Arc::new(AtomicUsize::new(0));
+        let sinks_calls = Arc::new(AtomicUsize::new(0));
+        let modules_calls = Arc::new(AtomicUsize::new(0));
+        let ic = Arc::clone(&info_calls);
+        let sc = Arc::clone(&sinks_calls);
+        let mc = Arc::clone(&modules_calls);
+
+        let runner = Arc::new(MockRunner::new(move |args, _env| {
+            let joined = args.join(" ");
+            let stdout = if joined.contains("list short sinks") {
+                sc.fetch_add(1, Ordering::Relaxed);
+                "1\talsa_output.pci\tPipeWire\ts16le 2ch 48000Hz\tRUNNING\n"
+            } else if joined.contains("list short modules") {
+                mc.fetch_add(1, Ordering::Relaxed);
+                "10\tmodule-null-sink\tsink_name=test\n"
+            } else if joined.ends_with(" info") {
+                ic.fetch_add(1, Ordering::Relaxed);
+                "Server Name: PulseAudio (on PipeWire 1.0.0)\nDefault Sink: alsa_output.pci\n"
+            } else {
+                ""
+            };
+            Ok(CommandResult {
+                args: args.to_vec(),
+                returncode: 0,
+                stdout: stdout.to_string(),
+                stderr: String::new(),
+            })
+        }));
+
+        let backend = LinuxAudioBackend::with_runner(runner);
+        assert_eq!(backend.info_cache_ttl(), INFO_CACHE_TTL);
+        assert_eq!(backend.list_cache_ttl(), LIST_CACHE_TTL);
+
+        // Enable subscribe mode -> longer fallback TTL.
+        backend.set_subscribe_active(true);
+        assert_eq!(backend.info_cache_ttl(), SUBSCRIBE_FALLBACK_TTL);
+        assert_eq!(backend.list_cache_ttl(), SUBSCRIBE_FALLBACK_TTL);
+
+        // Populate all three caches.
+        backend.info(false).unwrap();
+        backend.sinks().unwrap();
+        backend.modules().unwrap();
+        assert_eq!(info_calls.load(Ordering::Relaxed), 1);
+        assert_eq!(sinks_calls.load(Ordering::Relaxed), 1);
+        assert_eq!(modules_calls.load(Ordering::Relaxed), 1);
+
+        // Cached reads should not invoke pactl.
+        backend.info(false).unwrap();
+        backend.sinks().unwrap();
+        backend.modules().unwrap();
+        assert_eq!(info_calls.load(Ordering::Relaxed), 1);
+        assert_eq!(sinks_calls.load(Ordering::Relaxed), 1);
+        assert_eq!(modules_calls.load(Ordering::Relaxed), 1);
+
+        // Unrelated subscribe event should NOT invalidate caches.
+        backend.invalidate_on_event("Event 'change' on client #42");
+        backend.info(false).unwrap();
+        backend.sinks().unwrap();
+        backend.modules().unwrap();
+        assert_eq!(info_calls.load(Ordering::Relaxed), 1);
+        assert_eq!(sinks_calls.load(Ordering::Relaxed), 1);
+        assert_eq!(modules_calls.load(Ordering::Relaxed), 1);
+
+        // Relevant events (`on sink`, `on sink-input`, `on module`, `on server`) invalidate immediately.
+        for event in [
+            "Event 'new' on sink #3",
+            "Event 'change' on sink-input #7",
+            "Event 'remove' on module #10",
+            "Event 'change' on server #0",
+        ] {
+            backend.invalidate_on_event(event);
+            backend.info(false).unwrap();
+            backend.sinks().unwrap();
+            backend.modules().unwrap();
+        }
+        assert_eq!(info_calls.load(Ordering::Relaxed), 5);
+        assert_eq!(sinks_calls.load(Ordering::Relaxed), 5);
+        assert_eq!(modules_calls.load(Ordering::Relaxed), 5);
+
+        // Disabling subscribe mode restores short TTLs and invalidates caches.
+        backend.set_subscribe_active(false);
+        assert_eq!(backend.info_cache_ttl(), INFO_CACHE_TTL);
+        assert_eq!(backend.list_cache_ttl(), LIST_CACHE_TTL);
+        backend.info(false).unwrap();
+        assert_eq!(info_calls.load(Ordering::Relaxed), 6);
     }
 }

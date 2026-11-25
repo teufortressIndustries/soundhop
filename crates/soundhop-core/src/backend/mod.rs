@@ -146,6 +146,8 @@ pub struct SourceTunnelParams<'a> {
 pub trait AudioBackend: Send + Sync {
     fn available(&self) -> bool;
     fn invalidate(&self);
+    fn set_subscribe_active(&self, _active: bool) {}
+    fn invalidate_on_event(&self, _line: &str) {}
     fn server_name(&self) -> Result<String, BackendError>;
     fn server_version(&self) -> Result<String, BackendError>;
     fn server_label(&self) -> Result<String, BackendError> {

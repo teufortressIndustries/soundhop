@@ -46,6 +46,7 @@ pub(crate) struct AndroidReconnectTarget {
 #[derive(Debug)]
 pub(crate) struct AndroidSupervisorState {
     pub attempted_usb_switches: HashSet<String>,
+    pub last_usb_scan: Option<Instant>,
     pub was_active: bool,
     pub last_session: Option<AndroidReconnectTarget>,
     pub reconnect_attempts: u32,
@@ -58,6 +59,7 @@ impl Default for AndroidSupervisorState {
     fn default() -> Self {
         Self {
             attempted_usb_switches: HashSet::new(),
+            last_usb_scan: None,
             was_active: false,
             last_session: None,
             reconnect_attempts: 0,
@@ -561,61 +563,70 @@ impl Daemon {
         let cfg = lock_or_recover(&self.controller.config).clone();
 
         // 1. Auto-switch newly connected USB Android devices to ADB TCP/IP Wi-Fi mode.
+        const ANDROID_USB_SCAN_INTERVAL: Duration = Duration::from_secs(8);
         if cfg.android.auto_switch_wifi {
-            let devices = self.controller.android_manager.list_devices();
-            let live_serials: HashSet<&str> = devices.iter().map(|d| d.serial.as_str()).collect();
-            tracker
-                .attempted_usb_switches
-                .retain(|s| live_serials.contains(s.as_str()));
+            if tracker
+                .last_usb_scan
+                .is_none_or(|t| t.elapsed() >= ANDROID_USB_SCAN_INTERVAL)
+            {
+                tracker.last_usb_scan = Some(Instant::now());
+                let devices = self.controller.android_manager.list_devices();
+                let live_serials: HashSet<&str> =
+                    devices.iter().map(|d| d.serial.as_str()).collect();
+                tracker
+                    .attempted_usb_switches
+                    .retain(|s| live_serials.contains(s.as_str()));
 
-            for dev in &devices {
-                if dev.is_wifi || !dev.is_ready() {
-                    continue;
-                }
-                if tracker.attempted_usb_switches.contains(&dev.serial) {
-                    continue;
-                }
-                tracker.attempted_usb_switches.insert(dev.serial.clone());
-                match self
-                    .controller
-                    .android_manager
-                    .auto_switch_usb_to_wifi(dev, true, 5555)
-                {
-                    Ok(Some(outcome)) => {
-                        let now = now_secs();
-                        {
-                            let mut st = lock_or_recover(&self.controller.state);
-                            st.remember_android_device(
-                                &outcome.wifi_serial,
-                                &outcome.model,
-                                &outcome.manufacturer,
-                                &outcome.ip,
-                                outcome.port,
-                                true,
-                                true,
-                                Some(now),
+                for dev in &devices {
+                    if dev.is_wifi || !dev.is_ready() {
+                        continue;
+                    }
+                    if tracker.attempted_usb_switches.contains(&dev.serial) {
+                        continue;
+                    }
+                    tracker.attempted_usb_switches.insert(dev.serial.clone());
+                    match self
+                        .controller
+                        .android_manager
+                        .auto_switch_usb_to_wifi(dev, true, 5555)
+                    {
+                        Ok(Some(outcome)) => {
+                            let now = now_secs();
+                            {
+                                let mut st = lock_or_recover(&self.controller.state);
+                                st.remember_android_device(
+                                    &outcome.wifi_serial,
+                                    &outcome.model,
+                                    &outcome.manufacturer,
+                                    &outcome.ip,
+                                    outcome.port,
+                                    true,
+                                    true,
+                                    Some(now),
+                                );
+                            }
+                            self.controller.save();
+                            crate::util::append_log_line(
+                                "INFO",
+                                &format!(
+                                    "Auto-switched Android USB device {} to Wi-Fi {}",
+                                    outcome.usb_serial, outcome.wifi_serial
+                                ),
                             );
                         }
-                        self.controller.save();
-                        crate::util::append_log_line(
-                            "INFO",
-                            &format!(
-                                "Auto-switched Android USB device {} to Wi-Fi {}",
-                                outcome.usb_serial, outcome.wifi_serial
-                            ),
-                        );
-                    }
-                    Ok(None) => {}
-                    Err(err) => {
-                        crate::util::append_log_line(
-                            "WARN",
-                            &format!("Auto Wi-Fi switch skipped for {}: {err}", dev.serial),
-                        );
+                        Ok(None) => {}
+                        Err(err) => {
+                            crate::util::append_log_line(
+                                "WARN",
+                                &format!("Auto Wi-Fi switch skipped for {}: {err}", dev.serial),
+                            );
+                        }
                     }
                 }
             }
         } else {
             tracker.attempted_usb_switches.clear();
+            tracker.last_usb_scan = None;
         }
 
         // 2. Bounded auto-reconnect on Android audio session drop.
@@ -833,6 +844,7 @@ impl Daemon {
 
     fn audio_monitor_loop(&self) {
         if !command_exists("pactl") {
+            self.controller.backend.set_subscribe_active(false);
             while !self.should_stop() {
                 if lock_or_recover(&self.controller.state).is_connected() {
                     let _ = self.controller.sync_remote_volume();
@@ -878,6 +890,7 @@ impl Daemon {
             }
 
             if let Some(stdout) = stdout_opt {
+                self.controller.backend.set_subscribe_active(true);
                 let reader = BufReader::new(stdout);
                 let mut last_app_sync: Option<Instant> = None;
                 let mut last_vol_sync: Option<Instant> = None;
@@ -885,6 +898,7 @@ impl Daemon {
                     if self.should_stop() {
                         break;
                     }
+                    self.controller.backend.invalidate_on_event(&line);
                     let lower = line.to_lowercase();
                     if lower.contains("on sink-input") {
                         if last_app_sync.is_none_or(|t| t.elapsed() >= Duration::from_millis(150)) {
@@ -898,6 +912,7 @@ impl Daemon {
                         last_vol_sync = Some(Instant::now());
                     }
                 }
+                self.controller.backend.set_subscribe_active(false);
             }
 
             if let Some(mut child) = lock_or_recover(&self.audio_monitor_child).take() {

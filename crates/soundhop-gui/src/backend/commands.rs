@@ -162,7 +162,9 @@ impl WorkerState {
 
     pub(super) fn handle_command(&mut self, cmd: GuiCommand) {
         match cmd {
-            GuiCommand::RefreshFast => self.refresh_fast(true),
+            GuiCommand::RefreshFast => {
+                let _ = self.refresh_fast(true);
+            }
             GuiCommand::RefreshPeers => {
                 self.refresh_peers();
                 self.refresh_fast(true);
@@ -510,10 +512,12 @@ impl WorkerState {
                 .map_err(|e| e.to_string())
         };
         match res {
-            Ok(_) => self.refresh_fast(true),
+            Ok(_) => {
+                let _ = self.refresh_fast(true);
+            }
             Err(e) => {
                 self.push_toast(e, true);
-                self.refresh_fast(true);
+                let _ = self.refresh_fast(true);
             }
         }
     }

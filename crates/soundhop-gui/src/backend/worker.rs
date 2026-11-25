@@ -173,10 +173,10 @@ impl WorkerState {
             .unwrap_or(false);
     }
 
-    pub(super) fn refresh_fast(&mut self, allow_during_command: bool) {
+    pub(super) fn refresh_fast(&mut self, allow_during_command: bool) -> bool {
         let seq_before = self.mutation_seq.load(Ordering::SeqCst);
         if !allow_during_command && self.active_commands.load(Ordering::SeqCst) > 0 {
-            return;
+            return false;
         }
 
         let daemon_up = self.use_ipc && ipc_is_running(None);
@@ -243,11 +243,11 @@ impl WorkerState {
                 if self.active_commands.load(Ordering::SeqCst) > 0
                     || self.mutation_seq.load(Ordering::SeqCst) != seq_before
                 {
-                    return;
+                    return false;
                 }
                 match self.controller_sync_lock.try_lock() {
                     Ok(g) => Some(g),
-                    Err(_) => return,
+                    Err(_) => return false,
                 }
             };
 
@@ -290,11 +290,11 @@ impl WorkerState {
             && (self.active_commands.load(Ordering::SeqCst) > 0
                 || self.mutation_seq.load(Ordering::SeqCst) != seq_before)
         {
-            return;
+            return false;
         }
 
         let mut guard = write_or_recover(&self.snapshot);
-        update.apply_to(&mut guard, self.onboarding_reopened.load(Ordering::Relaxed));
+        update.apply_to(&mut guard, self.onboarding_reopened.load(Ordering::Relaxed))
     }
 
     pub(super) fn handle_android_install_tools(&mut self) {

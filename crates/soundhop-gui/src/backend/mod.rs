@@ -124,17 +124,22 @@ impl GuiBackend {
             poller_worker.refresh_system();
             poller_worker.request_repaint();
 
-            let mut last_fast = Instant::now();
-            let mut last_peers = Instant::now();
+            let mut next_fast_due = Instant::now() + Duration::from_millis(3000);
+            let mut next_peers_due = Instant::now() + Duration::from_secs(6);
 
             while !stop_poller.load(Ordering::Relaxed)
                 && !soundhop_core::util::signal_stop_requested()
                 && !quit_poller.load(Ordering::Acquire)
             {
-                let (lock, cvar) = &*wake_poller;
-                let guard = lock_or_recover(lock);
-                if !*guard {
-                    let _ = cvar.wait_timeout(guard, Duration::from_millis(50));
+                let now = Instant::now();
+                let next_due = next_fast_due.min(next_peers_due);
+                if now < next_due {
+                    let wait_dur = next_due.saturating_duration_since(now);
+                    let (lock, cvar) = &*wake_poller;
+                    let guard = lock_or_recover(lock);
+                    if !*guard {
+                        let _ = cvar.wait_timeout(guard, wait_dur);
+                    }
                 }
                 if soundhop_core::util::signal_stop_requested()
                     || quit_poller.load(Ordering::Acquire)
@@ -153,23 +158,35 @@ impl GuiBackend {
                     telemetry_monitor = None;
                 }
 
-                if last_fast.elapsed() >= Duration::from_millis(650) {
+                let mut changed = false;
+                if Instant::now() >= next_fast_due {
                     if telemetry_monitor.is_none()
                         && controller.is_save_enabled()
                         && !soundhop_core::ipc::is_running(None)
                     {
                         telemetry_monitor = Some(controller.start_telemetry_monitor());
                     }
-                    poller_worker.refresh_fast(false);
-                    poller_worker.request_repaint();
-                    last_fast = Instant::now();
+                    changed |= poller_worker.refresh_fast(false);
+                    let active = {
+                        let snap = read_or_recover(&poller_worker.snapshot);
+                        snap.connected || snap.audio_active || snap.busy_message.is_some()
+                    };
+                    let fast_interval = if active {
+                        Duration::from_millis(1500)
+                    } else {
+                        Duration::from_millis(3000)
+                    };
+                    next_fast_due = Instant::now() + fast_interval;
                 }
 
-                if last_peers.elapsed() >= Duration::from_secs(3) {
+                if Instant::now() >= next_peers_due {
                     poller_worker.refresh_peers();
-                    poller_worker.refresh_fast(false);
+                    changed |= poller_worker.refresh_fast(false);
+                    next_peers_due = Instant::now() + Duration::from_secs(6);
+                }
+
+                if changed {
                     poller_worker.request_repaint();
-                    last_peers = Instant::now();
                 }
             }
 

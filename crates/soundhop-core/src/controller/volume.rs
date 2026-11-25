@@ -32,8 +32,12 @@ impl Controller {
                 .remote_set_volume(&st.connected_host, st.connected_port, vol, Some(mute));
         }
     }
-    pub(super) fn status_volume_json(&self, st: &State) -> serde_json::Value {
-        if !self.backend.available() {
+    pub(super) fn status_volume_json(
+        &self,
+        st: &State,
+        backend_available: bool,
+    ) -> serde_json::Value {
+        if !backend_available {
             return serde_json::Value::Null;
         }
         let active_sink = if !st.connected_sink.is_empty() {

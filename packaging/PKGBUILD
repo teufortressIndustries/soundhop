@@ -1,6 +1,6 @@
 # Maintainer: SoundHop Contributors <https://github.com/teufortressIndustries/soundhop>
 pkgname=soundhop
-pkgver=2.6.0
+pkgver=2.6.1
 pkgrel=1
 pkgdesc="Seamless cross-distro local network audio sharing, multi-room broadcast, and Android bridge"
 arch=('x86_64' 'aarch64')

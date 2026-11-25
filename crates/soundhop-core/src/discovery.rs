@@ -142,7 +142,7 @@ impl PeerStore {
             return false;
         }
         let changed = {
-            let mut map = self.peers.write().unwrap();
+            let mut map = self.peers.write().unwrap_or_else(|e| e.into_inner());
             let prev = map.get(&peer.id);
             if let Some(p) = prev {
                 if matches!(p.security.as_str(), "psk" | "pin" | "paired") && peer.source == "mdns"
@@ -182,7 +182,12 @@ impl PeerStore {
     }
 
     pub fn remove(&self, peer_id: &str) {
-        let existed = self.peers.write().unwrap().remove(peer_id).is_some();
+        let existed = self
+            .peers
+            .write()
+            .unwrap_or_else(|e| e.into_inner())
+            .remove(peer_id)
+            .is_some();
         self.v3_meta
             .write()
             .unwrap_or_else(|e| e.into_inner())
@@ -195,14 +200,24 @@ impl PeerStore {
     }
 
     pub fn get(&self, peer_id: &str) -> Option<Peer> {
-        self.peers.read().unwrap().get(peer_id).cloned()
+        self.peers
+            .read()
+            .unwrap_or_else(|e| e.into_inner())
+            .get(peer_id)
+            .cloned()
     }
 
     pub fn snapshot(&self, prune: bool) -> Vec<Peer> {
         if prune {
             self.prune();
         }
-        let mut list: Vec<Peer> = self.peers.read().unwrap().values().cloned().collect();
+        let mut list: Vec<Peer> = self
+            .peers
+            .read()
+            .unwrap_or_else(|e| e.into_inner())
+            .values()
+            .cloned()
+            .collect();
         list.sort_by(|a, b| {
             b.compatible().cmp(&a.compatible()).then_with(|| {
                 a.display_name()
@@ -216,7 +231,7 @@ impl PeerStore {
     pub fn prune(&self) -> Vec<String> {
         let cutoff = now_secs() - self.timeout_secs;
         let stale: Vec<String> = {
-            let mut map = self.peers.write().unwrap();
+            let mut map = self.peers.write().unwrap_or_else(|e| e.into_inner());
             let keys: Vec<String> = map
                 .iter()
                 .filter(|(_, p)| p.last_seen < cutoff)

@@ -385,4 +385,62 @@ mod tests {
         let _ = done_tx.send(());
         client_handle.join().unwrap();
     }
+
+    #[test]
+    fn set_read_timeout_updates_live_server_connection_timeout() {
+        let k_pair = [0x4E; 32];
+        let trust = Arc::new(InMemoryTrustStore::new());
+        trust.insert("timeout-client", k_pair);
+
+        let mut server_cfg = Sht3ServerConfig::new("live-timeout-server");
+        server_cfg.io_timeout = Some(Duration::from_secs(2));
+
+        let listener = Sht3Listener::bind(
+            "127.0.0.1:0".parse().unwrap(),
+            server_cfg.clone(),
+            Arc::clone(&trust) as Arc<dyn TrustLookup>,
+        )
+        .unwrap();
+        let addr = listener.local_addr().unwrap();
+
+        let (done_tx, done_rx) = mpsc::channel::<()>();
+        let client_handle = thread::spawn(move || {
+            let cfg = Sht3ClientConfig::new(
+                "timeout-client",
+                AudioProfile::PcmLossless.to_audio_params(40),
+            );
+            let _conn = Sht3ClientConnection::connect(addr, cfg, &k_pair).unwrap();
+            let _ = done_rx.recv();
+        });
+
+        let (raw_stream, _peer) = listener.accept_raw().unwrap();
+        let mut server_conn =
+            Sht3Listener::handshake_arc(raw_stream, &server_cfg, &*trust).unwrap();
+        server_conn
+            .set_read_timeout(Some(Duration::from_millis(25)))
+            .unwrap();
+
+        let start = Instant::now();
+        let err = server_conn
+            .recv_frame()
+            .expect_err("updated live read timeout should fire promptly on idle client");
+        let elapsed = start.elapsed();
+
+        assert!(
+            matches!(
+                err,
+                TransportError::Io(ref e)
+                    if matches!(e.kind(), ErrorKind::WouldBlock | ErrorKind::TimedOut)
+            ),
+            "expected WouldBlock | TimedOut after set_read_timeout, got: {err:?}"
+        );
+        assert!(
+            elapsed < Duration::from_millis(400),
+            "expected <400ms live read timeout, got {:?}",
+            elapsed
+        );
+
+        let _ = done_tx.send(());
+        client_handle.join().unwrap();
+    }
 }

@@ -78,6 +78,18 @@ impl Default for ConnectOptions {
     }
 }
 
+#[derive(Default)]
+pub(super) struct DiskFileMtimes {
+    config: Option<(std::time::SystemTime, u64)>,
+    state: Option<(std::time::SystemTime, u64)>,
+}
+
+fn file_stamp(path: &std::path::Path) -> Option<(std::time::SystemTime, u64)> {
+    let meta = std::fs::metadata(path).ok()?;
+    let modified = meta.modified().ok()?;
+    Some((modified, meta.len()))
+}
+
 pub struct Controller {
     pub config: Mutex<Config>,
     pub state: Mutex<State>,
@@ -102,6 +114,7 @@ pub struct Controller {
     pub(super) notify_enabled: bool,
     pub(super) save_enabled: Mutex<bool>,
     pub(super) connect_lock: Mutex<()>,
+    pub(super) file_mtimes: Mutex<DiskFileMtimes>,
 }
 
 impl Controller {
@@ -125,6 +138,10 @@ impl Controller {
             Arc::clone(&mgr),
             Arc::clone(&be),
         ));
+        let initial_mtimes = DiskFileMtimes {
+            config: file_stamp(&config_path.clone().unwrap_or_else(crate::util::config_path)),
+            state: file_stamp(&state_path.clone().unwrap_or_else(crate::util::state_path)),
+        };
         Self {
             config: Mutex::new(cfg),
             state: Mutex::new(st),
@@ -147,6 +164,7 @@ impl Controller {
             notify_enabled,
             save_enabled: Mutex::new(true),
             connect_lock: Mutex::new(()),
+            file_mtimes: Mutex::new(initial_mtimes),
         }
     }
 
@@ -298,9 +316,34 @@ impl Controller {
         let Ok(_op_guard) = self.connect_lock.try_lock() else {
             return;
         };
-        if let Ok(disk_cfg) = Config::load(self.config_path.as_deref()) {
-            *lock_or_recover(&self.config) = disk_cfg;
+        let cfg_path = self
+            .config_path
+            .clone()
+            .unwrap_or_else(crate::util::config_path);
+        let st_path = self
+            .state_path
+            .clone()
+            .unwrap_or_else(crate::util::state_path);
+        let cfg_stamp = file_stamp(&cfg_path);
+        let st_stamp = file_stamp(&st_path);
+        let (cfg_changed, st_changed) = {
+            let mtimes = lock_or_recover(&self.file_mtimes);
+            (cfg_stamp != mtimes.config, st_stamp != mtimes.state)
+        };
+        if !cfg_changed && !st_changed {
+            return;
         }
+
+        if cfg_changed {
+            if let Ok(disk_cfg) = Config::load(self.config_path.as_deref()) {
+                *lock_or_recover(&self.config) = disk_cfg;
+            }
+            lock_or_recover(&self.file_mtimes).config = cfg_stamp;
+        }
+        if !st_changed {
+            return;
+        }
+        lock_or_recover(&self.file_mtimes).state = st_stamp;
         let Ok(mut disk_state) = State::try_load(self.state_path.as_deref()) else {
             return;
         };
@@ -355,6 +398,17 @@ impl Controller {
         }
         let _ = lock_or_recover(&self.config).save(self.config_path.as_deref());
         let _ = lock_or_recover(&self.state).save(self.state_path.as_deref());
+        let cfg_path = self
+            .config_path
+            .clone()
+            .unwrap_or_else(crate::util::config_path);
+        let st_path = self
+            .state_path
+            .clone()
+            .unwrap_or_else(crate::util::state_path);
+        let mut mtimes = lock_or_recover(&self.file_mtimes);
+        mtimes.config = file_stamp(&cfg_path);
+        mtimes.state = file_stamp(&st_path);
     }
 
     pub fn reload_config(&self) -> Result<Config, ControllerError> {
@@ -420,7 +474,8 @@ impl Controller {
                 .unwrap_or(std::cmp::Ordering::Equal)
         });
 
-        let backend_json = if self.backend.available() {
+        let backend_available = self.backend.available();
+        let backend_json = if backend_available {
             let sinks_json: Vec<serde_json::Value> = self
                 .backend
                 .sinks()
@@ -500,7 +555,7 @@ impl Controller {
             serde_json::Value::Null
         };
 
-        let volume_json = self.status_volume_json(&st);
+        let volume_json = self.status_volume_json(&st, backend_available);
 
         let peers_json: Vec<serde_json::Value> =
             peers.unwrap_or(&[]).iter().map(|p| p.to_json()).collect();
