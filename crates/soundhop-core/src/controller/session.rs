@@ -22,6 +22,7 @@ use super::{ConnectOptions, Controller, ControllerError};
 /// Parse `config.audio.profile` into an [`AudioProfile`], defaulting to [`AudioProfile::OpusBalanced`].
 pub fn parse_audio_profile(raw: &str) -> AudioProfile {
     match raw.trim().to_lowercase().as_str() {
+        "opus-ultra-low-latency" | "opus_ultra_low_latency" => AudioProfile::OpusUltraLowLatency,
         "opus-low-latency" | "opus_low_latency" => AudioProfile::OpusLowLatency,
         "opus-low-bandwidth" | "opus_low_bandwidth" => AudioProfile::OpusLowBandwidth,
         "pcm-lossless" | "pcm_lossless" => AudioProfile::PcmLossless,

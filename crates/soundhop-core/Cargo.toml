@@ -35,9 +35,13 @@ ureq.workspace = true
 flate2.workspace = true
 tar.workspace = true
 zip.workspace = true
+ringbuf.workspace = true
 
 [target.'cfg(unix)'.dependencies]
 libc.workspace = true
+
+[target.'cfg(target_os = "linux")'.dependencies]
+pulseaudio.workspace = true
 
 [target.'cfg(windows)'.dependencies]
 cpal.workspace = true

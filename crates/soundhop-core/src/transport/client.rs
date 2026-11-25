@@ -77,10 +77,15 @@ pub struct Sht3ClientConnection {
 pub struct Sht3ClientWriter {
     stream: TcpStream,
     seal: AeadSealHalf,
+    udp_seal: Option<AeadSealHalf>,
     wire_scratch: Vec<u8>,
 }
 
 impl Sht3ClientWriter {
+    /// Take the derived UDP outbound AEAD seal half for the optional SHT3-over-UDP data plane.
+    pub fn take_udp_seal(&mut self) -> Option<AeadSealHalf> {
+        self.udp_seal.take()
+    }
     fn seal_and_write(
         &mut self,
         frame_type: FrameType,
@@ -235,11 +240,14 @@ impl Sht3ClientConnection {
             &full_transcript,
         )?;
         let (seal, open) = AeadSession::new(Role::Client, &keys).split();
+        let udp_keys = keys.derive_udp_keys()?;
+        let (udp_seal, _) = AeadSession::new(Role::Client, &udp_keys).split();
 
         Ok(Self {
             writer: Sht3ClientWriter {
                 stream,
                 seal,
+                udp_seal: Some(udp_seal),
                 wire_scratch: Vec::with_capacity(INITIAL_WIRE_SCRATCH_CAP),
             },
             open,

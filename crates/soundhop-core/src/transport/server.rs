@@ -7,7 +7,7 @@ use std::time::Duration;
 
 use crate::transport::client::{bounded_write_timeout, configure_socket_defaults};
 use crate::transport::crypto::{
-    compute_server_hello_mac, generate_nonce, verify_client_hello_mac, AeadSession,
+    compute_server_hello_mac, generate_nonce, verify_client_hello_mac, AeadOpenHalf, AeadSession,
     EphemeralKeypair, Role, SessionKeys,
 };
 use crate::transport::wire::{
@@ -29,6 +29,8 @@ pub struct Sht3ServerConfig {
     pub initial_muted: bool,
     pub supported_codecs: Vec<CodecId>,
     pub io_timeout: Option<Duration>,
+    /// Enable the optional encrypted SHT3-over-UDP audio data plane.
+    pub enable_udp: bool,
 }
 
 impl Sht3ServerConfig {
@@ -44,6 +46,7 @@ impl Sht3ServerConfig {
             initial_muted: false,
             supported_codecs,
             io_timeout: Some(Duration::from_secs(10)),
+            enable_udp: true,
         }
     }
 }
@@ -185,6 +188,8 @@ impl Sht3Listener {
             &full_transcript,
         )?;
         let session = AeadSession::new(Role::Server, &keys);
+        let udp_keys = keys.derive_udp_keys()?;
+        let (_, udp_open) = AeadSession::new(Role::Server, &udp_keys).split();
 
         stream.set_read_timeout(config.io_timeout)?;
         stream.set_write_timeout(bounded_write_timeout(config.io_timeout))?;
@@ -192,6 +197,7 @@ impl Sht3Listener {
         Ok(Sht3ServerConnection {
             stream,
             session,
+            udp_open: Some(udp_open),
             wire_scratch: Vec::with_capacity(INITIAL_WIRE_SCRATCH_CAP),
             peer_device_id: client_hello.client_device_id,
             audio_params: negotiated_params,
@@ -209,6 +215,7 @@ fn send_auth_failed(stream: &mut TcpStream, server_device_id: &str) {
 pub struct Sht3ServerConnection {
     stream: TcpStream,
     session: AeadSession,
+    udp_open: Option<AeadOpenHalf>,
     wire_scratch: Vec<u8>,
     peer_device_id: String,
     audio_params: AudioParams,
@@ -221,6 +228,15 @@ impl Sht3ServerConnection {
 
     pub fn audio_params(&self) -> &AudioParams {
         &self.audio_params
+    }
+
+    pub fn local_addr(&self) -> TransportResult<SocketAddr> {
+        Ok(self.stream.local_addr()?)
+    }
+
+    /// Take the derived UDP inbound AEAD open half for the optional SHT3-over-UDP data plane.
+    pub fn take_udp_open(&mut self) -> Option<AeadOpenHalf> {
+        self.udp_open.take()
     }
 
     pub fn send_frame(

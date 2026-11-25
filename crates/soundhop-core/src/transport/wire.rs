@@ -581,6 +581,7 @@ pub enum ControlMessage {
     VolumeState { volume: u8, muted: bool },
     BitrateHint(u16),
     DelayOffsetMs(i16),
+    UdpAudioPort(u16),
 }
 
 impl ControlMessage {
@@ -596,6 +597,10 @@ impl ControlMessage {
             Self::DelayOffsetMs(ms) => {
                 let b = ms.to_be_bytes();
                 vec![0x05, b[0], b[1]]
+            }
+            Self::UdpAudioPort(port) => {
+                let b = port.to_be_bytes();
+                vec![0x06, b[0], b[1]]
             }
         }
     }
@@ -617,6 +622,9 @@ impl ControlMessage {
             0x05 if bytes.len() == 3 => Ok(Self::DelayOffsetMs(i16::from_be_bytes([
                 bytes[1], bytes[2],
             ]))),
+            0x06 if bytes.len() == 3 => {
+                Ok(Self::UdpAudioPort(u16::from_be_bytes([bytes[1], bytes[2]])))
+            }
             tag => Err(TransportError::Wire(format!(
                 "invalid control message tag 0x{tag:02X} with len {}",
                 bytes.len()

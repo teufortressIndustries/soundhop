@@ -21,6 +21,7 @@ type HmacSha256 = Hmac<Sha256>;
 const CLIENT_HELLO_MAC_DOMAIN: &[u8] = b"sht3-c-hello";
 const SERVER_HELLO_MAC_DOMAIN: &[u8] = b"sht3-s-hello";
 const HKDF_INFO_PREFIX: &[u8] = b"sht3-session-keys-v3";
+const HKDF_UDP_INFO: &[u8] = b"sht3-udp-audio-v1";
 
 /// Ephemeral X25519 keypair, zeroized automatically on drop.
 pub struct EphemeralKeypair {
@@ -202,6 +203,38 @@ impl SessionKeys {
             iv_s2c,
         })
     }
+
+    /// Derive independent directional session keys for the optional SHT3-over-UDP audio
+    /// data plane so UDP sequence numbers and nonces never collide with the TCP control stream.
+    pub fn derive_udp_keys(&self) -> TransportResult<Self> {
+        let mut ikm = Zeroizing::new([0u8; 72]);
+        ikm[0..32].copy_from_slice(&self.k_c2s);
+        ikm[32..64].copy_from_slice(&self.k_s2c);
+        ikm[64..68].copy_from_slice(&self.iv_c2s);
+        ikm[68..72].copy_from_slice(&self.iv_s2c);
+
+        let hk = Hkdf::<Sha256>::new(None, &ikm[..]);
+        let mut okm = Zeroizing::new([0u8; 72]);
+        hk.expand(HKDF_UDP_INFO, &mut okm[..])
+            .map_err(|e| TransportError::Crypto(format!("UDP HKDF expand failed: {e}")))?;
+
+        let mut k_c2s = [0u8; 32];
+        let mut k_s2c = [0u8; 32];
+        let mut iv_c2s = [0u8; 4];
+        let mut iv_s2c = [0u8; 4];
+
+        k_c2s.copy_from_slice(&okm[0..32]);
+        k_s2c.copy_from_slice(&okm[32..64]);
+        iv_c2s.copy_from_slice(&okm[64..68]);
+        iv_s2c.copy_from_slice(&okm[68..72]);
+
+        Ok(Self {
+            k_c2s,
+            k_s2c,
+            iv_c2s,
+            iv_s2c,
+        })
+    }
 }
 
 /// Endpoint role determining send/receive directional key assignment.
@@ -345,6 +378,112 @@ impl AeadOpenHalf {
 
         self.recv_expected_seq += 1;
         Ok(plaintext)
+    }
+
+    /// Authenticate and decrypt an out-of-order UDP `frame` using a 64-frame sliding
+    /// [`ReplayWindow`]. The replay window is only updated after AEAD authentication succeeds.
+    pub fn open_frame_unordered(
+        &mut self,
+        frame: &EncryptedFrame,
+        replay: &mut ReplayWindow,
+    ) -> TransportResult<Vec<u8>> {
+        let payload_len = usize::from(frame.header.payload_len);
+        if payload_len > MAX_PAYLOAD_LEN {
+            return Err(TransportError::PayloadTooLarge {
+                len: payload_len,
+                max: MAX_PAYLOAD_LEN,
+            });
+        }
+        if frame.ciphertext_and_tag.len() != payload_len + AEAD_TAG_LEN {
+            return Err(TransportError::Wire(format!(
+                "encrypted frame length {} != payload_len + tag ({})",
+                frame.ciphertext_and_tag.len(),
+                payload_len + AEAD_TAG_LEN
+            )));
+        }
+        if frame.header.seq >= MAX_FRAMES_PER_KEY {
+            return Err(TransportError::RekeyRequired);
+        }
+        if let Err(expected) = replay.check(frame.header.seq) {
+            return Err(TransportError::ReplayDetected {
+                expected,
+                got: frame.header.seq,
+            });
+        }
+
+        let aad = frame.header.to_bytes();
+        let nonce_bytes = build_nonce(&self.iv, frame.header.seq);
+        let plaintext = self
+            .cipher
+            .decrypt(
+                Nonce::from_slice(&nonce_bytes),
+                Payload {
+                    msg: &frame.ciphertext_and_tag,
+                    aad: &aad,
+                },
+            )
+            .map_err(|_| {
+                TransportError::Crypto("ChaCha20-Poly1305 authentication failed".into())
+            })?;
+
+        replay.accept(frame.header.seq);
+        Ok(plaintext)
+    }
+}
+
+/// 64-frame sliding replay-protection window for unordered UDP SHT3 datagrams.
+#[derive(Debug, Clone, Default)]
+pub struct ReplayWindow {
+    highest_seq: Option<u64>,
+    bitmap: u64,
+}
+
+impl ReplayWindow {
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    /// Highest authenticated sequence number seen so far.
+    pub fn highest_seq(&self) -> Option<u64> {
+        self.highest_seq
+    }
+
+    /// Check whether `seq` is fresh (not a duplicate and not older than the 64-frame window).
+    pub fn check(&self, seq: u64) -> Result<(), u64> {
+        let Some(max) = self.highest_seq else {
+            return Ok(());
+        };
+        if seq > max {
+            return Ok(());
+        }
+        let diff = max - seq;
+        if diff >= 64 || ((self.bitmap >> diff) & 1) != 0 {
+            return Err(max.saturating_add(1));
+        }
+        Ok(())
+    }
+
+    /// Record `seq` as authenticated in the sliding window.
+    pub fn accept(&mut self, seq: u64) {
+        let Some(max) = self.highest_seq else {
+            self.highest_seq = Some(seq);
+            self.bitmap = 1;
+            return;
+        };
+        if seq > max {
+            let shift = seq - max;
+            self.bitmap = if shift >= 64 {
+                1
+            } else {
+                (self.bitmap << shift) | 1
+            };
+            self.highest_seq = Some(seq);
+        } else {
+            let diff = max - seq;
+            if diff < 64 {
+                self.bitmap |= 1u64 << diff;
+            }
+        }
     }
 }
 

@@ -1,10 +1,14 @@
 //! Windows WASAPI PCM capture and playback bridges for the SHT3 audio transport
 //! pipeline, wrapping [`WindowsLoopbackRecorder`] and [`WindowsPlayer`].
 
-use std::collections::VecDeque;
 use std::sync::atomic::{AtomicBool, AtomicU8, Ordering};
-use std::sync::{Arc, Condvar, Mutex};
+use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
+
+use ringbuf::traits::{
+    Consumer as RbConsumer, Observer as RbObserver, Producer as RbProducer, Split as RbSplit,
+};
+use ringbuf::{HeapCons, HeapRb};
 
 use crate::backend::windows::audio::{WindowsLoopbackRecorder, WindowsPlayer};
 use crate::transport::dsp::{encode_ramped_s16le, scale_sample_f32, target_gain_factor};
@@ -24,10 +28,11 @@ const SHT3_PLAYBACK_TARGET_MS: f64 = 40.0;
 /// Stereo frames over which partial capture timeouts are faded out before zero-fill.
 const CAPTURE_TIMEOUT_FADE_FRAMES: usize = 64;
 
-/// Pull-based [`PcmCapture`] adapter over [`WindowsLoopbackRecorder`] (48 kHz stereo S16LE).
+/// Pull-based [`PcmCapture`] adapter over [`WindowsLoopbackRecorder`] (48 kHz stereo S16LE)
+/// backed by a lock-free `ringbuf` SPSC ring buffer.
 pub struct WindowsPcmCapture {
     recorder: WindowsLoopbackRecorder,
-    queue: Arc<(Mutex<VecDeque<i16>>, Condvar)>,
+    cons: HeapCons<i16>,
     stopped: Arc<AtomicBool>,
     external_stop: Option<Arc<AtomicBool>>,
 }
@@ -35,34 +40,27 @@ pub struct WindowsPcmCapture {
 impl WindowsPcmCapture {
     /// Start WASAPI system-loopback capture feeding a bounded 48 kHz stereo S16LE ring buffer.
     pub fn start() -> TransportResult<Self> {
-        let queue = Arc::new((Mutex::new(VecDeque::with_capacity(8_192)), Condvar::new()));
+        let rb = HeapRb::<i16>::new(MAX_CAPTURE_QUEUE_SAMPLES);
+        let (prod, cons) = rb.split();
+        let prod = Arc::new(Mutex::new(prod));
         let stopped = Arc::new(AtomicBool::new(false));
 
-        let queue_cb = Arc::clone(&queue);
+        let prod_cb = Arc::clone(&prod);
         let stopped_cb = Arc::clone(&stopped);
         let recorder = WindowsLoopbackRecorder::try_new(move |pcm_bytes: &[u8]| {
             if stopped_cb.load(Ordering::Acquire) || pcm_bytes.len() < 2 {
                 return;
             }
-            let (lock, cvar) = &*queue_cb;
-            let mut guard = lock.lock().unwrap_or_else(|e| e.into_inner());
-            let incoming = pcm_bytes.len() / 2;
-            if guard.len() + incoming > MAX_CAPTURE_QUEUE_SAMPLES {
-                let overflow = (guard.len() + incoming) - MAX_CAPTURE_QUEUE_SAMPLES;
-                let drop_n = overflow.min(guard.len());
-                let aligned = drop_n - (drop_n % usize::from(PCM_CHANNELS));
-                guard.drain(..aligned);
-            }
+            let mut guard = prod_cb.lock().unwrap_or_else(|e| e.into_inner());
             for &pair in pcm_bytes.as_chunks::<2>().0 {
-                guard.push_back(i16::from_le_bytes(pair));
+                let _ = guard.try_push(i16::from_le_bytes(pair));
             }
-            cvar.notify_one();
         })
         .map_err(|msg| TransportError::Io(std::io::Error::other(msg)))?;
 
         Ok(Self {
             recorder,
-            queue,
+            cons,
             stopped,
             external_stop: None,
         })
@@ -76,11 +74,10 @@ impl WindowsPcmCapture {
                 .is_some_and(|flag| flag.load(Ordering::Acquire))
     }
 
-    /// Stop the underlying WASAPI loopback recorder and wake any blocked reader.
+    /// Stop the underlying WASAPI loopback recorder.
     pub fn stop(&self) {
         self.stopped.store(true, Ordering::Release);
         self.recorder.stop();
-        self.queue.1.notify_all();
     }
 }
 
@@ -94,11 +91,8 @@ impl PcmCapture for WindowsPcmCapture {
             return Ok(0);
         }
 
-        let (lock, cvar) = &*self.queue;
-        let mut guard = lock.lock().unwrap_or_else(|e| e.into_inner());
         let deadline = Instant::now() + CAPTURE_WAIT_STEP;
-
-        while guard.len() < buf.len() {
+        while self.cons.occupied_len() < buf.len() {
             if self.is_stopped() || !self.recorder.is_alive() {
                 return Ok(0);
             }
@@ -112,38 +106,35 @@ impl PcmCapture for WindowsPcmCapture {
             } else {
                 remaining
             };
-            let (next_guard, _) = cvar
-                .wait_timeout(guard, wait_slice)
-                .unwrap_or_else(|e| e.into_inner());
-            guard = next_guard;
+            std::thread::sleep(wait_slice.min(Duration::from_millis(2)));
         }
 
         if self.is_stopped() || !self.recorder.is_alive() {
             return Ok(0);
         }
 
-        read_capture_queue_into(&mut guard, buf)
+        read_capture_queue_into(&mut self.cons, buf)
     }
 }
 
-/// Drain a full frame from `guard`, or stereo-aligned partial samples + zero-fill on idle timeout.
-fn read_capture_queue_into(guard: &mut VecDeque<i16>, buf: &mut [i16]) -> TransportResult<usize> {
-    if guard.len() >= buf.len() {
-        for slot in buf.iter_mut() {
-            *slot = guard.pop_front().unwrap_or(0);
-        }
-        return Ok(buf.len());
+/// Drain a full frame from `cons`, or stereo-aligned partial samples + zero-fill on idle timeout.
+fn read_capture_queue_into(cons: &mut HeapCons<i16>, buf: &mut [i16]) -> TransportResult<usize> {
+    if cons.occupied_len() >= buf.len() {
+        let n = cons.pop_slice(buf);
+        return Ok(n);
     }
 
     let ch = usize::from(PCM_CHANNELS);
-    let avail = guard.len().min(buf.len());
+    let avail = cons.occupied_len().min(buf.len());
     let aligned = avail - (avail % ch);
-    for slot in buf.iter_mut().take(aligned) {
-        *slot = guard.pop_front().unwrap_or(0);
-    }
-    if aligned >= CAPTURE_TIMEOUT_FADE_FRAMES * ch {
+    let popped = if aligned > 0 {
+        cons.pop_slice(&mut buf[..aligned])
+    } else {
+        0
+    };
+    if popped >= CAPTURE_TIMEOUT_FADE_FRAMES * ch {
         let fade_samples = CAPTURE_TIMEOUT_FADE_FRAMES * ch;
-        let fade_start = aligned - fade_samples;
+        let fade_start = popped - fade_samples;
         let denom = CAPTURE_TIMEOUT_FADE_FRAMES as f32;
         for frame_idx in 0..CAPTURE_TIMEOUT_FADE_FRAMES {
             let gain = 1.0 - ((frame_idx + 1) as f32 / denom);
@@ -153,7 +144,7 @@ fn read_capture_queue_into(guard: &mut VecDeque<i16>, buf: &mut [i16]) -> Transp
             }
         }
     }
-    buf[aligned..].fill(0);
+    buf[popped..].fill(0);
     Ok(buf.len())
 }
 
@@ -302,13 +293,16 @@ mod tests {
 
     #[test]
     fn idle_timeout_synthesizes_stereo_aligned_silence() {
-        let mut guard = VecDeque::from([100i16, -100, 200]);
+        let rb = HeapRb::<i16>::new(16);
+        let (mut prod, mut cons) = rb.split();
+        let _ = prod.push_slice(&[100i16, -100, 200]);
         let mut buf = [999i16; 6];
-        let n = read_capture_queue_into(&mut guard, &mut buf).unwrap();
+        let n = read_capture_queue_into(&mut cons, &mut buf).unwrap();
         assert_eq!(n, 6);
         // Only the complete stereo pair (100, -100) is consumed; trailing mono sample stays queued.
         assert_eq!(buf, [100, -100, 0, 0, 0, 0]);
-        assert_eq!(guard.into_iter().collect::<Vec<_>>(), vec![200]);
+        assert_eq!(cons.try_pop(), Some(200));
+        assert_eq!(cons.try_pop(), None);
     }
 
     #[test]
@@ -360,11 +354,14 @@ mod tests {
 
     #[test]
     fn idle_timeout_fades_out_when_aligned_at_least_128_samples() {
-        let mut guard = VecDeque::from([10_000i16, -10_000].repeat(96)); // 192 samples
+        let rb = HeapRb::<i16>::new(256);
+        let (mut prod, mut cons) = rb.split();
+        let data = [10_000i16, -10_000].repeat(96); // 192 samples
+        let _ = prod.push_slice(&data);
         let mut buf = [999i16; 384];
-        let n = read_capture_queue_into(&mut guard, &mut buf).unwrap();
+        let n = read_capture_queue_into(&mut cons, &mut buf).unwrap();
         assert_eq!(n, 384);
-        assert!(guard.is_empty());
+        assert!(cons.is_empty());
 
         // First 32 frames (64 samples) remain untouched
         assert_eq!(buf[0], 10_000);

@@ -1,16 +1,24 @@
-//! Linux PulseAudio/PipeWire PCM capture (`parec` / `pacat --record`) and playback (`pacat`)
-//! bridges for the SHT3 audio transport pipeline.
+//! Linux PulseAudio/PipeWire PCM capture and playback bridges for the SHT3 audio transport
+//! pipeline: pure-Rust `pulseaudio` native protocol + lock-free `ringbuf` SPSC ring buffers,
+//! with automatic fallback to `parec` / `pacat` subprocesses.
 
 use std::collections::VecDeque;
-use std::io::{ErrorKind, Read, Write};
+use std::ffi::CString;
+use std::io::{BufReader, ErrorKind, Read, Write};
 use std::os::unix::io::{AsRawFd, RawFd};
+use std::os::unix::net::UnixStream;
 use std::process::{Child, ChildStdin, ChildStdout, Command, Stdio};
 use std::sync::atomic::{AtomicBool, AtomicU64, AtomicU8, AtomicUsize, Ordering};
 use std::sync::{Arc, Condvar, Mutex};
 use std::thread::{self, JoinHandle};
 use std::time::{Duration, Instant};
 
-#[cfg(test)]
+use pulseaudio::protocol as pa_proto;
+use ringbuf::traits::{
+    Consumer as RbConsumer, Observer as RbObserver, Producer as RbProducer, Split as RbSplit,
+};
+use ringbuf::{HeapCons, HeapProd, HeapRb};
+
 #[cfg(test)]
 use crate::transport::dsp::encode_ramped_s16le;
 use crate::transport::dsp::{
@@ -18,6 +26,10 @@ use crate::transport::dsp::{
 };
 use crate::transport::pcm::{PcmCapture, PcmPlayback, PCM_CHANNELS, PCM_SAMPLE_RATE};
 use crate::transport::{TransportError, TransportResult};
+
+fn should_use_linux_pcm_fallback() -> bool {
+    std::env::var_os("SOUNDHOP_LINUX_PCM_FALLBACK").is_some_and(|v| v == "1")
+}
 
 const DEFAULT_LATENCY_MS: u32 = 20;
 const DEFAULT_PLAYBACK_LATENCY_MS: u32 = 30;
@@ -52,11 +64,301 @@ enum CaptureSpawner {
     Custom(Box<dyn FnMut() -> Command + Send>),
 }
 
-/// Captures 48 kHz stereo S16LE PCM from a PulseAudio/PipeWire monitor source via `parec`
-/// (with automatic fallback to `pacat --record` when `parec` is absent).
-///
-/// The child process is terminated and reaped automatically on [`Drop`].
+fn connect_pulse_native(client_name: &str) -> TransportResult<(BufReader<UnixStream>, u16)> {
+    let socket_path = pulseaudio::socket_path_from_env().ok_or_else(|| {
+        TransportError::Io(std::io::Error::new(
+            ErrorKind::NotFound,
+            "PulseAudio native Unix socket not found",
+        ))
+    })?;
+    let stream = UnixStream::connect(socket_path)?;
+    stream.set_read_timeout(Some(Duration::from_secs(2)))?;
+    let mut sock = BufReader::new(stream);
+    let cookie = pulseaudio::cookie_path_from_env()
+        .and_then(|p| std::fs::read(p).ok())
+        .unwrap_or_default();
+
+    let auth = pa_proto::AuthParams {
+        version: pa_proto::MAX_VERSION,
+        supports_shm: false,
+        supports_memfd: false,
+        cookie,
+    };
+    pa_proto::write_command_message(
+        sock.get_mut(),
+        0,
+        &pa_proto::Command::Auth(auth),
+        pa_proto::MAX_VERSION,
+    )
+    .map_err(|e| TransportError::Io(std::io::Error::other(e.to_string())))?;
+
+    let (_, auth_reply) =
+        pa_proto::read_reply_message::<pa_proto::AuthReply>(&mut sock, pa_proto::MAX_VERSION)
+            .map_err(|e| TransportError::Io(std::io::Error::other(e.to_string())))?;
+    let protocol_version = pa_proto::MAX_VERSION.min(auth_reply.version);
+
+    let mut props = pa_proto::Props::new();
+    let app_cstr = CString::new(client_name).unwrap_or_else(|_| CString::new("soundhop").unwrap());
+    props.set(pa_proto::Prop::ApplicationName, app_cstr);
+    pa_proto::write_command_message(
+        sock.get_mut(),
+        1,
+        &pa_proto::Command::SetClientName(props),
+        protocol_version,
+    )
+    .map_err(|e| TransportError::Io(std::io::Error::other(e.to_string())))?;
+    let _ =
+        pa_proto::read_reply_message::<pa_proto::SetClientNameReply>(&mut sock, protocol_version)
+            .map_err(|e| TransportError::Io(std::io::Error::other(e.to_string())))?;
+
+    Ok((sock, protocol_version))
+}
+
+struct NativePulseCapture {
+    cons: HeapCons<i16>,
+    stop_flag: Arc<AtomicBool>,
+    external_stop: Option<Arc<AtomicBool>>,
+    reader_failed: Arc<AtomicBool>,
+    reader: Option<JoinHandle<()>>,
+    discontinuity: bool,
+    need_fade_in: bool,
+}
+
+impl NativePulseCapture {
+    fn spawn(monitor_source: &str, latency_ms: u32) -> TransportResult<Self> {
+        let source_cstr = CString::new(monitor_source).map_err(|_| {
+            TransportError::Io(std::io::Error::new(
+                ErrorKind::InvalidInput,
+                "invalid monitor source name",
+            ))
+        })?;
+        let (mut sock, protocol_version) = connect_pulse_native("soundhop-capture")?;
+        let fragment_bytes =
+            (latency_ms.max(1) as usize * STEREO_FRAMES_PER_MS * BYTES_PER_STEREO_FRAME)
+                .clamp(BYTES_PER_STEREO_FRAME, 65_536) as u32;
+
+        pa_proto::write_command_message(
+            sock.get_mut(),
+            2,
+            &pa_proto::Command::CreateRecordStream(pa_proto::RecordStreamParams {
+                source_name: Some(source_cstr),
+                sample_spec: pa_proto::SampleSpec {
+                    format: pa_proto::SampleFormat::S16Le,
+                    channels: PCM_CHANNELS,
+                    sample_rate: PCM_SAMPLE_RATE,
+                },
+                channel_map: pa_proto::ChannelMap::stereo(),
+                buffer_attr: pa_proto::stream::BufferAttr {
+                    max_length: u32::MAX,
+                    fragment_size: fragment_bytes,
+                    ..Default::default()
+                },
+                flags: pa_proto::stream::StreamFlags {
+                    adjust_latency: true,
+                    ..Default::default()
+                },
+                cvolume: Some(pa_proto::ChannelVolume::norm(PCM_CHANNELS)),
+                ..Default::default()
+            }),
+            protocol_version,
+        )
+        .map_err(|e| TransportError::Io(std::io::Error::other(e.to_string())))?;
+
+        let (_, record_reply) = pa_proto::read_reply_message::<pa_proto::CreateRecordStreamReply>(
+            &mut sock,
+            protocol_version,
+        )
+        .map_err(|e| TransportError::Io(std::io::Error::other(e.to_string())))?;
+
+        if record_reply.sample_spec.format != pa_proto::SampleFormat::S16Le
+            || record_reply.sample_spec.channels != PCM_CHANNELS
+            || record_reply.sample_spec.sample_rate != PCM_SAMPLE_RATE
+        {
+            return Err(TransportError::Io(std::io::Error::other(format!(
+                "unexpected PulseAudio record format: {:?}",
+                record_reply.sample_spec
+            ))));
+        }
+
+        sock.get_ref()
+            .set_read_timeout(Some(Duration::from_millis(15)))?;
+
+        let rb = HeapRb::<i16>::new(RING_CAPACITY_SAMPLES * 2);
+        let (mut prod, cons) = rb.split();
+        let stop_flag = Arc::new(AtomicBool::new(false));
+        let reader_failed = Arc::new(AtomicBool::new(false));
+        let stop_c = Arc::clone(&stop_flag);
+        let failed_c = Arc::clone(&reader_failed);
+
+        let reader = thread::Builder::new()
+            .name("soundhop-pa-capture".to_string())
+            .spawn(move || {
+                let mut byte_buf = vec![0u8; 8192];
+                let mut sample_buf = Vec::with_capacity(4096);
+                let mut leftover: Option<u8> = None;
+
+                while !stop_c.load(Ordering::Acquire) {
+                    let desc = match pa_proto::read_descriptor(&mut sock) {
+                        Ok(d) => d,
+                        Err(pa_proto::ProtocolError::Io(ref e))
+                            if matches!(
+                                e.kind(),
+                                ErrorKind::WouldBlock
+                                    | ErrorKind::TimedOut
+                                    | ErrorKind::Interrupted
+                            ) =>
+                        {
+                            continue;
+                        }
+                        Err(_) => {
+                            failed_c.store(true, Ordering::Release);
+                            break;
+                        }
+                    };
+
+                    if desc.channel == u32::MAX {
+                        if pa_proto::Command::read_tag_prefixed(&mut sock, protocol_version)
+                            .is_err()
+                        {
+                            failed_c.store(true, Ordering::Release);
+                            break;
+                        }
+                        continue;
+                    }
+
+                    let len = desc.length as usize;
+                    if byte_buf.len() < len {
+                        byte_buf.resize(len, 0);
+                    }
+                    if sock.read_exact(&mut byte_buf[..len]).is_err() {
+                        failed_c.store(true, Ordering::Release);
+                        break;
+                    }
+
+                    sample_buf.clear();
+                    let mut idx = 0usize;
+                    if let Some(prev) = leftover.take() {
+                        if len > 0 {
+                            sample_buf.push(i16::from_le_bytes([prev, byte_buf[0]]));
+                            idx = 1;
+                        } else {
+                            leftover = Some(prev);
+                        }
+                    }
+                    while idx + 1 < len {
+                        sample_buf.push(i16::from_le_bytes([byte_buf[idx], byte_buf[idx + 1]]));
+                        idx += 2;
+                    }
+                    if idx < len {
+                        leftover = Some(byte_buf[idx]);
+                    }
+                    let aligned = sample_buf.len() & !1;
+                    if aligned > 0 {
+                        let _ = prod.push_slice(&sample_buf[..aligned]);
+                    }
+                }
+            })
+            .map_err(TransportError::Io)?;
+
+        Ok(Self {
+            cons,
+            stop_flag,
+            external_stop: None,
+            reader_failed,
+            reader: Some(reader),
+            discontinuity: false,
+            need_fade_in: false,
+        })
+    }
+
+    fn is_stopped(&self) -> bool {
+        self.stop_flag.load(Ordering::Acquire)
+            || self
+                .external_stop
+                .as_ref()
+                .is_some_and(|flag| flag.load(Ordering::Acquire))
+    }
+
+    fn read_frame(&mut self, buf: &mut [i16]) -> TransportResult<usize> {
+        if buf.is_empty() || self.is_stopped() {
+            return Ok(0);
+        }
+
+        let deadline = Instant::now() + CAPTURE_POLL_TIMEOUT;
+        while self.cons.occupied_len() < buf.len() {
+            if self.is_stopped() {
+                return Ok(0);
+            }
+            if self.reader_failed.load(Ordering::Acquire) {
+                if self.cons.is_empty() {
+                    return Ok(0);
+                }
+                break;
+            }
+            let now = Instant::now();
+            if now >= deadline {
+                break;
+            }
+            let rem = deadline.saturating_duration_since(now);
+            thread::sleep(rem.min(Duration::from_millis(2)));
+        }
+
+        let avail = self.cons.occupied_len().min(buf.len());
+        if avail >= buf.len() {
+            let n = self.cons.pop_slice(buf);
+            if self.need_fade_in && n > 0 {
+                fade_in_stereo_in_place(&mut buf[..n], CAPTURE_DECLICK_RAMP_FRAMES);
+                self.need_fade_in = false;
+            }
+            return Ok(n);
+        }
+
+        if self.reader_failed.load(Ordering::Acquire) && avail == 0 {
+            return Ok(0);
+        }
+
+        let aligned = avail & !1;
+        let samples = if aligned > 0 {
+            self.cons.pop_slice(&mut buf[..aligned])
+        } else {
+            0
+        };
+        if samples > 0 && samples < buf.len() {
+            if self.need_fade_in {
+                fade_in_stereo_in_place(&mut buf[..samples], CAPTURE_DECLICK_RAMP_FRAMES);
+            }
+            fade_out_stereo_in_place(&mut buf[..samples], CAPTURE_DECLICK_RAMP_FRAMES);
+            self.need_fade_in = true;
+        } else if samples == 0 {
+            self.need_fade_in = true;
+        }
+        buf[samples..].fill(0);
+        Ok(buf.len())
+    }
+}
+
+impl Drop for NativePulseCapture {
+    fn drop(&mut self) {
+        self.stop_flag.store(true, Ordering::Release);
+        if let Some(h) = self.reader.take() {
+            let _ = h.join();
+        }
+    }
+}
+
+enum CaptureBackend {
+    NativePulse(NativePulseCapture),
+    Subprocess(SubprocessCapture),
+}
+
+/// Captures 48 kHz stereo S16LE PCM from a PulseAudio/PipeWire monitor source via
+/// pure-Rust `pulseaudio` + lock-free `ringbuf`, with automatic fallback to `parec` / `pacat --record`.
 pub struct LinuxPcmCapture {
+    monitor_source: String,
+    backend: CaptureBackend,
+}
+
+struct SubprocessCapture {
     monitor_source: String,
     spawner: CaptureSpawner,
     child: Child,
@@ -70,24 +372,40 @@ pub struct LinuxPcmCapture {
 }
 
 impl LinuxPcmCapture {
-    /// Spawn `parec` (or `pacat --record` fallback) at default 20 ms latency.
+    /// Spawn capture on `monitor_source` at default 20 ms latency.
     pub fn spawn(monitor_source: impl Into<String>) -> TransportResult<Self> {
         Self::spawn_with_latency(monitor_source, DEFAULT_LATENCY_MS)
     }
 
-    /// Spawn `parec` (or `pacat --record` fallback) with a custom `--latency-msec` value.
+    /// Spawn capture on `monitor_source` with a custom latency in milliseconds.
     pub fn spawn_with_latency(
         monitor_source: impl Into<String>,
         latency_ms: u32,
     ) -> TransportResult<Self> {
         let monitor_source = monitor_source.into();
-        let cmd = build_pulse_capture_command(&monitor_source, latency_ms);
-        Self::spawn_internal(monitor_source, CaptureSpawner::Pulse { latency_ms }, cmd)
+        if !should_use_linux_pcm_fallback() {
+            if let Ok(native) = NativePulseCapture::spawn(&monitor_source, latency_ms) {
+                return Ok(Self {
+                    monitor_source,
+                    backend: CaptureBackend::NativePulse(native),
+                });
+            }
+        }
+        let sub = SubprocessCapture::spawn_with_latency(monitor_source.clone(), latency_ms)?;
+        Ok(Self {
+            monitor_source,
+            backend: CaptureBackend::Subprocess(sub),
+        })
     }
 
     #[cfg(test)]
     fn spawn_command(monitor_source: String, cmd: Command) -> TransportResult<Self> {
-        Self::spawn_internal(monitor_source, CaptureSpawner::None, cmd)
+        let sub =
+            SubprocessCapture::spawn_internal(monitor_source.clone(), CaptureSpawner::None, cmd)?;
+        Ok(Self {
+            monitor_source,
+            backend: CaptureBackend::Subprocess(sub),
+        })
     }
 
     #[cfg(test)]
@@ -96,11 +414,50 @@ impl LinuxPcmCapture {
         mut make_cmd: impl FnMut() -> Command + Send + 'static,
     ) -> TransportResult<Self> {
         let cmd = make_cmd();
-        Self::spawn_internal(
-            monitor_source,
+        let sub = SubprocessCapture::spawn_internal(
+            monitor_source.clone(),
             CaptureSpawner::Custom(Box::new(make_cmd)),
             cmd,
-        )
+        )?;
+        Ok(Self {
+            monitor_source,
+            backend: CaptureBackend::Subprocess(sub),
+        })
+    }
+
+    /// Name of the monitor source being captured.
+    pub fn monitor_source(&self) -> &str {
+        &self.monitor_source
+    }
+}
+
+impl PcmCapture for LinuxPcmCapture {
+    fn attach_stop_flag(&mut self, stop_flag: Arc<AtomicBool>) {
+        match &mut self.backend {
+            CaptureBackend::NativePulse(n) => n.external_stop = Some(stop_flag),
+            CaptureBackend::Subprocess(s) => s.stop_flag = Some(stop_flag),
+        }
+    }
+
+    fn take_discontinuity(&mut self) -> bool {
+        match &mut self.backend {
+            CaptureBackend::NativePulse(n) => std::mem::replace(&mut n.discontinuity, false),
+            CaptureBackend::Subprocess(s) => std::mem::replace(&mut s.discontinuity, false),
+        }
+    }
+
+    fn read_frame(&mut self, buf: &mut [i16]) -> TransportResult<usize> {
+        match &mut self.backend {
+            CaptureBackend::NativePulse(n) => n.read_frame(buf),
+            CaptureBackend::Subprocess(s) => s.read_frame(buf),
+        }
+    }
+}
+
+impl SubprocessCapture {
+    fn spawn_with_latency(monitor_source: String, latency_ms: u32) -> TransportResult<Self> {
+        let cmd = build_pulse_capture_command(&monitor_source, latency_ms);
+        Self::spawn_internal(monitor_source, CaptureSpawner::Pulse { latency_ms }, cmd)
     }
 
     fn spawn_internal(
@@ -121,11 +478,6 @@ impl LinuxPcmCapture {
             discontinuity: false,
             need_fade_in: false,
         })
-    }
-
-    /// Name of the monitor source being captured.
-    pub fn monitor_source(&self) -> &str {
-        &self.monitor_source
     }
 
     fn is_stopped(&self) -> bool {
@@ -182,16 +534,6 @@ impl LinuxPcmCapture {
                     .min(Duration::from_millis(10)),
             );
         }
-    }
-}
-
-impl PcmCapture for LinuxPcmCapture {
-    fn attach_stop_flag(&mut self, stop_flag: Arc<AtomicBool>) {
-        self.stop_flag = Some(stop_flag);
-    }
-
-    fn take_discontinuity(&mut self) -> bool {
-        std::mem::replace(&mut self.discontinuity, false)
     }
 
     fn read_frame(&mut self, buf: &mut [i16]) -> TransportResult<usize> {
@@ -314,7 +656,7 @@ impl PcmCapture for LinuxPcmCapture {
     }
 }
 
-impl Drop for LinuxPcmCapture {
+impl Drop for SubprocessCapture {
     fn drop(&mut self) {
         let _ = self.child.kill();
         let _ = self.child.wait();
@@ -413,9 +755,206 @@ struct AsyncPlayback {
     ramp_buf: Vec<i16>,
 }
 
+struct NativePulsePlayback {
+    prod: HeapProd<i16>,
+    ring_samples: Arc<AtomicUsize>,
+    underruns: Arc<AtomicU64>,
+    overruns: Arc<AtomicU64>,
+    stop_flag: Arc<AtomicBool>,
+    failed: Arc<AtomicBool>,
+    writer: Option<JoinHandle<()>>,
+    gain_ramp: GainRamp,
+    ramp_buf: Vec<i16>,
+}
+
+impl NativePulsePlayback {
+    fn spawn(sink: Option<&str>, latency_ms: u32) -> TransportResult<Self> {
+        let sink_cstr = match sink {
+            Some(s) if !s.trim().is_empty() => Some(CString::new(s).map_err(|_| {
+                TransportError::Io(std::io::Error::new(
+                    ErrorKind::InvalidInput,
+                    "invalid sink name",
+                ))
+            })?),
+            _ => None,
+        };
+
+        let (mut sock, protocol_version) = connect_pulse_native("soundhop-playback")?;
+        let target_bytes =
+            (latency_ms.max(1) as usize * STEREO_FRAMES_PER_MS * BYTES_PER_STEREO_FRAME)
+                .clamp(BYTES_PER_STEREO_FRAME, 65_536) as u32;
+        let min_req = (target_bytes / 4).max(BYTES_PER_STEREO_FRAME as u32);
+
+        pa_proto::write_command_message(
+            sock.get_mut(),
+            2,
+            &pa_proto::Command::CreatePlaybackStream(pa_proto::PlaybackStreamParams {
+                sample_spec: pa_proto::SampleSpec {
+                    format: pa_proto::SampleFormat::S16Le,
+                    channels: PCM_CHANNELS,
+                    sample_rate: PCM_SAMPLE_RATE,
+                },
+                channel_map: pa_proto::ChannelMap::stereo(),
+                sink_name: sink_cstr,
+                buffer_attr: pa_proto::stream::BufferAttr {
+                    max_length: target_bytes.saturating_mul(4),
+                    target_length: target_bytes,
+                    pre_buffering: target_bytes,
+                    minimum_request_length: min_req,
+                    ..Default::default()
+                },
+                flags: pa_proto::stream::StreamFlags {
+                    adjust_latency: true,
+                    ..Default::default()
+                },
+                cvolume: Some(pa_proto::ChannelVolume::norm(PCM_CHANNELS)),
+                ..Default::default()
+            }),
+            protocol_version,
+        )
+        .map_err(|e| TransportError::Io(std::io::Error::other(e.to_string())))?;
+
+        let (_, stream_info) = pa_proto::read_reply_message::<pa_proto::CreatePlaybackStreamReply>(
+            &mut sock,
+            protocol_version,
+        )
+        .map_err(|e| TransportError::Io(std::io::Error::other(e.to_string())))?;
+
+        sock.get_ref()
+            .set_read_timeout(Some(Duration::from_millis(10)))?;
+
+        let rb = HeapRb::<i16>::new(RING_CAPACITY_SAMPLES);
+        let (prod, mut cons) = rb.split();
+        let ring_samples = Arc::new(AtomicUsize::new(0));
+        let underruns = Arc::new(AtomicU64::new(0));
+        let overruns = Arc::new(AtomicU64::new(0));
+        let stop_flag = Arc::new(AtomicBool::new(false));
+        let failed = Arc::new(AtomicBool::new(false));
+
+        let ring_c = Arc::clone(&ring_samples);
+        let under_c = Arc::clone(&underruns);
+        let over_c = Arc::clone(&overruns);
+        let stop_c = Arc::clone(&stop_flag);
+        let failed_c = Arc::clone(&failed);
+
+        let channel = stream_info.channel;
+        let mut credit = stream_info.requested_bytes as usize;
+        let prebuf_samples = ((DEFAULT_SINK_TARGET_MS * BYTES_PER_MS).round() as usize / 2).max(2);
+
+        let writer = thread::Builder::new()
+            .name("soundhop-pa-playback".to_string())
+            .spawn(move || {
+                let mut primed = false;
+                let mut sample_chunk = vec![0i16; WRITER_CHUNK_SAMPLES];
+                let mut byte_chunk = Vec::with_capacity(WRITER_CHUNK_SAMPLES * 2);
+
+                while !stop_c.load(Ordering::Acquire) {
+                    let occ = cons.occupied_len();
+                    ring_c.store(occ, Ordering::Release);
+
+                    if !primed && occ >= prebuf_samples {
+                        primed = true;
+                    }
+
+                    if primed && credit >= BYTES_PER_STEREO_FRAME && occ >= 2 {
+                        let max_samples = (credit / 2).min(occ).min(sample_chunk.len()) & !1;
+                        if max_samples >= 2 {
+                            let popped = cons.pop_slice(&mut sample_chunk[..max_samples]);
+                            ring_c.store(cons.occupied_len(), Ordering::Release);
+                            if popped >= 2 {
+                                byte_chunk.clear();
+                                for &s in &sample_chunk[..popped] {
+                                    byte_chunk.extend_from_slice(&s.to_le_bytes());
+                                }
+                                if pa_proto::write_memblock(sock.get_mut(), channel, &byte_chunk, 0)
+                                    .is_err()
+                                {
+                                    failed_c.store(true, Ordering::Release);
+                                    break;
+                                }
+                                credit = credit.saturating_sub(byte_chunk.len());
+                                continue;
+                            }
+                        }
+                    }
+
+                    match pa_proto::read_command_message(&mut sock, protocol_version) {
+                        Ok((_, pa_proto::Command::Request(req))) => {
+                            if req.channel == channel {
+                                credit = credit.saturating_add(req.length as usize);
+                            }
+                        }
+                        Ok((_, pa_proto::Command::Underflow(_))) => {
+                            under_c.fetch_add(1, Ordering::Relaxed);
+                        }
+                        Ok((_, pa_proto::Command::Overflow(_))) => {
+                            over_c.fetch_add(1, Ordering::Relaxed);
+                        }
+                        Ok((_, pa_proto::Command::Error(_))) => {
+                            failed_c.store(true, Ordering::Release);
+                            break;
+                        }
+                        Ok(_) => {}
+                        Err(pa_proto::ProtocolError::Io(ref e))
+                            if matches!(
+                                e.kind(),
+                                ErrorKind::WouldBlock
+                                    | ErrorKind::TimedOut
+                                    | ErrorKind::Interrupted
+                            ) => {}
+                        Err(_) => {
+                            failed_c.store(true, Ordering::Release);
+                            break;
+                        }
+                    }
+                }
+            })
+            .map_err(TransportError::Io)?;
+
+        Ok(Self {
+            prod,
+            ring_samples,
+            underruns,
+            overruns,
+            stop_flag,
+            failed,
+            writer: Some(writer),
+            gain_ramp: GainRamp::with_initial(100, false).with_ramp_frames(GAIN_RAMP_MAX_FRAMES),
+            ramp_buf: Vec::new(),
+        })
+    }
+
+    fn write_frame(&mut self, samples: &[i16], vol: u32, muted: bool) -> TransportResult<()> {
+        if self.failed.load(Ordering::Acquire) || self.stop_flag.load(Ordering::Acquire) {
+            return Err(TransportError::Closed);
+        }
+        let aligned_len = samples.len() & !1;
+        if aligned_len == 0 {
+            return Ok(());
+        }
+        self.ramp_buf.clear();
+        self.ramp_buf.extend_from_slice(&samples[..aligned_len]);
+        self.gain_ramp.apply(&mut self.ramp_buf, 2, vol, muted);
+
+        let vacant = self.prod.vacant_len() & !1;
+        if vacant < aligned_len {
+            self.overruns.fetch_add(1, Ordering::Relaxed);
+            if vacant >= 2 {
+                let _ = self.prod.push_slice(&self.ramp_buf[..vacant]);
+            }
+        } else {
+            let _ = self.prod.push_slice(&self.ramp_buf);
+        }
+        self.ring_samples
+            .store(self.prod.occupied_len(), Ordering::Release);
+        Ok(())
+    }
+}
+
 enum PlaybackBackend {
     #[cfg(test)]
     Sync(SyncPlayback),
+    NativePulse(NativePulsePlayback),
     Async(AsyncPlayback),
 }
 
@@ -442,9 +981,20 @@ impl LinuxPcmPlayback {
         Self::spawn_for_sink(None, DEFAULT_PLAYBACK_LATENCY_MS)
     }
 
-    /// Spawn `pacat --playback` targeting an optional PulseAudio/PipeWire sink and latency.
+    /// Spawn playback targeting an optional PulseAudio/PipeWire sink and latency.
     pub fn spawn_for_sink(sink: Option<&str>, latency_ms: u32) -> TransportResult<Self> {
         let sink_owned = sink.map(str::to_string);
+        if !should_use_linux_pcm_fallback() {
+            if let Ok(native) = NativePulsePlayback::spawn(sink, latency_ms) {
+                return Ok(Self {
+                    sink: sink_owned,
+                    latency_ms,
+                    volume_pct: Arc::new(AtomicU8::new(100)),
+                    muted: Arc::new(AtomicBool::new(false)),
+                    backend: PlaybackBackend::NativePulse(native),
+                });
+            }
+        }
         let cmd = build_pacat_command(sink_owned.as_deref(), latency_ms);
         Self::spawn_async_internal(
             sink_owned.clone(),
@@ -638,6 +1188,10 @@ impl LinuxPcmPlayback {
         match &self.backend {
             #[cfg(test)]
             PlaybackBackend::Sync(_) => None,
+            PlaybackBackend::NativePulse(native) => {
+                let bytes = native.ring_samples.load(Ordering::Acquire) * 2;
+                Some((bytes as f64) / BYTES_PER_MS)
+            }
             PlaybackBackend::Async(async_pb) => {
                 let ring_bytes = async_pb.atomics.ring_samples.load(Ordering::Acquire) * 2;
                 let staging_bytes = async_pb.atomics.staging_bytes.load(Ordering::Acquire);
@@ -658,6 +1212,7 @@ impl LinuxPcmPlayback {
         match &self.backend {
             #[cfg(test)]
             PlaybackBackend::Sync(_) => 0,
+            PlaybackBackend::NativePulse(native) => native.underruns.load(Ordering::Acquire),
             PlaybackBackend::Async(async_pb) => async_pb.atomics.underruns.load(Ordering::Acquire),
         }
     }
@@ -667,6 +1222,7 @@ impl LinuxPcmPlayback {
         match &self.backend {
             #[cfg(test)]
             PlaybackBackend::Sync(_) => 0,
+            PlaybackBackend::NativePulse(native) => native.overruns.load(Ordering::Acquire),
             PlaybackBackend::Async(async_pb) => async_pb.atomics.overruns.load(Ordering::Acquire),
         }
     }
@@ -677,6 +1233,12 @@ impl LinuxPcmPlayback {
             PlaybackBackend::Sync(sync_pb) => {
                 drop(sync_pb.stdin.take());
                 let _ = sync_pb.child.wait();
+            }
+            PlaybackBackend::NativePulse(native) => {
+                native.stop_flag.store(true, Ordering::Release);
+                if let Some(writer) = native.writer.take() {
+                    let _ = writer.join();
+                }
             }
             PlaybackBackend::Async(async_pb) => {
                 let (lock, cv) = &*async_pb.queue;
@@ -706,6 +1268,7 @@ impl PcmPlayback for LinuxPcmPlayback {
         match &mut self.backend {
             #[cfg(test)]
             PlaybackBackend::Sync(sync_pb) => sync_pb.write_frame(samples, vol, muted),
+            PlaybackBackend::NativePulse(native) => native.write_frame(samples, vol, muted),
             PlaybackBackend::Async(async_pb) => async_pb.write_frame(samples, vol, muted),
         }
     }
@@ -752,6 +1315,12 @@ impl Drop for LinuxPcmPlayback {
                 drop(sync_pb.stdin.take());
                 let _ = sync_pb.child.kill();
                 let _ = sync_pb.child.wait();
+            }
+            PlaybackBackend::NativePulse(native) => {
+                native.stop_flag.store(true, Ordering::Release);
+                if let Some(writer) = native.writer.take() {
+                    let _ = writer.join();
+                }
             }
             PlaybackBackend::Async(async_pb) => {
                 async_pb.stop_flag.store(true, Ordering::Release);

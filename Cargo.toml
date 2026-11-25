@@ -58,7 +58,9 @@ muda = "0.15"
 image = { version = "0.25", default-features = false, features = ["png"] }
 libc = "0.2"
 tempfile = "3.13"
-cpal = "0.15"
+cpal = "0.18"
+ringbuf = "0.6"
+pulseaudio = "0.3"
 
 [profile.dev]
 debug = 1

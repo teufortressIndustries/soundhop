@@ -12,6 +12,8 @@ pub enum AudioProfile {
     OpusBalanced,
     /// Low-latency: Opus 48 kHz stereo, 10 ms frames (480 samples/ch), 128 kbps VBR.
     OpusLowLatency,
+    /// Ultra-low-latency: Opus 48 kHz stereo, 5 ms frames (240 samples/ch), 128 kbps VBR.
+    OpusUltraLowLatency,
     /// Low-bandwidth: Opus 48 kHz stereo, 20 ms frames (960 samples/ch), 64 kbps VBR.
     OpusLowBandwidth,
     /// Uncompressed lossless PCM: 48 kHz stereo S16LE, 20 ms frames (3,840 B/frame).
@@ -21,7 +23,10 @@ pub enum AudioProfile {
 impl AudioProfile {
     pub fn codec_id(self) -> CodecId {
         match self {
-            Self::OpusBalanced | Self::OpusLowLatency | Self::OpusLowBandwidth => CodecId::Opus,
+            Self::OpusBalanced
+            | Self::OpusLowLatency
+            | Self::OpusUltraLowLatency
+            | Self::OpusLowBandwidth => CodecId::Opus,
             Self::PcmLossless => CodecId::PcmS16Le,
         }
     }
@@ -43,6 +48,7 @@ impl AudioProfile {
 
     pub fn frame_ms(self) -> u8 {
         match self {
+            Self::OpusUltraLowLatency => 5,
             Self::OpusLowLatency => 10,
             Self::OpusBalanced | Self::OpusLowBandwidth | Self::PcmLossless => 20,
         }
@@ -50,7 +56,7 @@ impl AudioProfile {
 
     pub fn bitrate_kbps(self) -> u16 {
         match self {
-            Self::OpusBalanced | Self::OpusLowLatency => 128,
+            Self::OpusBalanced | Self::OpusLowLatency | Self::OpusUltraLowLatency => 128,
             Self::OpusLowBandwidth => 64,
             Self::PcmLossless => 1536,
         }
@@ -86,6 +92,7 @@ impl AudioProfile {
         }
         match (params.codec, params.frame_ms, params.bitrate_kbps) {
             (CodecId::PcmS16Le, 20, _) => Ok(Self::PcmLossless),
+            (CodecId::Opus, 5, _) => Ok(Self::OpusUltraLowLatency),
             (CodecId::Opus, 10, _) => Ok(Self::OpusLowLatency),
             (CodecId::Opus, 20, kbps) if kbps <= 80 => Ok(Self::OpusLowBandwidth),
             (CodecId::Opus, 20, _) => Ok(Self::OpusBalanced),
@@ -498,6 +505,7 @@ mod tests {
         for profile in [
             AudioProfile::OpusBalanced,
             AudioProfile::OpusLowLatency,
+            AudioProfile::OpusUltraLowLatency,
             AudioProfile::OpusLowBandwidth,
         ] {
             let mut codec = OpusCodec::from_profile(profile).unwrap();
@@ -565,7 +573,7 @@ mod tests {
             let mut best_lag = 0usize;
             let mut best_corr = -1.0f64;
             let search_start = spc * 5;
-            let search_end = total_spc - spc * 2;
+            let search_end = total_spc - (spc * 2).max(800);
             for lag in 0..800usize {
                 let mut dot = 0.0f64;
                 let mut e_in = 0.0f64;
@@ -696,7 +704,7 @@ mod tests {
         let mut best_lag = 0usize;
         let mut best_corr = -1.0f64;
         let search_start = spc * 5;
-        let search_end = total_spc - spc * 2;
+        let search_end = total_spc - (spc * 2).max(800);
         for lag in 0..800usize {
             let mut dot = 0.0f64;
             let mut e_in = 0.0f64;
@@ -788,6 +796,7 @@ mod tests {
         for profile in [
             AudioProfile::OpusBalanced,
             AudioProfile::OpusLowLatency,
+            AudioProfile::OpusUltraLowLatency,
             AudioProfile::OpusLowBandwidth,
         ] {
             let (ld_lag, ld_corr, ld_snr_l, ld_snr_r) =
@@ -803,5 +812,20 @@ mod tests {
             );
             assert!(au_corr.is_finite() && au_snr_l.is_finite() && au_snr_r.is_finite());
         }
+    }
+
+    #[test]
+    fn opus_ultra_low_latency_5ms_profile_params() {
+        let profile = AudioProfile::OpusUltraLowLatency;
+        assert_eq!(profile.frame_ms(), 5);
+        assert_eq!(profile.frame_samples_per_channel(), 240);
+        assert_eq!(profile.interleaved_samples_per_frame(), 480);
+        assert_eq!(profile.bitrate_kbps(), 128);
+        let params = profile.to_audio_params(15);
+        assert_eq!(params.frame_ms, 5);
+        assert_eq!(
+            AudioProfile::from_audio_params(&params).unwrap(),
+            AudioProfile::OpusUltraLowLatency
+        );
     }
 }

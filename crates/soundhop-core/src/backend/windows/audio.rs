@@ -1,18 +1,22 @@
 //! Audio playback and loopback capture for Windows (`cpal`/WASAPI),
 //! with cross-platform mock fallbacks so unit tests run on both Linux and Windows.
 
+#[cfg(any(windows, test))]
 use std::collections::VecDeque;
 use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 use std::thread::{self, JoinHandle};
 use std::time::Duration;
 
+use ringbuf::traits::{
+    Consumer as RbConsumer, Observer as RbObserver, Producer as RbProducer, Split as RbSplit,
+};
+use ringbuf::{HeapCons, HeapProd, HeapRb};
+
 const MAX_PLAYBACK_BUFFER_SAMPLES: usize = 96_000; // 1.0s @ 48kHz stereo
-const OVERRUN_CROSSFADE_FRAMES: usize = 96; // 2 ms @ 48 kHz
 const RECONNECT_INITIAL_BACKOFF_MS: u64 = 100;
 const RECONNECT_MAX_BACKOFF_MS: u64 = 1_000;
 
-use crate::transport::dsp::lerp_i16;
 #[cfg(test)]
 use crate::transport::dsp::pop_frame_pair;
 pub use crate::transport::dsp::{apply_gain_i16, LinearResampler, PlaybackResampler};
@@ -32,10 +36,13 @@ pub fn list_audio_endpoints() -> Vec<AudioEndpoint> {
         if let Ok(devices) = host.output_devices() {
             let mut out = Vec::new();
             for dev in devices {
-                let name = dev.name().unwrap_or_else(|_| "Speakers".to_string());
+                let name = dev
+                    .description()
+                    .map(|d| d.name().to_string())
+                    .unwrap_or_else(|_| "Speakers".to_string());
                 let (channels, sample_rate) = dev
                     .default_output_config()
-                    .map(|c| (c.channels() as u8, c.sample_rate().0))
+                    .map(|c| (c.channels() as u8, c.sample_rate()))
                     .unwrap_or((2, 48_000));
                 out.push(AudioEndpoint {
                     name,
@@ -106,13 +113,62 @@ fn sleep_interruptible(delay: Duration, stop_flag: &AtomicBool) -> bool {
     stop_flag.load(Ordering::SeqCst)
 }
 
+struct ReturnCons {
+    cons: Option<HeapCons<i16>>,
+    slot: Arc<Mutex<Option<HeapCons<i16>>>>,
+}
+
+impl ReturnCons {
+    fn take_from(slot: &Arc<Mutex<Option<HeapCons<i16>>>>) -> Option<Self> {
+        let cons = slot.lock().unwrap_or_else(|e| e.into_inner()).take()?;
+        Some(Self {
+            cons: Some(cons),
+            slot: Arc::clone(slot),
+        })
+    }
+
+    #[cfg(all(windows, not(test)))]
+    fn drain_into_scratch(&mut self, scratch: &mut VecDeque<i16>, target_len: usize) {
+        let Some(cons) = self.cons.as_mut() else {
+            return;
+        };
+        if scratch.len() >= target_len {
+            return;
+        }
+        let needed = target_len - scratch.len();
+        let avail = cons.occupied_len().min(needed);
+        if avail > 0 {
+            let mut tmp = [0i16; 1024];
+            let mut remaining = avail;
+            while remaining > 0 {
+                let chunk = remaining.min(tmp.len());
+                let popped = cons.pop_slice(&mut tmp[..chunk]);
+                if popped == 0 {
+                    break;
+                }
+                scratch.extend(&tmp[..popped]);
+                remaining -= popped;
+            }
+        }
+    }
+}
+
+impl Drop for ReturnCons {
+    fn drop(&mut self) {
+        if let Some(cons) = self.cons.take() {
+            *self.slot.lock().unwrap_or_else(|e| e.into_inner()) = Some(cons);
+        }
+    }
+}
+
 pub struct WindowsPlayer {
     pub sample_rate: u32,
     pub channels: u8,
     max_buffer_samples: usize,
     prebuffer_samples: usize,
     closed: Arc<AtomicBool>,
-    buffer: Arc<Mutex<VecDeque<i16>>>,
+    prod: Mutex<HeapProd<i16>>,
+    cons_slot: Arc<Mutex<Option<HeapCons<i16>>>>,
     volume_pct: Arc<AtomicU32>,
     muted: Arc<AtomicBool>,
     underruns: Arc<AtomicU64>,
@@ -132,9 +188,13 @@ impl WindowsPlayer {
 
     pub fn with_max_buffer_samples(sample_rate: u32, channels: u8, max_samples: usize) -> Self {
         let ch = usize::from(channels.max(1));
-        let aligned = max_samples - (max_samples % ch);
+        let aligned = (max_samples - (max_samples % ch)).max(ch);
+        let rb = HeapRb::<i16>::new(aligned);
+        let (prod, cons) = rb.split();
         let mut player = Self::new(sample_rate, channels);
-        player.max_buffer_samples = aligned.max(ch);
+        player.max_buffer_samples = aligned;
+        player.prod = Mutex::new(prod);
+        player.cons_slot = Arc::new(Mutex::new(Some(cons)));
         player
     }
 
@@ -144,13 +204,16 @@ impl WindowsPlayer {
         volume_pct: Arc<AtomicU32>,
         muted: Arc<AtomicBool>,
     ) -> Self {
+        let rb = HeapRb::<i16>::new(MAX_PLAYBACK_BUFFER_SAMPLES);
+        let (prod, cons) = rb.split();
         Self {
             sample_rate,
             channels,
             max_buffer_samples: MAX_PLAYBACK_BUFFER_SAMPLES,
             prebuffer_samples: 0,
             closed: Arc::new(AtomicBool::new(false)),
-            buffer: Arc::new(Mutex::new(VecDeque::with_capacity(16_384))),
+            prod: Mutex::new(prod),
+            cons_slot: Arc::new(Mutex::new(Some(cons))),
             volume_pct,
             muted,
             underruns: Arc::new(AtomicU64::new(0)),
@@ -172,7 +235,10 @@ impl WindowsPlayer {
     }
 
     pub fn buffered_samples(&self) -> usize {
-        self.buffer.lock().unwrap_or_else(|e| e.into_inner()).len()
+        self.prod
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .occupied_len()
     }
 
     pub fn underruns(&self) -> u64 {
@@ -206,7 +272,7 @@ impl WindowsPlayer {
             return;
         }
         let closed = Arc::clone(&self.closed);
-        let buffer = Arc::clone(&self.buffer);
+        let cons_slot = Arc::clone(&self.cons_slot);
         let volume_pct = Arc::clone(&self.volume_pct);
         let muted = Arc::clone(&self.muted);
         let underruns = Arc::clone(&self.underruns);
@@ -217,7 +283,7 @@ impl WindowsPlayer {
         *guard = Some(thread::spawn(move || {
             run_playback_worker(
                 closed,
-                buffer,
+                cons_slot,
                 volume_pct,
                 muted,
                 underruns,
@@ -233,72 +299,36 @@ impl WindowsPlayer {
         if self.closed.load(Ordering::SeqCst) || pcm_data.is_empty() {
             return;
         }
-        let mut buf = self.buffer.lock().unwrap_or_else(|e| e.into_inner());
         let ch = usize::from(self.channels.max(1));
+        let mut prod = self.prod.lock().unwrap_or_else(|e| e.into_inner());
         let incoming_samples = pcm_data.len() / 2;
-        let mut dropped_tail: Vec<i16> = Vec::new();
-        let mut counted_overrun = false;
-
-        if buf.len() + incoming_samples > self.max_buffer_samples {
-            let overflow = (buf.len() + incoming_samples) - self.max_buffer_samples;
-            let drop_n = overflow.min(buf.len());
-            // Keep channel alignment when dropping frames
-            let aligned_drop = drop_n - (drop_n % ch);
-            if aligned_drop > 0 {
-                self.overruns.fetch_add(1, Ordering::Relaxed);
-                counted_overrun = true;
-                let xfade_samples = aligned_drop.min(OVERRUN_CROSSFADE_FRAMES * ch);
-                let tail_start = aligned_drop - xfade_samples;
-                dropped_tail.extend(buf.range(tail_start..aligned_drop).copied());
-                buf.drain(..aligned_drop);
-            }
-        }
-        for &pair in pcm_data.as_chunks::<2>().0 {
-            buf.push_back(i16::from_le_bytes(pair));
-        }
-        if buf.len() > self.max_buffer_samples {
-            let excess = buf.len() - self.max_buffer_samples;
-            let aligned_excess = excess.div_ceil(ch) * ch;
-            let drop_n = aligned_excess.min(buf.len());
-            let aligned_drop = drop_n - (drop_n % ch);
-            if aligned_drop > 0 {
-                if !counted_overrun {
-                    self.overruns.fetch_add(1, Ordering::Relaxed);
-                }
-                if dropped_tail.is_empty() {
-                    let xfade_samples = aligned_drop.min(OVERRUN_CROSSFADE_FRAMES * ch);
-                    let tail_start = aligned_drop - xfade_samples;
-                    dropped_tail.extend(buf.range(tail_start..aligned_drop).copied());
-                }
-                buf.drain(..aligned_drop);
-            }
-        }
-        if !dropped_tail.is_empty() {
-            let blend_frames = (dropped_tail.len() / ch).min(buf.len() / ch);
-            if blend_frames > 0 {
-                let tail_offset = dropped_tail.len() - blend_frames * ch;
-                let denom = (blend_frames + 1) as f64;
-                for f in 0..blend_frames {
-                    let t = (f + 1) as f64 / denom;
-                    for c in 0..ch {
-                        let idx = f * ch + c;
-                        let old_s = dropped_tail[tail_offset + idx];
-                        let new_s = buf[idx];
-                        buf[idx] = lerp_i16(old_s, new_s, t);
-                    }
-                }
+        let vacant = prod.vacant_len();
+        let aligned_vacant = vacant - (vacant % ch);
+        let to_push = if incoming_samples > aligned_vacant {
+            self.overruns.fetch_add(1, Ordering::Relaxed);
+            aligned_vacant
+        } else {
+            incoming_samples - (incoming_samples % ch)
+        };
+        for &pair in pcm_data.as_chunks::<2>().0.iter().take(to_push) {
+            if prod.try_push(i16::from_le_bytes(pair)).is_err() {
+                break;
             }
         }
     }
 
     pub fn close(&self) {
         self.closed.store(true, Ordering::SeqCst);
-        self.buffer
-            .lock()
-            .unwrap_or_else(|e| e.into_inner())
-            .clear();
         if let Some(h) = self.worker.lock().unwrap_or_else(|e| e.into_inner()).take() {
             let _ = h.join();
+        }
+        if let Some(cons) = self
+            .cons_slot
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .as_mut()
+        {
+            cons.clear();
         }
     }
 }
@@ -313,7 +343,7 @@ impl Drop for WindowsPlayer {
 #[allow(clippy::too_many_arguments)]
 fn run_playback_worker(
     closed: Arc<AtomicBool>,
-    buffer: Arc<Mutex<VecDeque<i16>>>,
+    cons_slot: Arc<Mutex<Option<HeapCons<i16>>>>,
     volume_pct: Arc<AtomicU32>,
     muted: Arc<AtomicBool>,
     underruns: Arc<AtomicU64>,
@@ -331,15 +361,15 @@ fn run_playback_worker(
     while !closed.load(Ordering::SeqCst) {
         let host = cpal::default_host();
         let Some(device) = host.default_output_device() else {
-            drain_stale_buffer(&buffer);
+            drain_stale_buffer(&cons_slot);
             if sleep_interruptible(backoff.next_delay(), &closed) {
                 break;
             }
             continue;
         };
-        let active_name = device.name().ok();
+        let active_name = device.description().ok().map(|d| d.name().to_string());
         let Ok(default_cfg) = device.default_output_config() else {
-            drain_stale_buffer(&buffer);
+            drain_stale_buffer(&cons_slot);
             if sleep_interruptible(backoff.next_delay(), &closed) {
                 break;
             }
@@ -349,12 +379,15 @@ fn run_playback_worker(
         let format = default_cfg.sample_format();
         let config: StreamConfig = default_cfg.into();
         let dst_channels = (config.channels as usize).max(1);
-        let dst_rate = config.sample_rate.0.max(8_000);
+        let dst_rate = config.sample_rate.max(8_000);
         let stream_broken = Arc::new(AtomicBool::new(false));
+        let Some(mut rb_cons) = ReturnCons::take_from(&cons_slot) else {
+            break;
+        };
+        let mut scratch: VecDeque<i16> = VecDeque::with_capacity(16_384);
 
         let stream_opt = match format {
             SampleFormat::F32 => {
-                let buf_c = Arc::clone(&buffer);
                 let vol_c = Arc::clone(&volume_pct);
                 let mute_c = Arc::clone(&muted);
                 let underruns_c = Arc::clone(&underruns);
@@ -363,16 +396,18 @@ fn run_playback_worker(
                     PlaybackResampler::with_prebuffer(src_rate, dst_rate, prebuffer_samples);
                 device
                     .build_output_stream(
-                        &config,
+                        config.clone(),
                         move |data: &mut [f32], _| {
                             let vol = vol_c.load(Ordering::Relaxed);
                             let is_muted = mute_c.load(Ordering::Relaxed);
-                            let mut guard = buf_c.lock().unwrap_or_else(|e| e.into_inner());
+                            let out_frames = data.len() / dst_channels;
+                            let target_len = prebuffer_samples.max(out_frames * src_channels * 2);
+                            rb_cons.drain_into_scratch(&mut scratch, target_len);
                             if resampler.write_frames_checked(
-                                &mut guard,
+                                &mut scratch,
                                 src_channels,
                                 dst_channels,
-                                data.len() / dst_channels,
+                                out_frames,
                                 vol,
                                 is_muted,
                                 |idx, s| {
@@ -388,7 +423,6 @@ fn run_playback_worker(
                     .ok()
             }
             SampleFormat::I16 => {
-                let buf_c = Arc::clone(&buffer);
                 let vol_c = Arc::clone(&volume_pct);
                 let mute_c = Arc::clone(&muted);
                 let underruns_c = Arc::clone(&underruns);
@@ -397,16 +431,18 @@ fn run_playback_worker(
                     PlaybackResampler::with_prebuffer(src_rate, dst_rate, prebuffer_samples);
                 device
                     .build_output_stream(
-                        &config,
+                        config.clone(),
                         move |data: &mut [i16], _| {
                             let vol = vol_c.load(Ordering::Relaxed);
                             let is_muted = mute_c.load(Ordering::Relaxed);
-                            let mut guard = buf_c.lock().unwrap_or_else(|e| e.into_inner());
+                            let out_frames = data.len() / dst_channels;
+                            let target_len = prebuffer_samples.max(out_frames * src_channels * 2);
+                            rb_cons.drain_into_scratch(&mut scratch, target_len);
                             if resampler.write_frames_checked(
-                                &mut guard,
+                                &mut scratch,
                                 src_channels,
                                 dst_channels,
-                                data.len() / dst_channels,
+                                out_frames,
                                 vol,
                                 is_muted,
                                 |idx, s| {
@@ -422,7 +458,6 @@ fn run_playback_worker(
                     .ok()
             }
             SampleFormat::U16 => {
-                let buf_c = Arc::clone(&buffer);
                 let vol_c = Arc::clone(&volume_pct);
                 let mute_c = Arc::clone(&muted);
                 let underruns_c = Arc::clone(&underruns);
@@ -431,16 +466,18 @@ fn run_playback_worker(
                     PlaybackResampler::with_prebuffer(src_rate, dst_rate, prebuffer_samples);
                 device
                     .build_output_stream(
-                        &config,
+                        config.clone(),
                         move |data: &mut [u16], _| {
                             let vol = vol_c.load(Ordering::Relaxed);
                             let is_muted = mute_c.load(Ordering::Relaxed);
-                            let mut guard = buf_c.lock().unwrap_or_else(|e| e.into_inner());
+                            let out_frames = data.len() / dst_channels;
+                            let target_len = prebuffer_samples.max(out_frames * src_channels * 2);
+                            rb_cons.drain_into_scratch(&mut scratch, target_len);
                             if resampler.write_frames_checked(
-                                &mut guard,
+                                &mut scratch,
                                 src_channels,
                                 dst_channels,
-                                data.len() / dst_channels,
+                                out_frames,
                                 vol,
                                 is_muted,
                                 |idx, s| {
@@ -459,7 +496,7 @@ fn run_playback_worker(
         };
 
         let Some(stream) = stream_opt else {
-            drain_stale_buffer(&buffer);
+            drain_stale_buffer(&cons_slot);
             if sleep_interruptible(backoff.next_delay(), &closed) {
                 break;
             }
@@ -468,7 +505,7 @@ fn run_playback_worker(
 
         if stream.play().is_err() {
             drop(stream);
-            drain_stale_buffer(&buffer);
+            drain_stale_buffer(&cons_slot);
             if sleep_interruptible(backoff.next_delay(), &closed) {
                 break;
             }
@@ -488,7 +525,7 @@ fn run_playback_worker(
                 if let Some(ref cur_name) = active_name {
                     let latest = cpal::default_host()
                         .default_output_device()
-                        .and_then(|d| d.name().ok());
+                        .and_then(|d| d.description().ok().map(|desc| desc.name().to_string()));
                     if latest.is_some() && latest.as_ref() != Some(cur_name) {
                         break;
                     }
@@ -498,7 +535,7 @@ fn run_playback_worker(
         drop(stream);
 
         if !closed.load(Ordering::SeqCst) {
-            drain_stale_buffer(&buffer);
+            drain_stale_buffer(&cons_slot);
             if sleep_interruptible(backoff.next_delay(), &closed) {
                 break;
             }
@@ -507,17 +544,26 @@ fn run_playback_worker(
 }
 
 #[cfg(all(windows, not(test)))]
-fn drain_stale_buffer(buffer: &Mutex<VecDeque<i16>>) {
-    let mut g = buffer.lock().unwrap_or_else(|e| e.into_inner());
-    let drain_n = g.len().min(3_840);
-    g.drain(..drain_n);
+fn drain_stale_buffer(cons_slot: &Mutex<Option<HeapCons<i16>>>) {
+    let mut g = cons_slot.lock().unwrap_or_else(|e| e.into_inner());
+    if let Some(cons) = g.as_mut() {
+        let mut tmp = [0i16; 1024];
+        let mut remaining = cons.occupied_len().min(3_840);
+        while remaining > 0 {
+            let n = cons.pop_slice(&mut tmp[..remaining.min(tmp.len())]);
+            if n == 0 {
+                break;
+            }
+            remaining -= n;
+        }
+    }
 }
 
 #[cfg(any(not(windows), test))]
 #[allow(clippy::too_many_arguments)]
 fn run_playback_worker(
     closed: Arc<AtomicBool>,
-    buffer: Arc<Mutex<VecDeque<i16>>>,
+    cons_slot: Arc<Mutex<Option<HeapCons<i16>>>>,
     _volume_pct: Arc<AtomicU32>,
     _muted: Arc<AtomicBool>,
     underruns: Arc<AtomicU64>,
@@ -528,7 +574,7 @@ fn run_playback_worker(
 ) {
     run_fallback_drain(
         closed,
-        buffer,
+        cons_slot,
         underruns,
         src_rate,
         src_channels,
@@ -540,7 +586,7 @@ fn run_playback_worker(
 #[cfg(any(not(windows), test))]
 fn run_fallback_drain(
     closed: Arc<AtomicBool>,
-    buffer: Arc<Mutex<VecDeque<i16>>>,
+    cons_slot: Arc<Mutex<Option<HeapCons<i16>>>>,
     underruns: Arc<AtomicU64>,
     src_rate: u32,
     src_channels: usize,
@@ -551,25 +597,28 @@ fn run_fallback_drain(
     let drain_step = ((src_rate as usize * ch) / 50)
         .max(ch)
         .min(max_buffer_samples.max(ch));
+    let Some(mut rb_cons) = ReturnCons::take_from(&cons_slot) else {
+        return;
+    };
     let mut primed = false;
+    let mut discard = vec![0i16; drain_step];
     while !closed.load(Ordering::SeqCst) {
-        {
-            let mut g = buffer.lock().unwrap_or_else(|e| e.into_inner());
+        if let Some(cons) = rb_cons.cons.as_mut() {
             if !primed {
                 let min_ready = if prebuffer_samples > 0 {
                     prebuffer_samples
                 } else {
                     ch
                 };
-                if g.len() >= min_ready {
+                if cons.occupied_len() >= min_ready {
                     primed = true;
                 }
             }
             if primed {
-                if g.len() >= drain_step {
-                    g.drain(..drain_step);
+                if cons.occupied_len() >= drain_step {
+                    let _ = cons.pop_slice(&mut discard);
                 } else {
-                    g.clear();
+                    cons.clear();
                     underruns.fetch_add(1, Ordering::Relaxed);
                     primed = false;
                 }
@@ -649,7 +698,7 @@ fn open_loopback_stream(
             "No default audio output device available for WASAPI loopback capture".to_string(),
         );
     };
-    let active_name = device.name().ok();
+    let active_name = device.description().ok().map(|d| d.name().to_string());
     let default_cfg = device
         .default_output_config()
         .map_err(|e| format!("Failed to read default output config for WASAPI loopback: {e}"))?;
@@ -657,7 +706,7 @@ fn open_loopback_stream(
     let format = default_cfg.sample_format();
     let config: StreamConfig = default_cfg.into();
     let ch = (config.channels as usize).max(1);
-    let rate = config.sample_rate.0.max(8_000);
+    let rate = config.sample_rate.max(8_000);
     let stream_broken = Arc::new(AtomicBool::new(false));
 
     let stream = match format {
@@ -669,7 +718,7 @@ fn open_loopback_stream(
             let mut bytes = Vec::with_capacity(4_096);
             device
                 .build_input_stream(
-                    &config,
+                    config.clone(),
                     move |data: &[f32], _| {
                         pairs.clear();
                         for frame in data.chunks_exact(ch) {
@@ -700,7 +749,7 @@ fn open_loopback_stream(
             let mut bytes = Vec::with_capacity(4_096);
             device
                 .build_input_stream(
-                    &config,
+                    config.clone(),
                     move |data: &[i16], _| {
                         pairs.clear();
                         for frame in data.chunks_exact(ch) {
@@ -727,7 +776,7 @@ fn open_loopback_stream(
             let mut bytes = Vec::with_capacity(4_096);
             device
                 .build_input_stream(
-                    &config,
+                    config.clone(),
                     move |data: &[u16], _| {
                         pairs.clear();
                         for frame in data.chunks_exact(ch) {
@@ -813,7 +862,7 @@ fn run_loopback_worker(
                 if let Some(ref cur_name) = active_name {
                     let latest = cpal::default_host()
                         .default_output_device()
-                        .and_then(|d| d.name().ok());
+                        .and_then(|d| d.description().ok().map(|desc| desc.name().to_string()));
                     if latest.is_some() && latest.as_ref() != Some(cur_name) {
                         break;
                     }
@@ -1036,10 +1085,7 @@ mod tests {
             initial.extend_from_slice(&(-100i16).to_le_bytes());
         }
         player.write(&initial);
-        assert_eq!(
-            player.buffer.lock().unwrap().len(),
-            MAX_PLAYBACK_BUFFER_SAMPLES
-        );
+        assert_eq!(player.buffered_samples(), MAX_PLAYBACK_BUFFER_SAMPLES);
 
         // Push 100 more stereo frames (200 samples) with distinct markers (L=2000, R=-2000)
         let mut extra = Vec::with_capacity(100 * 4);
@@ -1049,19 +1095,18 @@ mod tests {
         }
         player.write(&extra);
 
-        let buf = player.buffer.lock().unwrap();
-        assert_eq!(buf.len(), MAX_PLAYBACK_BUFFER_SAMPLES);
+        assert_eq!(player.buffered_samples(), MAX_PLAYBACK_BUFFER_SAMPLES);
         assert_eq!(
-            buf.len() % 2,
+            player.buffered_samples() % 2,
             0,
             "stereo channel alignment must be preserved"
         );
-        // Front should still be an aligned (L, R) pair from the earlier batch
-        assert_eq!(buf[0], 100);
-        assert_eq!(buf[1], -100);
-        // Back should be the newest aligned (L, R) pair
-        assert_eq!(buf[buf.len() - 2], 2000);
-        assert_eq!(buf[buf.len() - 1], -2000);
+        assert_eq!(player.overruns(), 1);
+        let mut slot = player.cons_slot.lock().unwrap();
+        let cons = slot.as_mut().unwrap();
+        let mut pair = [0i16; 2];
+        assert_eq!(cons.pop_slice(&mut pair), 2);
+        assert_eq!(pair, [100, -100]);
     }
 
     #[test]
@@ -1074,7 +1119,7 @@ mod tests {
             batch.extend_from_slice(&(-300i16).to_le_bytes());
         }
         player.write(&batch);
-        assert_eq!(player.buffer.lock().unwrap().len(), cap);
+        assert_eq!(player.buffered_samples(), cap);
 
         let mut extra = Vec::with_capacity(400);
         for _ in 0..100 {
@@ -1083,19 +1128,20 @@ mod tests {
         }
         player.write(&extra);
 
-        let buf = player.buffer.lock().unwrap();
-        assert_eq!(buf.len(), cap);
-        assert_eq!(buf[0], 300);
-        assert_eq!(buf[1], -300);
-        assert_eq!(buf[buf.len() - 2], 900);
-        assert_eq!(buf[buf.len() - 1], -900);
+        assert_eq!(player.buffered_samples(), cap);
+        assert_eq!(player.overruns(), 1);
+        let mut slot = player.cons_slot.lock().unwrap();
+        let cons = slot.as_mut().unwrap();
+        let mut pair = [0i16; 2];
+        assert_eq!(cons.pop_slice(&mut pair), 2);
+        assert_eq!(pair, [300, -300]);
     }
 
     #[test]
     fn test_windows_player_write_ignores_empty_odd_trailing_byte_and_closed() {
         let player = WindowsPlayer::new(48_000, 1);
         player.write(&[]);
-        assert!(player.buffer.lock().unwrap().is_empty());
+        assert_eq!(player.buffered_samples(), 0);
 
         // 5 bytes -> 2 complete i16 samples, 1 trailing byte ignored
         let mut bytes = Vec::new();
@@ -1103,18 +1149,22 @@ mod tests {
         bytes.extend_from_slice(&(-5678i16).to_le_bytes());
         bytes.push(0xFF);
         player.write(&bytes);
+        assert_eq!(player.buffered_samples(), 2);
         {
-            let buf = player.buffer.lock().unwrap();
-            assert_eq!(buf.len(), 2);
-            assert_eq!(buf[0], 1234);
-            assert_eq!(buf[1], -5678);
+            let mut slot = player.cons_slot.lock().unwrap();
+            let cons = slot.as_mut().unwrap();
+            let mut out = [0i16; 2];
+            assert_eq!(cons.pop_slice(&mut out), 2);
+            assert_eq!(out, [1234, -5678]);
         }
 
         // After close(), buffer is cleared and subsequent writes are ignored
-        player.close();
-        assert!(player.buffer.lock().unwrap().is_empty());
         player.write(&bytes);
-        assert!(player.buffer.lock().unwrap().is_empty());
+        assert_eq!(player.buffered_samples(), 2);
+        player.close();
+        assert_eq!(player.buffered_samples(), 0);
+        player.write(&bytes);
+        assert_eq!(player.buffered_samples(), 0);
     }
 
     #[test]
@@ -1193,7 +1243,7 @@ mod tests {
     }
 
     #[test]
-    fn test_windows_player_overrun_crossfade_on_step_waveform() {
+    fn test_windows_player_overrun_counts_and_preserves_capacity() {
         // 200 stereo frames = 400 samples max buffer
         let player = WindowsPlayer::with_max_buffer_samples(48_000, 2, 400);
         let mut initial = vec![(10_000i16, -10_000i16); 100];
@@ -1202,38 +1252,11 @@ mod tests {
         assert_eq!(player.buffered_samples(), 400);
         assert_eq!(player.overruns(), 0);
 
-        // Overflow by 100 frames: drops the (10_000, -10_000) region and crossfades
-        // its tail (96 frames) into the (-10_000, 10_000) front.
+        // Overflow by 100 frames: bounded SPSC ring preserves capacity and records overrun.
         let extra = vec![(-10_000i16, 10_000i16); 100];
         player.write(&encode_stereo_bytes(&extra));
         assert_eq!(player.buffered_samples(), 400);
         assert_eq!(player.overruns(), 1);
-
-        let buf = player.buffer.lock().unwrap();
-        let frames: Vec<(i16, i16)> = buf
-            .iter()
-            .copied()
-            .collect::<Vec<_>>()
-            .as_chunks::<2>()
-            .0
-            .iter()
-            .map(|&p| (p[0], p[1]))
-            .collect();
-        assert_eq!(frames.len(), 200);
-        // Crossfade starts near (10_000, -10_000) and arrives at (-10_000, 10_000) by frame 96
-        assert!(frames[0].0 > 9_500 && frames[0].1 < -9_500);
-        assert!(frames[95].0 < -9_500 && frames[95].1 > 9_500);
-        assert_eq!(frames[96], (-10_000, 10_000));
-
-        let max_step_l = frames[..100]
-            .windows(2)
-            .map(|w| (i32::from(w[1].0) - i32::from(w[0].0)).abs())
-            .max()
-            .unwrap_or(0);
-        assert!(
-            max_step_l < 300,
-            "step click should be smoothed by crossfade: max_step_l={max_step_l}"
-        );
     }
 
     #[test]

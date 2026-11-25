@@ -19,6 +19,7 @@ pub mod jitter;
 pub mod linux_pcm;
 pub mod pcm;
 pub mod server;
+pub mod udp;
 pub mod windows_pcm;
 pub mod wire;
 
@@ -36,7 +37,7 @@ pub use client::{Sht3ClientConfig, Sht3ClientConnection, Sht3ClientReader, Sht3C
 #[cfg(feature = "opus")]
 pub use codec::OpusCodec;
 pub use codec::{create_codec, AudioCodec, AudioProfile, PcmCodec};
-pub use crypto::{AeadSession, EphemeralKeypair, Role, SessionKeys};
+pub use crypto::{AeadSession, EphemeralKeypair, ReplayWindow, Role, SessionKeys};
 pub use dsp::{
     apply_gain_buffer, apply_gain_i16, AdaptiveResampler, DriftController, LinearResampler,
     PlaybackResampler,
@@ -50,6 +51,7 @@ pub use pcm::{
     PCM_FRAME_SAMPLES_10MS, PCM_FRAME_SAMPLES_20MS, PCM_SAMPLE_RATE,
 };
 pub use server::{Sht3Listener, Sht3ServerConfig, Sht3ServerConnection};
+pub use udp::{bind_dscp_ef_udp, set_dscp_ef, Sht3UdpReceiver, Sht3UdpSender, UdpTarget, DSCP_EF};
 pub use windows_pcm::{WindowsPcmCapture, WindowsPcmPlayback};
 pub use wire::{
     AudioParams, ClientHello, CodecId, ControlMessage, DecryptedFrame, EncryptedFrame, FrameHeader,
@@ -207,6 +209,9 @@ pub struct OutboundConfig {
     pub ping_interval: Duration,
     pub io_timeout: Option<Duration>,
     pub reconnect_window: Duration,
+    /// Prefer encrypted SHT3-over-UDP (DSCP EF `0xB8`) for audio frames when the receiver
+    /// advertises a UDP port over the TCP control channel, falling back to TCP automatically.
+    pub prefer_udp: bool,
 }
 
 impl OutboundConfig {
@@ -231,6 +236,7 @@ impl OutboundConfig {
             ping_interval: DEFAULT_PING_INTERVAL,
             io_timeout: Some(DEFAULT_OUTBOUND_IO_TIMEOUT),
             reconnect_window: Duration::ZERO,
+            prefer_udp: false,
         }
     }
 
@@ -251,6 +257,11 @@ impl OutboundConfig {
 
     pub fn with_reconnect_window(mut self, window: Duration) -> Self {
         self.reconnect_window = window;
+        self
+    }
+
+    pub fn with_prefer_udp(mut self, prefer_udp: bool) -> Self {
+        self.prefer_udp = prefer_udp;
         self
     }
 }
@@ -294,6 +305,7 @@ struct OutboundReaderShared {
     session_stop: Arc<AtomicBool>,
     remote_closed: Arc<AtomicBool>,
     pending_bitrate_kbps: Arc<AtomicU16>,
+    udp_audio_port: Arc<AtomicU16>,
     telemetry: Arc<Mutex<StreamTelemetry>>,
     start_instant: Instant,
     read_timeout: Duration,
@@ -312,6 +324,7 @@ fn spawn_outbound_reader(
     let session_stop = Arc::clone(&shared.session_stop);
     let remote_closed = Arc::clone(&shared.remote_closed);
     let pending_bitrate_kbps = Arc::clone(&shared.pending_bitrate_kbps);
+    let udp_audio_port = Arc::clone(&shared.udp_audio_port);
     let telemetry = Arc::clone(&shared.telemetry);
     let start_instant = shared.start_instant;
     let conn_stop_c = Arc::clone(&conn_stop);
@@ -348,6 +361,9 @@ fn spawn_outbound_reader(
                                 ControlMessage::BitrateHint(kbps) => {
                                     pending_bitrate_kbps
                                         .store(kbps.clamp(16, 510), Ordering::Release);
+                                }
+                                ControlMessage::UdpAudioPort(port) => {
+                                    udp_audio_port.store(port, Ordering::Release);
                                 }
                                 ControlMessage::SetVolume(_)
                                 | ControlMessage::SetMute(_)
@@ -571,6 +587,7 @@ impl OutboundSessionHandle {
         let running = Arc::new(AtomicBool::new(true));
         let remote_closed = Arc::new(AtomicBool::new(false));
         let pending_bitrate_kbps = Arc::new(AtomicU16::new(0));
+        let udp_audio_port = Arc::new(AtomicU16::new(0));
         let telemetry = Arc::new(Mutex::new(StreamTelemetry {
             remote_volume: initial_volume,
             remote_muted: initial_muted,
@@ -588,6 +605,7 @@ impl OutboundSessionHandle {
             session_stop: Arc::clone(&stop_flag),
             remote_closed: Arc::clone(&remote_closed),
             pending_bitrate_kbps: Arc::clone(&pending_bitrate_kbps),
+            udp_audio_port: Arc::clone(&udp_audio_port),
             telemetry: Arc::clone(&telemetry),
             start_instant,
             read_timeout: reader_timeout,
@@ -598,9 +616,12 @@ impl OutboundSessionHandle {
         let running_c = Arc::clone(&running);
         let telemetry_c = Arc::clone(&telemetry);
         let ping_interval = config.ping_interval;
+        let server_device_id_c = server_device_id.clone();
 
         let worker = thread::spawn(move || {
             let mut writer_opt = Some(initial_writer);
+            let mut udp_sender: Option<Sht3UdpSender> = None;
+            let mut udp_failed = false;
             let mut last_ping_at: Option<Instant> = None;
             let mut pcm_buf = vec![0i16; frame_samples];
             let mut encoded_buf = Vec::with_capacity(MAX_PAYLOAD_LEN);
@@ -808,10 +829,16 @@ impl OutboundSessionHandle {
                 }
 
                 // Proactive rekey before directional AEAD frame limit is exhausted.
-                if writer_opt
+                let tcp_rekey = writer_opt
                     .as_ref()
-                    .is_some_and(|w| w.frames_remaining() <= PROACTIVE_REKEY_FRAMES_REMAINING)
-                {
+                    .is_some_and(|w| w.frames_remaining() <= PROACTIVE_REKEY_FRAMES_REMAINING);
+                let udp_rekey = udp_sender
+                    .as_ref()
+                    .is_some_and(|s| s.frames_remaining_min() <= PROACTIVE_REKEY_FRAMES_REMAINING);
+                if tcp_rekey || udp_rekey {
+                    udp_audio_port.store(0, Ordering::Release);
+                    udp_sender = None;
+                    udp_failed = false;
                     let Some((new_writer, new_reader_handle)) = try_reconnect_outbound(
                         true,
                         &config,
@@ -832,6 +859,35 @@ impl OutboundSessionHandle {
                     pending_discontinuity = true;
                 }
 
+                // Lazily attach the encrypted SHT3-over-UDP data plane once the server
+                // advertises its UDP audio port over the TCP control channel.
+                if config.prefer_udp && udp_sender.is_none() && !udp_failed {
+                    let port = udp_audio_port.load(Ordering::Acquire);
+                    if port > 0 {
+                        if let Some(udp_seal) = writer_opt.as_mut().and_then(|w| w.take_udp_seal())
+                        {
+                            let bind_ip = match config.target_addr {
+                                SocketAddr::V4(_) => IpAddr::V4(Ipv4Addr::UNSPECIFIED),
+                                SocketAddr::V6(_) => IpAddr::V6(Ipv6Addr::UNSPECIFIED),
+                            };
+                            match Sht3UdpSender::bind(SocketAddr::new(bind_ip, 0)) {
+                                Ok(mut sender) => {
+                                    let udp_addr = SocketAddr::new(config.target_addr.ip(), port);
+                                    sender.add_target(
+                                        server_device_id_c.clone(),
+                                        udp_addr,
+                                        udp_seal,
+                                    );
+                                    udp_sender = Some(sender);
+                                }
+                                Err(_) => {
+                                    udp_failed = true;
+                                }
+                            }
+                        }
+                    }
+                }
+
                 encoded_buf.clear();
                 let Ok(pkt_len) = codec.encode(&pcm_buf[..frame_samples], &mut encoded_buf) else {
                     break 'stream;
@@ -842,11 +898,34 @@ impl OutboundSessionHandle {
                 } else {
                     0
                 };
-                let send_res = match writer_opt.as_mut() {
-                    Some(w) => w
-                        .send_audio(frame_type, flags, timestamp_samples, &encoded_buf)
-                        .and_then(|()| w.flush()),
-                    None => break 'stream,
+                let mut sent_via_udp = false;
+                if let Some(sender) = udp_sender.as_mut() {
+                    if sender
+                        .send_to_peer(
+                            &server_device_id_c,
+                            frame_type,
+                            flags,
+                            timestamp_samples,
+                            &encoded_buf,
+                        )
+                        .is_ok()
+                    {
+                        sent_via_udp = true;
+                    } else {
+                        // Fall back to TCP SHT3 audio seamlessly on UDP send failure.
+                        udp_sender = None;
+                        udp_failed = true;
+                    }
+                }
+                let send_res = if sent_via_udp {
+                    Ok(())
+                } else {
+                    match writer_opt.as_mut() {
+                        Some(w) => w
+                            .send_audio(frame_type, flags, timestamp_samples, &encoded_buf)
+                            .and_then(|()| w.flush()),
+                        None => break 'stream,
+                    }
                 };
                 match send_res {
                     Ok(()) => {
@@ -1172,6 +1251,7 @@ impl Sht3SessionManager {
                                     &hs_factory,
                                     initial_volume,
                                     initial_muted,
+                                    hs_cfg.enable_udp,
                                 );
                             }
                         });
@@ -1568,6 +1648,117 @@ fn maybe_pace_inbound_plc(
 }
 
 #[allow(clippy::too_many_arguments)]
+fn process_inbound_audio_frame(
+    frame: &DecryptedFrame,
+    jb: &mut JitterBuffer,
+    codec: &mut dyn AudioCodec,
+    playback: &mut dyn PcmPlayback,
+    conn: &mut Sht3ServerConnection,
+    drift_ctrl: &mut DriftController,
+    resampler: &mut AdaptiveResampler,
+    decoded_pcm: &mut Vec<i16>,
+    out_pcm: &mut Vec<i16>,
+    resampled_pcm: &mut Vec<i16>,
+    frame_samples: usize,
+    frame_ms_u16: u16,
+    frame_dt_secs: f64,
+    nominal_interval_us: u64,
+    audio_frames_received: &mut u64,
+    decode_errors: &mut u64,
+    last_audio_at: &mut Option<Instant>,
+    last_arrival_at: &mut Option<Instant>,
+    last_pace_at: &mut Option<Instant>,
+    prev_underruns: &mut u64,
+    jitter_us: &mut f64,
+    max_inter_arrival_gap_us: &mut u64,
+    bitrate_ctrl: &mut Option<BitrateAdaptation>,
+) -> bool {
+    let now = Instant::now();
+    if frame.header.flags & FLAG_DISCONTINUITY != 0 {
+        jb.reset();
+        codec.reset();
+        drift_ctrl.reset();
+        resampler.reset();
+        *prev_underruns = jb.stats().underruns;
+        *last_arrival_at = None;
+    }
+    if let Some(prev_at) = *last_arrival_at {
+        let gap_us = now
+            .saturating_duration_since(prev_at)
+            .as_micros()
+            .min(u128::from(u64::MAX)) as u64;
+        if gap_us > *max_inter_arrival_gap_us {
+            *max_inter_arrival_gap_us = gap_us;
+        }
+        let d_us = (gap_us as f64 - nominal_interval_us as f64).abs();
+        *jitter_us += (d_us - *jitter_us) / 16.0;
+    }
+    *last_arrival_at = Some(now);
+
+    decoded_pcm.clear();
+    let decode_ok = codec.decode(&frame.payload, decoded_pcm).is_ok();
+    if !decode_ok {
+        *decode_errors += 1;
+        decoded_pcm.clear();
+        if codec.decode_plc(decoded_pcm).is_err() || decoded_pcm.is_empty() {
+            decoded_pcm.resize(frame_samples, 0);
+        }
+    }
+    *audio_frames_received += 1;
+    *last_audio_at = Some(now);
+    *last_pace_at = None;
+
+    jb.push_realtime(std::mem::take(decoded_pcm));
+    decoded_pcm.reserve(frame_samples);
+
+    if jb.is_primed() {
+        let steady_cushion = jb.effective_target_frames().saturating_sub(1);
+        let target_ms = f64::from(
+            (steady_cushion * usize::from(frame_ms_u16)).min(usize::from(u16::MAX)) as u16,
+        ) + playback.sink_target_ms();
+        drift_ctrl.set_target_ms(target_ms);
+        while jb.stats().buffered_frames > steady_cushion {
+            if jb.concealed_debt() > 0
+                && playback
+                    .buffered_ms()
+                    .is_some_and(|ms| ms >= playback.sink_target_ms() * 0.75)
+                && jb.catchup_concealed_frame()
+            {
+                continue;
+            }
+            out_pcm.clear();
+            match jb.pop_with_codec(codec, out_pcm) {
+                Ok(_) => {
+                    if !write_inbound_pcm(
+                        playback,
+                        out_pcm,
+                        resampler,
+                        resampled_pcm,
+                        drift_ctrl.ratio(),
+                    ) {
+                        return false;
+                    }
+                    if let Some(sink_ms) = playback.buffered_ms() {
+                        let total_ms = f64::from(jb.stats().buffered_ms) + sink_ms;
+                        drift_ctrl.update(total_ms, frame_dt_secs);
+                    }
+                }
+                Err(_) => break,
+            }
+        }
+    }
+
+    if decode_ok {
+        if let Some(ref mut ctrl) = bitrate_ctrl {
+            if let Some(new_kbps) = ctrl.on_clean_frame(now) {
+                let _ = conn.send_control(&ControlMessage::BitrateHint(new_kbps));
+            }
+        }
+    }
+    true
+}
+
+#[allow(clippy::too_many_arguments)]
 fn spawn_inbound_peer(
     mut conn: Sht3ServerConnection,
     active_peers: &Arc<Mutex<HashMap<String, ActiveInboundPeer>>>,
@@ -1577,6 +1768,7 @@ fn spawn_inbound_peer(
     playback_factory: &PcmPlaybackFactory,
     initial_volume: u8,
     initial_muted: bool,
+    enable_udp: bool,
 ) {
     let peer_id = conn.peer_device_id().to_string();
     let audio_params = *conn.audio_params();
@@ -1656,7 +1848,78 @@ fn spawn_inbound_peer(
             .then(|| BitrateAdaptation::new(audio_params.bitrate_kbps));
         let mut clean_close = false;
 
+        let mut udp_rx: Option<Sht3UdpReceiver> = if enable_udp {
+            conn.take_udp_open().and_then(|udp_open| {
+                let bind_ip = conn
+                    .local_addr()
+                    .map(|a| a.ip())
+                    .unwrap_or(IpAddr::V4(Ipv4Addr::UNSPECIFIED));
+                match Sht3UdpReceiver::bind(SocketAddr::new(bind_ip, 0), udp_open) {
+                    Ok(rx) => {
+                        let _ = rx.set_nonblocking(true);
+                        if let Ok(addr) = rx.local_addr() {
+                            let _ = conn.send_control(&ControlMessage::UdpAudioPort(addr.port()));
+                        }
+                        Some(rx)
+                    }
+                    Err(_) => None,
+                }
+            })
+        } else {
+            None
+        };
+
         while !peer_stop_c.load(Ordering::Acquire) && !manager_stop_c.load(Ordering::Acquire) {
+            if let Some(ref mut rx) = udp_rx {
+                let mut udp_write_failed = false;
+                for _ in 0..16 {
+                    match rx.recv_frame() {
+                        Ok((udp_frame, _src)) => {
+                            if matches!(
+                                udp_frame.header.frame_type,
+                                FrameType::AudioOpus | FrameType::AudioPcm
+                            ) && !process_inbound_audio_frame(
+                                &udp_frame,
+                                &mut jb,
+                                &mut *codec,
+                                &mut *playback,
+                                &mut conn,
+                                &mut drift_ctrl,
+                                &mut resampler,
+                                &mut decoded_pcm,
+                                &mut out_pcm,
+                                &mut resampled_pcm,
+                                frame_samples,
+                                frame_ms_u16,
+                                frame_dt_secs,
+                                nominal_interval_us,
+                                &mut audio_frames_received,
+                                &mut decode_errors,
+                                &mut last_audio_at,
+                                &mut last_arrival_at,
+                                &mut last_pace_at,
+                                &mut prev_underruns,
+                                &mut jitter_us,
+                                &mut max_inter_arrival_gap_us,
+                                &mut bitrate_ctrl,
+                            ) {
+                                udp_write_failed = true;
+                                break;
+                            }
+                        }
+                        Err(TransportError::Io(ref e))
+                            if matches!(e.kind(), ErrorKind::WouldBlock | ErrorKind::TimedOut) =>
+                        {
+                            break;
+                        }
+                        Err(_) => continue,
+                    }
+                }
+                if udp_write_failed {
+                    break;
+                }
+            }
+
             match conn.recv_frame() {
                 Ok(frame) => {
                     if peer_stop_c.load(Ordering::Acquire) || manager_stop_c.load(Ordering::Acquire)
@@ -1665,99 +1928,32 @@ fn spawn_inbound_peer(
                     }
                     match frame.header.frame_type {
                         FrameType::AudioOpus | FrameType::AudioPcm => {
-                            let now = Instant::now();
-                            if frame.header.flags & FLAG_DISCONTINUITY != 0 {
-                                jb.reset();
-                                codec.reset();
-                                drift_ctrl.reset();
-                                resampler.reset();
-                                prev_underruns = jb.stats().underruns;
-                                last_arrival_at = None;
-                            }
-                            if let Some(prev_at) = last_arrival_at {
-                                let gap_us = now
-                                    .saturating_duration_since(prev_at)
-                                    .as_micros()
-                                    .min(u128::from(u64::MAX))
-                                    as u64;
-                                if gap_us > max_inter_arrival_gap_us {
-                                    max_inter_arrival_gap_us = gap_us;
-                                }
-                                let d_us = (gap_us as f64 - nominal_interval_us as f64).abs();
-                                jitter_us += (d_us - jitter_us) / 16.0;
-                            }
-                            last_arrival_at = Some(now);
-
-                            decoded_pcm.clear();
-                            let decode_ok = codec.decode(&frame.payload, &mut decoded_pcm).is_ok();
-                            if !decode_ok {
-                                decode_errors += 1;
-                                decoded_pcm.clear();
-                                if codec.decode_plc(&mut decoded_pcm).is_err()
-                                    || decoded_pcm.is_empty()
-                                {
-                                    decoded_pcm.resize(frame_samples, 0);
-                                }
-                            }
-                            audio_frames_received += 1;
-                            last_audio_at = Some(now);
-                            last_pace_at = None;
-
-                            jb.push_realtime(std::mem::take(&mut decoded_pcm));
-                            decoded_pcm.reserve(frame_samples);
-
-                            if jb.is_primed() {
-                                let steady_cushion = jb.effective_target_frames().saturating_sub(1);
-                                let target_ms = f64::from(
-                                    (steady_cushion * usize::from(frame_ms_u16))
-                                        .min(usize::from(u16::MAX))
-                                        as u16,
-                                ) + playback.sink_target_ms();
-                                drift_ctrl.set_target_ms(target_ms);
-                                let mut write_failed = false;
-                                while jb.stats().buffered_frames > steady_cushion {
-                                    if jb.concealed_debt() > 0
-                                        && playback.buffered_ms().is_some_and(|ms| {
-                                            ms >= playback.sink_target_ms() * 0.75
-                                        })
-                                        && jb.catchup_concealed_frame()
-                                    {
-                                        continue;
-                                    }
-                                    out_pcm.clear();
-                                    match jb.pop_with_codec(&mut *codec, &mut out_pcm) {
-                                        Ok(_) => {
-                                            if !write_inbound_pcm(
-                                                &mut *playback,
-                                                &out_pcm,
-                                                &mut resampler,
-                                                &mut resampled_pcm,
-                                                drift_ctrl.ratio(),
-                                            ) {
-                                                write_failed = true;
-                                                break;
-                                            }
-                                            if let Some(sink_ms) = playback.buffered_ms() {
-                                                let total_ms =
-                                                    f64::from(jb.stats().buffered_ms) + sink_ms;
-                                                drift_ctrl.update(total_ms, frame_dt_secs);
-                                            }
-                                        }
-                                        Err(_) => break,
-                                    }
-                                }
-                                if write_failed {
-                                    break;
-                                }
-                            }
-
-                            if decode_ok {
-                                if let Some(ref mut ctrl) = bitrate_ctrl {
-                                    if let Some(new_kbps) = ctrl.on_clean_frame(now) {
-                                        let _ = conn
-                                            .send_control(&ControlMessage::BitrateHint(new_kbps));
-                                    }
-                                }
+                            if !process_inbound_audio_frame(
+                                &frame,
+                                &mut jb,
+                                &mut *codec,
+                                &mut *playback,
+                                &mut conn,
+                                &mut drift_ctrl,
+                                &mut resampler,
+                                &mut decoded_pcm,
+                                &mut out_pcm,
+                                &mut resampled_pcm,
+                                frame_samples,
+                                frame_ms_u16,
+                                frame_dt_secs,
+                                nominal_interval_us,
+                                &mut audio_frames_received,
+                                &mut decode_errors,
+                                &mut last_audio_at,
+                                &mut last_arrival_at,
+                                &mut last_pace_at,
+                                &mut prev_underruns,
+                                &mut jitter_us,
+                                &mut max_inter_arrival_gap_us,
+                                &mut bitrate_ctrl,
+                            ) {
+                                break;
                             }
                         }
                         FrameType::Control => {
@@ -1779,7 +1975,8 @@ fn spawn_inbound_peer(
                                     }
                                     ControlMessage::VolumeState { .. }
                                     | ControlMessage::BitrateHint(_)
-                                    | ControlMessage::DelayOffsetMs(_) => {}
+                                    | ControlMessage::DelayOffsetMs(_)
+                                    | ControlMessage::UdpAudioPort(_) => {}
                                 }
                             }
                             if !maybe_pace_inbound_plc(
@@ -3431,5 +3628,112 @@ mod tests {
                 );
             }
         }
+    }
+
+    #[cfg(feature = "opus")]
+    #[test]
+    fn end_to_end_udp_audio_data_plane_with_tcp_control_and_fallback() {
+        let k_pair = [0x91; 32];
+        let trust = Arc::new(InMemoryTrustStore::new());
+        trust.insert("udp-sender", k_pair);
+
+        // 1. UDP-enabled server + prefer_udp=true + 5ms OpusUltraLowLatency
+        let rx_handle_slot: Arc<Mutex<Option<MockPcmPlaybackHandle>>> = Arc::new(Mutex::new(None));
+        let slot_c = Arc::clone(&rx_handle_slot);
+        let factory: PcmPlaybackFactory = Arc::new(move |_peer_id| {
+            let (play, handle) = MockPcmPlayback::pair();
+            *slot_c.lock().unwrap() = Some(handle);
+            Ok(Box::new(play))
+        });
+
+        let manager = Sht3SessionManager::new();
+        let addr = manager
+            .start_listener(
+                "127.0.0.1:0".parse().unwrap(),
+                Sht3ServerConfig::new("udp-receiver"),
+                trust.clone(),
+                factory,
+            )
+            .unwrap();
+
+        let spc = AudioProfile::OpusUltraLowLatency.frame_samples_per_channel();
+        assert_eq!(spc, 240);
+        let mut frames = Vec::new();
+        for f in 0..30usize {
+            let mut pcm = Vec::with_capacity(spc * 2);
+            for i in 0..spc {
+                let t = (f * spc + i) as f64 / 48_000.0;
+                let s = ((2.0 * std::f64::consts::PI * 440.0 * t).sin() * 12_000.0) as i16;
+                pcm.push(s);
+                pcm.push(s);
+            }
+            frames.push(pcm);
+        }
+
+        let cfg = OutboundConfig::new("udp-sender", addr, k_pair)
+            .with_profile(AudioProfile::OpusUltraLowLatency)
+            .with_jitter_ms(15)
+            .with_prefer_udp(true);
+        let session = manager
+            .start_outbound(
+                cfg,
+                Box::new(MockPcmCapture::from_frames(frames).with_pace(Duration::from_millis(5))),
+            )
+            .unwrap();
+        session.set_volume(77).unwrap();
+        session.join();
+
+        let tel = session.telemetry();
+        assert_eq!(tel.frames_sent, 30);
+        assert_eq!(tel.remote_volume, 77);
+        assert!(tel.pongs_received >= 1);
+
+        assert!(wait_until(Duration::from_secs(2), || {
+            rx_handle_slot
+                .lock()
+                .unwrap()
+                .as_ref()
+                .is_some_and(|h| h.is_closed() && h.frame_count() >= 20)
+        }));
+
+        // 2. Fallback to TCP when server has enable_udp = false even if client prefer_udp = true
+        let rx_fb_slot: Arc<Mutex<Option<MockPcmPlaybackHandle>>> = Arc::new(Mutex::new(None));
+        let fb_c = Arc::clone(&rx_fb_slot);
+        let fb_factory: PcmPlaybackFactory = Arc::new(move |_peer_id| {
+            let (play, handle) = MockPcmPlayback::pair();
+            *fb_c.lock().unwrap() = Some(handle);
+            Ok(Box::new(play))
+        });
+
+        let mut no_udp_cfg = Sht3ServerConfig::new("tcp-fallback-receiver");
+        no_udp_cfg.enable_udp = false;
+        let fb_addr = manager
+            .start_listener(
+                "127.0.0.1:0".parse().unwrap(),
+                no_udp_cfg,
+                trust,
+                fb_factory,
+            )
+            .unwrap();
+
+        let fb_frames = vec![vec![500i16; spc * 2]; 12];
+        let fb_session = manager
+            .start_outbound(
+                OutboundConfig::new("udp-sender", fb_addr, k_pair)
+                    .with_profile(AudioProfile::OpusUltraLowLatency)
+                    .with_jitter_ms(15)
+                    .with_prefer_udp(true),
+                Box::new(MockPcmCapture::from_frames(fb_frames)),
+            )
+            .unwrap();
+        fb_session.join();
+        assert_eq!(fb_session.telemetry().frames_sent, 12);
+        assert!(wait_until(Duration::from_secs(2), || {
+            rx_fb_slot
+                .lock()
+                .unwrap()
+                .as_ref()
+                .is_some_and(|h| h.is_closed() && h.frame_count() >= 10)
+        }));
     }
 }

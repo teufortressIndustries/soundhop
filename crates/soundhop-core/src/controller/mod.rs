@@ -264,6 +264,7 @@ impl Controller {
         let audio_profile = match profile_opt {
             Some(AudioProfile::OpusBalanced) | None => "opus-balanced",
             Some(AudioProfile::OpusLowLatency) => "opus-low-latency",
+            Some(AudioProfile::OpusUltraLowLatency) => "opus-ultra-low-latency",
             Some(AudioProfile::OpusLowBandwidth) => "opus-low-bandwidth",
             Some(AudioProfile::PcmLossless) => "pcm-lossless",
         };
