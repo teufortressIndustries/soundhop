@@ -8,8 +8,13 @@ repository.workspace = true
 description = "Core library for SoundHop local network audio sharing, discovery, multi-room, and Android bridge"
 
 [features]
-default = ["opus"]
-opus = ["dep:opus2", "dep:mousiki"]
+default = ["gstreamer"]
+gstreamer = [
+    "dep:gstreamer",
+    "dep:gstreamer-audio",
+    "dep:gstreamer-rtp",
+    "dep:gstreamer-app",
+]
 
 [dependencies]
 serde.workspace = true
@@ -27,8 +32,10 @@ ed25519-dalek.workspace = true
 x25519-dalek.workspace = true
 chacha20poly1305.workspace = true
 zeroize.workspace = true
-opus2 = { workspace = true, optional = true }
-mousiki = { workspace = true, optional = true }
+gstreamer = { workspace = true, optional = true }
+gstreamer-audio = { workspace = true, optional = true }
+gstreamer-rtp = { workspace = true, optional = true }
+gstreamer-app = { workspace = true, optional = true }
 hex.workspace = true
 rand.workspace = true
 ureq.workspace = true

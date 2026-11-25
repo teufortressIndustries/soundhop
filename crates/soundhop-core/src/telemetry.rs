@@ -669,6 +669,7 @@ mod tests {
         assert_eq!(snap.audio.dbfs, -60.0);
     }
 
+    #[cfg(feature = "gstreamer")]
     #[test]
     fn test_network_probe_skips_raw_tcp_when_sht3_active_and_syncs_telemetry() {
         use std::io::ErrorKind;
@@ -681,7 +682,7 @@ mod tests {
         use crate::discovery::{BeaconV3Meta, Peer};
         use crate::pairing::TrustedPeer;
         use crate::state::State;
-        use crate::transport::{MockPcmCapture, MockPcmPlayback, PcmCapture, PcmPlayback};
+        use crate::transport::{CaptureEndpoint, PlaybackEndpoint};
         use crate::util::{CommandResult, MockRunner};
 
         let make_runner = || {
@@ -710,6 +711,7 @@ mod tests {
         srv_cfg.device.id = "srv-probe-sht3".to_string();
         srv_cfg.sharing.security = "paired".to_string();
         srv_cfg.sharing.v3_port = free_v3_port;
+        srv_cfg.sharing.rtp_port = 0;
         let server_ctrl = Controller::new(
             Some(srv_cfg),
             Some(State::default()),
@@ -720,8 +722,9 @@ mod tests {
         );
         server_ctrl.set_save_enabled(false);
         server_ctrl.set_playback_factory(Arc::new(|_| {
-            let (playback, _) = MockPcmPlayback::pair();
-            Ok(Box::new(playback) as Box<dyn PcmPlayback>)
+            Ok(PlaybackEndpoint::TestAppSink(Arc::new(Mutex::new(
+                Vec::new(),
+            ))))
         }));
 
         let k_pair = [0x88u8; 32];
@@ -749,13 +752,14 @@ mod tests {
         ));
         client_ctrl.set_save_enabled(false);
         client_ctrl.set_capture_factory(Arc::new(|| {
-            let cap =
-                MockPcmCapture::sine_wave(440.0, Some(200)).with_pace(Duration::from_millis(15));
-            Ok(Box::new(cap) as Box<dyn PcmCapture>)
+            Ok(CaptureEndpoint::TestSineWave {
+                freq_hz: 440.0,
+                netsim: None,
+            })
         }));
         client_ctrl.record_trusted_peer(TrustedPeer {
             device_id: "srv-probe-sht3".to_string(),
-            display_name: "SHT3 Probe Target".to_string(),
+            display_name: "SRTP Probe Target".to_string(),
             ed25519_pub: [0x22u8; 32],
             pairwise_secret: k_pair,
             fingerprint: "9999-8888-7777-6666".to_string(),
@@ -767,7 +771,7 @@ mod tests {
                 v3_port: Some(bound_v3_port),
                 pair_port: Some(4715),
                 pub_fp: Some("9999-8888-7777-6666".to_string()),
-                caps: vec!["sht3".to_string(), "pcm".to_string()],
+                caps: vec!["gst-srtp".to_string(), "pcm".to_string()],
             },
         );
 

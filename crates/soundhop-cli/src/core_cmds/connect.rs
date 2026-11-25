@@ -5,7 +5,7 @@ use std::time::Duration;
 
 use soundhop_core::constants::{PROTOCOL_VERSION, VERSION};
 use soundhop_core::controller::{ConnectOptions, Controller};
-use soundhop_core::discovery::{discover_once_with_psk, Peer};
+use soundhop_core::discovery::{discover_once_with_meta, Peer};
 use soundhop_core::util::{is_private_address, split_host_port};
 
 use super::try_ipc;
@@ -129,9 +129,15 @@ pub fn handle_discover(controller: &Arc<Controller>, args: &DiscoverArgs, json_o
         None => {
             let cfg = lock_or_recover(&controller.config).clone();
             let psk = (!cfg.sharing.psk_hash.is_empty()).then_some(cfg.sharing.psk_hash.as_str());
-            let found = discover_once_with_psk(timeout, cfg.discovery.port, &cfg.device.id, psk);
-            for p in &found {
-                controller.remember_peer(p);
+            let found_with_meta =
+                discover_once_with_meta(timeout, cfg.discovery.port, &cfg.device.id, psk);
+            let mut found = Vec::with_capacity(found_with_meta.len());
+            for (p, meta) in found_with_meta {
+                if let Some(m) = meta {
+                    controller.remember_peer_v3_meta(&p.id, m);
+                }
+                controller.remember_peer(&p);
+                found.push(p);
             }
             controller.save();
             found
@@ -206,10 +212,16 @@ fn resolve_cli_peer(controller: &Arc<Controller>, target: &str) -> Result<Peer, 
     }
     // Quick scan fallback
     let psk = (!cfg.sharing.psk_hash.is_empty()).then_some(cfg.sharing.psk_hash.as_str());
-    let mut scanned = discover_once_with_psk(0.9, cfg.discovery.port, &cfg.device.id, psk);
-    scanned.sort_by(|a, b| a.id.cmp(&b.id));
-    for p in &scanned {
-        controller.remember_peer(p);
+    let mut scanned_with_meta =
+        discover_once_with_meta(0.9, cfg.discovery.port, &cfg.device.id, psk);
+    scanned_with_meta.sort_by(|(a, _), (b, _)| a.id.cmp(&b.id));
+    let mut scanned = Vec::with_capacity(scanned_with_meta.len());
+    for (p, meta) in scanned_with_meta {
+        if let Some(m) = meta {
+            controller.remember_peer_v3_meta(&p.id, m);
+        }
+        controller.remember_peer(&p);
+        scanned.push(p);
     }
     if let Some(p) = scanned.iter().find(|p| {
         p.id.eq_ignore_ascii_case(q)

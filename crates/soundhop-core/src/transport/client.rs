@@ -1,21 +1,23 @@
-//! SHT3 TCP client with mutual authentication and encrypted audio/control framing.
+//! SHT4 TCP control-channel client with mutual authentication, SRTP parameter negotiation,
+//! and encrypted control/ping/pong/close framing.
 
 use std::io::Write;
 use std::net::{SocketAddr, TcpStream};
 use std::time::Duration;
 
 use socket2::{SockRef, TcpKeepalive};
+use zeroize::Zeroizing;
 
 use crate::transport::crypto::{
-    compute_client_hello_mac, generate_nonce, verify_server_hello_mac, AeadOpenHalf, AeadSealHalf,
-    AeadSession, EphemeralKeypair, Role, SessionKeys,
+    compute_client_hello_mac, generate_nonce, generate_ssrc, verify_server_hello_mac, AeadOpenHalf,
+    AeadSealHalf, AeadSession, EphemeralKeypair, Role, SessionKeys,
 };
 use crate::transport::wire::{
     AudioParams, ClientHello, ControlMessage, DecryptedFrame, EncryptedFrame, FrameType,
-    HandshakeStatus, PingPayload, ServerHello,
+    HandshakeStatus, PingPayload, ServerHello, SRTP_SUITE_AES128_ICM_HMAC_SHA1_80,
 };
 use crate::transport::{
-    TransportError, TransportResult, AEAD_TAG_LEN, FRAME_HEADER_LEN, MAX_PAYLOAD_LEN, SHT3_VERSION,
+    TransportError, TransportResult, AEAD_TAG_LEN, FRAME_HEADER_LEN, MAX_PAYLOAD_LEN, SHT4_VERSION,
 };
 
 const DEFAULT_CONNECT_TIMEOUT: Duration = Duration::from_secs(3);
@@ -63,7 +65,7 @@ impl Sht3ClientConfig {
     }
 }
 
-/// Authenticated, encrypted client-side SHT3 connection.
+/// Authenticated, encrypted client-side SHT4 control connection.
 pub struct Sht3ClientConnection {
     writer: Sht3ClientWriter,
     open: AeadOpenHalf,
@@ -71,9 +73,13 @@ pub struct Sht3ClientConnection {
     audio_params: AudioParams,
     initial_volume: u8,
     initial_muted: bool,
+    sender_ssrc: u32,
+    rtp_port: u16,
+    srtp_master_key_c2s: Zeroizing<[u8; 30]>,
+    srtp_master_key_s2c: Zeroizing<[u8; 30]>,
 }
 
-/// Outbound write half of a split [`Sht3ClientConnection`], reusing a pre-allocated wire buffer.
+/// Outbound write half of a split [`Sht3ClientConnection`].
 pub struct Sht3ClientWriter {
     stream: TcpStream,
     seal: AeadSealHalf,
@@ -93,16 +99,6 @@ impl Sht3ClientWriter {
             .seal_frame(frame_type, flags, timestamp_samples, payload)?;
         frame.write_into_buf(&mut self.wire_scratch, &mut self.stream)?;
         Ok(())
-    }
-
-    pub fn send_audio(
-        &mut self,
-        frame_type: FrameType,
-        flags: u8,
-        timestamp_samples: u32,
-        encoded_audio: &[u8],
-    ) -> TransportResult<()> {
-        self.seal_and_write(frame_type, flags, timestamp_samples, encoded_audio)
     }
 
     pub fn send_control(&mut self, msg: &ControlMessage) -> TransportResult<()> {
@@ -158,7 +154,7 @@ impl Sht3ClientReader {
 }
 
 impl Sht3ClientConnection {
-    /// Connect to an SHT3 server and execute the mutual-auth + X25519 handshake.
+    /// Connect to an SHT4 server and execute the mutual-auth + X25519 + SRTP key handshake.
     pub fn connect(
         addr: SocketAddr,
         config: Sht3ClientConfig,
@@ -174,14 +170,17 @@ impl Sht3ClientConnection {
         let client_eph = EphemeralKeypair::generate();
         let client_pk = client_eph.public_bytes();
         let client_nonce = generate_nonce();
+        let sender_ssrc = generate_ssrc();
 
         let mut client_hello = ClientHello {
-            version: SHT3_VERSION,
+            version: SHT4_VERSION,
             flags: 0,
             client_device_id: config.client_device_id,
             client_pk,
             client_nonce,
             audio_params: config.audio_params,
+            sender_ssrc,
+            srtp_suite: SRTP_SUITE_AES128_ICM_HMAC_SHA1_80,
             mac_c: [0u8; 32],
         };
         let client_transcript = client_hello.encode_transcript()?;
@@ -200,7 +199,7 @@ impl Sht3ClientConnection {
             }
             HandshakeStatus::UnsupportedVersion => {
                 return Err(TransportError::Wire(
-                    "server rejected SHT3 protocol version".into(),
+                    "server rejected SHT4 protocol version".into(),
                 ));
             }
             HandshakeStatus::UnsupportedCodec => {
@@ -213,6 +212,18 @@ impl Sht3ClientConnection {
                     "server reported internal error".into(),
                 ));
             }
+        }
+
+        if server_hello.srtp_suite != SRTP_SUITE_AES128_ICM_HMAC_SHA1_80 {
+            return Err(TransportError::Wire(format!(
+                "server returned unsupported SRTP suite {}",
+                server_hello.srtp_suite
+            )));
+        }
+        if server_hello.rtp_port == 0 {
+            return Err(TransportError::Wire(
+                "server returned invalid rtp_port 0".into(),
+            ));
         }
 
         let mut full_transcript = Vec::with_capacity(client_transcript.len() + server_body.len());
@@ -234,6 +245,8 @@ impl Sht3ClientConnection {
             &server_hello.server_nonce,
             &full_transcript,
         )?;
+        let srtp_master_key_c2s = Zeroizing::new(keys.srtp_master_key_c2s);
+        let srtp_master_key_s2c = Zeroizing::new(keys.srtp_master_key_s2c);
         let (seal, open) = AeadSession::new(Role::Client, &keys).split();
 
         Ok(Self {
@@ -247,6 +260,10 @@ impl Sht3ClientConnection {
             audio_params: server_hello.audio_params,
             initial_volume: server_hello.initial_volume,
             initial_muted: server_hello.initial_muted,
+            sender_ssrc,
+            rtp_port: server_hello.rtp_port,
+            srtp_master_key_c2s,
+            srtp_master_key_s2c,
         })
     }
 
@@ -278,19 +295,24 @@ impl Sht3ClientConnection {
         self.initial_muted
     }
 
-    pub fn frames_remaining(&self) -> u64 {
-        self.writer.frames_remaining()
+    pub fn sender_ssrc(&self) -> u32 {
+        self.sender_ssrc
     }
 
-    pub fn send_audio(
-        &mut self,
-        frame_type: FrameType,
-        flags: u8,
-        timestamp_samples: u32,
-        encoded_audio: &[u8],
-    ) -> TransportResult<()> {
-        self.writer
-            .send_audio(frame_type, flags, timestamp_samples, encoded_audio)
+    pub fn rtp_port(&self) -> u16 {
+        self.rtp_port
+    }
+
+    pub fn srtp_master_key_c2s(&self) -> &[u8; 30] {
+        &self.srtp_master_key_c2s
+    }
+
+    pub fn srtp_master_key_s2c(&self) -> &[u8; 30] {
+        &self.srtp_master_key_s2c
+    }
+
+    pub fn frames_remaining(&self) -> u64 {
+        self.writer.frames_remaining()
     }
 
     pub fn send_control(&mut self, msg: &ControlMessage) -> TransportResult<()> {
@@ -329,28 +351,16 @@ mod tests {
     use std::sync::Arc;
     use std::thread;
 
-    use crate::transport::codec::{create_codec, AudioProfile};
-    use crate::transport::jitter::{JitterBuffer, JitterConfig};
     use crate::transport::server::{Sht3Listener, Sht3ServerConfig};
-    use crate::transport::wire::{ControlMessage, FrameType, PingPayload, PongPayload};
+    use crate::transport::wire::{
+        AudioProfile, ControlMessage, FrameType, PingPayload, PongPayload,
+    };
     use crate::transport::{InMemoryTrustStore, TransportError};
 
     use super::*;
 
-    fn test_sine_frame(spc: usize, idx: usize) -> Vec<i16> {
-        let mut out = Vec::with_capacity(spc * 2);
-        let base = idx * spc;
-        for i in 0..spc {
-            let t = (base + i) as f64 / 48_000.0;
-            let s = ((2.0 * std::f64::consts::PI * 440.0 * t).sin() * 12_000.0) as i16;
-            out.push(s);
-            out.push(-s);
-        }
-        out
-    }
-
     #[test]
-    fn loopback_pcm_audio_control_and_ping_pong() {
+    fn loopback_v4_handshake_control_and_ping_pong() {
         let k_pair = [0x5A; 32];
         let trust = Arc::new(InMemoryTrustStore::new());
         trust.insert("client-pc", k_pair);
@@ -358,37 +368,22 @@ mod tests {
         let mut server_cfg = Sht3ServerConfig::new("server-speaker");
         server_cfg.initial_volume = 72;
         server_cfg.initial_muted = false;
+        server_cfg.rtp_port = 51234;
 
         let listener =
             Sht3Listener::bind("127.0.0.1:0".parse().unwrap(), server_cfg, trust).unwrap();
         let addr = listener.local_addr().unwrap();
 
-        let profile = AudioProfile::PcmLossless;
-        let expected_pcm_0 = test_sine_frame(profile.frame_samples_per_channel(), 0);
-        let expected_pcm_1 = test_sine_frame(profile.frame_samples_per_channel(), 1);
-        let expected_pcm_0_srv = expected_pcm_0.clone();
-        let expected_pcm_1_srv = expected_pcm_1.clone();
+        let profile = AudioProfile::OpusBalanced;
 
         let server_handle = thread::spawn(move || {
             let mut conn = listener.accept().unwrap();
             assert_eq!(conn.peer_device_id(), "client-pc");
-            let mut codec = create_codec(conn.audio_params()).unwrap();
-            let mut jb = JitterBuffer::new(JitterConfig::default());
-
-            // Receive 2 encrypted PCM frames.
-            for (i, expected) in [expected_pcm_0_srv, expected_pcm_1_srv]
-                .into_iter()
-                .enumerate()
-            {
-                let frame = conn.recv_frame().unwrap();
-                assert_eq!(frame.header.frame_type, FrameType::AudioPcm);
-                assert_eq!(frame.header.seq, i as u64);
-                let mut pcm = Vec::new();
-                codec.decode(&frame.payload, &mut pcm).unwrap();
-                assert_eq!(pcm, expected);
-                jb.push(pcm);
-            }
-            assert!(jb.is_primed());
+            assert_eq!(conn.rtp_port(), 51234);
+            assert_ne!(conn.sender_ssrc(), 0);
+            assert_ne!(conn.sender_ssrc(), u32::MAX);
+            let srv_c2s_key = *conn.srtp_master_key_c2s();
+            let srv_ssrc = conn.sender_ssrc();
 
             // Receive Control::SetVolume and reply with VolumeState.
             let ctrl = conn.recv_frame().unwrap();
@@ -409,7 +404,7 @@ mod tests {
             assert_eq!(ping.client_time_us, 999_001);
             conn.send_pong(&PongPayload {
                 client_time_us: ping.client_time_us,
-                jitter_buf_ms: jb.stats().buffered_ms,
+                jitter_buf_ms: 40,
                 dropped_frames: 0,
             })
             .unwrap();
@@ -417,6 +412,7 @@ mod tests {
             // Receive Close.
             let close_frame = conn.recv_frame().unwrap();
             assert_eq!(close_frame.header.frame_type, FrameType::Close);
+            (srv_c2s_key, srv_ssrc)
         });
 
         let client_cfg = Sht3ClientConfig::new("client-pc", profile.to_audio_params(40));
@@ -424,15 +420,10 @@ mod tests {
         assert_eq!(client.server_device_id(), "server-speaker");
         assert_eq!(client.initial_volume(), 72);
         assert!(!client.initial_muted());
+        assert_eq!(client.rtp_port(), 51234);
+        let cli_c2s_key = *client.srtp_master_key_c2s();
+        let cli_ssrc = client.sender_ssrc();
 
-        let mut codec = create_codec(client.audio_params()).unwrap();
-        for (i, pcm) in [&expected_pcm_0, &expected_pcm_1].into_iter().enumerate() {
-            let mut pkt = Vec::new();
-            codec.encode(pcm, &mut pkt).unwrap();
-            client
-                .send_audio(FrameType::AudioPcm, 0, (i as u32) * 960, &pkt)
-                .unwrap();
-        }
         client.send_control(&ControlMessage::SetVolume(65)).unwrap();
 
         let state_frame = client.recv_frame().unwrap();
@@ -455,69 +446,9 @@ mod tests {
         assert_eq!(pong.jitter_buf_ms, 40);
 
         client.send_close().unwrap();
-        server_handle.join().unwrap();
-    }
-
-    #[cfg(feature = "opus")]
-    #[test]
-    fn loopback_opus_encrypted_stream_and_control() {
-        let k_pair = [0xC3; 32];
-        let trust = Arc::new(InMemoryTrustStore::new());
-        trust.insert("opus-sender", k_pair);
-
-        let listener = Sht3Listener::bind(
-            "127.0.0.1:0".parse().unwrap(),
-            Sht3ServerConfig::new("opus-receiver"),
-            trust,
-        )
-        .unwrap();
-        let addr = listener.local_addr().unwrap();
-
-        let profile = AudioProfile::OpusBalanced;
-
-        let server_handle = thread::spawn(move || {
-            let mut conn = listener.accept().unwrap();
-            let mut codec = create_codec(conn.audio_params()).unwrap();
-            let mut total_energy = 0i64;
-            for idx in 0..4u64 {
-                let frame = conn.recv_frame().unwrap();
-                assert_eq!(frame.header.frame_type, FrameType::AudioOpus);
-                assert_eq!(frame.header.seq, idx);
-                let mut pcm = Vec::new();
-                let n = codec.decode(&frame.payload, &mut pcm).unwrap();
-                assert_eq!(n, 1920);
-                total_energy += pcm.iter().map(|&s| i64::from(s).abs()).sum::<i64>();
-            }
-            assert!(total_energy > 200_000, "decoded Opus audio was silent");
-
-            let ctrl = conn.recv_frame().unwrap();
-            assert_eq!(
-                ControlMessage::decode(&ctrl.payload).unwrap(),
-                ControlMessage::SetMute(true)
-            );
-            conn.send_control(&ControlMessage::BitrateHint(64)).unwrap();
-        });
-
-        let client_cfg = Sht3ClientConfig::new("opus-sender", profile.to_audio_params(40));
-        let mut client = Sht3ClientConnection::connect(addr, client_cfg, &k_pair).unwrap();
-        let mut codec = create_codec(client.audio_params()).unwrap();
-
-        for idx in 0..4 {
-            let pcm = test_sine_frame(profile.frame_samples_per_channel(), idx);
-            let mut pkt = Vec::new();
-            codec.encode(&pcm, &mut pkt).unwrap();
-            client
-                .send_audio(FrameType::AudioOpus, 0, (idx as u32) * 960, &pkt)
-                .unwrap();
-        }
-        client.send_control(&ControlMessage::SetMute(true)).unwrap();
-
-        let hint = client.recv_frame().unwrap();
-        assert_eq!(
-            ControlMessage::decode(&hint.payload).unwrap(),
-            ControlMessage::BitrateHint(64)
-        );
-        server_handle.join().unwrap();
+        let (srv_c2s_key, srv_ssrc) = server_handle.join().unwrap();
+        assert_eq!(cli_c2s_key, srv_c2s_key);
+        assert_eq!(cli_ssrc, srv_ssrc);
     }
 
     #[test]
@@ -534,16 +465,13 @@ mod tests {
         let addr = listener.local_addr().unwrap();
 
         let server_handle = thread::spawn(move || {
-            // 1. Unknown device id
             let err1 = listener.accept().err().expect("unknown peer must fail");
             assert!(matches!(err1, TransportError::AuthRejected(_)));
 
-            // 2. Known device id with wrong K_pair (bad MAC)
             let err2 = listener.accept().err().expect("wrong key peer must fail");
             assert!(matches!(err2, TransportError::AuthRejected(_)));
         });
 
-        // 1. Unknown device id
         let cfg1 = Sht3ClientConfig::new(
             "stranger-device",
             AudioProfile::PcmLossless.to_audio_params(40),
@@ -553,7 +481,6 @@ mod tests {
             .expect("client should see AuthRejected");
         assert!(matches!(c_err1, TransportError::AuthRejected(_)));
 
-        // 2. Known device id with wrong key
         let cfg2 =
             Sht3ClientConfig::new("known-peer", AudioProfile::PcmLossless.to_audio_params(40));
         let c_err2 = Sht3ClientConnection::connect(addr, cfg2, &[0x22; 32])
@@ -565,7 +492,53 @@ mod tests {
     }
 
     #[test]
-    fn into_split_concurrent_full_duplex_audio_and_telemetry() {
+    fn rejects_legacy_v3_client_with_unsupported_version() {
+        let k_pair = [0x44; 32];
+        let trust = Arc::new(InMemoryTrustStore::new());
+        trust.insert("old-v3-client", k_pair);
+
+        let listener = Sht3Listener::bind(
+            "127.0.0.1:0".parse().unwrap(),
+            Sht3ServerConfig::new("v4-server"),
+            trust,
+        )
+        .unwrap();
+        let addr = listener.local_addr().unwrap();
+
+        let server_handle = thread::spawn(move || {
+            let err = listener.accept().err().expect("v3 client must be rejected");
+            assert!(matches!(err, TransportError::Wire(_)));
+        });
+
+        // Craft a raw v3 ClientHello (version = 3, no sender_ssrc / srtp_suite).
+        let mut stream = TcpStream::connect(addr).unwrap();
+        let id = b"old-v3-client";
+        let mut body = Vec::new();
+        body.extend_from_slice(&crate::transport::SHT3_MAGIC);
+        body.push(3u8); // old version 3
+        body.push(0u8);
+        body.extend_from_slice(&(id.len() as u16).to_be_bytes());
+        body.extend_from_slice(id);
+        body.extend_from_slice(&[0x11; 32]);
+        body.extend_from_slice(&[0x22; 16]);
+        AudioParams::default().encode_into(&mut body);
+        let mac = compute_client_hello_mac(&k_pair, &body);
+        let total_len = (body.len() + 32) as u16;
+        stream.write_all(&crate::transport::SHT3_MAGIC).unwrap();
+        stream.write_all(&[0x01]).unwrap();
+        stream.write_all(&total_len.to_be_bytes()).unwrap();
+        stream.write_all(&body).unwrap();
+        stream.write_all(&mac).unwrap();
+        stream.flush().unwrap();
+
+        let (sh, _) = ServerHello::read_from(&mut stream).unwrap();
+        assert_eq!(sh.status, HandshakeStatus::UnsupportedVersion);
+
+        server_handle.join().unwrap();
+    }
+
+    #[test]
+    fn into_split_concurrent_full_duplex_control_and_telemetry() {
         let k_pair = [0x6B; 32];
         let trust = Arc::new(InMemoryTrustStore::new());
         trust.insert("duplex-client", k_pair);
@@ -580,15 +553,11 @@ mod tests {
 
         let server_handle = thread::spawn(move || {
             let mut conn = listener.accept().unwrap();
-            let mut audio_count = 0usize;
             let mut saw_ping = false;
             let mut saw_ctrl = false;
             loop {
                 let frame = conn.recv_frame().unwrap();
                 match frame.header.frame_type {
-                    FrameType::AudioPcm => {
-                        audio_count += 1;
-                    }
                     FrameType::Ping => {
                         let ping = PingPayload::decode(&frame.payload).unwrap();
                         conn.send_pong(&PongPayload {
@@ -612,10 +581,9 @@ mod tests {
                         saw_ctrl = true;
                     }
                     FrameType::Close => break,
-                    _ => {}
+                    FrameType::Pong => {}
                 }
             }
-            assert_eq!(audio_count, 20);
             assert!(saw_ping && saw_ctrl);
         });
 
@@ -658,28 +626,18 @@ mod tests {
             }
         });
 
-        let dummy_pcm = vec![0x12u8; 64];
-        for i in 0..20u32 {
-            writer
-                .send_audio(FrameType::AudioPcm, 0, i * 960, &dummy_pcm)
-                .unwrap();
-            if i == 5 {
-                writer
-                    .send_ping(&PingPayload {
-                        client_time_us: 42_000,
-                    })
-                    .unwrap();
-            }
-            if i == 10 {
-                writer.send_control(&ControlMessage::SetVolume(55)).unwrap();
-            }
-        }
+        writer
+            .send_ping(&PingPayload {
+                client_time_us: 42_000,
+            })
+            .unwrap();
+        writer.send_control(&ControlMessage::SetVolume(55)).unwrap();
         writer.flush().unwrap();
-        assert_eq!(writer.frames_remaining(), initial_remaining - 22);
+        assert_eq!(writer.frames_remaining(), initial_remaining - 2);
 
         reader_thread.join().unwrap();
         writer.send_close().unwrap();
-        assert_eq!(writer.frames_remaining(), initial_remaining - 23);
+        assert_eq!(writer.frames_remaining(), initial_remaining - 3);
         server_handle.join().unwrap();
     }
 
@@ -692,8 +650,6 @@ mod tests {
         assert_eq!(cfg.connect_timeout, Duration::from_secs(3));
         cfg.connect_timeout = Duration::from_millis(60);
 
-        // TEST-NET-1 (RFC 5737) blackhole address: either times out in ~60ms or fails immediately
-        // with NetworkUnreachable/HostUnreachable in offline environments.
         let blackhole: SocketAddr = "192.0.2.1:4714".parse().unwrap();
         let start = std::time::Instant::now();
         let err = Sht3ClientConnection::connect(blackhole, cfg, &[0x11; 32])
@@ -705,5 +661,59 @@ mod tests {
             "connect_timeout took too long: {:?}",
             start.elapsed()
         );
+    }
+
+    #[test]
+    fn tampering_with_server_rtp_port_or_srtp_suite_invalidates_mac() {
+        let k_pair = [0x77; 32];
+        let trust = Arc::new(InMemoryTrustStore::new());
+        trust.insert("tamper-client", k_pair);
+
+        let raw_listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let addr = raw_listener.local_addr().unwrap();
+
+        let mitm = thread::spawn(move || {
+            let (mut stream, _) = raw_listener.accept().unwrap();
+            let (ch, client_transcript) = ClientHello::read_from(&mut stream).unwrap();
+            assert_eq!(ch.version, SHT4_VERSION);
+            assert!(crate::transport::crypto::verify_client_hello_mac(
+                &k_pair,
+                &client_transcript,
+                &ch.mac_c
+            ));
+
+            let s_eph = EphemeralKeypair::generate();
+            let mut sh = ServerHello {
+                status: HandshakeStatus::Ok,
+                server_device_id: "mitm-srv".into(),
+                server_pk: s_eph.public_bytes(),
+                server_nonce: generate_nonce(),
+                audio_params: ch.audio_params,
+                initial_volume: 100,
+                initial_muted: false,
+                rtp_port: 4716,
+                srtp_suite: SRTP_SUITE_AES128_ICM_HMAC_SHA1_80,
+                mac_s: [0u8; 32],
+            };
+            let body = sh.encode_body().unwrap();
+            let mut full = Vec::with_capacity(client_transcript.len() + body.len());
+            full.extend_from_slice(&client_transcript);
+            full.extend_from_slice(&body);
+            sh.mac_s = crate::transport::crypto::compute_server_hello_mac(&k_pair, &full);
+            // Tamper with rtp_port after computing mac_s -> client must reject!
+            sh.rtp_port = 9999;
+            sh.write_to(&mut stream).unwrap();
+            stream.flush().unwrap();
+        });
+
+        let cfg = Sht3ClientConfig::new(
+            "tamper-client",
+            AudioProfile::OpusBalanced.to_audio_params(40),
+        );
+        let err = Sht3ClientConnection::connect(addr, cfg, &k_pair)
+            .err()
+            .expect("tampered rtp_port must fail ServerHello MAC verification");
+        assert!(matches!(err, TransportError::AuthRejected(_)));
+        mitm.join().unwrap();
     }
 }

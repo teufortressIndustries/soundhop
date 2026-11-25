@@ -27,7 +27,7 @@ use crate::transport::{
     AudioProfile, OutboundSessionHandle, Sht3SessionManager, StreamTelemetry, DEFAULT_V3_PORT,
 };
 #[cfg(test)]
-use crate::transport::{PcmCapture, PcmPlaybackFactory, TransportResult};
+use crate::transport::{CaptureEndpoint, PlaybackEndpointFactory, TransportResult};
 use crate::util::{
     format_duration, is_own_non_loopback_ip, local_addresses, lock_or_recover, now_secs, short_id,
     slugify,
@@ -102,11 +102,11 @@ pub struct Controller {
     pub(super) sht3_mode_active: AtomicBool,
     pub(super) peer_v3_meta: Mutex<HashMap<String, BeaconV3Meta>>,
     #[cfg(test)]
-    pub(super) playback_factory_override: Mutex<Option<PcmPlaybackFactory>>,
+    pub(super) playback_factory_override: Mutex<Option<PlaybackEndpointFactory>>,
     #[cfg(test)]
     #[allow(clippy::type_complexity)]
     pub(super) capture_factory_override:
-        Mutex<Option<Arc<dyn Fn() -> TransportResult<Box<dyn PcmCapture>> + Send + Sync>>>,
+        Mutex<Option<Arc<dyn Fn() -> TransportResult<CaptureEndpoint> + Send + Sync>>>,
     #[cfg(test)]
     pub(super) capture_creates_null_sink: AtomicBool,
     pub(super) config_path: Option<PathBuf>,
@@ -277,7 +277,8 @@ impl Controller {
     }
 
     #[cfg(test)]
-    pub(crate) fn set_playback_factory(&self, factory: PcmPlaybackFactory) {
+    #[allow(dead_code)]
+    pub(crate) fn set_playback_factory(&self, factory: PlaybackEndpointFactory) {
         *lock_or_recover(&self.playback_factory_override) = Some(factory);
     }
 
@@ -285,12 +286,13 @@ impl Controller {
     #[allow(dead_code)]
     pub(crate) fn set_capture_factory(
         &self,
-        factory: Arc<dyn Fn() -> TransportResult<Box<dyn PcmCapture>> + Send + Sync>,
+        factory: Arc<dyn Fn() -> TransportResult<CaptureEndpoint> + Send + Sync>,
     ) {
         *lock_or_recover(&self.capture_factory_override) = Some(factory);
     }
 
     #[cfg(test)]
+    #[allow(dead_code)]
     pub(crate) fn set_capture_creates_null_sink(&self, enabled: bool) {
         self.capture_creates_null_sink
             .store(enabled, Ordering::Release);
@@ -531,7 +533,7 @@ impl Controller {
                 "port": st.connected_port,
                 "sink": st.connected_sink,
                 "module": st.connected_module,
-                "transport": if sht3_out_active { "sht3" } else { "pa-tcp" },
+                "transport": if sht3_out_active { "gst-srtp" } else { "pa-tcp" },
                 "multiroom": st.is_multiroom(),
                 "multiroom_peers": st.multiroom_peers,
                 "keep_local": st.keep_local,
@@ -583,6 +585,7 @@ impl Controller {
                 "port": cfg.sharing.port,
                 "v3_port": cfg.sharing.v3_port,
                 "pair_port": cfg.sharing.pair_port,
+                "rtp_port": cfg.sharing.rtp_port,
                 "security": cfg.sharing.security,
                 "listener_module": st.listener_module,
                 "listener_created": st.listener_created,
@@ -858,6 +861,7 @@ mod tests {
         }
     }
 
+    #[cfg(feature = "gstreamer")]
     #[test]
     fn test_reconcile_clears_dead_sht3_session_and_restarts_v3_listener() {
         use std::net::TcpListener;
@@ -866,7 +870,7 @@ mod tests {
 
         use crate::discovery::{BeaconV3Meta, Peer};
         use crate::pairing::TrustedPeer;
-        use crate::transport::{MockPcmCapture, MockPcmPlayback, PcmCapture, PcmPlayback};
+        use crate::transport::{CaptureEndpoint, PlaybackEndpoint};
 
         let make_mock_runner = || {
             let next_id = Arc::new(AtomicU32::new(301));
@@ -954,6 +958,7 @@ mod tests {
         srv_cfg.sharing.security = "trusted-lan".to_string();
         srv_cfg.sharing.enabled = true;
         srv_cfg.sharing.v3_port = free_v3_port;
+        srv_cfg.sharing.rtp_port = 0;
         let server_ctrl = Controller::new(
             Some(srv_cfg),
             Some(State::default()),
@@ -964,8 +969,9 @@ mod tests {
         );
         server_ctrl.set_save_enabled(false);
         server_ctrl.set_playback_factory(Arc::new(|_| {
-            let (playback, _) = MockPcmPlayback::pair();
-            Ok(Box::new(playback) as Box<dyn PcmPlayback>)
+            Ok(PlaybackEndpoint::TestAppSink(Arc::new(Mutex::new(
+                Vec::new(),
+            ))))
         }));
 
         let k_pair = [0x5Au8; 32];
@@ -997,9 +1003,10 @@ mod tests {
         client_ctrl.set_save_enabled(false);
         client_ctrl.set_capture_creates_null_sink(true);
         client_ctrl.set_capture_factory(Arc::new(|| {
-            // Finite 2-frame capture exits cleanly, turning the session into a dead SHT3 zombie.
-            let cap = MockPcmCapture::sine_wave(440.0, Some(2)).with_pace(Duration::from_millis(5));
-            Ok(Box::new(cap) as Box<dyn PcmCapture>)
+            Ok(CaptureEndpoint::TestSineWave {
+                freq_hz: 440.0,
+                netsim: None,
+            })
         }));
         client_ctrl.record_trusted_peer(TrustedPeer {
             device_id: "server-dead".to_string(),
@@ -1015,7 +1022,7 @@ mod tests {
                 v3_port: Some(bound_v3_port),
                 pair_port: Some(4715),
                 pub_fp: Some("5555-6666-7777-8888".to_string()),
-                caps: vec!["sht3".to_string(), "pcm".to_string()],
+                caps: vec!["gst-srtp".to_string(), "pcm".to_string()],
             },
         );
 
@@ -1036,18 +1043,31 @@ mod tests {
             .connect(&peer, ConnectOptions::default())
             .unwrap();
 
+        // Wait for server to register client-dead, then disconnect it remotely so client session exits cleanly.
+        let reg_deadline = Instant::now() + Duration::from_secs(2);
+        while !server_ctrl
+            .sht3_manager
+            .active_inbound_peers()
+            .iter()
+            .any(|id| id == "client-dead")
+        {
+            assert!(Instant::now() < reg_deadline);
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        assert!(server_ctrl.sht3_manager.disconnect_peer("client-dead"));
+
         let deadline = Instant::now() + Duration::from_secs(2);
         while !client_ctrl.has_dead_sht3_session() {
             assert!(
                 Instant::now() < deadline,
-                "timed out waiting for finite SHT3 outbound session to become dead"
+                "timed out waiting for remotely closed outbound session to become dead"
             );
             std::thread::sleep(Duration::from_millis(10));
         }
         assert!(!client_ctrl.sht3_outbound_active());
         assert!(client_ctrl.state.lock().unwrap().is_connected());
 
-        // reconcile() must tear down the zombie SHT3 session, unload module-null-sink 301,
+        // reconcile() must tear down the zombie session, unload module-null-sink 301,
         // restore default sink, and preserve last_peer + auto_paused=false for auto-reconnect.
         let rec = client_ctrl.reconcile();
         let actions = rec["actions"].as_array().unwrap();
@@ -1068,7 +1088,7 @@ mod tests {
             .iter()
             .any(|s| s == "alsa_output.pci"));
 
-        // Verify reconcile() also restarts SHT3 listener when sharing.enabled && !is_v3_active().
+        // Verify reconcile() also restarts v3 listener when sharing.enabled && !is_v3_active().
         assert!(server_ctrl.is_v3_active());
         server_ctrl.sht3_manager.stop_listener();
         assert!(!server_ctrl.is_v3_active());
@@ -1083,6 +1103,7 @@ mod tests {
         server_ctrl.stop_listener(Some(false)).unwrap();
     }
 
+    #[cfg(feature = "gstreamer")]
     #[test]
     fn test_sync_sht3_telemetry_and_status_metrics() {
         use std::net::TcpListener;
@@ -1090,7 +1111,7 @@ mod tests {
 
         use crate::discovery::{BeaconV3Meta, Peer};
         use crate::pairing::TrustedPeer;
-        use crate::transport::{MockPcmCapture, MockPcmPlayback, PcmCapture, PcmPlayback};
+        use crate::transport::{CaptureEndpoint, PlaybackEndpoint};
 
         let make_runner = || {
             Arc::new(MockRunner::new(|args, _| {
@@ -1119,6 +1140,7 @@ mod tests {
         srv_cfg.device.id = "server-tel".to_string();
         srv_cfg.sharing.security = "paired".to_string();
         srv_cfg.sharing.v3_port = free_v3_port;
+        srv_cfg.sharing.rtp_port = 0;
         let server_ctrl = Controller::new(
             Some(srv_cfg),
             Some(State::default()),
@@ -1129,8 +1151,9 @@ mod tests {
         );
         server_ctrl.set_save_enabled(false);
         server_ctrl.set_playback_factory(Arc::new(|_| {
-            let (playback, _) = MockPcmPlayback::pair();
-            Ok(Box::new(playback) as Box<dyn PcmPlayback>)
+            Ok(PlaybackEndpoint::TestAppSink(Arc::new(Mutex::new(
+                Vec::new(),
+            ))))
         }));
 
         let k_pair = [0x66u8; 32];
@@ -1158,9 +1181,10 @@ mod tests {
         );
         client_ctrl.set_save_enabled(false);
         client_ctrl.set_capture_factory(Arc::new(|| {
-            let cap =
-                MockPcmCapture::sine_wave(440.0, Some(200)).with_pace(Duration::from_millis(15));
-            Ok(Box::new(cap) as Box<dyn PcmCapture>)
+            Ok(CaptureEndpoint::TestSineWave {
+                freq_hz: 440.0,
+                netsim: None,
+            })
         }));
         client_ctrl.record_trusted_peer(TrustedPeer {
             device_id: "server-tel".to_string(),
@@ -1176,7 +1200,7 @@ mod tests {
                 v3_port: Some(bound_v3_port),
                 pair_port: Some(4715),
                 pub_fp: Some("9999-8888-7777-6666".to_string()),
-                caps: vec!["sht3".to_string(), "pcm".to_string()],
+                caps: vec!["gst-srtp".to_string(), "pcm".to_string()],
             },
         );
 
@@ -1197,13 +1221,13 @@ mod tests {
             .connect(&peer, ConnectOptions::default())
             .unwrap();
 
-        // Trigger a Ping/Pong exchange and wait for Pong telemetry.
+        // Trigger a Ping/Pong exchange and wait for Pong telemetry & sent SRTP frames.
         {
             let guard = client_ctrl.sht3_outbounds.lock().unwrap();
             let handle = guard.get("server-tel").unwrap();
             handle.request_ping().unwrap();
         }
-        let deadline = Instant::now() + Duration::from_secs(2);
+        let deadline = Instant::now() + Duration::from_secs(3);
         loop {
             let ready = {
                 let guard = client_ctrl.sht3_outbounds.lock().unwrap();
@@ -1215,9 +1239,9 @@ mod tests {
             }
             assert!(
                 Instant::now() < deadline,
-                "timed out waiting for SHT3 pong & frames"
+                "timed out waiting for SRTP pong & frames"
             );
-            std::thread::sleep(Duration::from_millis(10));
+            std::thread::sleep(Duration::from_millis(15));
         }
 
         assert!(client_ctrl.sync_sht3_telemetry());
@@ -1225,8 +1249,12 @@ mod tests {
         assert!(peer_stats.last_rtt_ms > 0.0);
 
         let status = client_ctrl.status(None);
+        assert_eq!(
+            status["sharing"]["rtp_port"],
+            crate::config::DEFAULT_RTP_PORT
+        );
         let conn = &status["connection"];
-        assert_eq!(conn["transport"], "sht3");
+        assert_eq!(conn["transport"], "gst-srtp");
         assert_eq!(conn["audio_profile"], "pcm-lossless");
         assert!(conn["frames_sent"].as_u64().unwrap() > 0);
         assert!(conn["bytes_sent"].as_u64().unwrap() > 0);

@@ -77,6 +77,7 @@ trait DoctorEnv {
     fn list_appimage_mounts(&self) -> Vec<String>;
     fn own_appimage_mount(&self) -> Option<String>;
     fn unmount_fuse(&self, mount_point: &str) -> Result<(), String>;
+    fn gstreamer_status(&self) -> serde_json::Value;
 }
 
 struct SystemDoctorEnv;
@@ -141,6 +142,23 @@ impl DoctorEnv for SystemDoctorEnv {
             Ok(())
         }
     }
+
+    fn gstreamer_status(&self) -> serde_json::Value {
+        match soundhop_core::transport::check_gstreamer_runtime() {
+            Ok(status) => serde_json::to_value(status).unwrap_or_else(
+                |_| serde_json::json!({ "available": false, "error": "serialization error" }),
+            ),
+            Err(err) => serde_json::json!({
+                "available": false,
+                "version": "",
+                "missing_elements": [],
+                "audio_src_available": false,
+                "audio_sink_available": false,
+                "bundled_plugin_dir": null,
+                "error": err.to_string(),
+            }),
+        }
+    }
 }
 
 struct DoctorOutcome {
@@ -155,6 +173,7 @@ struct DoctorOutcome {
     svc: serde_json::Value,
     svc_active: bool,
     daemon_ipc: bool,
+    gstreamer: serde_json::Value,
     tools: serde_json::Value,
     appimage_mounts: Vec<String>,
     fixed_actions: Vec<String>,
@@ -267,6 +286,7 @@ fn collect_doctor_report(
     }
 
     let addrs = env.local_addresses();
+    let gstreamer = env.gstreamer_status();
     let tools = controller.android_tool_status();
     let daemon_log_path = log_path();
     let exit_ok = backend_ok && !fix_failed;
@@ -281,9 +301,11 @@ fn collect_doctor_report(
             "pipewire": is_pw,
             "default_sink": def_sink,
         },
+        "gstreamer": gstreamer,
         "network": {
             "addresses": addrs,
             "sharing_port": cfg.sharing.port,
+            "sharing_rtp_port": cfg.sharing.rtp_port,
             "discovery_port": cfg.discovery.port,
         },
         "firewall": fw,
@@ -309,6 +331,7 @@ fn collect_doctor_report(
         svc,
         svc_active,
         daemon_ipc,
+        gstreamer,
         tools,
         appimage_mounts,
         fixed_actions,
@@ -435,6 +458,37 @@ pub fn run_doctor(controller: &Arc<Controller>, fix: bool, json_out: bool) -> i3
     #[cfg(not(windows))]
     {
         let _ = (&outcome.svc, &outcome.daemon_log_path);
+    }
+
+    let gst_ready = outcome
+        .gstreamer
+        .get("available")
+        .and_then(|v| v.as_bool())
+        .unwrap_or(false);
+    let gst_ver = outcome
+        .gstreamer
+        .get("version")
+        .and_then(|v| v.as_str())
+        .unwrap_or("");
+    if gst_ready {
+        ok(&format!(
+            "GStreamer SRTP/Opus Engine: Ready (GStreamer {gst_ver})"
+        ));
+    } else if let Some(err_str) = outcome.gstreamer.get("error").and_then(|v| v.as_str()) {
+        warning(&format!(
+            "GStreamer SRTP/Opus Engine: Unavailable ({err_str})"
+        ));
+    } else {
+        let missing: Vec<&str> = outcome
+            .gstreamer
+            .get("missing_elements")
+            .and_then(|v| v.as_array())
+            .map(|arr| arr.iter().filter_map(|v| v.as_str()).collect())
+            .unwrap_or_default();
+        warning(&format!(
+            "GStreamer SRTP/Opus Engine: Missing plugins ({}) — install gstreamer1.0-plugins-base/good/bad (opus, srtp)",
+            missing.join(", ")
+        ));
     }
 
     let scrcpy_ready = outcome
@@ -611,6 +665,17 @@ mod tests {
             self.unmounted.lock().unwrap().push(mount_point.to_string());
             self.mounts.lock().unwrap().retain(|m| m != mount_point);
             Ok(())
+        }
+
+        fn gstreamer_status(&self) -> serde_json::Value {
+            serde_json::json!({
+                "available": true,
+                "version": "1.28.9",
+                "missing_elements": [],
+                "audio_src_available": true,
+                "audio_sink_available": true,
+                "bundled_plugin_dir": null,
+            })
         }
     }
 

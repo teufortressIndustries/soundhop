@@ -8,11 +8,11 @@ use std::time::Duration;
 use crate::backend::TunnelParams;
 use crate::config::{is_paired_security_mode, Config};
 use crate::constants::{MULTIROOM_SINK_NAME, PROTOCOL_VERSION, SINK_PREFIX};
-use crate::discovery::{discover_once_with_psk, BeaconV3Meta, Peer};
+use crate::discovery::{discover_once_with_meta, BeaconV3Meta, Peer};
 use crate::pairing::TrustedPeer;
 use crate::security::soundhop_cookie_path;
 use crate::state::ActivePeerSession;
-use crate::transport::{AudioProfile, OutboundConfig, PcmCapture, DEFAULT_V3_PORT};
+use crate::transport::{AudioProfile, CaptureEndpoint, OutboundConfig, DEFAULT_V3_PORT};
 use crate::util::{
     is_own_non_loopback_ip, is_private_address, lock_or_recover, notify, now_secs, tcp_probe_rtt,
 };
@@ -30,16 +30,7 @@ pub fn parse_audio_profile(raw: &str) -> AudioProfile {
 }
 
 fn effective_outbound_profile(raw: &str) -> AudioProfile {
-    let parsed = parse_audio_profile(raw);
-    #[cfg(feature = "opus")]
-    {
-        parsed
-    }
-    #[cfg(not(feature = "opus"))]
-    {
-        let _ = parsed;
-        AudioProfile::PcmLossless
-    }
+    parse_audio_profile(raw)
 }
 
 struct Sht3PeerTarget {
@@ -60,7 +51,7 @@ impl Controller {
         let probe_port = match (
             self.lookup_trusted_peer(&peer.id),
             self.peer_v3_meta(&peer.id)
-                .filter(BeaconV3Meta::supports_sht3),
+                .filter(BeaconV3Meta::supports_gst_srtp),
         ) {
             (Some(_), Some(meta)) => meta.v3_port.filter(|&p| p > 0).unwrap_or(peer.port),
             _ => peer.port,
@@ -71,7 +62,10 @@ impl Controller {
             return peer.clone();
         }
         let psk = (!cfg.sharing.psk_hash.is_empty()).then_some(cfg.sharing.psk_hash.as_str());
-        for found in discover_once_with_psk(0.7, cfg.discovery.port, &cfg.device.id, psk) {
+        for (found, meta) in discover_once_with_meta(0.7, cfg.discovery.port, &cfg.device.id, psk) {
+            if let Some(m) = meta {
+                self.remember_peer_v3_meta(&found.id, m);
+            }
             if found.id == peer.id || found.name.eq_ignore_ascii_case(&peer.name) {
                 self.remember_peer(&found);
                 return found;
@@ -144,14 +138,15 @@ impl Controller {
 
         let trusted_peer = self.lookup_trusted_peer(&peer.id);
         let v3_meta = self.peer_v3_meta(&peer.id);
-        if let (Some(trusted), Some(meta)) =
-            (trusted_peer, v3_meta.filter(BeaconV3Meta::supports_sht3))
-        {
+        if let (Some(trusted), Some(meta)) = (
+            trusted_peer,
+            v3_meta.filter(BeaconV3Meta::supports_gst_srtp),
+        ) {
             return self.connect_sht3_internal(peer, &trusted, &meta, &cfg, opts);
         }
         if is_paired_security_mode(&peer.security) {
             return Err(ControllerError::Message(
-                "This device requires pairing over encrypted SHT3 transport. Pair with it first."
+                "This device requires pairing over encrypted GStreamer SRTP transport. Pair with it first."
                     .to_string(),
             ));
         }
@@ -262,10 +257,10 @@ impl Controller {
         sink_name: &str,
         description: &str,
         frame_ms: u8,
-    ) -> Result<(Box<dyn PcmCapture>, u32), ControllerError> {
+    ) -> Result<(CaptureEndpoint, u32), ControllerError> {
+        let _ = frame_ms;
         #[cfg(test)]
         if let Some(factory) = lock_or_recover(&self.capture_factory_override).clone() {
-            let _ = frame_ms;
             if self.capture_creates_null_sink.load(Ordering::Acquire) {
                 let clean_desc = crate::util::slugify(description, 48);
                 let module_id = self
@@ -279,7 +274,7 @@ impl Controller {
                     )
                     .map_err(|e| {
                         ControllerError::Message(format!(
-                            "Could not create virtual SHT3 sink {sink_name}: {e}"
+                            "Could not create virtual audio sink {sink_name}: {e}"
                         ))
                     })?;
                 return match factory() {
@@ -287,13 +282,13 @@ impl Controller {
                     Err(e) => {
                         let _ = self.backend.unload_module(module_id, true);
                         Err(ControllerError::Message(format!(
-                            "Could not start SHT3 audio capture: {e}"
+                            "Could not start encrypted audio capture: {e}"
                         )))
                     }
                 };
             }
             let capture = factory().map_err(|e| {
-                ControllerError::Message(format!("Could not start SHT3 audio capture: {e}"))
+                ControllerError::Message(format!("Could not start encrypted audio capture: {e}"))
             })?;
             return Ok((capture, 0));
         }
@@ -312,38 +307,27 @@ impl Controller {
                 )
                 .map_err(|e| {
                     ControllerError::Message(format!(
-                        "Could not create virtual SHT3 sink {sink_name}: {e}"
+                        "Could not create virtual audio sink {sink_name}: {e}"
                     ))
                 })?;
             let monitor = format!("{sink_name}.monitor");
-            match crate::transport::LinuxPcmCapture::spawn_with_latency(
-                &monitor,
-                u32::from(frame_ms),
-            ) {
-                Ok(cap) => Ok((Box::new(cap) as Box<dyn PcmCapture>, module_id)),
-                Err(e) => {
-                    let _ = self.backend.unload_module(module_id, true);
-                    Err(ControllerError::Message(format!(
-                        "Could not start Linux PCM capture on {monitor}: {e}"
-                    )))
-                }
-            }
+            Ok((
+                CaptureEndpoint::SystemPulseMonitor { device: monitor },
+                module_id,
+            ))
         }
 
         #[cfg(target_os = "windows")]
         {
-            let _ = (sink_name, description, frame_ms);
-            let cap = crate::transport::WindowsPcmCapture::start().map_err(|e| {
-                ControllerError::Message(format!("Could not start Windows loopback capture: {e}"))
-            })?;
-            Ok((Box::new(cap) as Box<dyn PcmCapture>, 0))
+            let _ = (sink_name, description);
+            Ok((CaptureEndpoint::SystemWasapiLoopback, 0))
         }
 
         #[cfg(not(any(target_os = "linux", target_os = "windows")))]
         {
-            let _ = (sink_name, description, frame_ms);
+            let _ = (sink_name, description);
             Err(ControllerError::Message(
-                "SHT3 outbound audio capture is not supported on this platform".to_string(),
+                "Encrypted outbound audio capture is not supported on this platform".to_string(),
             ))
         }
     }
@@ -526,9 +510,10 @@ impl Controller {
             self.validate_peer(p, &cfg)?;
             let trusted_peer = self.lookup_trusted_peer(&p.id);
             let v3_meta = self.peer_v3_meta(&p.id);
-            if let (Some(trusted), Some(meta)) =
-                (trusted_peer, v3_meta.filter(BeaconV3Meta::supports_sht3))
-            {
+            if let (Some(trusted), Some(meta)) = (
+                trusted_peer,
+                v3_meta.filter(BeaconV3Meta::supports_gst_srtp),
+            ) {
                 let v3_port = Self::resolved_v3_port(&cfg, &meta);
                 let target_ip: IpAddr = p.host.parse().map_err(|e| {
                     ControllerError::Message(format!("Invalid peer address {}: {e}", p.host))
@@ -792,12 +777,12 @@ impl Controller {
                     "This device requires pairing. Pair with it first.".to_string(),
                 ));
             }
-            let has_sht3 = self
+            let has_gst_srtp = self
                 .peer_v3_meta(&peer.id)
-                .is_some_and(|meta| meta.supports_sht3());
-            if !has_sht3 {
+                .is_some_and(|meta| meta.supports_gst_srtp());
+            if !has_gst_srtp {
                 return Err(ControllerError::Message(format!(
-                    "{} requires pairing but does not advertise SHT3 encrypted transport. Update SoundHop on both devices.",
+                    "{} requires pairing but does not advertise encrypted GStreamer SRTP transport. Update SoundHop on both devices.",
                     peer.display_name()
                 )));
             }
@@ -941,7 +926,7 @@ impl Controller {
     fn connection_dict(&self) -> serde_json::Value {
         let st = lock_or_recover(&self.state);
         let transport = if self.sht3_outbound_active() {
-            "sht3"
+            "gst-srtp"
         } else {
             "pa-tcp"
         };
@@ -1179,17 +1164,17 @@ mod tests {
             });
         }
         let cfg_paired = ctrl.config.lock().unwrap().clone();
-        // Trusted peer WITHOUT SHT3 metadata must still be rejected with an actionable error.
+        // Trusted peer WITHOUT gst-srtp metadata must still be rejected with an actionable error.
         let err_no_sht3 = ctrl
             .validate_peer(&paired_peer, &cfg_paired)
             .unwrap_err()
             .to_string();
         assert!(
-            err_no_sht3.contains("SHT3"),
-            "expected SHT3 error, got: {err_no_sht3}"
+            err_no_sht3.contains("SRTP"),
+            "expected SRTP error, got: {err_no_sht3}"
         );
 
-        // Once the peer advertises SHT3 (v3_port + caps), validation succeeds.
+        // Once the peer advertises gst-srtp (v3_port + caps), validation succeeds.
         for target_id in ["peer-psk", "peer-paired"] {
             ctrl.remember_peer_v3_meta(
                 target_id,
@@ -1197,7 +1182,11 @@ mod tests {
                     v3_port: Some(4714),
                     pair_port: Some(4715),
                     pub_fp: Some("0102-0304-0506-0708".to_string()),
-                    caps: vec!["sht3".to_string(), "opus".to_string(), "pcm".to_string()],
+                    caps: vec![
+                        "gst-srtp".to_string(),
+                        "opus".to_string(),
+                        "pcm".to_string(),
+                    ],
                 },
             );
         }
@@ -1248,14 +1237,14 @@ mod tests {
         );
     }
 
+    #[cfg(feature = "gstreamer")]
     #[test]
     fn test_outbound_connect_uses_sht3_for_trusted_peer_and_never_falls_back_to_pa_tcp() {
         use std::net::TcpListener;
-        use std::time::Duration;
 
         use crate::discovery::BeaconV3Meta;
         use crate::pairing::TrustedPeer;
-        use crate::transport::{MockPcmCapture, MockPcmPlayback, PcmCapture, PcmPlayback};
+        use crate::transport::{CaptureEndpoint, PlaybackEndpoint};
 
         let tunnel_calls = Arc::new(Mutex::new(0usize));
         let tunnel_calls_c = Arc::clone(&tunnel_calls);
@@ -1292,6 +1281,7 @@ mod tests {
         server_cfg.device.id = "server-v3".to_string();
         server_cfg.sharing.security = "paired".to_string();
         server_cfg.sharing.v3_port = free_v3_port;
+        server_cfg.sharing.rtp_port = 0;
         let server_ctrl = Controller::new(
             Some(server_cfg),
             Some(State::default()),
@@ -1302,8 +1292,9 @@ mod tests {
         );
         server_ctrl.set_save_enabled(false);
         server_ctrl.set_playback_factory(Arc::new(|_peer_id| {
-            let (playback, _handle) = MockPcmPlayback::pair();
-            Ok(Box::new(playback) as Box<dyn PcmPlayback>)
+            Ok(PlaybackEndpoint::TestAppSink(Arc::new(Mutex::new(
+                Vec::new(),
+            ))))
         }));
 
         let k_pair = [0x99u8; 32];
@@ -1332,9 +1323,10 @@ mod tests {
         );
         client_ctrl.set_save_enabled(false);
         client_ctrl.set_capture_factory(Arc::new(|| {
-            let cap =
-                MockPcmCapture::sine_wave(440.0, Some(60)).with_pace(Duration::from_millis(15));
-            Ok(Box::new(cap) as Box<dyn PcmCapture>)
+            Ok(CaptureEndpoint::TestSineWave {
+                freq_hz: 440.0,
+                netsim: None,
+            })
         }));
 
         let server_peer = Peer {
@@ -1359,7 +1351,7 @@ mod tests {
         assert!(err.contains("requires pairing"));
         assert_eq!(*tunnel_calls.lock().unwrap(), 0);
 
-        // 2. Trust server-v3 and record its SHT3 BeaconV3Meta -> connect() uses SHT3!
+        // 2. Trust server-v3 and record its gst-srtp BeaconV3Meta -> connect() uses gst-srtp!
         client_ctrl.record_trusted_peer(TrustedPeer {
             device_id: "server-v3".to_string(),
             display_name: "Studio Receiver".to_string(),
@@ -1374,20 +1366,24 @@ mod tests {
                 v3_port: Some(bound_v3_port),
                 pair_port: Some(4715),
                 pub_fp: Some("FEDC-BA98-7654-3210".to_string()),
-                caps: vec!["sht3".to_string(), "opus".to_string(), "pcm".to_string()],
+                caps: vec![
+                    "gst-srtp".to_string(),
+                    "opus".to_string(),
+                    "pcm".to_string(),
+                ],
             },
         );
 
         let conn_res = client_ctrl
             .connect(&server_peer, ConnectOptions::default())
-            .expect("trusted SHT3 connect should succeed");
+            .expect("trusted gst-srtp connect should succeed");
         assert_eq!(conn_res["connected"], true);
-        assert_eq!(conn_res["transport"], "sht3");
+        assert_eq!(conn_res["transport"], "gst-srtp");
         assert_eq!(conn_res["port"], bound_v3_port);
         assert_eq!(
             *tunnel_calls.lock().unwrap(),
             0,
-            "SHT3 connection must not load legacy PA module-tunnel-sink"
+            "gst-srtp connection must not load legacy PA module-tunnel-sink"
         );
 
         client_ctrl
@@ -1397,6 +1393,7 @@ mod tests {
         server_ctrl.stop_listener(Some(false)).unwrap();
     }
 
+    #[cfg(feature = "gstreamer")]
     #[test]
     fn test_paired_sht3_keep_local_multiroom_volume_revoke_and_rollback() {
         use std::net::TcpListener;
@@ -1406,7 +1403,7 @@ mod tests {
         use crate::constants::MULTIROOM_SINK_NAME;
         use crate::discovery::BeaconV3Meta;
         use crate::pairing::TrustedPeer;
-        use crate::transport::{MockPcmCapture, MockPcmPlayback, PcmCapture, PcmPlayback};
+        use crate::transport::{CaptureEndpoint, PlaybackEndpoint};
 
         let make_server = |dev_id: &str| {
             let free_port = {
@@ -1432,6 +1429,7 @@ mod tests {
             cfg.device.id = dev_id.to_string();
             cfg.sharing.security = "paired".to_string();
             cfg.sharing.v3_port = free_port;
+            cfg.sharing.rtp_port = 0;
             let ctrl = Controller::new(
                 Some(cfg),
                 Some(State::default()),
@@ -1441,18 +1439,16 @@ mod tests {
                 false,
             );
             ctrl.set_save_enabled(false);
-            let pb_handle_slot = Arc::new(Mutex::new(None));
-            let pb_slot_c = Arc::clone(&pb_handle_slot);
-            ctrl.set_playback_factory(Arc::new(move |_| {
-                let (playback, handle) = MockPcmPlayback::pair();
-                *pb_slot_c.lock().unwrap() = Some(handle);
-                Ok(Box::new(playback) as Box<dyn PcmPlayback>)
+            ctrl.set_playback_factory(Arc::new(|_| {
+                Ok(PlaybackEndpoint::TestAppSink(Arc::new(Mutex::new(
+                    Vec::new(),
+                ))))
             }));
-            (ctrl, pb_handle_slot)
+            ctrl
         };
 
-        let (srv1, pb1) = make_server("srv-sht3-1");
-        let (srv2, pb2) = make_server("srv-sht3-2");
+        let srv1 = make_server("srv-sht3-1");
+        let srv2 = make_server("srv-sht3-2");
         let k1 = [0xA1u8; 32];
         let k2 = [0xB2u8; 32];
         srv1.record_trusted_peer(TrustedPeer {
@@ -1571,9 +1567,10 @@ mod tests {
         client_ctrl.set_save_enabled(false);
         client_ctrl.set_capture_creates_null_sink(true);
         client_ctrl.set_capture_factory(Arc::new(|| {
-            let cap =
-                MockPcmCapture::sine_wave(440.0, Some(300)).with_pace(Duration::from_millis(15));
-            Ok(Box::new(cap) as Box<dyn PcmCapture>)
+            Ok(CaptureEndpoint::TestSineWave {
+                freq_hz: 440.0,
+                netsim: None,
+            })
         }));
 
         for (id, name, k, port) in [
@@ -1594,7 +1591,7 @@ mod tests {
                     v3_port: Some(port),
                     pair_port: Some(4715),
                     pub_fp: Some("2222-3333-4444-5555".to_string()),
-                    caps: vec!["sht3".to_string(), "pcm".to_string()],
+                    caps: vec!["gst-srtp".to_string(), "pcm".to_string()],
                 },
             );
         }
@@ -1618,7 +1615,7 @@ mod tests {
             ..peer1.clone()
         };
 
-        // 1. Single paired SHT3 peer with keep_local: true connects via SHT3.
+        // 1. Single paired gst-srtp peer with keep_local: true connects via gst-srtp.
         let single_res = client_ctrl
             .connect(
                 &peer1,
@@ -1627,14 +1624,14 @@ mod tests {
                     ..Default::default()
                 },
             )
-            .expect("paired SHT3 keep_local connect should succeed");
+            .expect("paired gst-srtp keep_local connect should succeed");
         assert_eq!(single_res["connected"], true);
-        assert_eq!(single_res["transport"], "sht3");
+        assert_eq!(single_res["transport"], "gst-srtp");
         assert_eq!(single_res["keep_local"], true);
         assert_eq!(*tunnel_calls.lock().unwrap(), 0);
         assert!(client_ctrl.sht3_outbound_active());
 
-        // 2. Multi-room with 2 paired SHT3 peers + keep_local: true creates null sinks + combine sink.
+        // 2. Multi-room with 2 paired gst-srtp peers + keep_local: true creates null sinks + combine sink.
         let multi_res = client_ctrl
             .connect_multi(
                 &[peer1.clone(), peer2.clone()],
@@ -1643,9 +1640,9 @@ mod tests {
                     ..Default::default()
                 },
             )
-            .expect("multi-room paired SHT3 connect should succeed");
+            .expect("multi-room paired gst-srtp connect should succeed");
         assert_eq!(multi_res["connected"], true);
-        assert_eq!(multi_res["transport"], "sht3");
+        assert_eq!(multi_res["transport"], "gst-srtp");
         assert_eq!(multi_res["multiroom"], true);
         assert_eq!(multi_res["keep_local"], true);
         assert_eq!(*tunnel_calls.lock().unwrap(), 0);
@@ -1655,26 +1652,34 @@ mod tests {
         assert!(slaves.contains(&Controller::sink_name_for(&peer1)));
         assert!(slaves.contains(&Controller::sink_name_for(&peer2)));
 
-        // 3. Volume/mute broadcasts across all SHT3 outbound handles.
+        // 3. Volume/mute broadcasts across all outbound handles.
         client_ctrl.set_volume(Some(55), Some(true), true);
-        let vol_deadline = Instant::now() + Duration::from_secs(2);
+        let vol_deadline = Instant::now() + Duration::from_secs(3);
         loop {
-            let v1 = pb1
+            let v1 = client_ctrl
+                .sht3_outbounds
                 .lock()
                 .unwrap()
-                .as_ref()
-                .map(|h| (h.volume(), h.is_muted()));
-            let v2 = pb2
+                .get("srv-sht3-1")
+                .map(|h| {
+                    let t = h.telemetry();
+                    (t.remote_volume, t.remote_muted)
+                });
+            let v2 = client_ctrl
+                .sht3_outbounds
                 .lock()
                 .unwrap()
-                .as_ref()
-                .map(|h| (h.volume(), h.is_muted()));
+                .get("srv-sht3-2")
+                .map(|h| {
+                    let t = h.telemetry();
+                    (t.remote_volume, t.remote_muted)
+                });
             if v1 == Some((55, true)) && v2 == Some((55, true)) {
                 break;
             }
             assert!(
                 Instant::now() < vol_deadline,
-                "timed out waiting for SHT3 multiroom volume/mute broadcast: v1={v1:?} v2={v2:?}"
+                "timed out waiting for multiroom volume/mute broadcast: v1={v1:?} v2={v2:?}"
             );
             std::thread::sleep(Duration::from_millis(15));
         }
@@ -1691,7 +1696,6 @@ mod tests {
         client_ctrl
             .disconnect(false, Some(false), false, Some(false), false, false)
             .unwrap();
-        // Re-trust srv-sht3-2 for rollback test.
         client_ctrl.record_trusted_peer(TrustedPeer {
             device_id: "srv-sht3-2".to_string(),
             display_name: "Room Two".to_string(),

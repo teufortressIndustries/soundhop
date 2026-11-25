@@ -299,15 +299,19 @@ impl BeaconV3Meta {
     }
 }
 
-/// Default Transport v3 capabilities advertised by this build.
+/// Default Transport v4 capabilities advertised by this build.
 pub fn default_v3_caps() -> Vec<String> {
-    #[cfg(feature = "opus")]
+    #[cfg(feature = "gstreamer")]
     {
-        vec!["sht3".to_string(), "opus".to_string(), "pcm".to_string()]
+        vec![
+            "gst-srtp".to_string(),
+            "opus".to_string(),
+            "pcm".to_string(),
+        ]
     }
-    #[cfg(not(feature = "opus"))]
+    #[cfg(not(feature = "gstreamer"))]
     {
-        vec!["sht3".to_string(), "pcm".to_string()]
+        Vec::new()
     }
 }
 
@@ -1442,9 +1446,22 @@ mod tests {
 
         // Absent gst-srtp capability must return false
         meta.v3_port = Some(4714);
-        meta.caps = default_v3_caps();
+        meta.caps = vec!["sht3".to_string(), "opus".to_string()];
         assert!(meta.supports_sht3());
         assert!(!meta.supports_gst_srtp());
+
+        // default_v3_caps() advertises gst-srtp + opus + pcm when built with gstreamer.
+        meta.caps = default_v3_caps();
+        #[cfg(feature = "gstreamer")]
+        {
+            assert!(meta.supports_gst_srtp());
+            assert_eq!(meta.caps, vec!["gst-srtp", "opus", "pcm"]);
+        }
+        #[cfg(not(feature = "gstreamer"))]
+        {
+            assert!(!meta.supports_gst_srtp());
+            assert!(meta.caps.is_empty());
+        }
     }
 
     #[test]

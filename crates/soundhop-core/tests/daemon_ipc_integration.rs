@@ -216,6 +216,10 @@ fn test_daemon_real_ipc_ping_status_config_patch_and_stop() {
     assert_eq!(status["version"], VERSION);
     assert_eq!(status["daemon"]["running"], true);
     assert_eq!(status["device"]["name"], "IntegrationHost");
+    assert_eq!(
+        status["sharing"]["rtp_port"],
+        soundhop_core::config::DEFAULT_RTP_PORT
+    );
 
     // 3. Config patch over IPC + verify persistence on disk
     let patch_resp = ipc::request(

@@ -1,5 +1,5 @@
-//! SHT3 cryptographic primitives: X25519 ephemeral DH, HMAC-SHA256 mutual auth,
-//! HKDF-SHA256 directional key derivation, and ChaCha20-Poly1305 AEAD framing.
+//! SHT4 cryptographic primitives: X25519 ephemeral DH, HMAC-SHA256 mutual auth,
+//! HKDF-SHA256 directional control + SRTP master key derivation, and ChaCha20-Poly1305 AEAD framing.
 
 use chacha20poly1305::aead::{Aead, KeyInit, Payload};
 use chacha20poly1305::{ChaCha20Poly1305, Key, Nonce};
@@ -20,7 +20,7 @@ type HmacSha256 = Hmac<Sha256>;
 
 const CLIENT_HELLO_MAC_DOMAIN: &[u8] = b"sht3-c-hello";
 const SERVER_HELLO_MAC_DOMAIN: &[u8] = b"sht3-s-hello";
-const HKDF_INFO_PREFIX: &[u8] = b"sht3-session-keys-v3";
+const HKDF_INFO_PREFIX: &[u8] = b"sht4-session-keys-v4";
 
 /// Ephemeral X25519 keypair, zeroized automatically on drop.
 pub struct EphemeralKeypair {
@@ -77,6 +77,16 @@ pub fn generate_nonce() -> [u8; 16] {
     let mut nonce = [0u8; 16];
     OsRng.fill_bytes(&mut nonce);
     nonce
+}
+
+/// Generate a fresh random non-zero, non-`u32::MAX` RTP SSRC using `OsRng`.
+pub fn generate_ssrc() -> u32 {
+    loop {
+        let ssrc = OsRng.next_u32();
+        if ssrc != 0 && ssrc != u32::MAX {
+            return ssrc;
+        }
+    }
 }
 
 /// Compute `HMAC-SHA256(k_pair, "sht3-c-hello" || client_transcript)`.
@@ -142,17 +152,21 @@ fn hmac_from_key(key: &[u8; 32]) -> HmacSha256 {
     <HmacSha256 as KeyInit>::new((&*padded).into())
 }
 
-/// Directional session keys & 4-byte nonce prefixes derived via HKDF-SHA256.
+/// Directional control-channel AEAD keys/IVs and 30-byte SRTP master keys derived via HKDF-SHA256.
 #[derive(Zeroize, ZeroizeOnDrop)]
 pub struct SessionKeys {
     pub k_c2s: [u8; 32],
     pub k_s2c: [u8; 32],
     pub iv_c2s: [u8; 4],
     pub iv_s2c: [u8; 4],
+    /// Client -> Server SRTP master key (16B AES-128 key + 14B SRTP salt).
+    pub srtp_master_key_c2s: [u8; 30],
+    /// Server -> Client SRTP master key (16B AES-128 key + 14B SRTP salt).
+    pub srtp_master_key_s2c: [u8; 30],
 }
 
 impl SessionKeys {
-    /// Derive directional keys and IVs bound to the nonces and full handshake transcript.
+    /// Derive directional AEAD + SRTP master keys bound to the nonces and full handshake transcript.
     pub fn derive(
         shared_dh: &[u8; 32],
         k_pair: &[u8; 32],
@@ -181,7 +195,7 @@ impl SessionKeys {
         info.extend_from_slice(&transcript_hash);
 
         let hk = Hkdf::<Sha256>::new(Some(&salt), &ikm[..]);
-        let mut okm = Zeroizing::new([0u8; 72]);
+        let mut okm = Zeroizing::new([0u8; 132]);
         hk.expand(&info, &mut okm[..])
             .map_err(|e| TransportError::Crypto(format!("HKDF expand failed: {e}")))?;
 
@@ -189,17 +203,23 @@ impl SessionKeys {
         let mut k_s2c = [0u8; 32];
         let mut iv_c2s = [0u8; 4];
         let mut iv_s2c = [0u8; 4];
+        let mut srtp_master_key_c2s = [0u8; 30];
+        let mut srtp_master_key_s2c = [0u8; 30];
 
         k_c2s.copy_from_slice(&okm[0..32]);
         k_s2c.copy_from_slice(&okm[32..64]);
         iv_c2s.copy_from_slice(&okm[64..68]);
         iv_s2c.copy_from_slice(&okm[68..72]);
+        srtp_master_key_c2s.copy_from_slice(&okm[72..102]);
+        srtp_master_key_s2c.copy_from_slice(&okm[102..132]);
 
         Ok(Self {
             k_c2s,
             k_s2c,
             iv_c2s,
             iv_s2c,
+            srtp_master_key_c2s,
+            srtp_master_key_s2c,
         })
     }
 }
@@ -426,7 +446,7 @@ fn build_nonce(iv: &[u8; 4], seq: u64) -> [u8; 12] {
 mod tests {
     use super::*;
 
-    fn derive_pair() -> (AeadSession, AeadSession) {
+    fn derive_pair() -> (AeadSession, AeadSession, SessionKeys, SessionKeys) {
         let k_pair = [0xAB; 32];
         let c_eph = EphemeralKeypair::generate();
         let s_eph = EphemeralKeypair::generate();
@@ -434,7 +454,7 @@ mod tests {
         let s_pk = s_eph.public_bytes();
         let c_nonce = generate_nonce();
         let s_nonce = generate_nonce();
-        let transcript = b"sample-handshake-transcript";
+        let transcript = b"sample-handshake-transcript-v4";
 
         let c_shared = c_eph.diffie_hellman(&s_pk).unwrap();
         let s_shared = s_eph.diffie_hellman(&c_pk).unwrap();
@@ -447,10 +467,9 @@ mod tests {
             SessionKeys::derive(s_shared.as_bytes(), &k_pair, &c_nonce, &s_nonce, transcript)
                 .unwrap();
 
-        (
-            AeadSession::new(Role::Client, &c_keys),
-            AeadSession::new(Role::Server, &s_keys),
-        )
+        let client = AeadSession::new(Role::Client, &c_keys);
+        let server = AeadSession::new(Role::Server, &s_keys);
+        (client, server, c_keys, s_keys)
     }
 
     #[test]
@@ -470,17 +489,33 @@ mod tests {
     }
 
     #[test]
+    fn session_keys_derive_distinct_srtp_master_keys_and_ssrc_valid() {
+        let (_client, _server, c_keys, s_keys) = derive_pair();
+        assert_eq!(c_keys.srtp_master_key_c2s, s_keys.srtp_master_key_c2s);
+        assert_eq!(c_keys.srtp_master_key_s2c, s_keys.srtp_master_key_s2c);
+        assert_ne!(c_keys.srtp_master_key_c2s, c_keys.srtp_master_key_s2c);
+        assert_ne!(c_keys.srtp_master_key_c2s, [0u8; 30]);
+        assert_ne!(c_keys.srtp_master_key_s2c, [0u8; 30]);
+
+        for _ in 0..32 {
+            let ssrc = generate_ssrc();
+            assert_ne!(ssrc, 0);
+            assert_ne!(ssrc, u32::MAX);
+        }
+    }
+
+    #[test]
     fn aead_bidirectional_roundtrip_and_tamper_detection() {
-        let (mut client, mut server) = derive_pair();
+        let (mut client, mut server, _, _) = derive_pair();
 
         let f0 = client
-            .seal_frame(FrameType::AudioOpus, 0, 0, b"opus-frame-0")
+            .seal_frame(FrameType::Control, 0, 0, &[0x01, 75])
             .unwrap();
         let f1 = client
-            .seal_frame(FrameType::AudioOpus, 0, 960, b"opus-frame-1")
+            .seal_frame(FrameType::Ping, 0, 960, &[1, 2, 3, 4, 5, 6, 7, 8])
             .unwrap();
 
-        assert_eq!(server.open_frame(&f0).unwrap(), b"opus-frame-0");
+        assert_eq!(server.open_frame(&f0).unwrap(), &[0x01, 75]);
 
         // Replay of f0 must fail.
         let replay_err = server.open_frame(&f0).unwrap_err();
@@ -509,7 +544,7 @@ mod tests {
         ));
 
         // Authentic f1 still succeeds because failed opens did not advance recv_expected_seq.
-        assert_eq!(server.open_frame(&f1).unwrap(), b"opus-frame-1");
+        assert_eq!(server.open_frame(&f1).unwrap(), &[1, 2, 3, 4, 5, 6, 7, 8]);
 
         // Reverse direction (server -> client) uses independent directional key.
         let reply = server
@@ -527,7 +562,7 @@ mod tests {
 
     #[test]
     fn split_halves_encrypt_decrypt_and_track_frames_remaining() {
-        let (client, server) = derive_pair();
+        let (client, server, _, _) = derive_pair();
         let (mut c_seal, mut c_open) = client.split();
         let (mut s_seal, mut s_open) = server.split();
 
@@ -536,7 +571,7 @@ mod tests {
         assert_eq!(s_open.recv_expected_seq(), 0);
 
         let f0 = c_seal
-            .seal_frame(FrameType::AudioOpus, 0, 0, b"split-frame-0")
+            .seal_frame(FrameType::Control, 0, 0, b"split-ctrl-0")
             .unwrap();
         assert_eq!(c_seal.send_seq(), 1);
         assert_eq!(c_seal.frames_remaining(), MAX_FRAMES_PER_KEY - 1);
@@ -546,7 +581,7 @@ mod tests {
             .unwrap();
         assert_eq!(s_seal.frames_remaining(), MAX_FRAMES_PER_KEY - 1);
 
-        assert_eq!(s_open.open_frame(&f0).unwrap(), b"split-frame-0");
+        assert_eq!(s_open.open_frame(&f0).unwrap(), b"split-ctrl-0");
         assert_eq!(s_open.recv_expected_seq(), 1);
 
         assert_eq!(c_open.open_frame(&f1).unwrap(), b"split-pong");

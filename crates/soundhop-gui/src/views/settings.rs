@@ -371,7 +371,7 @@ pub fn render(
 
     ui.add_space(12.0);
 
-    // 2. Audio Quality & Latency (SHT3 Transport Profile)
+    // 2. Audio Quality & Latency (GStreamer SRTP/Opus Profile)
     card(ui, pal, None, |ui| {
         ui.label(
             RichText::new("Audio Quality & Latency")
@@ -381,7 +381,7 @@ pub fn render(
         );
         ui.label(
             RichText::new(
-                "Choose the SoundHop Transport v3 (SHT3) codec and latency profile for encrypted streaming.",
+                "Choose the GStreamer SRTP/Opus codec and latency profile for encrypted streaming.",
             )
             .color(pal.text_muted)
             .size(12.0),
@@ -678,9 +678,9 @@ pub fn render(
         "settings_advanced_drawer",
         "Advanced Audio, Network & Diagnostics",
         |ui| {
-            // Audio Codec & Quality (SHT3)
+            // Audio Codec & Quality (GStreamer SRTP/Opus)
             ui.label(
-                RichText::new("Audio Codec & Quality (SHT3)")
+                RichText::new("Audio Codec & Quality (GStreamer SRTP/Opus)")
                     .color(pal.text)
                     .size(13.5)
                     .strong(),

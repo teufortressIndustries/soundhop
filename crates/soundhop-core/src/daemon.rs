@@ -18,7 +18,7 @@ use crate::android::{AdbMdnsBrowser, DiscoveredAdbDevice};
 use crate::constants::{OFFLINE_PROBE_LIMIT, SUPERVISOR_INTERVAL_SECS, VERSION};
 use crate::controller::{ConnectOptions, Controller};
 use crate::discovery::{
-    default_v3_caps, discover_once_with_psk, BeaconV3Meta, DiscoveryManager, Peer,
+    default_v3_caps, discover_once_with_meta, BeaconV3Meta, DiscoveryManager, Peer,
 };
 use crate::ipc::{is_reachable, ping, request as ipc_request, IpcServer};
 use crate::pairing::PairingServer;
@@ -1026,7 +1026,10 @@ impl Daemon {
                 .ok_or_else(|| format!("Unknown device: {q}"));
         }
         let psk = (!cfg.sharing.psk_hash.is_empty()).then_some(cfg.sharing.psk_hash.as_str());
-        for found in discover_once_with_psk(0.8, cfg.discovery.port, &cfg.device.id, psk) {
+        for (found, meta) in discover_once_with_meta(0.8, cfg.discovery.port, &cfg.device.id, psk) {
+            if let Some(m) = meta {
+                self.controller.remember_peer_v3_meta(&found.id, m);
+            }
             self.controller.remember_peer(&found);
             if found.id.eq_ignore_ascii_case(q)
                 || found.name.eq_ignore_ascii_case(q)
@@ -1116,11 +1119,16 @@ impl Daemon {
                         .clone();
                     let psk =
                         (!cfg.sharing.psk_hash.is_empty()).then_some(cfg.sharing.psk_hash.as_str());
-                    let found = discover_once_with_psk(t, cfg.discovery.port, &cfg.device.id, psk);
-                    for p in &found {
-                        self.controller.remember_peer(p);
+                    let found_with_meta =
+                        discover_once_with_meta(t, cfg.discovery.port, &cfg.device.id, psk);
+                    let mut list = Vec::with_capacity(found_with_meta.len());
+                    for (p, meta) in found_with_meta {
+                        if let Some(m) = meta {
+                            self.controller.remember_peer_v3_meta(&p.id, m);
+                        }
+                        self.controller.remember_peer(&p);
+                        list.push(p.to_json());
                     }
-                    let list: Vec<Value> = found.into_iter().map(|p| p.to_json()).collect();
                     serde_json::json!({ "ok": true, "peers": list })
                 } else {
                     serde_json::json!({ "ok": true, "peers": [] })

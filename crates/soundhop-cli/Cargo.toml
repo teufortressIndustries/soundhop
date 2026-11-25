@@ -9,8 +9,9 @@ description = "CLI, daemon entrypoint, and interactive TUI for SoundHop"
 default-run = "soundhop"
 
 [features]
-default = ["gui"]
+default = ["gui", "gstreamer"]
 gui = ["dep:soundhop-gui"]
+gstreamer = ["soundhop-core/gstreamer"]
 
 [[bin]]
 name = "soundhop"
@@ -22,7 +23,7 @@ path = "src/bin/soundhop_gui.rs"
 required-features = ["gui"]
 
 [dependencies]
-soundhop-core.workspace = true
+soundhop-core = { workspace = true, default-features = false }
 soundhop-gui = { workspace = true, optional = true }
 serde.workspace = true
 serde_json.workspace = true
