@@ -109,7 +109,16 @@ function Resolve-GStreamerRoot {
     if (-not [string]::IsNullOrWhiteSpace($env:GSTREAMER_1_0_ROOT_MSVC_X86_64)) {
         $candidates += $env:GSTREAMER_1_0_ROOT_MSVC_X86_64
     }
-    $candidates += "C:\gstreamer\1.0\msvc_x86_64"
+    $machineRoot = [System.Environment]::GetEnvironmentVariable("GSTREAMER_1_0_ROOT_MSVC_X86_64", "Machine")
+    if (-not [string]::IsNullOrWhiteSpace($machineRoot)) {
+        $candidates += $machineRoot
+    }
+    $candidates += @(
+        "C:\gstreamer\1.0\msvc_x86_64",
+        "D:\gstreamer\1.0\msvc_x86_64",
+        "C:\Program Files\gstreamer\1.0\msvc_x86_64",
+        "D:\Program Files\gstreamer\1.0\msvc_x86_64"
+    )
 
     foreach ($candidate in $candidates) {
         $trimmed = $candidate.TrimEnd('\', '/')

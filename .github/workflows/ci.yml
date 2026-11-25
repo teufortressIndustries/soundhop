@@ -49,16 +49,26 @@ jobs:
       - name: Install Linux system libraries
         if: runner.os == 'Linux'
         run: |
+          sudo apt-get update -qq
+          sudo apt-get remove -y 'libunwind-*-dev' || true
+          ok=0
           for i in 1 2 3; do
-            sudo DEBIAN_FRONTEND=noninteractive NEEDRESTART_MODE=l apt-get update -qq && \
-            sudo DEBIAN_FRONTEND=noninteractive NEEDRESTART_MODE=l apt-get install -y --no-install-recommends \
-              pkg-config libgtk-3-dev libayatana-appindicator3-dev libxdo-dev \
-              libxcb1-dev libxkbcommon-dev libxkbcommon-x11-dev libwayland-dev \
-              libgl1-mesa-dev \
-              libgstreamer1.0-dev libgstreamer-plugins-base1.0-dev \
-              gstreamer1.0-plugins-base gstreamer1.0-plugins-good \
-              gstreamer1.0-plugins-bad gstreamer1.0-pulseaudio && break || sleep 3
+            if sudo DEBIAN_FRONTEND=noninteractive NEEDRESTART_MODE=l apt-get update -qq && \
+               sudo DEBIAN_FRONTEND=noninteractive NEEDRESTART_MODE=l apt-get install -y --no-install-recommends \
+                 pkg-config libgtk-3-dev libayatana-appindicator3-dev libxdo-dev \
+                 libxcb1-dev libxkbcommon-dev libxkbcommon-x11-dev libwayland-dev \
+                 libgl1-mesa-dev \
+                 libgstreamer1.0-dev libgstreamer-plugins-base1.0-dev \
+                 gstreamer1.0-plugins-base gstreamer1.0-plugins-good \
+                 gstreamer1.0-plugins-bad gstreamer1.0-pulseaudio; then
+              ok=1
+              break
+            fi
+            sleep 3
           done
+          [ "$ok" -eq 1 ]
+          pkg-config --modversion gstreamer-1.0 gstreamer-audio-1.0 gstreamer-app-1.0 gstreamer-rtp-1.0
+          gst-inspect-1.0 --version
 
       - name: Install GStreamer (MSVC x86_64)
         if: runner.os == 'Windows'
@@ -66,7 +76,7 @@ jobs:
         run: |
           $ErrorActionPreference = "Stop"
           $gstVersion = "1.24.13"
-          $gstRoot = "C:\gstreamer\1.0\msvc_x86_64"
+          $installRoot = "C:\gstreamer"
           $baseUrl = "https://gstreamer.freedesktop.org/data/pkg/windows/$gstVersion/msvc"
           $runtimeMsi = Join-Path $env:RUNNER_TEMP "gstreamer-1.0-msvc-x86_64-$gstVersion.msi"
           $develMsi = Join-Path $env:RUNNER_TEMP "gstreamer-1.0-devel-msvc-x86_64-$gstVersion.msi"
@@ -88,21 +98,41 @@ jobs:
           }
 
           Write-Host "Installing GStreamer runtime MSI..."
-          $p1 = Start-Process msiexec.exe -ArgumentList "/i", "`"$runtimeMsi`"", "ADDLOCAL=ALL", "/qn", "/norestart" -Wait -PassThru -NoNewWindow
+          $p1 = Start-Process msiexec.exe -ArgumentList "/i", "`"$runtimeMsi`"", "INSTALLDIR=`"$installRoot`"", "ADDLOCAL=ALL", "/qn", "/norestart" -Wait -PassThru -NoNewWindow
           if ($p1.ExitCode -ne 0) { throw "GStreamer runtime MSI install failed with exit code $($p1.ExitCode)" }
 
           Write-Host "Installing GStreamer devel MSI..."
-          $p2 = Start-Process msiexec.exe -ArgumentList "/i", "`"$develMsi`"", "ADDLOCAL=ALL", "/qn", "/norestart" -Wait -PassThru -NoNewWindow
+          $p2 = Start-Process msiexec.exe -ArgumentList "/i", "`"$develMsi`"", "INSTALLDIR=`"$installRoot`"", "ADDLOCAL=ALL", "/qn", "/norestart" -Wait -PassThru -NoNewWindow
           if ($p2.ExitCode -ne 0) { throw "GStreamer devel MSI install failed with exit code $($p2.ExitCode)" }
 
-          if (-not (Test-Path "$gstRoot\lib\pkgconfig\gstreamer-1.0.pc")) {
-            throw "Expected gstreamer-1.0.pc not found under $gstRoot\lib\pkgconfig"
+          $machineGstRoot = [System.Environment]::GetEnvironmentVariable("GSTREAMER_1_0_ROOT_MSVC_X86_64", "Machine")
+          $candidates = @()
+          if (-not [string]::IsNullOrWhiteSpace($machineGstRoot)) { $candidates += $machineGstRoot }
+          $candidates += @(
+            "C:\gstreamer\1.0\msvc_x86_64",
+            "D:\gstreamer\1.0\msvc_x86_64",
+            "C:\Program Files\gstreamer\1.0\msvc_x86_64",
+            "D:\Program Files\gstreamer\1.0\msvc_x86_64"
+          )
+          $gstRoot = $null
+          foreach ($cand in $candidates) {
+            $trimmed = $cand.TrimEnd('\', '/')
+            if (Test-Path (Join-Path $trimmed "lib\pkgconfig\gstreamer-1.0.pc")) {
+              $gstRoot = $trimmed
+              break
+            }
+          }
+          if (-not $gstRoot) {
+            Write-Host "Machine GSTREAMER_1_0_ROOT_MSVC_X86_64: '$machineGstRoot'"
+            Get-ChildItem "C:\gstreamer*", "D:\gstreamer*", "C:\Program Files\gstreamer*", "D:\Program Files\gstreamer*" -ErrorAction SilentlyContinue | Out-String | Write-Host
+            throw "Expected gstreamer-1.0.pc not found under any candidate GStreamer root."
           }
 
           "GSTREAMER_1_0_ROOT_MSVC_X86_64=$gstRoot" | Out-File -FilePath $env:GITHUB_ENV -Encoding utf8 -Append
           "PKG_CONFIG_PATH=$gstRoot\lib\pkgconfig" | Out-File -FilePath $env:GITHUB_ENV -Encoding utf8 -Append
           if (Test-Path "$gstRoot\bin\pkg-config.exe") {
             "PKG_CONFIG=$gstRoot\bin\pkg-config.exe" | Out-File -FilePath $env:GITHUB_ENV -Encoding utf8 -Append
+            & "$gstRoot\bin\pkg-config.exe" --with-path="$gstRoot\lib\pkgconfig" --modversion gstreamer-1.0 gstreamer-audio-1.0 gstreamer-app-1.0 gstreamer-rtp-1.0
           }
           "$gstRoot\bin" | Out-File -FilePath $env:GITHUB_PATH -Encoding utf8 -Append
           & "$gstRoot\bin\gst-inspect-1.0.exe" --version
@@ -148,16 +178,22 @@ jobs:
 
       - name: Install Arch Linux build dependencies
         run: |
+          ok=0
           for i in 1 2 3; do
-            pacman -Sy --noconfirm --needed archlinux-keyring && \
-            pacman -Syu --noconfirm --needed \
-              base-devel rustup pkgconf wget curl file strace binutils patchelf zsync \
-              squashfs-tools desktop-file-utils appstream xorg-server-xvfb \
-              gtk3 libayatana-appindicator xdotool libxcb libxcursor libxi libxrandr \
-              libxkbcommon libxkbcommon-x11 wayland mesa \
-              gstreamer gst-plugins-base-libs gst-plugins-base gst-plugins-good gst-plugins-bad \
-              git && break || sleep 3
+            if pacman -Sy --noconfirm --needed archlinux-keyring && \
+               pacman -Syu --noconfirm --needed \
+                 base-devel rustup pkgconf wget curl file strace binutils patchelf zsync \
+                 squashfs-tools desktop-file-utils appstream xorg-server-xvfb \
+                 gtk3 libayatana-appindicator xdotool libxcb libxcursor libxi libxrandr \
+                 libxkbcommon libxkbcommon-x11 wayland mesa \
+                 gstreamer gst-plugins-base-libs gst-plugins-base gst-plugins-good gst-plugins-bad \
+                 git; then
+              ok=1
+              break
+            fi
+            sleep 3
           done
+          [ "$ok" -eq 1 ]
 
       - name: Initialize Rust toolchain
         run: |
@@ -212,7 +248,7 @@ jobs:
         run: |
           $ErrorActionPreference = "Stop"
           $gstVersion = "1.24.13"
-          $gstRoot = "C:\gstreamer\1.0\msvc_x86_64"
+          $installRoot = "C:\gstreamer"
           $baseUrl = "https://gstreamer.freedesktop.org/data/pkg/windows/$gstVersion/msvc"
           $runtimeMsi = Join-Path $env:RUNNER_TEMP "gstreamer-1.0-msvc-x86_64-$gstVersion.msi"
           $develMsi = Join-Path $env:RUNNER_TEMP "gstreamer-1.0-devel-msvc-x86_64-$gstVersion.msi"
@@ -234,21 +270,41 @@ jobs:
           }
 
           Write-Host "Installing GStreamer runtime MSI..."
-          $p1 = Start-Process msiexec.exe -ArgumentList "/i", "`"$runtimeMsi`"", "ADDLOCAL=ALL", "/qn", "/norestart" -Wait -PassThru -NoNewWindow
+          $p1 = Start-Process msiexec.exe -ArgumentList "/i", "`"$runtimeMsi`"", "INSTALLDIR=`"$installRoot`"", "ADDLOCAL=ALL", "/qn", "/norestart" -Wait -PassThru -NoNewWindow
           if ($p1.ExitCode -ne 0) { throw "GStreamer runtime MSI install failed with exit code $($p1.ExitCode)" }
 
           Write-Host "Installing GStreamer devel MSI..."
-          $p2 = Start-Process msiexec.exe -ArgumentList "/i", "`"$develMsi`"", "ADDLOCAL=ALL", "/qn", "/norestart" -Wait -PassThru -NoNewWindow
+          $p2 = Start-Process msiexec.exe -ArgumentList "/i", "`"$develMsi`"", "INSTALLDIR=`"$installRoot`"", "ADDLOCAL=ALL", "/qn", "/norestart" -Wait -PassThru -NoNewWindow
           if ($p2.ExitCode -ne 0) { throw "GStreamer devel MSI install failed with exit code $($p2.ExitCode)" }
 
-          if (-not (Test-Path "$gstRoot\lib\pkgconfig\gstreamer-1.0.pc")) {
-            throw "Expected gstreamer-1.0.pc not found under $gstRoot\lib\pkgconfig"
+          $machineGstRoot = [System.Environment]::GetEnvironmentVariable("GSTREAMER_1_0_ROOT_MSVC_X86_64", "Machine")
+          $candidates = @()
+          if (-not [string]::IsNullOrWhiteSpace($machineGstRoot)) { $candidates += $machineGstRoot }
+          $candidates += @(
+            "C:\gstreamer\1.0\msvc_x86_64",
+            "D:\gstreamer\1.0\msvc_x86_64",
+            "C:\Program Files\gstreamer\1.0\msvc_x86_64",
+            "D:\Program Files\gstreamer\1.0\msvc_x86_64"
+          )
+          $gstRoot = $null
+          foreach ($cand in $candidates) {
+            $trimmed = $cand.TrimEnd('\', '/')
+            if (Test-Path (Join-Path $trimmed "lib\pkgconfig\gstreamer-1.0.pc")) {
+              $gstRoot = $trimmed
+              break
+            }
+          }
+          if (-not $gstRoot) {
+            Write-Host "Machine GSTREAMER_1_0_ROOT_MSVC_X86_64: '$machineGstRoot'"
+            Get-ChildItem "C:\gstreamer*", "D:\gstreamer*", "C:\Program Files\gstreamer*", "D:\Program Files\gstreamer*" -ErrorAction SilentlyContinue | Out-String | Write-Host
+            throw "Expected gstreamer-1.0.pc not found under any candidate GStreamer root."
           }
 
           "GSTREAMER_1_0_ROOT_MSVC_X86_64=$gstRoot" | Out-File -FilePath $env:GITHUB_ENV -Encoding utf8 -Append
           "PKG_CONFIG_PATH=$gstRoot\lib\pkgconfig" | Out-File -FilePath $env:GITHUB_ENV -Encoding utf8 -Append
           if (Test-Path "$gstRoot\bin\pkg-config.exe") {
             "PKG_CONFIG=$gstRoot\bin\pkg-config.exe" | Out-File -FilePath $env:GITHUB_ENV -Encoding utf8 -Append
+            & "$gstRoot\bin\pkg-config.exe" --with-path="$gstRoot\lib\pkgconfig" --modversion gstreamer-1.0 gstreamer-audio-1.0 gstreamer-app-1.0 gstreamer-rtp-1.0
           }
           "$gstRoot\bin" | Out-File -FilePath $env:GITHUB_PATH -Encoding utf8 -Append
           & "$gstRoot\bin\gst-inspect-1.0.exe" --version
@@ -378,13 +434,23 @@ jobs:
 
       - name: Install Linux aarch64 GStreamer dependencies
         run: |
+          sudo apt-get update -qq
+          sudo apt-get remove -y 'libunwind-*-dev' || true
+          ok=0
           for i in 1 2 3; do
-            sudo DEBIAN_FRONTEND=noninteractive NEEDRESTART_MODE=l apt-get update -qq && \
-            sudo DEBIAN_FRONTEND=noninteractive NEEDRESTART_MODE=l apt-get install -y --no-install-recommends \
-              pkg-config libgstreamer1.0-dev libgstreamer-plugins-base1.0-dev \
-              gstreamer1.0-plugins-base gstreamer1.0-plugins-good \
-              gstreamer1.0-plugins-bad gstreamer1.0-pulseaudio && break || sleep 3
+            if sudo DEBIAN_FRONTEND=noninteractive NEEDRESTART_MODE=l apt-get update -qq && \
+               sudo DEBIAN_FRONTEND=noninteractive NEEDRESTART_MODE=l apt-get install -y --no-install-recommends \
+                 pkg-config libgstreamer1.0-dev libgstreamer-plugins-base1.0-dev \
+                 gstreamer1.0-plugins-base gstreamer1.0-plugins-good \
+                 gstreamer1.0-plugins-bad gstreamer1.0-pulseaudio; then
+              ok=1
+              break
+            fi
+            sleep 3
           done
+          [ "$ok" -eq 1 ]
+          pkg-config --modversion gstreamer-1.0 gstreamer-audio-1.0 gstreamer-app-1.0 gstreamer-rtp-1.0
+          gst-inspect-1.0 --version
 
       - name: Install Rust toolchain
         uses: dtolnay/rust-toolchain@stable
