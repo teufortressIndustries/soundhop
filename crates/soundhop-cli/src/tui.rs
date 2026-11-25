@@ -1099,10 +1099,7 @@ fn fd_hung_up(fd: std::os::unix::io::RawFd) -> bool {
         let err = io::Error::last_os_error();
         return err.kind() != io::ErrorKind::Interrupted;
     }
-    if rc > 0 && (pfd.revents & (libc::POLLHUP | libc::POLLERR | libc::POLLNVAL)) != 0 {
-        return true;
-    }
-    false
+    rc > 0 && (pfd.revents & (libc::POLLHUP | libc::POLLERR | libc::POLLNVAL)) != 0
 }
 
 #[cfg(unix)]
@@ -1116,20 +1113,22 @@ fn stdin_hung_up() -> bool {
 }
 
 fn is_terminal_disconnect_error(err: &io::Error) -> bool {
-    if matches!(
+    let kind_disconnected = matches!(
         err.kind(),
         io::ErrorKind::UnexpectedEof | io::ErrorKind::BrokenPipe | io::ErrorKind::ConnectionReset
-    ) {
-        return true;
-    }
+    );
     #[cfg(unix)]
-    if matches!(
-        err.raw_os_error(),
-        Some(libc::EIO | libc::EBADF | libc::ENXIO)
-    ) {
-        return true;
+    {
+        kind_disconnected
+            || matches!(
+                err.raw_os_error(),
+                Some(libc::EIO | libc::EBADF | libc::ENXIO)
+            )
     }
-    false
+    #[cfg(not(unix))]
+    {
+        kind_disconnected
+    }
 }
 
 fn should_exit_tui_loop(should_quit: bool, signal_stop: bool, hung_up: bool) -> bool {
