@@ -1,53 +1,116 @@
-//! Preferences view: clean intent-first settings cards, visual PIN pairing,
-//! Dark/Light/System theme selector, and collapsible Advanced diagnostics.
+//! Preferences view: 4 clean sub-tabs (General, Audio & Sync, Privacy & Devices,
+//! Network & Health) with GStreamer-tuned jitter/profile controls, full port mapping,
+//! live-apply updates, and diagnostics.
 
 use eframe::egui::{self, RichText};
+use soundhop_core::config::{is_paired_security_mode, DEFAULT_RTP_PORT};
+use soundhop_core::constants::{DEFAULT_AUDIO_PORT, DEFAULT_DISCOVERY_PORT};
+use soundhop_core::pairing::DEFAULT_PAIR_PORT;
+use soundhop_core::transport::DEFAULT_V3_PORT;
 
 use crate::backend::{security_friendly_label, GuiBackend, GuiCommand, GuiSnapshot};
 use crate::theme::{Palette, ThemeMode};
 use crate::widgets::{
-    callout_card, card, collapsible_advanced, danger_button, pill_badge, primary_button,
-    secondary_button, section_header, segmented_control, selectable_card, toggle_switch,
+    callout_card, card, danger_button, pill_badge, primary_button, secondary_button,
+    section_header, segmented_control, selectable_card, toggle_switch,
 };
 
-const AUDIO_PROFILE_OPTIONS: &[(&str, &str)] = &[
-    ("opus-balanced", "Balanced (Opus 128k)"),
-    ("opus-low-latency", "Low Latency (Opus 10ms)"),
-    ("opus-low-bandwidth", "Wi-Fi Saver (Opus 64k)"),
-    ("pcm-lossless", "Lossless (Uncompressed PCM)"),
+const AUDIO_PROFILE_CARDS: &[(&str, &str, &str)] = &[
+    (
+        "opus-balanced",
+        "Opus Balanced (Default)",
+        "48 kHz stereo Opus (20 ms frames, 128 kbps VBR, in-band FEC) • Best all-around quality and Wi-Fi resilience.",
+    ),
+    (
+        "opus-low-latency",
+        "Opus Low-Latency (10 ms)",
+        "48 kHz stereo Opus (10 ms frames, 128 kbps VBR, in-band FEC) • Ideal for videos, calls, and gaming.",
+    ),
+    (
+        "opus-low-bandwidth",
+        "Opus Low-Bandwidth (64 kbps)",
+        "48 kHz stereo Opus (20 ms frames, 64 kbps VBR, in-band FEC) • Smooth playback on congested Wi-Fi.",
+    ),
+    (
+        "pcm-lossless",
+        "Encrypted Lossless PCM",
+        "48 kHz stereo uncompressed L16 PCM over SRTP • Zero-loss studio audio.",
+    ),
 ];
 
+const DEFAULT_JITTER_MS: u32 = 40;
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum SettingsSubTab {
+    #[default]
+    General,
+    Audio,
+    Privacy,
+    Network,
+}
+
 pub struct SettingsViewState {
+    pub active_subtab: SettingsSubTab,
     pub device_name: String,
-    pub pairing_code_input: String,
-    pub generated_code: String,
     pub latency_ms: u32,
-    pub tcp_port: u16,
+    pub control_port: u16,
+    pub pair_port: u16,
+    pub rtp_port: u16,
     pub discovery_port: u16,
+    pub legacy_tcp_port: u16,
+    pub pending_reconnect_hint: bool,
     pub pending_copy_bug_report: bool,
     synced_name: String,
     synced_latency: u32,
-    synced_ports: (u16, u16),
+    synced_ports: (u16, u16, u16, u16, u16),
 }
 
 impl Default for SettingsViewState {
     fn default() -> Self {
+        let default_ports = (
+            DEFAULT_V3_PORT,
+            DEFAULT_PAIR_PORT,
+            DEFAULT_RTP_PORT,
+            DEFAULT_DISCOVERY_PORT,
+            DEFAULT_AUDIO_PORT,
+        );
         Self {
+            active_subtab: SettingsSubTab::General,
             device_name: String::new(),
-            pairing_code_input: String::new(),
-            generated_code: String::new(),
-            latency_ms: 150,
-            tcp_port: 4713,
-            discovery_port: 47777,
+            latency_ms: DEFAULT_JITTER_MS,
+            control_port: default_ports.0,
+            pair_port: default_ports.1,
+            rtp_port: default_ports.2,
+            discovery_port: default_ports.3,
+            legacy_tcp_port: default_ports.4,
+            pending_reconnect_hint: false,
             pending_copy_bug_report: false,
             synced_name: String::new(),
-            synced_latency: 150,
-            synced_ports: (4713, 47777),
+            synced_latency: DEFAULT_JITTER_MS,
+            synced_ports: default_ports,
         }
     }
 }
 
 impl SettingsViewState {
+    fn current_ports(&self) -> (u16, u16, u16, u16, u16) {
+        (
+            self.control_port,
+            self.pair_port,
+            self.rtp_port,
+            self.discovery_port,
+            self.legacy_tcp_port,
+        )
+    }
+
+    fn set_ports(&mut self, ports: (u16, u16, u16, u16, u16)) {
+        self.control_port = ports.0;
+        self.pair_port = ports.1;
+        self.rtp_port = ports.2;
+        self.discovery_port = ports.3;
+        self.legacy_tcp_port = ports.4;
+    }
+
     fn sync_from_snapshot(&mut self, snap: &GuiSnapshot) {
         if (self.synced_name != snap.config.device.name && self.device_name == self.synced_name)
             || (self.device_name.is_empty() && self.synced_name.is_empty())
@@ -56,17 +119,31 @@ impl SettingsViewState {
             self.synced_name = snap.config.device.name.clone();
         }
 
-        let snap_lat = snap.config.connection.latency_ms.unwrap_or(150);
+        let snap_lat = snap
+            .config
+            .connection
+            .latency_ms
+            .unwrap_or(DEFAULT_JITTER_MS)
+            .clamp(10, 500);
         if self.synced_latency != snap_lat && self.latency_ms == self.synced_latency {
             self.latency_ms = snap_lat;
             self.synced_latency = snap_lat;
         }
 
-        let ports = (snap.config.sharing.port, snap.config.discovery.port);
-        if self.synced_ports != ports && (self.tcp_port, self.discovery_port) == self.synced_ports {
-            self.tcp_port = ports.0;
-            self.discovery_port = ports.1;
+        let ports = (
+            snap.config.sharing.v3_port,
+            snap.config.sharing.pair_port,
+            snap.config.sharing.rtp_port,
+            snap.config.discovery.port,
+            snap.config.sharing.port,
+        );
+        if self.synced_ports != ports && self.current_ports() == self.synced_ports {
+            self.set_ports(ports);
             self.synced_ports = ports;
+        }
+
+        if !snap.connected {
+            self.pending_reconnect_hint = false;
         }
     }
 }
@@ -84,21 +161,87 @@ pub fn render(
         ui,
         pal,
         "Preferences",
-        Some("Personalize how this device looks, connects, and stays secure."),
+        Some("Personalize how this device looks, streams audio, and stays secure."),
     );
-    ui.add_space(10.0);
+    ui.add_space(8.0);
 
-    // 1. General & Appearance
+    segmented_control(
+        ui,
+        pal,
+        &mut state.active_subtab,
+        &[
+            ("General", SettingsSubTab::General),
+            ("Audio & Sync", SettingsSubTab::Audio),
+            ("Privacy & Devices", SettingsSubTab::Privacy),
+            ("Network & Health", SettingsSubTab::Network),
+        ],
+    );
+    ui.add_space(12.0);
+
+    match state.active_subtab {
+        SettingsSubTab::General => render_general_tab(ui, pal, snap, state, backend),
+        SettingsSubTab::Audio => render_audio_tab(ui, pal, snap, state, backend),
+        SettingsSubTab::Privacy => render_privacy_tab(ui, pal, snap, backend),
+        SettingsSubTab::Network => render_network_tab(ui, pal, snap, state, backend),
+    }
+}
+
+fn render_reconnect_hint_banner(ui: &mut egui::Ui, pal: &Palette) {
+    callout_card(ui, pal.accent_soft, pal.accent, |ui| {
+        ui.horizontal_wrapped(|ui| {
+            pill_badge(ui, "Reconnect to Apply", pal.accent, pal.card_elevated);
+            ui.label(
+                RichText::new(
+                    "Settings saved. Reconnect your active speaker to apply the new audio or port configuration.",
+                )
+                .color(pal.text_secondary)
+                .size(12.0),
+            );
+        });
+    });
+    ui.add_space(10.0);
+}
+
+fn render_toggle_row(
+    ui: &mut egui::Ui,
+    pal: &Palette,
+    title: &str,
+    subtitle: &str,
+    value: bool,
+) -> Option<bool> {
+    let mut toggled = value;
+    let mut changed = false;
+    ui.horizontal(|ui| {
+        ui.vertical(|ui| {
+            ui.label(RichText::new(title).color(pal.text).size(13.5));
+            ui.label(RichText::new(subtitle).color(pal.text_muted).size(12.0));
+        });
+        ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+            if toggle_switch(ui, pal, &mut toggled).changed() {
+                changed = true;
+            }
+        });
+    });
+    changed.then_some(toggled)
+}
+
+fn render_general_tab(
+    ui: &mut egui::Ui,
+    pal: &Palette,
+    snap: &GuiSnapshot,
+    state: &mut SettingsViewState,
+    backend: &GuiBackend,
+) {
+    // 1. Device & Appearance
     card(ui, pal, None, |ui| {
         ui.label(
-            RichText::new("General & Appearance")
+            RichText::new("Device & Appearance")
                 .color(pal.text)
                 .size(15.0)
                 .strong(),
         );
         ui.add_space(8.0);
 
-        // Device Name
         ui.horizontal(|ui| {
             ui.vertical(|ui| {
                 ui.label(RichText::new("Device Name").color(pal.text).size(13.5));
@@ -131,7 +274,6 @@ pub fn render(
         ui.separator();
         ui.add_space(10.0);
 
-        // Theme selector
         ui.horizontal(|ui| {
             ui.vertical(|ui| {
                 ui.label(RichText::new("Appearance").color(pal.text).size(13.5));
@@ -165,31 +307,68 @@ pub fn render(
         ui.separator();
         ui.add_space(10.0);
 
-        // Auto-connect
-        ui.horizontal(|ui| {
-            ui.vertical(|ui| {
-                ui.label(
-                    RichText::new("Auto-connect to preferred speaker")
-                        .color(pal.text)
-                        .size(13.5),
-                );
-                ui.label(
-                    RichText::new("Automatically reconnect when your last speaker comes online.")
-                        .color(pal.text_muted)
-                        .size(12.0),
-                );
+        if let Some(notif) = render_toggle_row(
+            ui,
+            pal,
+            "Desktop notifications",
+            "Show helpful alerts when speakers connect or disconnect.",
+            snap.config.ui.notifications,
+        ) {
+            backend.send(GuiCommand::SaveConfigPatch {
+                patch: serde_json::json!({ "ui": { "notifications": notif } }),
+                toast: None,
             });
-            ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                let mut auto = snap.auto_connect;
-                if toggle_switch(ui, pal, &mut auto).changed() {
-                    backend.send(GuiCommand::SetAutoConnect { enabled: auto });
-                }
+        }
+
+        ui.add_space(10.0);
+
+        #[cfg(target_os = "windows")]
+        let (autostart_title, autostart_sub) = (
+            "Start with Windows",
+            "Starts quietly in the Windows notification area so your speakers are always ready.",
+        );
+        #[cfg(not(target_os = "windows"))]
+        let (autostart_title, autostart_sub) = (
+            "Start SoundHop when I log in",
+            "Keeps your system tray and speaker discovery ready in the background.",
+        );
+        if let Some(start_login) = render_toggle_row(
+            ui,
+            pal,
+            autostart_title,
+            autostart_sub,
+            snap.autostart_installed || snap.service_enabled,
+        ) {
+            backend.send(GuiCommand::SetAutostart {
+                enabled: start_login,
             });
-        });
+        }
+    });
+
+    ui.add_space(12.0);
+
+    // 2. Connection Behavior
+    card(ui, pal, None, |ui| {
+        ui.label(
+            RichText::new("Connection Behavior")
+                .color(pal.text)
+                .size(15.0)
+                .strong(),
+        );
+        ui.add_space(8.0);
+
+        if let Some(auto) = render_toggle_row(
+            ui,
+            pal,
+            "Auto-connect to preferred speaker",
+            "Automatically reconnect when your last speaker comes online.",
+            snap.auto_connect,
+        ) {
+            backend.send(GuiCommand::SetAutoConnect { enabled: auto });
+        }
 
         ui.add_space(8.0);
 
-        // Preferred Auto-Connect Peer selector & clear
         ui.horizontal(|ui| {
             ui.vertical(|ui| {
                 ui.label(
@@ -256,106 +435,123 @@ pub fn render(
         });
 
         ui.add_space(10.0);
+        ui.separator();
+        ui.add_space(10.0);
 
-        // Disconnect on Quit
+        if let Some(disconnect_on_quit) = render_toggle_row(
+            ui,
+            pal,
+            "Disconnect speakers when quitting",
+            "Automatically return audio to this device when SoundHop exits.",
+            snap.config.connection.disconnect_on_quit,
+        ) {
+            backend.send(GuiCommand::SaveConfigPatch {
+                patch: serde_json::json!({
+                    "connection": { "disconnect_on_quit": disconnect_on_quit }
+                }),
+                toast: None,
+            });
+        }
+
+        ui.add_space(10.0);
+
+        if let Some(keep_local) = render_toggle_row(
+            ui,
+            pal,
+            "Keep local speakers active by default in Multi-Room",
+            "Include this computer's speakers alongside remote speakers when starting multi-room.",
+            snap.config.connection.keep_local_output,
+        ) {
+            backend.send(GuiCommand::SaveConfigPatch {
+                patch: serde_json::json!({
+                    "connection": { "keep_local_output": keep_local }
+                }),
+                toast: None,
+            });
+        }
+
+        #[cfg(not(target_os = "windows"))]
+        {
+            ui.add_space(10.0);
+            if let Some(switch_default) = render_toggle_row(
+                ui,
+                pal,
+                "Switch default system output on connect",
+                "Route new application audio automatically to the remote speaker.",
+                snap.config.connection.switch_default,
+            ) {
+                backend.send(GuiCommand::SaveConfigPatch {
+                    patch: serde_json::json!({ "connection": { "switch_default": switch_default } }),
+                    toast: None,
+                });
+            }
+
+            ui.add_space(10.0);
+            if let Some(move_streams) = render_toggle_row(
+                ui,
+                pal,
+                "Move currently playing apps on connect",
+                "Transfer already-running audio streams when a speaker connects.",
+                snap.config.connection.move_streams,
+            ) {
+                backend.send(GuiCommand::SaveConfigPatch {
+                    patch: serde_json::json!({ "connection": { "move_streams": move_streams } }),
+                    toast: None,
+                });
+            }
+        }
+
+        #[cfg(target_os = "windows")]
+        {
+            ui.add_space(8.0);
+            ui.label(
+                RichText::new(
+                    "Audio capture uses Windows WASAPI loopback without changing your default playback device.",
+                )
+                .color(pal.text_muted)
+                .size(11.5),
+            );
+        }
+    });
+
+    ui.add_space(12.0);
+
+    // 3. Application
+    card(ui, pal, None, |ui| {
+        ui.label(
+            RichText::new("Application")
+                .color(pal.text)
+                .size(15.0)
+                .strong(),
+        );
+        ui.add_space(8.0);
+
         ui.horizontal(|ui| {
             ui.vertical(|ui| {
+                ui.label(RichText::new("Welcome Tour").color(pal.text).size(13.5));
                 ui.label(
-                    RichText::new("Disconnect speakers when quitting")
-                        .color(pal.text)
-                        .size(13.5),
-                );
-                ui.label(
-                    RichText::new("Automatically return audio to this device when SoundHop exits.")
+                    RichText::new("Revisit the quick-start guide and pairing setup.")
                         .color(pal.text_muted)
                         .size(12.0),
                 );
             });
             ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                let mut disconnect_on_quit = snap.config.connection.disconnect_on_quit;
-                if toggle_switch(ui, pal, &mut disconnect_on_quit).changed() {
-                    backend.send(GuiCommand::SaveConfigPatch {
-                        patch: serde_json::json!({
-                            "connection": { "disconnect_on_quit": disconnect_on_quit }
-                        }),
-                        toast: None,
-                    });
+                if secondary_button(ui, pal, "Replay Welcome Tour").clicked() {
+                    backend.send(GuiCommand::ReopenOnboarding);
                 }
             });
         });
 
         ui.add_space(10.0);
-
-        // Notifications
-        ui.horizontal(|ui| {
-            ui.vertical(|ui| {
-                ui.label(
-                    RichText::new("Desktop notifications")
-                        .color(pal.text)
-                        .size(13.5),
-                );
-                ui.label(
-                    RichText::new("Show helpful alerts when speakers connect or disconnect.")
-                        .color(pal.text_muted)
-                        .size(12.0),
-                );
-            });
-            ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                let mut notif = snap.config.ui.notifications;
-                if toggle_switch(ui, pal, &mut notif).changed() {
-                    backend.send(GuiCommand::SaveConfigPatch {
-                        patch: serde_json::json!({ "ui": { "notifications": notif } }),
-                        toast: None,
-                    });
-                }
-            });
-        });
-
+        ui.separator();
         ui.add_space(10.0);
 
-        // Start at Login
         ui.horizontal(|ui| {
             ui.vertical(|ui| {
-                #[cfg(target_os = "windows")]
-                let (autostart_title, autostart_sub) = (
-                    "Start with Windows",
-                    "Starts quietly in the Windows notification area so your speakers are always ready.",
-                );
-                #[cfg(not(target_os = "windows"))]
-                let (autostart_title, autostart_sub) = (
-                    "Start SoundHop when I log in",
-                    "Keeps your system tray and speaker discovery ready in the background.",
-                );
-                ui.label(RichText::new(autostart_title).color(pal.text).size(13.5));
-                ui.label(
-                    RichText::new(autostart_sub)
-                        .color(pal.text_muted)
-                        .size(12.0),
-                );
-            });
-            ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                let mut start_login = snap.autostart_installed || snap.service_enabled;
-                if toggle_switch(ui, pal, &mut start_login).changed() {
-                    backend.send(GuiCommand::SetAutostart {
-                        enabled: start_login,
-                    });
-                }
-            });
-        });
-
-        ui.add_space(10.0);
-
-        // System / Background Service
-        ui.horizontal(|ui| {
-            ui.vertical(|ui| {
-                ui.label(
-                    RichText::new("Background Service & Tray")
-                        .color(pal.text)
-                        .size(13.5),
-                );
+                ui.label(RichText::new("Quit SoundHop").color(pal.text).size(13.5));
                 ui.label(
                     RichText::new(
-                        "Quit SoundHop completely, stopping the background service and system tray.",
+                        "Stop the background service, close the system tray, and exit completely.",
                     )
                     .color(pal.text_muted)
                     .size(12.0),
@@ -368,20 +564,139 @@ pub fn render(
             });
         });
     });
+}
 
-    ui.add_space(12.0);
+fn render_gstreamer_status_banner(
+    ui: &mut egui::Ui,
+    pal: &Palette,
+    snap: &GuiSnapshot,
+    state: &mut SettingsViewState,
+) {
+    match (&snap.gstreamer_status, &snap.gstreamer_error) {
+        (Some(gst), _) if gst.available => {
+            callout_card(ui, pal.success_soft, pal.success, |ui| {
+                ui.horizontal(|ui| {
+                    ui.vertical(|ui| {
+                        ui.horizontal(|ui| {
+                            ui.label(
+                                RichText::new("GStreamer Audio Engine")
+                                    .color(pal.text)
+                                    .size(13.0)
+                                    .strong(),
+                            );
+                            pill_badge(ui, "Ready", pal.success, pal.card_elevated);
+                        });
+                        let plugin_mode = if gst.bundled_plugin_dir.is_some() {
+                            "Bundled plugins"
+                        } else {
+                            "System plugins"
+                        };
+                        ui.label(
+                            RichText::new(format!(
+                                "GStreamer {} • SRTP/Opus & L16 PCM plugins active • {plugin_mode}",
+                                gst.version
+                            ))
+                            .color(pal.text_secondary)
+                            .size(11.5),
+                        );
+                    });
+                });
+            });
+        }
+        (Some(gst), _) => {
+            callout_card(ui, pal.warning_soft, pal.warning, |ui| {
+                ui.horizontal(|ui| {
+                    ui.vertical(|ui| {
+                        ui.horizontal(|ui| {
+                            ui.label(
+                                RichText::new("GStreamer Plugins Incomplete")
+                                    .color(pal.warning)
+                                    .size(13.0)
+                                    .strong(),
+                            );
+                            pill_badge(ui, "Missing Plugins", pal.warning, pal.card_elevated);
+                        });
+                        let detail = if !gst.missing_elements.is_empty() {
+                            format!(
+                                "GStreamer {} missing: {}",
+                                gst.version,
+                                gst.missing_elements.join(", ")
+                            )
+                        } else if !gst.audio_src_available || !gst.audio_sink_available {
+                            format!(
+                                "GStreamer {} audio I/O unavailable (src={}, sink={}).",
+                                gst.version, gst.audio_src_available, gst.audio_sink_available
+                            )
+                        } else {
+                            format!("GStreamer {} not ready.", gst.version)
+                        };
+                        ui.label(RichText::new(detail).color(pal.text_secondary).size(11.5));
+                    });
+                    ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                        if secondary_button(ui, pal, "Open Diagnostics").clicked() {
+                            state.active_subtab = SettingsSubTab::Network;
+                        }
+                    });
+                });
+            });
+        }
+        (None, Some(err)) => {
+            callout_card(ui, pal.warning_soft, pal.warning, |ui| {
+                ui.horizontal(|ui| {
+                    ui.vertical(|ui| {
+                        ui.label(
+                            RichText::new("GStreamer Runtime Unavailable")
+                                .color(pal.warning)
+                                .size(13.0)
+                                .strong(),
+                        );
+                        ui.label(RichText::new(err).color(pal.text_secondary).size(11.5));
+                    });
+                    ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                        if secondary_button(ui, pal, "Open Diagnostics").clicked() {
+                            state.active_subtab = SettingsSubTab::Network;
+                        }
+                    });
+                });
+            });
+        }
+        (None, None) => {
+            callout_card(ui, pal.card_elevated, pal.border_subtle, |ui| {
+                ui.label(
+                    RichText::new("Checking GStreamer runtime & plugins...")
+                        .color(pal.text_muted)
+                        .size(12.0),
+                );
+            });
+        }
+    }
+    ui.add_space(10.0);
+}
 
-    // 2. Audio Quality & Latency (GStreamer SRTP/Opus Profile)
+fn render_audio_tab(
+    ui: &mut egui::Ui,
+    pal: &Palette,
+    snap: &GuiSnapshot,
+    state: &mut SettingsViewState,
+    backend: &GuiBackend,
+) {
+    render_gstreamer_status_banner(ui, pal, snap, state);
+
+    if snap.connected && state.pending_reconnect_hint {
+        render_reconnect_hint_banner(ui, pal);
+    }
+
+    // 1. Audio Quality Profile
     card(ui, pal, None, |ui| {
         ui.label(
-            RichText::new("Audio Quality & Latency")
+            RichText::new("Audio Quality Profile")
                 .color(pal.text)
                 .size(15.0)
                 .strong(),
         );
         ui.label(
             RichText::new(
-                "Choose the GStreamer SRTP/Opus codec and latency profile for encrypted streaming.",
+                "Select the GStreamer SRTP/Opus or lossless PCM encoding profile for encrypted streams.",
             )
             .color(pal.text_muted)
             .size(12.0),
@@ -394,33 +709,22 @@ pub fn render(
             snap.audio_profile.as_str()
         };
 
-        for (profile_key, title, desc) in [
-            (
-                "opus-balanced",
-                "Opus Balanced (Default)",
-                "48 kHz stereo Opus (20 ms frames, 128 kbps VBR) • Best all-around quality and Wi-Fi resilience.",
-            ),
-            (
-                "opus-low-latency",
-                "Opus Low-Latency (10 ms)",
-                "48 kHz stereo Opus (10 ms frames, 128 kbps VBR) • Ideal for videos, calls, and gaming.",
-            ),
-            (
-                "opus-low-bandwidth",
-                "Opus Low-Bandwidth (64 kbps)",
-                "48 kHz stereo Opus (20 ms frames, 64 kbps VBR) • Smooth playback on congested Wi-Fi.",
-            ),
-            (
-                "pcm-lossless",
-                "Encrypted Lossless PCM",
-                "48 kHz stereo uncompressed L16 PCM over SRTP • Zero-loss studio audio.",
-            ),
-        ] {
+        for &(profile_key, title, desc) in AUDIO_PROFILE_CARDS {
             let selected = active_profile == profile_key;
-            if selectable_card(ui, pal, ("audio_profile", profile_key), selected, title, desc)
-                .clicked()
+            if selectable_card(
+                ui,
+                pal,
+                ("audio_profile", profile_key),
+                selected,
+                title,
+                desc,
+            )
+            .clicked()
                 && !selected
             {
+                if snap.connected {
+                    state.pending_reconnect_hint = true;
+                }
                 backend.send(GuiCommand::SaveConfigPatch {
                     patch: serde_json::json!({ "audio": { "profile": profile_key } }),
                     toast: Some(format!("Audio profile set to {title}.")),
@@ -432,14 +736,96 @@ pub fn render(
 
     ui.add_space(12.0);
 
-    // 3. Privacy & Pairing
+    // 2. Jitter Buffer & Latency
     card(ui, pal, None, |ui| {
-        let trusted_count = snap.trusted_peers.len();
-        let effective_paired_count = trusted_count.max(snap.paired_peer_count);
         ui.horizontal(|ui| {
             ui.vertical(|ui| {
                 ui.label(
-                    RichText::new("Privacy & Pairing")
+                    RichText::new("Jitter Buffer & Latency")
+                        .color(pal.text)
+                        .size(15.0)
+                        .strong(),
+                );
+                ui.label(
+                    RichText::new(
+                        "Controls GStreamer rtpjitterbuffer depth (10–500 ms). Lower values reduce delay; higher values absorb Wi-Fi spikes.",
+                    )
+                    .color(pal.text_muted)
+                    .size(12.0),
+                );
+            });
+            ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                if snap.config.connection.latency_ms.is_some()
+                    && secondary_button(ui, pal, "Reset to Auto (40 ms)").clicked()
+                {
+                    state.latency_ms = DEFAULT_JITTER_MS;
+                    state.synced_latency = DEFAULT_JITTER_MS;
+                    if snap.connected {
+                        state.pending_reconnect_hint = true;
+                    }
+                    backend.send(GuiCommand::SaveConfigPatch {
+                        patch: serde_json::json!({ "connection": { "latency_ms": null } }),
+                        toast: Some("Jitter buffer reset to Auto (40 ms).".to_string()),
+                    });
+                }
+            });
+        });
+        ui.add_space(8.0);
+
+        ui.horizontal_wrapped(|ui| {
+            for (label, ms) in [
+                ("Ultra-Low (20 ms)", 20u32),
+                ("Balanced (40 ms)", 40),
+                ("Wi-Fi (80 ms)", 80),
+                ("Stable (150 ms)", 150),
+            ] {
+                let is_active = state.latency_ms == ms;
+                let clicked = if is_active {
+                    primary_button(ui, pal, label).clicked()
+                } else {
+                    secondary_button(ui, pal, label).clicked()
+                };
+                if clicked && !is_active {
+                    state.latency_ms = ms;
+                    state.synced_latency = ms;
+                    if snap.connected {
+                        state.pending_reconnect_hint = true;
+                    }
+                    backend.send(GuiCommand::SaveConfigPatch {
+                        patch: serde_json::json!({ "connection": { "latency_ms": ms } }),
+                        toast: Some(format!("Jitter buffer set to {ms} ms.")),
+                    });
+                }
+            }
+        });
+        ui.add_space(8.0);
+
+        ui.horizontal(|ui| {
+            let slider = ui.add(egui::Slider::new(&mut state.latency_ms, 10..=500).suffix(" ms"));
+            if slider.drag_stopped() || (slider.changed() && !slider.dragged()) {
+                state.synced_latency = state.latency_ms;
+                if snap.connected {
+                    state.pending_reconnect_hint = true;
+                }
+                backend.send(GuiCommand::SaveConfigPatch {
+                    patch: serde_json::json!({ "connection": { "latency_ms": state.latency_ms } }),
+                    toast: None,
+                });
+            }
+        });
+    });
+}
+
+fn render_privacy_tab(ui: &mut egui::Ui, pal: &Palette, snap: &GuiSnapshot, backend: &GuiBackend) {
+    let trusted_count = snap.trusted_peers.len();
+    let effective_paired_count = trusted_count.max(snap.paired_peer_count);
+
+    // 1. Speaker Access Control
+    card(ui, pal, None, |ui| {
+        ui.horizontal(|ui| {
+            ui.vertical(|ui| {
+                ui.label(
+                    RichText::new("Speaker Access Control")
                         .color(pal.text)
                         .size(15.0)
                         .strong(),
@@ -567,7 +953,7 @@ pub fn render(
                 );
                 ui.label(
                     RichText::new(
-                        "\"Paired Devices Only\" is selected, but no devices are trusted yet. Click Pair on a nearby speaker in Play & Share, or enter a shared code below.",
+                        "\"Paired Devices Only\" is selected, but no devices are trusted yet. Click Pair on a nearby speaker in Play & Share to verify its 6-digit code.",
                     )
                     .color(pal.text_secondary)
                     .size(11.5),
@@ -576,20 +962,56 @@ pub fn render(
         }
 
         ui.add_space(10.0);
-        ui.separator();
-        ui.add_space(8.0);
 
-        // Trusted Devices (Pairing v2)
+        for (mode_key, title, desc) in [
+            (
+                "trusted-lan",
+                "Home Wi-Fi (Automatic)",
+                "Great for home networks — any SoundHop device on your Wi-Fi can connect.",
+            ),
+            (
+                "psk",
+                "Paired Devices Only (Recommended on shared Wi-Fi)",
+                "Enforces encrypted SRTP streaming and requires Pairing v2 verification between devices.",
+            ),
+            (
+                "cookie",
+                "System Audio Cookie",
+                "Uses your computer's built-in PulseAudio/PipeWire network cookie.",
+            ),
+        ] {
+            // PulseAudio/PipeWire cookie mode is Linux-only; only show on Windows if already active.
+            #[cfg(target_os = "windows")]
+            if mode_key == "cookie" && snap.config.sharing.security != "cookie" {
+                continue;
+            }
+            let selected = snap.config.sharing.security == mode_key;
+            if selectable_card(ui, pal, ("privacy_mode", mode_key), selected, title, desc).clicked()
+                && !selected
+            {
+                backend.send(GuiCommand::SaveConfigPatch {
+                    patch: serde_json::json!({ "sharing": { "security": mode_key } }),
+                    toast: Some(format!("Switched privacy mode to {title}.")),
+                });
+            }
+            ui.add_space(6.0);
+        }
+    });
+
+    ui.add_space(12.0);
+
+    // 2. Trusted Devices
+    card(ui, pal, None, |ui| {
         ui.horizontal(|ui| {
             ui.label(
                 RichText::new("Trusted Devices")
                     .color(pal.text)
-                    .size(13.5)
+                    .size(15.0)
                     .strong(),
             );
             pill_badge(ui, &format!("{trusted_count}"), pal.accent, pal.accent_soft);
         });
-        ui.add_space(4.0);
+        ui.add_space(6.0);
         if snap.trusted_peers.is_empty() {
             ui.label(
                 RichText::new(
@@ -631,391 +1053,444 @@ pub fn render(
                 ui.add_space(4.0);
             }
         }
+    });
+}
+
+fn port_drag_value(ui: &mut egui::Ui, port: &mut u16) {
+    let mut val = u32::from(*port);
+    if ui
+        .add(egui::DragValue::new(&mut val).range(1024..=65535))
+        .changed()
+    {
+        *port = val as u16;
+    }
+}
+
+fn render_network_tab(
+    ui: &mut egui::Ui,
+    pal: &Palette,
+    snap: &GuiSnapshot,
+    state: &mut SettingsViewState,
+    backend: &GuiBackend,
+) {
+    if snap.connected && state.pending_reconnect_hint {
+        render_reconnect_hint_banner(ui, pal);
+    }
+
+    // 1. LAN Discovery
+    card(ui, pal, None, |ui| {
+        ui.label(
+            RichText::new("LAN Discovery")
+                .color(pal.text)
+                .size(15.0)
+                .strong(),
+        );
+        ui.add_space(8.0);
+
+        if let Some(mdns) = render_toggle_row(
+            ui,
+            pal,
+            "mDNS / Zeroconf",
+            "Advertise and browse nearby SoundHop devices using standard multicast DNS.",
+            snap.config.discovery.mdns,
+        ) {
+            backend.send(GuiCommand::SaveConfigPatch {
+                patch: serde_json::json!({ "discovery": { "mdns": mdns } }),
+                toast: None,
+            });
+        }
 
         ui.add_space(10.0);
 
-        for (mode_key, title, desc) in [
-            (
-                "trusted-lan",
-                "Home Wi-Fi (Automatic)",
-                "Great for home networks — any SoundHop device on your Wi-Fi can connect.",
-            ),
-            (
-                "psk",
-                "PIN-Paired Devices Only (Recommended on shared Wi-Fi)",
-                "Requires matching a secret pairing code between your devices.",
-            ),
-            (
-                "cookie",
-                "System Audio Cookie",
-                "Uses your computer's built-in PulseAudio/PipeWire network cookie.",
-            ),
-        ] {
-            // PulseAudio/PipeWire cookie mode is Linux-only; only show on Windows if already active.
-            #[cfg(target_os = "windows")]
-            if mode_key == "cookie" && snap.config.sharing.security != "cookie" {
-                continue;
-            }
-            let selected = snap.config.sharing.security == mode_key;
-            if selectable_card(ui, pal, ("privacy_mode", mode_key), selected, title, desc).clicked()
-                && !selected
-            {
-                backend.send(GuiCommand::SaveConfigPatch {
-                    patch: serde_json::json!({ "sharing": { "security": mode_key } }),
-                    toast: Some(format!("Switched privacy mode to {title}.")),
-                });
-            }
-            ui.add_space(6.0);
+        if let Some(udp) = render_toggle_row(
+            ui,
+            pal,
+            "UDP LAN Beacon",
+            "Broadcast authenticated discovery packets on your local subnet.",
+            snap.config.discovery.udp,
+        ) {
+            backend.send(GuiCommand::SaveConfigPatch {
+                patch: serde_json::json!({ "discovery": { "udp": udp } }),
+                toast: None,
+            });
         }
     });
 
-    ui.add_space(10.0);
+    ui.add_space(12.0);
 
-    // 3. Progressive Disclosure: Advanced Settings & Diagnostics (collapsed by default)
-    collapsible_advanced(
-        ui,
-        pal,
-        "settings_advanced_drawer",
-        "Advanced Audio, Network & Diagnostics",
-        |ui| {
-            // Audio Codec & Quality (GStreamer SRTP/Opus)
-            ui.label(
-                RichText::new("Audio Codec & Quality (GStreamer SRTP/Opus)")
-                    .color(pal.text)
-                    .size(13.5)
-                    .strong(),
-            );
-            ui.label(
-                RichText::new(
-                    "Opus compresses and protects encrypted streams over Wi-Fi; Lossless sends raw 48 kHz stereo PCM.",
-                )
-                .color(pal.text_muted)
-                .size(12.0),
-            );
-            ui.add_space(6.0);
-            let current_profile = snap.config.audio.profile.as_str();
-            let selected_label = AUDIO_PROFILE_OPTIONS
-                .iter()
-                .find(|(key, _)| *key == current_profile)
-                .map(|(_, label)| *label)
-                .unwrap_or(current_profile);
-            let mut chosen = snap.config.audio.profile.clone();
-            egui::ComboBox::from_id_salt("settings_audio_profile_combo")
-                .selected_text(selected_label)
-                .show_ui(ui, |ui| {
-                    for (key, label) in AUDIO_PROFILE_OPTIONS {
-                        ui.selectable_value(&mut chosen, (*key).to_string(), *label);
-                    }
-                });
-            if chosen != snap.config.audio.profile {
-                let chosen_label = AUDIO_PROFILE_OPTIONS
-                    .iter()
-                    .find(|(key, _)| *key == chosen)
-                    .map(|(_, label)| *label)
-                    .unwrap_or(chosen.as_str());
-                backend.send(GuiCommand::SaveConfigPatch {
-                    patch: serde_json::json!({ "audio": { "profile": chosen } }),
-                    toast: Some(format!("Audio profile set to {chosen_label}.")),
-                });
-            }
+    // 2. Network Ports
+    card(ui, pal, None, |ui| {
+        let default_ports = (
+            DEFAULT_V3_PORT,
+            DEFAULT_PAIR_PORT,
+            DEFAULT_RTP_PORT,
+            DEFAULT_DISCOVERY_PORT,
+            DEFAULT_AUDIO_PORT,
+        );
+        let paired_mode = is_paired_security_mode(&snap.config.sharing.security);
 
-            ui.add_space(10.0);
-            ui.separator();
-            ui.add_space(8.0);
-
-            // Latency Presets
-            ui.label(
-                RichText::new("Audio Sync & Buffer Latency")
-                    .color(pal.text)
-                    .size(13.5)
-                    .strong(),
-            );
-            ui.label(
-                RichText::new(
-                    "Lower latency is better for videos; higher stability helps on busy Wi-Fi.",
-                )
-                .color(pal.text_muted)
-                .size(12.0),
-            );
-            ui.add_space(6.0);
-            ui.horizontal(|ui| {
-                for (label, ms) in [
-                    ("Low (50 ms)", 50u32),
-                    ("Balanced (150 ms)", 150),
-                    ("Stable (300 ms)", 300),
-                ] {
-                    if secondary_button(ui, pal, label).clicked() {
-                        state.latency_ms = ms;
-                        state.synced_latency = ms;
-                        backend.send(GuiCommand::SaveConfigPatch {
-                            patch: serde_json::json!({ "connection": { "latency_ms": ms } }),
-                            toast: Some(format!("Audio buffer set to {ms} ms.")),
-                        });
-                    }
-                }
-            });
-            ui.add_space(6.0);
-            ui.horizontal(|ui| {
-                let slider = ui.add(egui::Slider::new(&mut state.latency_ms, 10..=2000).suffix(" ms"));
-                if slider.drag_stopped() || (slider.changed() && !slider.dragged()) {
-                    state.synced_latency = state.latency_ms;
-                    backend.send(GuiCommand::SaveConfigPatch {
-                        patch: serde_json::json!({ "connection": { "latency_ms": state.latency_ms } }),
-                        toast: None,
-                    });
-                }
-            });
-
-            ui.add_space(10.0);
-            ui.separator();
-            ui.add_space(8.0);
-
-            // Behavior toggles
-            #[cfg(not(target_os = "windows"))]
-            for (title, val, key) in [
-                (
-                    "Switch default system output on connect",
-                    snap.config.connection.switch_default,
-                    "switch_default",
-                ),
-                (
-                    "Move currently playing apps on connect",
-                    snap.config.connection.move_streams,
-                    "move_streams",
-                ),
-            ] {
-                ui.horizontal(|ui| {
-                    ui.label(RichText::new(title).color(pal.text_secondary).size(12.5));
-                    ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                        let mut b = val;
-                        if toggle_switch(ui, pal, &mut b).changed() {
-                            backend.send(GuiCommand::SaveConfigPatch {
-                                patch: serde_json::json!({ "connection": { key: b } }),
-                                toast: None,
-                            });
-                        }
-                    });
-                });
-            }
-            ui.horizontal(|ui| {
+        ui.horizontal(|ui| {
+            ui.vertical(|ui| {
                 ui.label(
-                    RichText::new("Keep local speakers active by default in Multi-Room")
-                        .color(pal.text_secondary)
-                        .size(12.5),
+                    RichText::new("Network Ports")
+                        .color(pal.text)
+                        .size(15.0)
+                        .strong(),
                 );
-                ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                    let mut b = snap.config.connection.keep_local_output;
-                    if toggle_switch(ui, pal, &mut b).changed() {
-                        backend.send(GuiCommand::SaveConfigPatch {
-                            patch: serde_json::json!({ "connection": { "keep_local_output": b } }),
-                            toast: None,
-                        });
-                    }
-                });
-            });
-            #[cfg(target_os = "windows")]
-            {
-                ui.add_space(4.0);
                 ui.label(
                     RichText::new(
-                        "Audio capture uses Windows WASAPI loopback without changing your default playback device.",
+                        "Encrypted control, pairing, SRTP media, discovery, and legacy PA-TCP ports.",
                     )
                     .color(pal.text_muted)
-                    .size(11.5),
+                    .size(12.0),
                 );
-            }
-
-            ui.add_space(10.0);
-            ui.separator();
-            ui.add_space(8.0);
-
-            // Network Ports & Discovery
-            ui.label(
-                RichText::new("Network Ports & Discovery")
-                    .color(pal.text)
-                    .size(13.5)
-                    .strong(),
-            );
-            ui.add_space(6.0);
-            ui.horizontal(|ui| {
-                let mut mdns = snap.config.discovery.mdns;
-                if ui.checkbox(&mut mdns, "mDNS / Zeroconf").changed() {
-                    backend.send(GuiCommand::SaveConfigPatch {
-                        patch: serde_json::json!({ "discovery": { "mdns": mdns } }),
-                        toast: None,
-                    });
-                }
-                let mut udp = snap.config.discovery.udp;
-                if ui.checkbox(&mut udp, "UDP LAN Beacon").changed() {
-                    backend.send(GuiCommand::SaveConfigPatch {
-                        patch: serde_json::json!({ "discovery": { "udp": udp } }),
-                        toast: None,
-                    });
-                }
             });
-            ui.horizontal(|ui| {
-                ui.label(RichText::new("Audio TCP Port:").color(pal.text_secondary));
-                let mut tp = state.tcp_port as u32;
-                if ui
-                    .add(egui::DragValue::new(&mut tp).range(1024..=65535))
-                    .changed()
+            ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                if state.current_ports() != state.synced_ports
+                    && primary_button(ui, pal, "Apply Ports").clicked()
                 {
-                    state.tcp_port = tp as u16;
-                }
-                ui.label(RichText::new("Discovery UDP Port:").color(pal.text_secondary));
-                let mut dp = state.discovery_port as u32;
-                if ui
-                    .add(egui::DragValue::new(&mut dp).range(1024..=65535))
-                    .changed()
-                {
-                    state.discovery_port = dp as u16;
-                }
-                if (state.tcp_port, state.discovery_port) != state.synced_ports
-                    && secondary_button(ui, pal, "Apply Ports").clicked()
-                {
-                    state.synced_ports = (state.tcp_port, state.discovery_port);
+                    let next = state.current_ports();
+                    state.synced_ports = next;
+                    if snap.connected {
+                        state.pending_reconnect_hint = true;
+                    }
                     backend.send(GuiCommand::SaveConfigPatch {
                         patch: serde_json::json!({
-                            "sharing": { "port": state.tcp_port },
-                            "discovery": { "port": state.discovery_port }
+                            "sharing": {
+                                "v3_port": next.0,
+                                "pair_port": next.1,
+                                "rtp_port": next.2,
+                                "port": next.4,
+                            },
+                            "discovery": { "port": next.3 }
                         }),
                         toast: Some("Updated network ports.".to_string()),
                     });
                 }
+                if state.current_ports() != default_ports
+                    && secondary_button(ui, pal, "Defaults").clicked()
+                {
+                    state.set_ports(default_ports);
+                    state.synced_ports = default_ports;
+                    if snap.connected {
+                        state.pending_reconnect_hint = true;
+                    }
+                    backend.send(GuiCommand::SaveConfigPatch {
+                        patch: serde_json::json!({
+                            "sharing": {
+                                "v3_port": default_ports.0,
+                                "pair_port": default_ports.1,
+                                "rtp_port": default_ports.2,
+                                "port": default_ports.4,
+                            },
+                            "discovery": { "port": default_ports.3 }
+                        }),
+                        toast: Some("Restored default network ports.".to_string()),
+                    });
+                }
             });
+        });
 
-            ui.add_space(10.0);
-            ui.separator();
+        ui.add_space(10.0);
+
+        egui::Grid::new("settings_network_ports_grid")
+            .num_columns(3)
+            .spacing([14.0, 8.0])
+            .show(ui, |ui| {
+                ui.label(
+                    RichText::new("Control Channel (TCP)")
+                        .color(pal.text)
+                        .size(13.0),
+                );
+                port_drag_value(ui, &mut state.control_port);
+                ui.label(
+                    RichText::new("Encrypted handshake, volume & telemetry")
+                        .color(pal.text_muted)
+                        .size(11.5),
+                );
+                ui.end_row();
+
+                ui.label(
+                    RichText::new("Pairing Handshake (TCP)")
+                        .color(pal.text)
+                        .size(13.0),
+                );
+                port_drag_value(ui, &mut state.pair_port);
+                ui.label(
+                    RichText::new("Pairing v2 interactive code exchange")
+                        .color(pal.text_muted)
+                        .size(11.5),
+                );
+                ui.end_row();
+
+                ui.label(
+                    RichText::new("SRTP Audio Media (UDP)")
+                        .color(pal.text)
+                        .size(13.0),
+                );
+                port_drag_value(ui, &mut state.rtp_port);
+                ui.label(
+                    RichText::new("Encrypted GStreamer RTP/Opus & PCM stream")
+                        .color(pal.text_muted)
+                        .size(11.5),
+                );
+                ui.end_row();
+
+                ui.label(
+                    RichText::new("LAN Discovery (UDP)")
+                        .color(pal.text)
+                        .size(13.0),
+                );
+                port_drag_value(ui, &mut state.discovery_port);
+                ui.label(
+                    RichText::new("Local subnet peer discovery beacons")
+                        .color(pal.text_muted)
+                        .size(11.5),
+                );
+                ui.end_row();
+
+                ui.label(
+                    RichText::new("Legacy PA-TCP (TCP)")
+                        .color(pal.text_secondary)
+                        .size(13.0),
+                );
+                port_drag_value(ui, &mut state.legacy_tcp_port);
+                let legacy_note = if paired_mode {
+                    "Disabled in Paired Devices Only mode"
+                } else {
+                    "PulseAudio / PipeWire compatibility tunnel"
+                };
+                ui.label(RichText::new(legacy_note).color(pal.text_muted).size(11.5));
+                ui.end_row();
+            });
+    });
+
+    ui.add_space(12.0);
+
+    // 3. Connection Health & Diagnostics
+    card(ui, pal, None, |ui| {
+        ui.label(
+            RichText::new("Connection Health & Diagnostics")
+                .color(pal.text)
+                .size(15.0)
+                .strong(),
+        );
+        ui.add_space(6.0);
+
+        let transport_str = if !snap.connected {
+            "Idle"
+        } else if snap.connected_transport.is_empty() {
+            "Active"
+        } else {
+            snap.connected_transport.as_str()
+        };
+        let gst_str = match (&snap.gstreamer_status, &snap.gstreamer_error) {
+            (Some(gst), _) if gst.available => gst.version.clone(),
+            (Some(gst), _) => format!("{} (incomplete)", gst.version),
+            (None, Some(_)) => "Unavailable".to_string(),
+            (None, None) => "Checking".to_string(),
+        };
+        let rtt_str = snap
+            .rtt_ms
+            .map(|r| format!("{r:.1} ms"))
+            .unwrap_or_else(|| "--".to_string());
+        let jit_str = snap
+            .jitter_ms
+            .map(|j| format!("{j:.1} ms"))
+            .unwrap_or_else(|| "--".to_string());
+        let jb_str = snap
+            .jitter_buf_ms
+            .map(|b| format!("{b} ms"))
+            .unwrap_or_else(|| "--".to_string());
+        let drop_str = snap
+            .dropped_frames
+            .map(|d| d.to_string())
+            .unwrap_or_else(|| "--".to_string());
+        let fw_display = if snap.firewall_kind == "windows-defender" {
+            "Windows Defender Firewall"
+        } else {
+            snap.firewall_kind.as_str()
+        };
+
+        ui.label(
+            RichText::new(format!(
+                "Daemon: {} • Transport: {} • GStreamer: {} • Firewall: {}\nRTT: {} • Jitter: {} • Buffer: {} • Drops: {} • Audio: {:.1} dBFS",
+                if snap.daemon_connected {
+                    "Active"
+                } else {
+                    "Standalone"
+                },
+                transport_str,
+                gst_str,
+                fw_display,
+                rtt_str,
+                jit_str,
+                jb_str,
+                drop_str,
+                snap.audio_dbfs,
+            ))
+            .color(pal.text_muted)
+            .size(11.5)
+            .monospace(),
+        );
+        ui.add_space(8.0);
+
+        ui.horizontal_wrapped(|ui| {
+            ui.add_enabled_ui(!snap.diagnostics_running, |ui| {
+                let diag_label = if snap.diagnostics_running {
+                    "Running Diagnostics..."
+                } else {
+                    "Run Diagnostics & Fix"
+                };
+                if primary_button(ui, pal, diag_label).clicked() {
+                    backend.send(GuiCommand::RunDiagnostics { fix: true });
+                }
+            });
+            if secondary_button(ui, pal, "Copy / Export Bug Report").clicked() {
+                state.pending_copy_bug_report = true;
+                backend.send(GuiCommand::ExportBugReport);
+            }
+            #[cfg(target_os = "windows")]
+            let fw_btn_label = "Allow in Windows Firewall";
+            #[cfg(not(target_os = "windows"))]
+            let fw_btn_label = "Open Firewall Ports";
+            if secondary_button(ui, pal, fw_btn_label).clicked() {
+                backend.send(GuiCommand::OpenFirewall);
+            }
+        });
+
+        if state.pending_copy_bug_report {
+            if let Some(ref report_json) = snap.bug_report_json {
+                ui.ctx().copy_text(report_json.clone());
+                state.pending_copy_bug_report = false;
+            }
+        }
+
+        if let Some(ref summary) = snap.diagnostics_summary {
             ui.add_space(8.0);
-
-            // Live Diagnostics & Welcome Tour
-            ui.label(
-                RichText::new("Connection Health & Diagnostics")
-                    .color(pal.text)
-                    .size(13.5)
-                    .strong(),
-            );
-            ui.add_space(4.0);
-            let rtt_str = snap
-                .rtt_ms
-                .map(|r| format!("{r:.1} ms"))
-                .unwrap_or_else(|| "--".to_string());
-            let jit_str = snap
-                .jitter_ms
-                .map(|j| format!("{j:.1} ms"))
-                .unwrap_or_else(|| "--".to_string());
-            let fw_display = if snap.firewall_kind == "windows-defender" {
-                "Windows Defender Firewall"
+            let (bg, border) = if snap.diagnostics_healthy == Some(true) {
+                (pal.success_soft, pal.success)
             } else {
-                snap.firewall_kind.as_str()
+                (pal.warning_soft, pal.warning)
             };
-            ui.label(
-                RichText::new(format!(
-                    "Daemon: {} • Firewall: {} • RTT: {} • Jitter: {} • Audio: {:.1} dBFS",
-                    if snap.daemon_connected {
-                        "Active"
-                    } else {
-                        "Standalone"
-                    },
-                    fw_display,
-                    rtt_str,
-                    jit_str,
-                    snap.audio_dbfs,
-                ))
-                .color(pal.text_muted)
-                .size(11.5)
-                .monospace(),
-            );
+            callout_card(ui, bg, border, |ui| {
+                ui.label(
+                    RichText::new("Diagnostics Summary")
+                        .color(border)
+                        .size(12.5)
+                        .strong(),
+                );
+                ui.add_space(4.0);
+                ui.label(
+                    RichText::new(summary)
+                        .color(pal.text_secondary)
+                        .size(11.5)
+                        .monospace(),
+                );
+            });
+        }
+
+        if let Some(ref report_json) = snap.bug_report_json {
             ui.add_space(6.0);
             ui.horizontal_wrapped(|ui| {
-                ui.add_enabled_ui(!snap.diagnostics_running, |ui| {
-                    let diag_label = if snap.diagnostics_running {
-                        "Running Diagnostics..."
-                    } else {
-                        "Run Diagnostics & Fix"
-                    };
-                    if primary_button(ui, pal, diag_label).clicked() {
-                        backend.send(GuiCommand::RunDiagnostics { fix: true });
-                    }
-                });
-                if secondary_button(ui, pal, "Copy / Export Bug Report").clicked() {
-                    state.pending_copy_bug_report = true;
-                    backend.send(GuiCommand::ExportBugReport);
-                }
-                #[cfg(target_os = "windows")]
-                let fw_btn_label = "Allow in Windows Firewall";
-                #[cfg(not(target_os = "windows"))]
-                let fw_btn_label = "Open Firewall Ports";
-                if secondary_button(ui, pal, fw_btn_label).clicked() {
-                    backend.send(GuiCommand::OpenFirewall);
-                }
-                if secondary_button(ui, pal, "Replay Welcome Tour").clicked() {
-                    backend.send(GuiCommand::ReopenOnboarding);
-                }
-            });
-
-            if state.pending_copy_bug_report {
-                if let Some(ref report_json) = snap.bug_report_json {
+                if secondary_button(ui, pal, "Copy Report JSON").clicked() {
                     ui.ctx().copy_text(report_json.clone());
-                    state.pending_copy_bug_report = false;
                 }
-            }
-
-            if let Some(ref summary) = snap.diagnostics_summary {
-                ui.add_space(8.0);
-                let (bg, border) = if snap.diagnostics_healthy == Some(true) {
-                    (pal.success_soft, pal.success)
-                } else {
-                    (pal.warning_soft, pal.warning)
-                };
-                callout_card(ui, bg, border, |ui| {
+                if let Some(ref path) = snap.bug_report_path {
                     ui.label(
-                        RichText::new("Diagnostics Summary")
-                            .color(border)
-                            .size(12.5)
-                            .strong(),
-                    );
-                    ui.add_space(4.0);
-                    ui.label(
-                        RichText::new(summary)
-                            .color(pal.text_secondary)
+                        RichText::new(format!("Saved: {path}"))
+                            .color(pal.text_muted)
                             .size(11.5)
                             .monospace(),
                     );
-                });
-            }
-
-            if let Some(ref report_json) = snap.bug_report_json {
-                ui.add_space(6.0);
-                ui.horizontal_wrapped(|ui| {
-                    if secondary_button(ui, pal, "Copy Report JSON").clicked() {
-                        ui.ctx().copy_text(report_json.clone());
-                    }
-                    if let Some(ref path) = snap.bug_report_path {
-                        ui.label(
-                            RichText::new(format!("Saved: {path}"))
-                                .color(pal.text_muted)
-                                .size(11.5)
-                                .monospace(),
-                        );
-                    }
-                });
-            }
-        },
-    );
+                }
+            });
+        }
+    });
 }
 
 #[cfg(test)]
 mod tests {
-    use super::AUDIO_PROFILE_OPTIONS;
-    use soundhop_core::config::VALID_AUDIO_PROFILES;
+    use super::{render, SettingsSubTab, SettingsViewState, AUDIO_PROFILE_CARDS};
+    use crate::backend::{GuiBackend, GuiSnapshot};
+    use crate::theme::Palette;
+    use eframe::egui;
+    use soundhop_core::config::{Config, VALID_AUDIO_PROFILES};
+    use soundhop_core::controller::Controller;
+    use soundhop_core::state::State;
+    use soundhop_core::transport::GstreamerRuntimeStatus;
+    use std::sync::Arc;
 
     #[test]
     fn audio_profile_options_match_valid_audio_profiles() {
-        let keys: Vec<&str> = AUDIO_PROFILE_OPTIONS.iter().map(|(k, _)| *k).collect();
+        let keys: Vec<&str> = AUDIO_PROFILE_CARDS.iter().map(|(k, _, _)| *k).collect();
         assert_eq!(keys, VALID_AUDIO_PROFILES);
-        for (_, label) in AUDIO_PROFILE_OPTIONS {
-            assert!(!label.is_empty());
+        for (_, title, desc) in AUDIO_PROFILE_CARDS {
+            assert!(!title.is_empty());
+            assert!(!desc.is_empty());
         }
+    }
+
+    #[test]
+    fn settings_subtabs_render_cleanly_in_both_themes_and_states() {
+        let controller = Arc::new(Controller::new(
+            Some(Config::default()),
+            Some(State::default()),
+            None,
+            None,
+            None,
+            false,
+        ));
+        let backend = GuiBackend::start(controller.clone(), None);
+        let mut snap = GuiSnapshot::from_controller(&controller);
+        snap.connected = true;
+        snap.connected_transport = "gst-srtp".to_string();
+        snap.jitter_buf_ms = Some(40);
+        snap.dropped_frames = Some(2);
+        snap.gstreamer_status = Some(GstreamerRuntimeStatus {
+            available: true,
+            version: "1.28.9".to_string(),
+            missing_elements: Vec::new(),
+            audio_src_available: true,
+            audio_sink_available: true,
+            bundled_plugin_dir: None,
+        });
+
+        let mut state = SettingsViewState::default();
+        let ctx = egui::Context::default();
+        for pal in [Palette::dark(), Palette::light()] {
+            for tab in [
+                SettingsSubTab::General,
+                SettingsSubTab::Audio,
+                SettingsSubTab::Privacy,
+                SettingsSubTab::Network,
+            ] {
+                state.active_subtab = tab;
+                state.pending_reconnect_hint = true;
+                let _ = ctx.run(egui::RawInput::default(), |ctx| {
+                    egui::CentralPanel::default().show(ctx, |ui| {
+                        render(ui, &pal, &snap, &mut state, &backend);
+                    });
+                });
+            }
+        }
+
+        // Disconnected + missing plugins clears pending_reconnect_hint on sync
+        snap.connected = false;
+        snap.gstreamer_status = Some(GstreamerRuntimeStatus {
+            available: false,
+            version: "1.20.3".to_string(),
+            missing_elements: vec!["srtpenc".to_string()],
+            audio_src_available: true,
+            audio_sink_available: true,
+            bundled_plugin_dir: None,
+        });
+        state.active_subtab = SettingsSubTab::Audio;
+        let _ = ctx.run(egui::RawInput::default(), |ctx| {
+            egui::CentralPanel::default().show(ctx, |ui| {
+                render(ui, &Palette::dark(), &snap, &mut state, &backend);
+            });
+        });
+        assert!(!state.pending_reconnect_hint);
     }
 }

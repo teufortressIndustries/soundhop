@@ -161,6 +161,10 @@ impl WorkerState {
             };
 
         let svc = service_status();
+        let (gst_status, gst_error) = match soundhop_core::transport::check_gstreamer_runtime() {
+            Ok(st) => (Some(st), None),
+            Err(e) => (None, Some(e.to_string())),
+        };
         let mut guard = write_or_recover(&self.snapshot);
         guard.firewall_kind = fw_kind;
         guard.firewall_active = fw_active;
@@ -175,6 +179,8 @@ impl WorkerState {
             .get("tray_autostart")
             .and_then(|v| v.as_bool())
             .unwrap_or(false);
+        guard.gstreamer_status = gst_status;
+        guard.gstreamer_error = gst_error;
     }
 
     pub(super) fn refresh_fast(&mut self, allow_during_command: bool) -> bool {

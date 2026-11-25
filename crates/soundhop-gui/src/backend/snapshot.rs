@@ -10,6 +10,7 @@ use soundhop_core::discovery::Peer;
 use soundhop_core::pairing::{PendingPairRequest, TrustedPeer};
 use soundhop_core::state::{ActivePeerSession, KnownAndroidDevice, State};
 use soundhop_core::telemetry::TelemetrySnapshot;
+use soundhop_core::transport::GstreamerRuntimeStatus;
 use soundhop_core::util::{is_own_non_loopback_ip, is_private_address};
 
 use crate::lock_or_recover;
@@ -122,6 +123,11 @@ pub struct GuiSnapshot {
     pub trusted_peers: Vec<TrustedPeer>,
     pub pending_pair_requests: Vec<PendingPairRequest>,
     pub audio_profile: String,
+    pub connected_transport: String,
+    pub jitter_buf_ms: Option<u16>,
+    pub dropped_frames: Option<u32>,
+    pub gstreamer_status: Option<GstreamerRuntimeStatus>,
+    pub gstreamer_error: Option<String>,
     pub hydrated: bool,
 }
 
@@ -197,6 +203,11 @@ impl GuiSnapshot {
             refreshing_peers: false,
             refreshing_android: false,
             pending_peer_id: None,
+            connected_transport: String::new(),
+            jitter_buf_ms: None,
+            dropped_frames: None,
+            gstreamer_status: None,
+            gstreamer_error: None,
             hydrated: false,
         }
     }
@@ -375,6 +386,9 @@ pub(super) struct RefreshUpdate {
     trusted_peers: Vec<TrustedPeer>,
     pending_pair_requests: Vec<PendingPairRequest>,
     audio_profile: String,
+    connected_transport: String,
+    jitter_buf_ms: Option<u16>,
+    dropped_frames: Option<u32>,
 }
 
 impl RefreshUpdate {
@@ -433,6 +447,19 @@ impl RefreshUpdate {
         let jitter_ms = conn
             .and_then(|c| c.get("jitter_ms"))
             .and_then(|v| v.as_f64());
+        let connected_transport = conn
+            .and_then(|c| c.get("transport"))
+            .and_then(|v| v.as_str())
+            .unwrap_or("")
+            .to_string();
+        let jitter_buf_ms = conn
+            .and_then(|c| c.get("jitter_buf_ms"))
+            .and_then(|v| v.as_u64())
+            .and_then(|v| u16::try_from(v).ok());
+        let dropped_frames = conn
+            .and_then(|c| c.get("dropped_frames"))
+            .and_then(|v| v.as_u64())
+            .and_then(|v| u32::try_from(v).ok());
 
         // Volume
         let vol_obj = status_json.get("volume").filter(|v| !v.is_null());
@@ -666,6 +693,9 @@ impl RefreshUpdate {
             trusted_peers,
             pending_pair_requests,
             audio_profile,
+            connected_transport,
+            jitter_buf_ms,
+            dropped_frames,
         }
     }
 
@@ -700,6 +730,9 @@ impl RefreshUpdate {
                     || (guard.audio_peak - self.audio_peak).abs() > 0.01))
             || guard.rtt_ms != self.rtt_ms
             || guard.jitter_ms != self.jitter_ms
+            || guard.connected_transport != self.connected_transport
+            || guard.jitter_buf_ms != self.jitter_buf_ms
+            || guard.dropped_frames != self.dropped_frames
             || guard.android_session_active != self.android_session_active
             || guard.android_session_device != self.android_session_device
             || guard.listener_security != self.listener_security
@@ -711,6 +744,10 @@ impl RefreshUpdate {
             || guard.config.ui.theme != self.config.ui.theme
             || guard.config.sharing.security != self.config.sharing.security
             || guard.config.sharing.port != self.config.sharing.port
+            || guard.config.sharing.v3_port != self.config.sharing.v3_port
+            || guard.config.sharing.pair_port != self.config.sharing.pair_port
+            || guard.config.sharing.rtp_port != self.config.sharing.rtp_port
+            || guard.config.connection.latency_ms != self.config.connection.latency_ms
             || guard.config.discovery.port != self.config.discovery.port
             || guard.config.discovery.mdns != self.config.discovery.mdns
             || guard.config.discovery.udp != self.config.discovery.udp
@@ -742,6 +779,9 @@ impl RefreshUpdate {
         guard.audio_peak = self.audio_peak;
         guard.rtt_ms = self.rtt_ms;
         guard.jitter_ms = self.jitter_ms;
+        guard.connected_transport = self.connected_transport;
+        guard.jitter_buf_ms = self.jitter_buf_ms;
+        guard.dropped_frames = self.dropped_frames;
         if !self.android_history.is_empty() {
             changed |= guard.android_history.len() != self.android_history.len();
             guard.android_history = self.android_history;
