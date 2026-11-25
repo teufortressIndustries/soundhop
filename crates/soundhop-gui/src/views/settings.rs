@@ -413,7 +413,7 @@ pub fn render(
             (
                 "pcm-lossless",
                 "Encrypted Lossless PCM",
-                "48 kHz stereo uncompressed S16LE over ChaCha20-Poly1305 • Zero-loss studio audio.",
+                "48 kHz stereo uncompressed L16 PCM over SRTP • Zero-loss studio audio.",
             ),
         ] {
             let selected = active_profile == profile_key;

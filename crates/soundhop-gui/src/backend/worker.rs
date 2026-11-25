@@ -7,7 +7,7 @@ use std::time::{Duration, Instant};
 use eframe::egui;
 use soundhop_core::constants::{PROTOCOL_VERSION, VERSION};
 use soundhop_core::controller::Controller;
-use soundhop_core::discovery::{discover_once_with_psk, Peer};
+use soundhop_core::discovery::{discover_once_with_meta, Peer};
 use soundhop_core::firewall::{detect_for_config, open_ports_for_config};
 use soundhop_core::ipc::{is_running as ipc_is_running, request as ipc_request};
 use soundhop_core::service::{
@@ -92,9 +92,14 @@ impl WorkerState {
         }
         let cfg = lock_or_recover(&self.controller.config).clone();
         let psk = (!cfg.sharing.psk_hash.is_empty()).then_some(cfg.sharing.psk_hash.as_str());
-        let found = discover_once_with_psk(0.7, cfg.discovery.port, &cfg.device.id, psk);
-        for p in &found {
-            self.controller.remember_peer(p);
+        let found_with_meta = discover_once_with_meta(0.7, cfg.discovery.port, &cfg.device.id, psk);
+        let mut found = Vec::with_capacity(found_with_meta.len());
+        for (p, meta) in found_with_meta {
+            if let Some(m) = meta {
+                self.controller.remember_peer_v3_meta(&p.id, m);
+            }
+            self.controller.remember_peer(&p);
+            found.push(p);
         }
         *lock_or_recover(&self.cached_live_peers) = found;
     }

@@ -298,17 +298,65 @@ jobs:
             }
           }
 
-          # Run smoke test with a stripped PATH (no system GStreamer) to prove self-contained DLL resolution
-          $savedPath = $env:PATH
-          $savedGstRoot = $env:GSTREAMER_1_0_ROOT_MSVC_X86_64
+          # Run smoke test with a stripped PATH (no system GStreamer) to prove self-contained DLL & plugin resolution
+          $tempRegistry = Join-Path $env:RUNNER_TEMP "soundhop-ci-smoke-gst-registry.bin"
+          $envNames = @(
+            "PATH",
+            "GSTREAMER_1_0_ROOT_MSVC_X86_64",
+            "GST_PLUGIN_PATH",
+            "GST_PLUGIN_PATH_1_0",
+            "GST_PLUGIN_SYSTEM_PATH",
+            "GST_PLUGIN_SYSTEM_PATH_1_0",
+            "GST_REGISTRY_1_0",
+            "GST_REGISTRY_FORK"
+          )
+          $savedEnv = @{}
+          foreach ($name in $envNames) {
+            $savedEnv[$name] = [System.Environment]::GetEnvironmentVariable($name, "Process")
+          }
           try {
             $env:PATH = "$env:SystemRoot\System32;$env:SystemRoot"
-            Remove-Item Env:GSTREAMER_1_0_ROOT_MSVC_X86_64 -ErrorAction SilentlyContinue
+            foreach ($clearName in @(
+              "GSTREAMER_1_0_ROOT_MSVC_X86_64",
+              "GST_PLUGIN_PATH",
+              "GST_PLUGIN_PATH_1_0",
+              "GST_PLUGIN_SYSTEM_PATH",
+              "GST_PLUGIN_SYSTEM_PATH_1_0"
+            )) {
+              [System.Environment]::SetEnvironmentVariable($clearName, $null, "Process")
+            }
+            $env:GST_REGISTRY_1_0 = $tempRegistry
+
             & $cli.FullName --version
             if ($LASTEXITCODE -ne 0) { throw "soundhop.exe --version failed with stripped PATH!" }
+
+            $prevEap = $ErrorActionPreference
+            $ErrorActionPreference = "Continue"
+            try {
+              $doctorStdout = & $cli.FullName doctor --json 2>$null
+              $doctorExit = $LASTEXITCODE
+            } finally {
+              $ErrorActionPreference = $prevEap
+            }
+            if ($doctorExit -eq -1073741515 -or $doctorExit -eq -1073741511) {
+              throw "soundhop.exe doctor --json failed with Windows DLL loader error ($doctorExit)"
+            }
+            $doctorJsonText = ($doctorStdout | Out-String).Trim()
+            if ([string]::IsNullOrWhiteSpace($doctorJsonText)) {
+              throw "soundhop.exe doctor --json produced no JSON output (exit code: $doctorExit)"
+            }
+            $doctorReport = $doctorJsonText | ConvertFrom-Json
+            if ($null -eq $doctorReport.gstreamer -or $doctorReport.gstreamer.available -ne $true) {
+              throw "Bundled GStreamer runtime check failed in portable zip (gstreamer.available != true): $doctorJsonText"
+            }
+            Write-Host "Verified bundled GStreamer runtime: version=$($doctorReport.gstreamer.version), bundled=$($doctorReport.gstreamer.bundled_plugin_dir)"
           } finally {
-            $env:PATH = $savedPath
-            if ($null -ne $savedGstRoot) { $env:GSTREAMER_1_0_ROOT_MSVC_X86_64 = $savedGstRoot }
+            foreach ($name in $envNames) {
+              [System.Environment]::SetEnvironmentVariable($name, $savedEnv[$name], "Process")
+            }
+            if (Test-Path -LiteralPath $tempRegistry) {
+              Remove-Item -LiteralPath $tempRegistry -Force -ErrorAction SilentlyContinue
+            }
           }
 
       - name: Upload Windows Artifacts

@@ -10,12 +10,22 @@ use std::thread::{self, JoinHandle};
 use gstreamer as gst;
 use gstreamer::prelude::*;
 use gstreamer_app as gst_app;
+use zeroize::Zeroizing;
 
 use crate::transport::gst_runtime::{ensure_gst_init, make_element};
 use crate::transport::wire::{AudioParams, CodecId};
 use crate::transport::{TransportError, TransportResult};
 
 const BUS_POLL_TIMEOUT: gst::ClockTime = gst::ClockTime::from_mseconds(100);
+
+/// Owned `AsRef<[u8]>` wrapper so `gst::Buffer::from_slice` zeroizes key material on buffer drop.
+struct ZeroizingKeyBuf(Zeroizing<[u8; 30]>);
+
+impl AsRef<[u8]> for ZeroizingKeyBuf {
+    fn as_ref(&self) -> &[u8] {
+        self.0.as_slice()
+    }
+}
 
 /// Audio playback endpoint for a [`GstAudioReceiver`] pipeline.
 #[derive(Clone)]
@@ -106,6 +116,23 @@ impl PreparedGstReceiver {
 
         // Bind UDP port cleanly by transitioning udpsrc to Ready (preferred -> ephemeral fallback).
         let bound_rtp_port = bind_udpsrc_port(&udpsrc, preferred_rtp_port)?;
+        // Ensure udpsrc transitions back to Null if any subsequent element creation or linking fails
+        // before it is handed off to PreparedGstReceiver.
+        struct ElementNullGuard<'a> {
+            elem: &'a gst::Element,
+            armed: bool,
+        }
+        impl Drop for ElementNullGuard<'_> {
+            fn drop(&mut self) {
+                if self.armed {
+                    let _ = self.elem.set_state(gst::State::Null);
+                }
+            }
+        }
+        let mut udpsrc_guard = ElementNullGuard {
+            elem: &udpsrc,
+            armed: true,
+        };
 
         let srtpdec = make_element("srtpdec", None)?;
         srtpdec.set_property("replay-window-size", 256u32);
@@ -218,9 +245,11 @@ impl PreparedGstReceiver {
             }
             let _ = pipeline.set_state(gst::State::Null);
             let _ = udpsrc.set_state(gst::State::Null);
+            udpsrc_guard.armed = false;
             return Err(err);
         }
 
+        udpsrc_guard.armed = false;
         Ok(Self {
             pipeline,
             srtpdec,
@@ -244,9 +273,11 @@ impl PreparedGstReceiver {
     pub fn start(
         mut self,
         expected_ssrc: u32,
-        srtp_key: [u8; 30],
+        srtp_key: Zeroizing<[u8; 30]>,
     ) -> TransportResult<GstAudioReceiver> {
         // Signal callback captures ONLY `(expected_ssrc, srtp_key)` — zero mutex locks!
+        // `srtp_key` stays wrapped in `Zeroizing<[u8; 30]>` inside the closure so it is
+        // automatically zeroized when `srtpdec` and the closure are dropped.
         self.srtpdec.connect("request-key", false, move |values| {
             let ssrc = match values.get(1).and_then(|v| v.get::<u32>().ok()) {
                 Some(s) => s,
@@ -255,7 +286,7 @@ impl PreparedGstReceiver {
             if ssrc != expected_ssrc {
                 return Some(None::<gst::Caps>.to_value());
             }
-            let key_buf = gst::Buffer::from_slice(srtp_key);
+            let key_buf = gst::Buffer::from_slice(ZeroizingKeyBuf(srtp_key.clone()));
             let caps = gst::Caps::builder("application/x-srtp")
                 .field("srtp-key", key_buf)
                 .field("srtp-cipher", "aes-128-icm")
@@ -463,6 +494,7 @@ fn bind_udpsrc_port(udpsrc: &gst::Element, preferred_rtp_port: u16) -> Transport
     // Fall back to OS-assigned ephemeral UDP port.
     udpsrc.set_property("port", 0i32);
     udpsrc.set_state(gst::State::Ready).map_err(|e| {
+        let _ = udpsrc.set_state(gst::State::Null);
         TransportError::Pipeline(format!("failed binding udpsrc ephemeral port: {e:?}"))
     })?;
     let actual = udpsrc.property::<i32>("port");

@@ -912,8 +912,9 @@ mod tests {
             ctrl.sht3_manager.listener_addr().unwrap().port(),
         );
 
-        let outbound_cfg = OutboundConfig::new("peer-revoked", v3_addr, k_pair)
-            .with_profile(AudioProfile::PcmLossless);
+        let outbound_cfg =
+            OutboundConfig::new("peer-revoked", v3_addr, zeroize::Zeroizing::new(k_pair))
+                .with_profile(AudioProfile::PcmLossless);
         let outbound = OutboundSessionHandle::start(
             outbound_cfg,
             CaptureEndpoint::TestSineWave {

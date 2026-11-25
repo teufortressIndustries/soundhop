@@ -5,6 +5,8 @@ use std::path::PathBuf;
 use std::sync::atomic::Ordering;
 use std::time::Duration;
 
+use zeroize::Zeroizing;
+
 use crate::backend::TunnelParams;
 use crate::config::{is_paired_security_mode, Config};
 use crate::constants::{MULTIROOM_SINK_NAME, PROTOCOL_VERSION, SINK_PREFIX};
@@ -94,7 +96,7 @@ impl Controller {
         OutboundConfig::new(
             cfg.device.id.clone(),
             SocketAddr::new(target_ip, v3_port),
-            trusted.pairwise_secret,
+            Zeroizing::new(trusted.pairwise_secret),
         )
         .with_profile(profile)
         .with_jitter_ms(jitter_ms)
@@ -349,7 +351,7 @@ impl Controller {
             self.telemetry.record_rtt(&peer.id, rtt);
         } else {
             return Err(ControllerError::Message(format!(
-                "{} is not accepting encrypted SHT3 audio at {}:{}. Is it online and sharing?",
+                "{} is not accepting encrypted GStreamer SRTP audio at {}:{}. Is it online and sharing?",
                 peer.display_name(),
                 peer.host,
                 v3_port
@@ -385,7 +387,7 @@ impl Controller {
                     let _ = self.backend.unload_module(module_id, true);
                 }
                 return Err(ControllerError::Message(format!(
-                    "Could not establish encrypted SHT3 audio stream to {}: {e}",
+                    "Could not establish encrypted GStreamer SRTP audio stream to {}: {e}",
                     peer.display_name()
                 )));
             }
@@ -438,7 +440,7 @@ impl Controller {
             notify(
                 "SoundHop",
                 &format!(
-                    "Encrypted audio (SHT3) is now playing on {}",
+                    "Encrypted audio (SRTP) is now playing on {}",
                     peer.display_name()
                 ),
                 "normal",
@@ -522,7 +524,7 @@ impl Controller {
                     self.telemetry.record_rtt(&p.id, rtt);
                 } else {
                     return Err(ControllerError::Message(format!(
-                        "{} is not accepting encrypted SHT3 audio at {}:{}. Is it online and sharing?",
+                        "{} is not accepting encrypted GStreamer SRTP audio at {}:{}. Is it online and sharing?",
                         p.display_name(),
                         p.host,
                         v3_port
@@ -537,7 +539,7 @@ impl Controller {
             } else {
                 if is_paired_security_mode(&p.security) {
                     return Err(ControllerError::Message(
-                        "This device requires pairing over encrypted SHT3 transport. Pair with it first."
+                        "This device requires pairing over encrypted GStreamer SRTP transport. Pair with it first."
                             .to_string(),
                     ));
                 }
@@ -619,7 +621,7 @@ impl Controller {
                             }
                             self.rollback_multi_sessions(&inserted_sht3_ids, &sessions);
                             return Err(ControllerError::Message(format!(
-                                "Could not establish encrypted SHT3 audio stream to {}: {e}",
+                                "Could not establish encrypted GStreamer SRTP audio stream to {}: {e}",
                                 p.display_name()
                             )));
                         }

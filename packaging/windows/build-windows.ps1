@@ -377,20 +377,51 @@ function Invoke-StrippedPathSmokeTest {
         }
         Write-Host "    $versionOut"
 
-        # Run `soundhop doctor` to exercise bundled GStreamer plugin loading;
-        # tolerate audio/firewall warnings on headless CI runners, but fail on DLL load errors.
+        # Run `soundhop doctor --json` to exercise bundled GStreamer plugin loading;
+        # tolerate audio/firewall warnings on headless CI runners, but fail on DLL load errors
+        # or if bundled GStreamer reports available != true.
         $prevEap = $ErrorActionPreference
         $ErrorActionPreference = "Continue"
         try {
-            $doctorOut = & $stagedCli doctor 2>&1
+            $doctorStdout = & $stagedCli doctor --json 2>$null
             $doctorExit = $LASTEXITCODE
         } finally {
             $ErrorActionPreference = $prevEap
         }
         if ($doctorExit -eq -1073741515 -or $doctorExit -eq -1073741511) {
-            throw "Staged soundhop.exe doctor failed with Windows DLL loader error ($doctorExit): $doctorOut"
+            throw "Staged soundhop.exe doctor --json failed with Windows DLL loader error ($doctorExit)"
         }
-        Write-Host "    doctor exit code: $doctorExit"
+        $doctorJsonText = ($doctorStdout | Out-String).Trim()
+        if ([string]::IsNullOrWhiteSpace($doctorJsonText)) {
+            throw "Staged soundhop.exe doctor --json produced no JSON output (exit code: $doctorExit)"
+        }
+        try {
+            $doctorReport = $doctorJsonText | ConvertFrom-Json
+        } catch {
+            throw "Failed to parse JSON from soundhop.exe doctor --json (exit code: $doctorExit): $doctorJsonText"
+        }
+        $gstProp = $doctorReport.PSObject.Properties["gstreamer"]
+        $gst = if ($null -ne $gstProp) { $gstProp.Value } else { $null }
+        $gstAvailable = $false
+        if ($null -ne $gst -and $null -ne $gst.PSObject.Properties["available"]) {
+            $gstAvailable = [bool]$gst.available
+        }
+        if (-not $gstAvailable) {
+            $missing = if ($null -ne $gst -and $null -ne $gst.PSObject.Properties["missing_elements"] -and $null -ne $gst.missing_elements) {
+                ($gst.missing_elements -join ", ")
+            } else {
+                "unknown"
+            }
+            $gstErr = if ($null -ne $gst -and $null -ne $gst.PSObject.Properties["error"]) {
+                "$($gst.error)"
+            } else {
+                ""
+            }
+            throw "Bundled GStreamer runtime check failed (gstreamer.available != true; missing_elements=[$missing]; error='$gstErr'): $doctorJsonText"
+        }
+        $gstVersion = if ($null -ne $gst.PSObject.Properties["version"]) { $gst.version } else { "unknown" }
+        $gstBundled = if ($null -ne $gst.PSObject.Properties["bundled_plugin_dir"]) { $gst.bundled_plugin_dir } else { "" }
+        Write-Host "    doctor exit code: $doctorExit (gstreamer.available=true, version=$gstVersion, bundled=$gstBundled)"
     } finally {
         foreach ($name in $envNames) {
             [System.Environment]::SetEnvironmentVariable($name, $savedEnv[$name], "Process")

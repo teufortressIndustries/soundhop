@@ -74,7 +74,10 @@ fn configure_bundled_env_for_dir(plugin_dir: &Path) {
     if env::var_os("GST_PLUGIN_PATH_1_0").is_some_and(|v| !v.is_empty()) {
         return;
     }
-    env::set_var("GST_PLUGIN_SYSTEM_PATH_1_0", "");
+    // Use `plugin_dir` instead of `""`: on Windows, SetEnvironmentVariableW deletes the
+    // variable when passed an empty string, causing GStreamer to fall back to scanning
+    // system plugin directories.
+    env::set_var("GST_PLUGIN_SYSTEM_PATH_1_0", plugin_dir);
     env::set_var("GST_PLUGIN_PATH_1_0", plugin_dir);
     env::set_var("GST_REGISTRY_FORK", "no");
 

@@ -10,12 +10,22 @@ use std::time::Duration;
 
 use gstreamer as gst;
 use gstreamer::prelude::*;
+use zeroize::Zeroizing;
 
 use crate::transport::gst_runtime::{ensure_gst_init, make_element};
 use crate::transport::wire::{AudioParams, CodecId};
 use crate::transport::{TransportError, TransportResult};
 
 const BUS_POLL_TIMEOUT: gst::ClockTime = gst::ClockTime::from_mseconds(100);
+
+/// Owned `AsRef<[u8]>` wrapper so `gst::Buffer::from_slice` zeroizes key material on buffer drop.
+struct ZeroizingKeyBuf(Zeroizing<[u8; 30]>);
+
+impl AsRef<[u8]> for ZeroizingKeyBuf {
+    fn as_ref(&self) -> &[u8] {
+        self.0.as_slice()
+    }
+}
 
 /// Thread-safe handle allowing tests to trigger live packet drops or probability changes
 /// on a `netsim` element embedded in a [`CaptureEndpoint::TestSineWave`] sender pipeline.
@@ -128,7 +138,7 @@ impl GstAudioSender {
         dest_ip: IpAddr,
         rtp_port: u16,
         sender_ssrc: u32,
-        srtp_key: [u8; 30],
+        srtp_key: Zeroizing<[u8; 30]>,
     ) -> TransportResult<Self> {
         ensure_gst_init()?;
         if rtp_port == 0 {
@@ -143,7 +153,7 @@ impl GstAudioSender {
         let audioresample = make_element("audioresample", None)?;
 
         let srtpenc = make_element("srtpenc", None)?;
-        let key_buf = gst::Buffer::from_slice(srtp_key);
+        let key_buf = gst::Buffer::from_slice(ZeroizingKeyBuf(srtp_key));
         srtpenc.set_property("key", &key_buf);
         srtpenc.set_property_from_str("rtp-cipher", "aes-128-icm");
         srtpenc.set_property_from_str("rtp-auth", "hmac-sha1-80");

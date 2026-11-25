@@ -647,7 +647,7 @@ impl Controller {
         let st_snap = lock_or_recover(&self.state).clone();
         if st_snap.is_connected() && self.has_dead_sht3_session() {
             if let Ok(Some(res)) = self.teardown_dead_sht3_session() {
-                actions.push("cleared dead SHT3 session".to_string());
+                actions.push("cleared dead SRTP session".to_string());
                 if let Some(restored) = res.get("restored_to").and_then(|v| v.as_str()) {
                     if !restored.is_empty() {
                         actions.push(format!("restored default sink to {restored}"));
@@ -663,7 +663,7 @@ impl Controller {
                 h.stop();
             }
             self.sht3_mode_active.store(false, Ordering::Release);
-            actions.push("cleaned up orphaned SHT3 session handles".to_string());
+            actions.push("cleaned up orphaned SRTP session handles".to_string());
         } else if st_snap.is_connected() && !self.sht3_outbound_active() {
             let sink_ok = self
                 .backend
@@ -704,7 +704,7 @@ impl Controller {
                 .start_sht3_listener_internal(v3_port, &cfg_snap)
                 .is_ok()
             {
-                actions.push("restarted SHT3 listener".to_string());
+                actions.push("restarted SRTP listener".to_string());
             }
         }
         if let Ok(removed_mics) = self.backend.cleanup_orphaned_remote_mic_modules() {
@@ -1073,7 +1073,7 @@ mod tests {
         let actions = rec["actions"].as_array().unwrap();
         assert!(actions
             .iter()
-            .any(|a| a.as_str() == Some("cleared dead SHT3 session")));
+            .any(|a| a.as_str() == Some("cleared dead SRTP session")));
         assert!(!client_ctrl.state.lock().unwrap().is_connected());
         assert!(!client_ctrl.has_dead_sht3_session());
         assert_eq!(
@@ -1099,7 +1099,7 @@ mod tests {
             .as_array()
             .unwrap()
             .iter()
-            .any(|a| a.as_str() == Some("restarted SHT3 listener")));
+            .any(|a| a.as_str() == Some("restarted SRTP listener")));
         server_ctrl.stop_listener(Some(false)).unwrap();
     }
 

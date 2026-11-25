@@ -6,6 +6,8 @@ use std::sync::{Arc, Mutex};
 use std::thread;
 use std::time::{Duration, Instant};
 
+use zeroize::Zeroizing;
+
 use crate::transport::{
     check_gstreamer_runtime, AudioProfile, CaptureEndpoint, InMemoryTrustStore, NetsimConfig,
     NetsimController, OutboundConfig, PlaybackEndpoint, Sht3ServerConfig, TransportManager,
@@ -130,7 +132,7 @@ fn clean_e2e_srtp_loopback_all_profiles_and_forged_udp_rejection() {
             )
             .unwrap();
 
-        let out_cfg = OutboundConfig::new("sender-e2e", addr, k_pair)
+        let out_cfg = OutboundConfig::new("sender-e2e", addr, Zeroizing::new(k_pair))
             .with_profile(profile)
             .with_jitter_ms(40)
             .with_ping_interval(Duration::from_millis(150));
@@ -216,7 +218,7 @@ fn wifi_bump_burst_drop_recovers_440hz_with_fec_and_plc() {
         )
         .unwrap();
 
-    let out_cfg = OutboundConfig::new("sender-burst", addr, k_pair)
+    let out_cfg = OutboundConfig::new("sender-burst", addr, Zeroizing::new(k_pair))
         .with_profile(AudioProfile::OpusBalanced)
         .with_jitter_ms(50)
         .with_ping_interval(Duration::from_millis(150));
@@ -288,7 +290,7 @@ fn wifi_sustained_loss_jitter_reordering_reports_bounded_telemetry() {
         .unwrap();
 
     let configured_jitter_ms = 60u16;
-    let out_cfg = OutboundConfig::new("sender-wifi", addr, k_pair)
+    let out_cfg = OutboundConfig::new("sender-wifi", addr, Zeroizing::new(k_pair))
         .with_profile(AudioProfile::OpusBalanced)
         .with_jitter_ms(configured_jitter_ms)
         .with_ping_interval(Duration::from_millis(200));
@@ -373,7 +375,7 @@ fn live_volume_mute_and_ping_telemetry() {
         )
         .unwrap();
 
-    let out_cfg = OutboundConfig::new("sender-vol", addr, k_pair)
+    let out_cfg = OutboundConfig::new("sender-vol", addr, Zeroizing::new(k_pair))
         .with_profile(AudioProfile::OpusBalanced)
         .with_jitter_ms(40)
         .with_ping_interval(Duration::from_millis(500));
@@ -482,7 +484,7 @@ fn lifecycle_disconnect_peer_abrupt_reconnect_and_rapid_stress() {
 
     let handle = manager
         .start_outbound(
-            OutboundConfig::new("sender-life", addr, k_pair)
+            OutboundConfig::new("sender-life", addr, Zeroizing::new(k_pair))
                 .with_profile(AudioProfile::OpusLowLatency),
             CaptureEndpoint::TestSineWave {
                 freq_hz: 440.0,
@@ -541,7 +543,7 @@ fn lifecycle_disconnect_peer_abrupt_reconnect_and_rapid_stress() {
 
     let reconnecting = srv_a
         .start_outbound(
-            OutboundConfig::new("sender-life", fixed_addr, k_pair)
+            OutboundConfig::new("sender-life", fixed_addr, Zeroizing::new(k_pair))
                 .with_profile(AudioProfile::OpusBalanced)
                 .with_ping_interval(Duration::from_millis(120))
                 .with_reconnect_window(Duration::from_secs(5)),
@@ -616,7 +618,7 @@ fn lifecycle_disconnect_peer_abrupt_reconnect_and_rapid_stress() {
             .unwrap();
         let h = mgr
             .start_outbound(
-                OutboundConfig::new("sender-life", a, k_pair)
+                OutboundConfig::new("sender-life", a, Zeroizing::new(k_pair))
                     .with_profile(AudioProfile::OpusLowLatency),
                 CaptureEndpoint::TestSineWave {
                     freq_hz: 440.0,

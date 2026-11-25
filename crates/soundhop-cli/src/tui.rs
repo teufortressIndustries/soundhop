@@ -23,7 +23,7 @@ use ratatui::text::{Line, Span};
 use ratatui::widgets::{Block, Borders, Clear, Gauge, List, ListItem, Paragraph, Tabs};
 use ratatui::{Frame, Terminal};
 use soundhop_core::controller::{ConnectOptions, Controller};
-use soundhop_core::discovery::{discover_once_with_psk, DiscoveryManager, Peer};
+use soundhop_core::discovery::{discover_once_with_meta, DiscoveryManager, Peer};
 use soundhop_core::pairing::PendingPairRequest;
 use soundhop_core::util::{
     install_signal_handlers, is_own_non_loopback_ip, is_private_address, now_secs,
@@ -316,11 +316,17 @@ impl TuiState {
                 let cfg = lock_or_recover(&self.controller.config).clone();
                 let psk =
                     (!cfg.sharing.psk_hash.is_empty()).then_some(cfg.sharing.psk_hash.as_str());
-                let found = discover_once_with_psk(0.8, cfg.discovery.port, &cfg.device.id, psk);
-                let found_count = found.len();
-                for p in &found {
-                    self.controller.remember_peer(p);
+                let found_with_meta =
+                    discover_once_with_meta(0.8, cfg.discovery.port, &cfg.device.id, psk);
+                let mut found = Vec::with_capacity(found_with_meta.len());
+                for (p, meta) in found_with_meta {
+                    if let Some(m) = meta {
+                        self.controller.remember_peer_v3_meta(&p.id, m);
+                    }
+                    self.controller.remember_peer(&p);
+                    found.push(p);
                 }
+                let found_count = found.len();
                 self.merge_live_peers(found);
                 self.refresh_data();
                 self.status_message = format!(
@@ -1171,7 +1177,11 @@ pub fn run_tui(controller: Arc<Controller>) -> Result<i32, String> {
         cfg.discovery.mdns,
     ));
     let ctrl_cb = Arc::clone(&controller);
+    let disc_store = Arc::clone(&disc.store);
     disc.store.set_on_peer(move |peer| {
+        if let Some(meta) = disc_store.v3_meta(&peer.id) {
+            ctrl_cb.remember_peer_v3_meta(&peer.id, meta);
+        }
         ctrl_cb.remember_peer(peer);
     });
     let _ = disc.start(cfg.sharing.enabled);

@@ -34,6 +34,7 @@ use std::time::Duration;
 use std::time::Instant;
 
 use thiserror::Error;
+use zeroize::Zeroizing;
 
 pub use crate::pairing::{InMemoryTrustStore, TrustLookup};
 pub use client::{Sht3ClientConfig, Sht3ClientConnection, Sht3ClientReader, Sht3ClientWriter};
@@ -164,6 +165,17 @@ pub enum PlaybackEndpoint {
 pub type PlaybackEndpointFactory =
     Arc<dyn Fn(&str) -> TransportResult<PlaybackEndpoint> + Send + Sync>;
 
+/// Configure bundled GStreamer plugin environment variables if bundled plugins are present.
+///
+/// Call once during single-threaded process startup (before spawning background threads)
+/// to avoid POSIX `setenv`/`getenv` races. No-op when compiled without the `gstreamer` feature.
+pub fn init_bundled_gst_env() {
+    #[cfg(feature = "gstreamer")]
+    {
+        let _ = configure_gst_env_if_bundled();
+    }
+}
+
 // ---------------------------------------------------------------------------
 // Transport Engine Traits & Telemetry
 // ---------------------------------------------------------------------------
@@ -247,11 +259,11 @@ pub struct StreamTelemetry {
 }
 
 /// Configuration for an outbound SRTP/Opus audio streaming session.
-#[derive(Debug, Clone)]
+#[derive(Clone)]
 pub struct OutboundConfig {
     pub client_device_id: String,
     pub target_addr: SocketAddr,
-    pub k_pair: [u8; 32],
+    pub k_pair: Zeroizing<[u8; 32]>,
     pub profile: AudioProfile,
     pub jitter_ms: u16,
     pub ping_interval: Duration,
@@ -259,12 +271,27 @@ pub struct OutboundConfig {
     pub reconnect_window: Duration,
 }
 
+impl std::fmt::Debug for OutboundConfig {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("OutboundConfig")
+            .field("client_device_id", &self.client_device_id)
+            .field("target_addr", &self.target_addr)
+            .field("k_pair", &"[REDACTED]")
+            .field("profile", &self.profile)
+            .field("jitter_ms", &self.jitter_ms)
+            .field("ping_interval", &self.ping_interval)
+            .field("io_timeout", &self.io_timeout)
+            .field("reconnect_window", &self.reconnect_window)
+            .finish()
+    }
+}
+
 impl OutboundConfig {
     /// Create an [`OutboundConfig`] targeting `target_addr` with the default `OpusBalanced` profile.
     pub fn new(
         client_device_id: impl Into<String>,
         target_addr: SocketAddr,
-        k_pair: [u8; 32],
+        k_pair: Zeroizing<[u8; 32]>,
     ) -> Self {
         Self {
             client_device_id: client_device_id.into(),
@@ -516,7 +543,8 @@ fn try_reconnect_outbound(
                 let negotiated = *conn.audio_params();
                 let new_ssrc = conn.sender_ssrc();
                 let new_rtp_port = conn.rtp_port();
-                let new_srtp_key = *conn.srtp_master_key_c2s();
+                let mut new_srtp_key = Zeroizing::new([0u8; 30]);
+                new_srtp_key.copy_from_slice(conn.srtp_master_key_c2s());
                 let Ok((mut new_writer, new_reader)) = conn.into_split() else {
                     return None;
                 };
@@ -600,7 +628,8 @@ impl OutboundSessionHandle {
         let initial_muted = conn.initial_muted();
         let initial_ssrc = conn.sender_ssrc();
         let initial_rtp_port = conn.rtp_port();
-        let initial_srtp_key = *conn.srtp_master_key_c2s();
+        let mut initial_srtp_key = Zeroizing::new([0u8; 30]);
+        initial_srtp_key.copy_from_slice(conn.srtp_master_key_c2s());
 
         let initial_sender = GstAudioSender::start(
             capture.clone(),
@@ -1180,7 +1209,9 @@ impl Sht3SessionManager {
                                     Ok((bound_port, prepared))
                                 },
                                 |prepared, sender_ssrc, keys| {
-                                    prepared.start(sender_ssrc, keys.srtp_master_key_c2s)
+                                    let mut srtp_key = Zeroizing::new([0u8; 30]);
+                                    srtp_key.copy_from_slice(&keys.srtp_master_key_c2s);
+                                    prepared.start(sender_ssrc, srtp_key)
                                 },
                             ) else {
                                 return;
