@@ -6,13 +6,30 @@ on:
     tags: [ "v*" ]
   pull_request:
     branches: [ "main" ]
+  workflow_dispatch:
+    inputs:
+      publish_beta:
+        description: "Publish a beta prerelease GitHub Release"
+        required: false
+        type: boolean
+        default: true
+      tag_suffix:
+        description: "Prerelease suffix appended to workspace version (e.g. beta.1 -> beta-v2.6.2-beta.1)"
+        required: false
+        type: string
+        default: "beta.1"
+      release_tag:
+        description: "Optional explicit tag override (must NOT start with 'v' to avoid colliding with stable v* releases)"
+        required: false
+        type: string
+        default: ""
 
 permissions:
   contents: read
 
 concurrency:
   group: ${{ github.workflow }}-${{ github.ref }}
-  cancel-in-progress: ${{ !startsWith(github.ref, 'refs/tags/v') }}
+  cancel-in-progress: ${{ !startsWith(github.ref, 'refs/tags/v') && github.event_name != 'workflow_dispatch' }}
 
 env:
   CARGO_TERM_COLOR: always
@@ -225,7 +242,7 @@ jobs:
 
   release:
     name: Publish GitHub Release
-    if: startsWith(github.ref, 'refs/tags/v')
+    if: startsWith(github.ref, 'refs/tags/v') || (github.event_name == 'workflow_dispatch' && inputs.publish_beta)
     needs: [test, build-appimage, build-windows, build-linux-aarch64]
     runs-on: ubuntu-22.04
 
@@ -234,6 +251,48 @@ jobs:
 
     steps:
       - uses: actions/checkout@v4
+
+      - name: Resolve release metadata
+        id: meta
+        env:
+          EVENT_NAME: ${{ github.event_name }}
+          REF_NAME: ${{ github.ref_name }}
+          INPUT_TAG: ${{ inputs.release_tag }}
+          INPUT_SUFFIX: ${{ inputs.tag_suffix }}
+        run: |
+          if [ "$EVENT_NAME" != "workflow_dispatch" ]; then
+            echo "tag=${REF_NAME}" >> "$GITHUB_OUTPUT"
+            echo "name=" >> "$GITHUB_OUTPUT"
+            echo "target=" >> "$GITHUB_OUTPUT"
+            echo "prerelease=false" >> "$GITHUB_OUTPUT"
+            echo "make_latest=true" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+
+          VERSION="$(sed -n '/^\[workspace\.package\]/,/^\[/{s/^version = "\([^"]*\)"/\1/p}' Cargo.toml | head -n1)"
+          if [ -z "$VERSION" ]; then
+            echo "Failed to determine workspace version from Cargo.toml" >&2
+            exit 1
+          fi
+
+          if [ -n "$INPUT_TAG" ]; then
+            TAG="$INPUT_TAG"
+          else
+            SUFFIX="${INPUT_SUFFIX:-beta.1}"
+            SUFFIX="${SUFFIX#-}"
+            TAG="beta-v${VERSION}-${SUFFIX}"
+          fi
+
+          if [[ "$TAG" == v* ]]; then
+            echo "Error: Beta release tag '$TAG' must not start with 'v' (would trigger stable v* release workflow)." >&2
+            exit 1
+          fi
+
+          echo "tag=${TAG}" >> "$GITHUB_OUTPUT"
+          echo "name=SoundHop ${TAG} (Pre-release)" >> "$GITHUB_OUTPUT"
+          echo "target=${GITHUB_SHA}" >> "$GITHUB_OUTPUT"
+          echo "prerelease=true" >> "$GITHUB_OUTPUT"
+          echo "make_latest=false" >> "$GITHUB_OUTPUT"
 
       - name: Download AppImage Artifact
         uses: actions/download-artifact@v4
@@ -262,6 +321,11 @@ jobs:
       - name: Create GitHub Release
         uses: softprops/action-gh-release@v2
         with:
+          tag_name: ${{ steps.meta.outputs.tag }}
+          target_commitish: ${{ steps.meta.outputs.target }}
+          name: ${{ steps.meta.outputs.name }}
+          prerelease: ${{ steps.meta.outputs.prerelease }}
+          make_latest: ${{ steps.meta.outputs.make_latest }}
           files: |
             dist/*.AppImage
             dist/*.zsync
