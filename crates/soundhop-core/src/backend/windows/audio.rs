@@ -550,7 +550,8 @@ fn drain_stale_buffer(cons_slot: &Mutex<Option<HeapCons<i16>>>) {
         let mut tmp = [0i16; 1024];
         let mut remaining = cons.occupied_len().min(3_840);
         while remaining > 0 {
-            let n = cons.pop_slice(&mut tmp[..remaining.min(tmp.len())]);
+            let chunk = remaining.min(tmp.len());
+            let n = cons.pop_slice(&mut tmp[..chunk]);
             if n == 0 {
                 break;
             }

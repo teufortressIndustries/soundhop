@@ -29,6 +29,7 @@ pub fn set_dscp_ef(socket: &UdpSocket) {
                 let _ = sock_ref.set_tos(u32::from(DSCP_EF));
             }
             SocketAddr::V6(_) => {
+                #[cfg(unix)]
                 let _ = sock_ref.set_tclass_v6(u32::from(DSCP_EF));
             }
         }
