@@ -5,7 +5,7 @@ use std::sync::Arc;
 use soundhop_core::constants::{PROTOCOL_VERSION, VERSION};
 use soundhop_core::controller::Controller;
 use soundhop_core::firewall::{
-    detect as detect_firewall, open_ports, FirewallResult, FirewallState,
+    detect_for_ports, open_ports, FirewallPorts, FirewallResult, FirewallState,
 };
 use soundhop_core::ipc::is_running as ipc_is_running;
 use soundhop_core::service::{install as install_service, status as service_status};
@@ -68,8 +68,8 @@ fn unmount_fuse(mount_point: &str) -> Result<(), String> {
 }
 
 trait DoctorEnv {
-    fn detect_firewall(&self) -> FirewallState;
-    fn open_firewall(&self, audio_port: u16, discovery_port: u16, mdns: bool) -> FirewallResult;
+    fn detect_firewall(&self, ports: &FirewallPorts) -> FirewallState;
+    fn open_firewall(&self, ports: &FirewallPorts) -> FirewallResult;
     fn service_status(&self) -> serde_json::Value;
     fn install_service(&self) -> serde_json::Value;
     fn ipc_running(&self) -> bool;
@@ -82,12 +82,12 @@ trait DoctorEnv {
 struct SystemDoctorEnv;
 
 impl DoctorEnv for SystemDoctorEnv {
-    fn detect_firewall(&self) -> FirewallState {
-        detect_firewall()
+    fn detect_firewall(&self, ports: &FirewallPorts) -> FirewallState {
+        detect_for_ports(ports)
     }
 
-    fn open_firewall(&self, audio_port: u16, discovery_port: u16, mdns: bool) -> FirewallResult {
-        open_ports(audio_port, discovery_port, false, mdns)
+    fn open_firewall(&self, ports: &FirewallPorts) -> FirewallResult {
+        open_ports(ports, false)
     }
 
     fn service_status(&self) -> serde_json::Value {
@@ -188,9 +188,10 @@ fn collect_doctor_report(
         }
     }
 
-    let mut fw = env.detect_firewall();
+    let fw_ports = FirewallPorts::from_config(&cfg);
+    let mut fw = env.detect_firewall(&fw_ports);
     if fix && fw.active {
-        let fw_res = env.open_firewall(cfg.sharing.port, cfg.discovery.port, cfg.discovery.mdns);
+        let fw_res = env.open_firewall(&fw_ports);
         if fw_res.ran {
             if fw_res.ok {
                 fixed_actions.push(format!("Opened firewall ports on {}", fw.kind));
@@ -205,7 +206,7 @@ fn collect_doctor_report(
                 }
             }
         }
-        fw = env.detect_firewall();
+        fw = env.detect_firewall(&fw_ports);
     }
 
     let mut svc = env.service_status();
@@ -317,8 +318,9 @@ fn collect_doctor_report(
 }
 
 fn collect_bug_report(controller: &Arc<Controller>, env: &dyn DoctorEnv) -> serde_json::Value {
+    let cfg = lock_or_recover(&controller.config).clone();
     let st = controller.status(None);
-    let fw = env.detect_firewall();
+    let fw = env.detect_firewall(&FirewallPorts::from_config(&cfg));
     let svc = env.service_status();
     serde_json::json!({
         "version": VERSION,
@@ -505,7 +507,7 @@ mod tests {
         firewall: Mutex<FirewallState>,
         open_fw_ok: bool,
         open_fw_errors: Vec<String>,
-        open_fw_calls: Mutex<Vec<(u16, u16, bool)>>,
+        open_fw_calls: Mutex<Vec<FirewallPorts>>,
         service_active: Mutex<bool>,
         install_svc_started: bool,
         install_svc_calls: Mutex<usize>,
@@ -547,20 +549,12 @@ mod tests {
     }
 
     impl DoctorEnv for MockDoctorEnv {
-        fn detect_firewall(&self) -> FirewallState {
+        fn detect_firewall(&self, _ports: &FirewallPorts) -> FirewallState {
             self.firewall.lock().unwrap().clone()
         }
 
-        fn open_firewall(
-            &self,
-            audio_port: u16,
-            discovery_port: u16,
-            mdns: bool,
-        ) -> FirewallResult {
-            self.open_fw_calls
-                .lock()
-                .unwrap()
-                .push((audio_port, discovery_port, mdns));
+        fn open_firewall(&self, ports: &FirewallPorts) -> FirewallResult {
+            self.open_fw_calls.lock().unwrap().push(ports.clone());
             let fw = self.firewall.lock().unwrap().clone();
             FirewallResult {
                 firewall: fw,
@@ -761,7 +755,14 @@ mod tests {
         // Firewall fix ran with configured ports
         assert_eq!(
             env.open_fw_calls.lock().unwrap().as_slice(),
-            &[(4713, 47777, true)]
+            &[FirewallPorts {
+                legacy_audio_tcp: Some(4713),
+                control_tcp: 4714,
+                pair_tcp: 4715,
+                rtp_udp: 4716,
+                discovery_udp: 47777,
+                include_mdns: true,
+            }]
         );
         assert!(outcome
             .fixed_actions

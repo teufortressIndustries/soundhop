@@ -6,8 +6,177 @@ use std::io::IsTerminal;
 use std::path::Path;
 use std::time::Duration;
 
+use crate::config::{is_paired_security_mode, Config, DEFAULT_RTP_PORT};
 use crate::constants::{DEFAULT_AUDIO_PORT, DEFAULT_DISCOVERY_PORT, MDNS_PORT};
+use crate::pairing::DEFAULT_PAIR_PORT;
+use crate::transport::DEFAULT_V3_PORT;
 use crate::util::{ProcessRunner, SystemRunner};
+
+/// Transport protocol for a firewall port rule.
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq, Hash)]
+#[serde(rename_all = "lowercase")]
+pub enum PortProtocol {
+    Tcp,
+    Udp,
+}
+
+impl PortProtocol {
+    pub fn as_lower(self) -> &'static str {
+        match self {
+            Self::Tcp => "tcp",
+            Self::Udp => "udp",
+        }
+    }
+
+    pub fn as_upper(self) -> &'static str {
+        match self {
+            Self::Tcp => "TCP",
+            Self::Udp => "UDP",
+        }
+    }
+}
+
+/// Single firewall port specification (port, protocol, and display label).
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct FirewallPortSpec {
+    pub port: u16,
+    pub protocol: PortProtocol,
+    pub label: String,
+    #[serde(default)]
+    pub is_mdns: bool,
+}
+
+impl FirewallPortSpec {
+    pub fn new(port: u16, protocol: PortProtocol, label: impl Into<String>) -> Self {
+        Self {
+            port,
+            protocol,
+            label: label.into(),
+            is_mdns: false,
+        }
+    }
+
+    pub fn mdns() -> Self {
+        Self {
+            port: MDNS_PORT,
+            protocol: PortProtocol::Udp,
+            label: "mDNS".to_string(),
+            is_mdns: true,
+        }
+    }
+
+    /// Canonical `port/proto` spec string (e.g., `"4714/tcp"`, `"4716/udp"`).
+    pub fn port_proto(&self) -> String {
+        format!("{}/{}", self.port, self.protocol.as_lower())
+    }
+
+    /// Windows Defender Firewall rule display name (e.g., `"SoundHop Audio (4713/tcp)"`).
+    pub fn windows_rule_name(&self) -> String {
+        format!("SoundHop {} ({})", self.label, self.port_proto())
+    }
+}
+
+/// Full set of SoundHop firewall ports derived from [`Config`] or explicit settings.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct FirewallPorts {
+    /// Legacy PulseAudio TCP audio port (`None` when omitted in paired/PSK security mode).
+    pub legacy_audio_tcp: Option<u16>,
+    /// Control / SHT3 TCP port (`cfg.sharing.v3_port`, default `4714`).
+    pub control_tcp: u16,
+    /// Pairing v2 interactive handshake TCP port (`cfg.sharing.pair_port`, default `4715`).
+    pub pair_tcp: u16,
+    /// Encrypted RTP/SRTP media UDP port (`cfg.sharing.rtp_port`, default `4716`).
+    pub rtp_udp: u16,
+    /// UDP broadcast discovery port (`cfg.discovery.port`, default `47777`).
+    pub discovery_udp: u16,
+    /// Whether to include mDNS (`5353/udp`).
+    pub include_mdns: bool,
+}
+
+impl Default for FirewallPorts {
+    fn default() -> Self {
+        Self {
+            legacy_audio_tcp: Some(DEFAULT_AUDIO_PORT),
+            control_tcp: DEFAULT_V3_PORT,
+            pair_tcp: DEFAULT_PAIR_PORT,
+            rtp_udp: DEFAULT_RTP_PORT,
+            discovery_udp: DEFAULT_DISCOVERY_PORT,
+            include_mdns: false,
+        }
+    }
+}
+
+impl FirewallPorts {
+    /// Build the required firewall port set from a SoundHop [`Config`].
+    ///
+    /// Omits the legacy PulseAudio TCP port (`sharing.port`) when paired/PSK security
+    /// mode is active, since paired mode does not expose unauthenticated PA-TCP.
+    pub fn from_config(cfg: &Config) -> Self {
+        let legacy_audio_tcp = if is_paired_security_mode(&cfg.sharing.security) {
+            None
+        } else {
+            Some(cfg.sharing.port)
+        };
+        Self {
+            legacy_audio_tcp,
+            control_tcp: cfg.sharing.v3_port,
+            pair_tcp: cfg.sharing.pair_port,
+            rtp_udp: cfg.sharing.rtp_port,
+            discovery_udp: cfg.discovery.port,
+            include_mdns: cfg.discovery.mdns,
+        }
+    }
+
+    /// Ordered, deduplicated list of firewall port specifications to inspect or open.
+    pub fn specs(&self) -> Vec<FirewallPortSpec> {
+        let mut out = Vec::new();
+        let mut push_unique = |spec: FirewallPortSpec| {
+            if spec.port == 0 {
+                return;
+            }
+            if !out.iter().any(|existing: &FirewallPortSpec| {
+                existing.port == spec.port && existing.protocol == spec.protocol
+            }) {
+                out.push(spec);
+            }
+        };
+        if let Some(port) = self.legacy_audio_tcp {
+            push_unique(FirewallPortSpec::new(port, PortProtocol::Tcp, "Audio"));
+        }
+        push_unique(FirewallPortSpec::new(
+            self.control_tcp,
+            PortProtocol::Tcp,
+            "Control",
+        ));
+        push_unique(FirewallPortSpec::new(
+            self.pair_tcp,
+            PortProtocol::Tcp,
+            "Pairing",
+        ));
+        push_unique(FirewallPortSpec::new(
+            self.rtp_udp,
+            PortProtocol::Udp,
+            "RTP",
+        ));
+        push_unique(FirewallPortSpec::new(
+            self.discovery_udp,
+            PortProtocol::Udp,
+            "Discovery",
+        ));
+        if self.include_mdns {
+            push_unique(FirewallPortSpec::mdns());
+        }
+        out
+    }
+
+    /// Port specifications to delete on Windows Defender cleanup (always includes the
+    /// SoundHop-scoped mDNS rule so previously created rules are cleaned up).
+    pub fn windows_close_specs(&self) -> Vec<FirewallPortSpec> {
+        let mut copy = self.clone();
+        copy.include_mdns = true;
+        copy.specs()
+    }
+}
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct FirewallState {
@@ -103,18 +272,6 @@ fn parse_windows_firewall_state(stdout: &str) -> bool {
     false
 }
 
-fn windows_audio_rule_name(audio_port: u16) -> String {
-    format!("SoundHop Audio ({audio_port}/tcp)")
-}
-
-fn windows_discovery_rule_name(discovery_port: u16) -> String {
-    format!("SoundHop Discovery ({discovery_port}/udp)")
-}
-
-fn windows_mdns_rule_name() -> String {
-    format!("SoundHop mDNS ({MDNS_PORT}/udp)")
-}
-
 fn windows_delete_rule_cmd(name: &str) -> Vec<String> {
     vec![
         "netsh".into(),
@@ -153,33 +310,25 @@ fn windows_add_rule_cmd(name: &str, protocol: &str, port: u16) -> Vec<String> {
     ]
 }
 
-fn build_windows_open_commands(
-    audio_port: u16,
-    discovery_port: u16,
-    include_mdns: bool,
-) -> Vec<Vec<String>> {
-    let audio_name = windows_audio_rule_name(audio_port);
-    let discovery_name = windows_discovery_rule_name(discovery_port);
-    let mut cmds = vec![
-        windows_delete_rule_cmd(&audio_name),
-        windows_add_rule_cmd(&audio_name, "TCP", audio_port),
-        windows_delete_rule_cmd(&discovery_name),
-        windows_add_rule_cmd(&discovery_name, "UDP", discovery_port),
-    ];
-    if include_mdns {
-        let mdns_name = windows_mdns_rule_name();
-        cmds.push(windows_delete_rule_cmd(&mdns_name));
-        cmds.push(windows_add_rule_cmd(&mdns_name, "UDP", MDNS_PORT));
+fn build_windows_open_commands(specs: &[FirewallPortSpec]) -> Vec<Vec<String>> {
+    let mut cmds = Vec::with_capacity(specs.len() * 2);
+    for spec in specs {
+        let name = spec.windows_rule_name();
+        cmds.push(windows_delete_rule_cmd(&name));
+        cmds.push(windows_add_rule_cmd(
+            &name,
+            spec.protocol.as_upper(),
+            spec.port,
+        ));
     }
     cmds
 }
 
-fn build_windows_close_commands(audio_port: u16, discovery_port: u16) -> Vec<Vec<String>> {
-    vec![
-        windows_delete_rule_cmd(&windows_audio_rule_name(audio_port)),
-        windows_delete_rule_cmd(&windows_discovery_rule_name(discovery_port)),
-        windows_delete_rule_cmd(&windows_mdns_rule_name()),
-    ]
+fn build_windows_close_commands(specs: &[FirewallPortSpec]) -> Vec<Vec<String>> {
+    specs
+        .iter()
+        .map(|spec| windows_delete_rule_cmd(&spec.windows_rule_name()))
+        .collect()
 }
 
 #[cfg_attr(not(windows), allow(dead_code))]
@@ -512,30 +661,17 @@ fn ufw_line_allows_port(line: &str, port: u16, proto: &str) -> bool {
     true
 }
 
-pub fn parse_ufw_ports_allowed(
-    stdout: &str,
-    audio_port: u16,
-    discovery_port: u16,
-    include_mdns: bool,
-) -> Option<bool> {
+pub fn parse_ufw_ports_allowed(stdout: &str, specs: &[FirewallPortSpec]) -> Option<bool> {
     if !stdout.to_lowercase().contains("status: active") {
         return None;
     }
-    let mut audio_ok = false;
-    let mut discovery_ok = false;
-    let mut mdns_ok = !include_mdns;
-    for line in stdout.lines() {
-        if ufw_line_allows_port(line, audio_port, "tcp") {
-            audio_ok = true;
-        }
-        if ufw_line_allows_port(line, discovery_port, "udp") {
-            discovery_ok = true;
-        }
-        if include_mdns && ufw_line_allows_port(line, MDNS_PORT, "udp") {
-            mdns_ok = true;
-        }
-    }
-    Some(audio_ok && discovery_ok && mdns_ok)
+    let lines: Vec<&str> = stdout.lines().collect();
+    let all_allowed = specs.iter().all(|spec| {
+        lines
+            .iter()
+            .any(|line| ufw_line_allows_port(line, spec.port, spec.protocol.as_lower()))
+    });
+    Some(all_allowed)
 }
 
 pub fn parse_firewall_cmd_query_output(returncode: i32, stdout: &str) -> Option<bool> {
@@ -551,9 +687,7 @@ pub fn parse_firewall_cmd_query_output(returncode: i32, stdout: &str) -> Option<
 
 fn check_firewalld_ports_allowed(
     runner: &dyn ProcessRunner,
-    audio_port: u16,
-    discovery_port: u16,
-    include_mdns: bool,
+    specs: &[FirewallPortSpec],
 ) -> Option<bool> {
     let query_port = |spec: String| -> Option<bool> {
         let args = vec!["firewall-cmd".to_string(), format!("--query-port={spec}")];
@@ -561,26 +695,22 @@ fn check_firewalld_ports_allowed(
         parse_firewall_cmd_query_output(res.returncode, &res.stdout)
     };
 
-    let audio_ok = query_port(format!("{audio_port}/tcp"))?;
-    if !audio_ok {
-        return Some(false);
-    }
-    let discovery_ok = query_port(format!("{discovery_port}/udp"))?;
-    if !discovery_ok {
-        return Some(false);
-    }
-    if include_mdns {
-        let mdns_port_ok = query_port(format!("{MDNS_PORT}/udp"))?;
-        if !mdns_port_ok {
-            let svc_args = vec![
-                "firewall-cmd".to_string(),
-                "--query-service=mdns".to_string(),
-            ];
-            let svc_ok = runner
-                .run(&svc_args, None, Duration::from_secs(5))
-                .ok()
-                .and_then(|res| parse_firewall_cmd_query_output(res.returncode, &res.stdout))?;
-            if !svc_ok {
+    for spec in specs {
+        let port_ok = query_port(spec.port_proto())?;
+        if !port_ok {
+            if spec.is_mdns {
+                let svc_args = vec![
+                    "firewall-cmd".to_string(),
+                    "--query-service=mdns".to_string(),
+                ];
+                let svc_ok = runner
+                    .run(&svc_args, None, Duration::from_secs(5))
+                    .ok()
+                    .and_then(|res| parse_firewall_cmd_query_output(res.returncode, &res.stdout))?;
+                if !svc_ok {
+                    return Some(false);
+                }
+            } else {
                 return Some(false);
             }
         }
@@ -643,18 +773,10 @@ pub fn parse_netsh_rule_allowed(returncode: i32, stdout: &str, stderr: &str) -> 
 
 fn check_windows_ports_allowed(
     runner: &dyn ProcessRunner,
-    audio_port: u16,
-    discovery_port: u16,
-    include_mdns: bool,
+    specs: &[FirewallPortSpec],
 ) -> Option<bool> {
-    let mut rule_names = vec![
-        windows_audio_rule_name(audio_port),
-        windows_discovery_rule_name(discovery_port),
-    ];
-    if include_mdns {
-        rule_names.push(windows_mdns_rule_name());
-    }
-    for name in rule_names {
+    for spec in specs {
+        let name = spec.windows_rule_name();
         let cmd = windows_show_rule_cmd(&name);
         let res = runner.run(&cmd, None, Duration::from_secs(5)).ok()?;
         let allowed = parse_netsh_rule_allowed(res.returncode, &res.stdout, &res.stderr)?;
@@ -666,39 +788,34 @@ fn check_windows_ports_allowed(
 }
 
 pub fn detect() -> FirewallState {
-    detect_for_ports(DEFAULT_AUDIO_PORT, DEFAULT_DISCOVERY_PORT, false)
+    detect_for_ports(&FirewallPorts::default())
 }
 
-pub fn detect_for_ports(audio_port: u16, discovery_port: u16, include_mdns: bool) -> FirewallState {
-    detect_with_runner_for_ports(&SystemRunner, audio_port, discovery_port, include_mdns)
+pub fn detect_for_ports(ports: &FirewallPorts) -> FirewallState {
+    detect_with_runner_for_ports(&SystemRunner, ports)
+}
+
+pub fn detect_for_config(cfg: &Config) -> FirewallState {
+    detect_for_ports(&FirewallPorts::from_config(cfg))
 }
 
 pub fn detect_with_runner(runner: &dyn ProcessRunner) -> FirewallState {
-    detect_with_runner_for_ports(runner, DEFAULT_AUDIO_PORT, DEFAULT_DISCOVERY_PORT, false)
+    detect_with_runner_for_ports(runner, &FirewallPorts::default())
 }
 
 pub fn detect_with_runner_for_ports(
     runner: &dyn ProcessRunner,
-    audio_port: u16,
-    discovery_port: u16,
-    include_mdns: bool,
+    ports: &FirewallPorts,
 ) -> FirewallState {
-    detect_with_runner_and_ufw_conf(
-        runner,
-        Path::new("/etc/ufw/ufw.conf"),
-        audio_port,
-        discovery_port,
-        include_mdns,
-    )
+    detect_with_runner_and_ufw_conf(runner, Path::new("/etc/ufw/ufw.conf"), ports)
 }
 
 fn detect_with_runner_and_ufw_conf(
     runner: &dyn ProcessRunner,
     ufw_conf_path: &Path,
-    audio_port: u16,
-    discovery_port: u16,
-    include_mdns: bool,
+    ports: &FirewallPorts,
 ) -> FirewallState {
+    let specs = ports.specs();
     if cfg!(windows) {
         if runner.command_exists("netsh") {
             let args = vec![
@@ -712,12 +829,7 @@ fn detect_with_runner_and_ufw_conf(
                 if res.ok() {
                     let active = parse_windows_firewall_state(&res.stdout);
                     let ports_allowed = if active {
-                        check_windows_ports_allowed(
-                            runner,
-                            audio_port,
-                            discovery_port,
-                            include_mdns,
-                        )
+                        check_windows_ports_allowed(runner, &specs)
                     } else {
                         None
                     };
@@ -747,8 +859,7 @@ fn detect_with_runner_and_ufw_conf(
         if let Ok(res) = runner.run(&args, None, Duration::from_secs(5)) {
             let output = format!("{}{}", res.stdout, res.stderr).to_lowercase();
             if output.contains("status: active") {
-                let ports_allowed =
-                    parse_ufw_ports_allowed(&res.stdout, audio_port, discovery_port, include_mdns);
+                let ports_allowed = parse_ufw_ports_allowed(&res.stdout, &specs);
                 return FirewallState {
                     kind: "ufw".to_string(),
                     active: true,
@@ -817,8 +928,7 @@ fn detect_with_runner_and_ufw_conf(
         ];
         if let Ok(res) = runner.run(&args, None, Duration::from_secs(5)) {
             if res.ok() {
-                let ports_allowed =
-                    check_firewalld_ports_allowed(runner, audio_port, discovery_port, include_mdns);
+                let ports_allowed = check_firewalld_ports_allowed(runner, &specs);
                 return FirewallState {
                     kind: "firewalld".to_string(),
                     active: true,
@@ -1024,40 +1134,30 @@ fn execute_firewall_commands_with_runner(
     }
 }
 
-pub fn open_ports(
-    audio_port: u16,
-    discovery_port: u16,
-    dry_run: bool,
-    include_mdns: bool,
-) -> FirewallResult {
-    open_ports_with_mode(audio_port, discovery_port, dry_run, include_mdns, true)
+pub fn open_ports(ports: &FirewallPorts, dry_run: bool) -> FirewallResult {
+    open_ports_with_mode(ports, dry_run, true)
+}
+
+pub fn open_ports_for_config(cfg: &Config, dry_run: bool) -> FirewallResult {
+    open_ports(&FirewallPorts::from_config(cfg), dry_run)
 }
 
 /// Non-interactive variant for background daemons/IPC: uses `pkexec` batch elevation
 /// when available on Linux (GUI/Polkit), otherwise falls back to `sudo -n` so it
 /// never blocks on a TTY password prompt.
-pub fn open_ports_non_interactive(
-    audio_port: u16,
-    discovery_port: u16,
-    dry_run: bool,
-    include_mdns: bool,
-) -> FirewallResult {
-    open_ports_with_mode(audio_port, discovery_port, dry_run, include_mdns, false)
+pub fn open_ports_non_interactive(ports: &FirewallPorts, dry_run: bool) -> FirewallResult {
+    open_ports_with_mode(ports, dry_run, false)
 }
 
-fn open_ports_with_mode(
-    audio_port: u16,
-    discovery_port: u16,
-    dry_run: bool,
-    include_mdns: bool,
-    interactive: bool,
-) -> FirewallResult {
+pub fn open_ports_for_config_non_interactive(cfg: &Config, dry_run: bool) -> FirewallResult {
+    open_ports_non_interactive(&FirewallPorts::from_config(cfg), dry_run)
+}
+
+fn open_ports_with_mode(ports: &FirewallPorts, dry_run: bool, interactive: bool) -> FirewallResult {
     open_ports_with_runner(
         &SystemRunner,
-        audio_port,
-        discovery_port,
+        ports,
         dry_run,
-        include_mdns,
         interactive,
         is_admin(),
         std::io::stdin().is_terminal(),
@@ -1068,16 +1168,14 @@ fn open_ports_with_mode(
 #[allow(clippy::too_many_arguments)]
 fn open_ports_with_runner(
     runner: &dyn ProcessRunner,
-    audio_port: u16,
-    discovery_port: u16,
+    ports: &FirewallPorts,
     dry_run: bool,
-    include_mdns: bool,
     interactive: bool,
     is_admin_user: bool,
     stdin_is_tty: bool,
     use_system_interactive: bool,
 ) -> FirewallResult {
-    let state = detect_with_runner_for_ports(runner, audio_port, discovery_port, include_mdns);
+    let state = detect_with_runner_for_ports(runner, ports);
     let mut result = FirewallResult {
         firewall: state.clone(),
         commands: Vec::new(),
@@ -1091,65 +1189,48 @@ fn open_ports_with_runner(
         return result;
     }
 
+    let specs = ports.specs();
     let elevation = select_linux_elevation(runner, interactive, is_admin_user, stdin_is_tty);
     match state.kind.as_str() {
         "ufw" => {
-            let mut raw = vec![
-                vec!["ufw".into(), "allow".into(), format!("{audio_port}/tcp")],
-                vec![
-                    "ufw".into(),
-                    "allow".into(),
-                    format!("{discovery_port}/udp"),
-                ],
-            ];
-            if include_mdns {
-                raw.push(vec![
-                    "ufw".into(),
-                    "allow".into(),
-                    format!("{MDNS_PORT}/udp"),
-                ]);
-            }
+            let raw: Vec<Vec<String>> = specs
+                .iter()
+                .map(|spec| vec!["ufw".into(), "allow".into(), spec.port_proto()])
+                .collect();
             result.commands = apply_linux_elevation(raw, elevation);
         }
         "firewalld" => {
-            let mut raw = vec![
-                vec![
-                    "firewall-cmd".into(),
-                    format!("--add-port={audio_port}/tcp"),
-                    "--permanent".into(),
-                ],
-                vec![
-                    "firewall-cmd".into(),
-                    format!("--add-port={discovery_port}/udp"),
-                    "--permanent".into(),
-                ],
-            ];
-            if include_mdns {
+            let mut raw = Vec::new();
+            for spec in &specs {
                 raw.push(vec![
                     "firewall-cmd".into(),
-                    format!("--add-port={MDNS_PORT}/udp"),
+                    format!("--add-port={}", spec.port_proto()),
                     "--permanent".into(),
                 ]);
-                raw.push(vec![
-                    "firewall-cmd".into(),
-                    "--add-service=mdns".into(),
-                    "--permanent".into(),
-                ]);
+                if spec.is_mdns {
+                    raw.push(vec![
+                        "firewall-cmd".into(),
+                        "--add-service=mdns".into(),
+                        "--permanent".into(),
+                    ]);
+                }
             }
             raw.push(vec!["firewall-cmd".into(), "--reload".into()]);
             result.commands = apply_linux_elevation(raw, elevation);
         }
         "windows-defender" => {
-            result.commands.extend(build_windows_open_commands(
-                audio_port,
-                discovery_port,
-                include_mdns,
-            ));
+            result.commands.extend(build_windows_open_commands(&specs));
         }
         _ => {
-            result.note = format!(
-                "nftables detected. Add these rules yourself:\n  nft add rule inet filter input tcp dport {audio_port} accept\n  nft add rule inet filter input udp dport {discovery_port} accept"
-            );
+            let mut lines = vec!["nftables detected. Add these rules yourself:".to_string()];
+            for spec in &specs {
+                lines.push(format!(
+                    "  nft add rule inet filter input {} dport {} accept",
+                    spec.protocol.as_lower(),
+                    spec.port
+                ));
+            }
+            result.note = lines.join("\n");
             return result;
         }
     }
@@ -1168,11 +1249,10 @@ fn open_ports_with_runner(
     result
 }
 
-pub fn close_ports(audio_port: u16, discovery_port: u16, dry_run: bool) -> FirewallResult {
+pub fn close_ports(ports: &FirewallPorts, dry_run: bool) -> FirewallResult {
     close_ports_with_runner(
         &SystemRunner,
-        audio_port,
-        discovery_port,
+        ports,
         dry_run,
         true,
         is_admin(),
@@ -1181,18 +1261,21 @@ pub fn close_ports(audio_port: u16, discovery_port: u16, dry_run: bool) -> Firew
     )
 }
 
+pub fn close_ports_for_config(cfg: &Config, dry_run: bool) -> FirewallResult {
+    close_ports(&FirewallPorts::from_config(cfg), dry_run)
+}
+
 #[allow(clippy::too_many_arguments)]
 fn close_ports_with_runner(
     runner: &dyn ProcessRunner,
-    audio_port: u16,
-    discovery_port: u16,
+    ports: &FirewallPorts,
     dry_run: bool,
     interactive: bool,
     is_admin_user: bool,
     stdin_is_tty: bool,
     use_system_interactive: bool,
 ) -> FirewallResult {
-    let state = detect_with_runner_for_ports(runner, audio_port, discovery_port, false);
+    let state = detect_with_runner_for_ports(runner, ports);
     let mut result = FirewallResult {
         firewall: state.clone(),
         commands: Vec::new(),
@@ -1205,45 +1288,42 @@ fn close_ports_with_runner(
         result.note = state.detail;
         return result;
     }
+    let specs = ports.specs();
     let elevation = select_linux_elevation(runner, interactive, is_admin_user, stdin_is_tty);
     match state.kind.as_str() {
         "ufw" => {
-            let raw = vec![
-                vec![
-                    "ufw".into(),
-                    "delete".into(),
-                    "allow".into(),
-                    format!("{audio_port}/tcp"),
-                ],
-                vec![
-                    "ufw".into(),
-                    "delete".into(),
-                    "allow".into(),
-                    format!("{discovery_port}/udp"),
-                ],
-            ];
+            let raw: Vec<Vec<String>> = specs
+                .iter()
+                .map(|spec| {
+                    vec![
+                        "ufw".into(),
+                        "delete".into(),
+                        "allow".into(),
+                        spec.port_proto(),
+                    ]
+                })
+                .collect();
             result.commands = apply_linux_elevation(raw, elevation);
         }
         "firewalld" => {
-            let raw = vec![
-                vec![
-                    "firewall-cmd".into(),
-                    format!("--remove-port={audio_port}/tcp"),
-                    "--permanent".into(),
-                ],
-                vec![
-                    "firewall-cmd".into(),
-                    format!("--remove-port={discovery_port}/udp"),
-                    "--permanent".into(),
-                ],
-                vec!["firewall-cmd".into(), "--reload".into()],
-            ];
+            let mut raw: Vec<Vec<String>> = specs
+                .iter()
+                .map(|spec| {
+                    vec![
+                        "firewall-cmd".into(),
+                        format!("--remove-port={}", spec.port_proto()),
+                        "--permanent".into(),
+                    ]
+                })
+                .collect();
+            raw.push(vec!["firewall-cmd".into(), "--reload".into()]);
             result.commands = apply_linux_elevation(raw, elevation);
         }
         "windows-defender" => {
+            let close_specs = ports.windows_close_specs();
             result
                 .commands
-                .extend(build_windows_close_commands(audio_port, discovery_port));
+                .extend(build_windows_close_commands(&close_specs));
         }
         _ => {
             result.note =
@@ -1336,35 +1416,19 @@ mod tests {
             .unwrap()
             .insert("ufw".to_string());
 
-        let st_yes = detect_with_runner_and_ufw_conf(
-            &runner,
-            &conf_yes,
-            DEFAULT_AUDIO_PORT,
-            DEFAULT_DISCOVERY_PORT,
-            false,
-        );
+        let default_ports = FirewallPorts::default();
+
+        let st_yes = detect_with_runner_and_ufw_conf(&runner, &conf_yes, &default_ports);
         assert_eq!(st_yes.kind, "ufw");
         assert!(st_yes.active);
         assert_eq!(st_yes.ports_allowed, None);
 
-        let st_no = detect_with_runner_and_ufw_conf(
-            &runner,
-            &conf_no,
-            DEFAULT_AUDIO_PORT,
-            DEFAULT_DISCOVERY_PORT,
-            false,
-        );
+        let st_no = detect_with_runner_and_ufw_conf(&runner, &conf_no, &default_ports);
         assert_eq!(st_no.kind, "ufw");
         assert!(!st_no.active);
         assert_eq!(st_no.ports_allowed, None);
 
-        let st_systemd = detect_with_runner_and_ufw_conf(
-            &runner,
-            &conf_missing,
-            DEFAULT_AUDIO_PORT,
-            DEFAULT_DISCOVERY_PORT,
-            false,
-        );
+        let st_systemd = detect_with_runner_and_ufw_conf(&runner, &conf_missing, &default_ports);
         assert_eq!(st_systemd.kind, "ufw");
         assert!(st_systemd.active);
         assert_eq!(st_systemd.ports_allowed, None);
@@ -1460,50 +1524,112 @@ State                                 ON
     }
 
     #[test]
+    fn test_firewall_ports_from_config_security_modes_and_specs() {
+        let mut cfg = Config::default();
+        cfg.sharing.security = "trusted-lan".to_string();
+        cfg.discovery.mdns = true;
+        let ports = FirewallPorts::from_config(&cfg);
+        assert_eq!(ports.legacy_audio_tcp, Some(4713));
+        assert_eq!(ports.control_tcp, 4714);
+        assert_eq!(ports.pair_tcp, 4715);
+        assert_eq!(ports.rtp_udp, 4716);
+        assert_eq!(ports.discovery_udp, 47777);
+        assert!(ports.include_mdns);
+        let spec_strs: Vec<String> = ports.specs().iter().map(|s| s.port_proto()).collect();
+        assert_eq!(
+            spec_strs,
+            vec![
+                "4713/tcp",
+                "4714/tcp",
+                "4715/tcp",
+                "4716/udp",
+                "47777/udp",
+                "5353/udp",
+            ]
+        );
+
+        // Paired/PSK security mode omits legacy PA-TCP (4713/tcp)
+        for sec in ["psk", "pin", "paired"] {
+            cfg.sharing.security = sec.to_string();
+            cfg.discovery.mdns = false;
+            let paired_ports = FirewallPorts::from_config(&cfg);
+            assert_eq!(paired_ports.legacy_audio_tcp, None);
+            let paired_specs: Vec<String> = paired_ports
+                .specs()
+                .iter()
+                .map(|s| s.port_proto())
+                .collect();
+            assert_eq!(
+                paired_specs,
+                vec!["4714/tcp", "4715/tcp", "4716/udp", "47777/udp"]
+            );
+        }
+    }
+
+    #[test]
     fn test_build_windows_open_commands_idempotent_and_scoped() {
-        let cmds_no_mdns = build_windows_open_commands(4713, 47777, false);
-        assert_eq!(cmds_no_mdns.len(), 4);
-        assert!(is_netsh_delete_rule(&cmds_no_mdns[0]));
-        assert_eq!(
-            extract_netsh_rule_name(&cmds_no_mdns[0]),
-            Some("SoundHop Audio (4713/tcp)")
-        );
-        assert!(!is_netsh_delete_rule(&cmds_no_mdns[1]));
-        assert!(cmds_no_mdns[1].contains(&"profile=private,domain".to_string()));
-        assert!(cmds_no_mdns[1].contains(&"protocol=TCP".to_string()));
-        assert!(cmds_no_mdns[1].contains(&"localport=4713".to_string()));
+        let ports_no_mdns = FirewallPorts::default();
+        let cmds_no_mdns = build_windows_open_commands(&ports_no_mdns.specs());
+        assert_eq!(cmds_no_mdns.len(), 10);
+        let expected_rules = [
+            ("SoundHop Audio (4713/tcp)", "TCP", "localport=4713"),
+            ("SoundHop Control (4714/tcp)", "TCP", "localport=4714"),
+            ("SoundHop Pairing (4715/tcp)", "TCP", "localport=4715"),
+            ("SoundHop RTP (4716/udp)", "UDP", "localport=4716"),
+            ("SoundHop Discovery (47777/udp)", "UDP", "localport=47777"),
+        ];
+        for (idx, (rule_name, proto, localport)) in expected_rules.iter().enumerate() {
+            let del = &cmds_no_mdns[idx * 2];
+            let add = &cmds_no_mdns[idx * 2 + 1];
+            assert!(is_netsh_delete_rule(del));
+            assert_eq!(extract_netsh_rule_name(del), Some(*rule_name));
+            assert!(!is_netsh_delete_rule(add));
+            assert!(add.contains(&"profile=private,domain".to_string()));
+            assert!(add.contains(&format!("protocol={proto}")));
+            assert!(add.contains(&(*localport).to_string()));
+        }
 
-        assert!(is_netsh_delete_rule(&cmds_no_mdns[2]));
+        let ports_with_mdns = FirewallPorts {
+            include_mdns: true,
+            ..FirewallPorts::default()
+        };
+        let cmds_with_mdns = build_windows_open_commands(&ports_with_mdns.specs());
+        assert_eq!(cmds_with_mdns.len(), 12);
+        assert!(is_netsh_delete_rule(&cmds_with_mdns[10]));
         assert_eq!(
-            extract_netsh_rule_name(&cmds_no_mdns[2]),
-            Some("SoundHop Discovery (47777/udp)")
-        );
-        assert!(cmds_no_mdns[3].contains(&"profile=private,domain".to_string()));
-        assert!(cmds_no_mdns[3].contains(&"protocol=UDP".to_string()));
-        assert!(cmds_no_mdns[3].contains(&"localport=47777".to_string()));
-
-        let cmds_with_mdns = build_windows_open_commands(4713, 47777, true);
-        assert_eq!(cmds_with_mdns.len(), 6);
-        assert!(is_netsh_delete_rule(&cmds_with_mdns[4]));
-        assert_eq!(
-            extract_netsh_rule_name(&cmds_with_mdns[4]),
+            extract_netsh_rule_name(&cmds_with_mdns[10]),
             Some("SoundHop mDNS (5353/udp)")
         );
-        assert!(cmds_with_mdns[5].contains(&"profile=private,domain".to_string()));
-        assert!(cmds_with_mdns[5].contains(&"protocol=UDP".to_string()));
-        assert!(cmds_with_mdns[5].contains(&format!("localport={MDNS_PORT}")));
+        assert!(cmds_with_mdns[11].contains(&"profile=private,domain".to_string()));
+        assert!(cmds_with_mdns[11].contains(&"protocol=UDP".to_string()));
+        assert!(cmds_with_mdns[11].contains(&format!("localport={MDNS_PORT}")));
+
+        // Paired mode omits legacy Audio (4713/tcp)
+        let paired_ports = FirewallPorts {
+            legacy_audio_tcp: None,
+            ..FirewallPorts::default()
+        };
+        let cmds_paired = build_windows_open_commands(&paired_ports.specs());
+        assert_eq!(cmds_paired.len(), 8);
+        assert!(cmds_paired
+            .iter()
+            .all(|c| extract_netsh_rule_name(c) != Some("SoundHop Audio (4713/tcp)")));
     }
 
     #[test]
     fn test_build_windows_close_commands_includes_mdns() {
-        let cmds = build_windows_close_commands(4713, 47777);
-        assert_eq!(cmds.len(), 3);
+        let ports = FirewallPorts::default();
+        let cmds = build_windows_close_commands(&ports.windows_close_specs());
+        assert_eq!(cmds.len(), 6);
         assert!(cmds.iter().all(|c| is_netsh_delete_rule(c)));
         let names: Vec<Option<&str>> = cmds.iter().map(|c| extract_netsh_rule_name(c)).collect();
         assert_eq!(
             names,
             vec![
                 Some("SoundHop Audio (4713/tcp)"),
+                Some("SoundHop Control (4714/tcp)"),
+                Some("SoundHop Pairing (4715/tcp)"),
+                Some("SoundHop RTP (4716/udp)"),
                 Some("SoundHop Discovery (47777/udp)"),
                 Some("SoundHop mDNS (5353/udp)"),
             ]
@@ -1512,21 +1638,29 @@ State                                 ON
 
     #[test]
     fn test_build_windows_elevated_cmd_params_open_and_close() {
-        let open_cmds = build_windows_open_commands(4713, 47777, true);
+        let ports = FirewallPorts {
+            include_mdns: true,
+            ..FirewallPorts::default()
+        };
+        let open_cmds = build_windows_open_commands(&ports.specs());
         let open_params = build_windows_elevated_cmd_params(&open_cmds, false);
         assert!(open_params.starts_with("/C \""));
         assert!(open_params.ends_with('"'));
         assert!(open_params.contains("name=\"SoundHop Audio (4713/tcp)\""));
+        assert!(open_params.contains("name=\"SoundHop Control (4714/tcp)\""));
+        assert!(open_params.contains("name=\"SoundHop Pairing (4715/tcp)\""));
+        assert!(open_params.contains("name=\"SoundHop RTP (4716/udp)\""));
         assert!(open_params.contains("name=\"SoundHop Discovery (47777/udp)\""));
         assert!(open_params.contains("name=\"SoundHop mDNS (5353/udp)\""));
         assert!(open_params.contains("profile=private,domain"));
         assert!(open_params.contains(" >nul 2>&1 & netsh advfirewall firewall add rule "));
         assert!(open_params.contains(") && ("));
 
-        let close_cmds = build_windows_close_commands(4713, 47777);
+        let close_cmds = build_windows_close_commands(&ports.windows_close_specs());
         let close_params = build_windows_elevated_cmd_params(&close_cmds, true);
         assert!(close_params.starts_with("/C \""));
         assert!(close_params.ends_with("& exit /b 0\""));
+        assert!(close_params.contains("show rule name=\"SoundHop RTP (4716/udp)\""));
         assert!(close_params.contains("show rule name=\"SoundHop mDNS (5353/udp)\""));
         assert!(close_params.contains("delete rule name=\"SoundHop mDNS (5353/udp)\""));
     }
@@ -1543,22 +1677,35 @@ State                                 ON
 
     #[test]
     fn test_parse_ufw_ports_allowed() {
+        let ports_no_mdns = FirewallPorts::default();
+        let ports_with_mdns = FirewallPorts {
+            include_mdns: true,
+            ..FirewallPorts::default()
+        };
+        let ports_paired = FirewallPorts {
+            legacy_audio_tcp: None,
+            ..FirewallPorts::default()
+        };
+
         let ufw_open = "\
 Status: active
 
 To                         Action      From
 --                         ------      ----
 4713/tcp                   ALLOW       Anywhere
+4714/tcp                   ALLOW       Anywhere
+4715/tcp                   ALLOW       Anywhere
+4716/udp                   ALLOW       Anywhere
 47777/udp                  ALLOW IN    Anywhere
 5353/udp                   ALLOW       Anywhere
 4713/tcp (v6)              ALLOW       Anywhere (v6)
 ";
         assert_eq!(
-            parse_ufw_ports_allowed(ufw_open, 4713, 47777, false),
+            parse_ufw_ports_allowed(ufw_open, &ports_no_mdns.specs()),
             Some(true)
         );
         assert_eq!(
-            parse_ufw_ports_allowed(ufw_open, 4713, 47777, true),
+            parse_ufw_ports_allowed(ufw_open, &ports_with_mdns.specs()),
             Some(true)
         );
 
@@ -1568,14 +1715,53 @@ Status: active
 To                         Action      From
 --                         ------      ----
 4713/tcp                   ALLOW       Anywhere
+4714/tcp                   ALLOW       Anywhere
+4715/tcp                   ALLOW       Anywhere
+4716/udp                   ALLOW       Anywhere
 47777/udp                  ALLOW       Anywhere
 ";
         assert_eq!(
-            parse_ufw_ports_allowed(ufw_missing_mdns, 4713, 47777, false),
+            parse_ufw_ports_allowed(ufw_missing_mdns, &ports_no_mdns.specs()),
             Some(true)
         );
         assert_eq!(
-            parse_ufw_ports_allowed(ufw_missing_mdns, 4713, 47777, true),
+            parse_ufw_ports_allowed(ufw_missing_mdns, &ports_with_mdns.specs()),
+            Some(false)
+        );
+
+        // Missing RTP (4716/udp) must report false
+        let ufw_missing_rtp = "\
+Status: active
+
+To                         Action      From
+--                         ------      ----
+4713/tcp                   ALLOW       Anywhere
+4714/tcp                   ALLOW       Anywhere
+4715/tcp                   ALLOW       Anywhere
+47777/udp                  ALLOW       Anywhere
+";
+        assert_eq!(
+            parse_ufw_ports_allowed(ufw_missing_rtp, &ports_no_mdns.specs()),
+            Some(false)
+        );
+
+        // Paired mode succeeds without legacy 4713/tcp
+        let ufw_paired_only = "\
+Status: active
+
+To                         Action      From
+--                         ------      ----
+4714/tcp                   ALLOW       Anywhere
+4715/tcp                   ALLOW       Anywhere
+4716/udp                   ALLOW       Anywhere
+47777/udp                  ALLOW       Anywhere
+";
+        assert_eq!(
+            parse_ufw_ports_allowed(ufw_paired_only, &ports_paired.specs()),
+            Some(true)
+        );
+        assert_eq!(
+            parse_ufw_ports_allowed(ufw_paired_only, &ports_no_mdns.specs()),
             Some(false)
         );
 
@@ -1585,10 +1771,13 @@ Status: active
 To                         Action      From
 --                         ------      ----
 4713/tcp                   DENY        Anywhere
+4714/tcp                   ALLOW       Anywhere
+4715/tcp                   ALLOW       Anywhere
+4716/udp                   ALLOW       Anywhere
 47777/udp                  ALLOW OUT   Anywhere
 ";
         assert_eq!(
-            parse_ufw_ports_allowed(ufw_denied_or_out, 4713, 47777, false),
+            parse_ufw_ports_allowed(ufw_denied_or_out, &ports_no_mdns.specs()),
             Some(false)
         );
 
@@ -1598,15 +1787,18 @@ Status: active
 To                         Action      From
 --                         ------      ----
 4713/tcp (v6)              ALLOW       Anywhere (v6)
+4714/tcp (v6)              ALLOW       Anywhere (v6)
+4715/tcp (v6)              ALLOW       Anywhere (v6)
+4716/udp (v6)              ALLOW       Anywhere (v6)
 47777/udp (v6)             ALLOW       Anywhere (v6)
 ";
         assert_eq!(
-            parse_ufw_ports_allowed(ufw_v6_only, 4713, 47777, false),
+            parse_ufw_ports_allowed(ufw_v6_only, &ports_no_mdns.specs()),
             Some(false)
         );
 
         assert_eq!(
-            parse_ufw_ports_allowed("Status: inactive\n", 4713, 47777, false),
+            parse_ufw_ports_allowed("Status: inactive\n", &ports_no_mdns.specs()),
             None
         );
     }
@@ -1625,10 +1817,15 @@ To                         Action      From
             }
             if args.first().map(|s| s.as_str()) == Some("firewall-cmd") {
                 let query = args.get(1).map(|s| s.as_str()).unwrap_or("");
-                if query == "--query-port=4713/tcp"
-                    || query == "--query-port=47777/udp"
-                    || query == "--query-service=mdns"
-                {
+                if matches!(
+                    query,
+                    "--query-port=4713/tcp"
+                        | "--query-port=4714/tcp"
+                        | "--query-port=4715/tcp"
+                        | "--query-port=4716/udp"
+                        | "--query-port=47777/udp"
+                        | "--query-service=mdns"
+                ) {
                     return Ok(CommandResult {
                         args: args.to_vec(),
                         returncode: 0,
@@ -1656,12 +1853,20 @@ To                         Action      From
             .unwrap()
             .insert("firewall-cmd".to_string());
 
-        let st_with_mdns = detect_with_runner_for_ports(&runner, 4713, 47777, true);
+        let with_mdns = FirewallPorts {
+            include_mdns: true,
+            ..FirewallPorts::default()
+        };
+        let st_with_mdns = detect_with_runner_for_ports(&runner, &with_mdns);
         assert_eq!(st_with_mdns.kind, "firewalld");
         assert!(st_with_mdns.active);
         assert_eq!(st_with_mdns.ports_allowed, Some(true));
 
-        let st_missing_custom = detect_with_runner_for_ports(&runner, 4799, 47777, false);
+        let custom_rtp = FirewallPorts {
+            rtp_udp: 4799,
+            ..FirewallPorts::default()
+        };
+        let st_missing_custom = detect_with_runner_for_ports(&runner, &custom_rtp);
         assert_eq!(st_missing_custom.kind, "firewalld");
         assert!(st_missing_custom.active);
         assert_eq!(st_missing_custom.ports_allowed, Some(false));
@@ -1705,6 +1910,9 @@ Action:                               Block
         let runner = MockRunner::new(move |args, _| {
             let joined = args.join(" ");
             if joined.contains("SoundHop Audio (4713/tcp)")
+                || joined.contains("SoundHop Control (4714/tcp)")
+                || joined.contains("SoundHop Pairing (4715/tcp)")
+                || joined.contains("SoundHop RTP (4716/udp)")
                 || joined.contains("SoundHop Discovery (47777/udp)")
             {
                 return Ok(CommandResult {
@@ -1722,11 +1930,15 @@ Action:                               Block
             })
         });
         assert_eq!(
-            check_windows_ports_allowed(&runner, 4713, 47777, false),
+            check_windows_ports_allowed(&runner, &FirewallPorts::default().specs()),
             Some(true)
         );
+        let with_mdns = FirewallPorts {
+            include_mdns: true,
+            ..FirewallPorts::default()
+        };
         assert_eq!(
-            check_windows_ports_allowed(&runner, 4713, 47777, true),
+            check_windows_ports_allowed(&runner, &with_mdns.specs()),
             Some(false)
         );
     }
@@ -1763,10 +1975,15 @@ Action:                               Block
             cmds.insert("sudo".to_string());
         }
 
+        let ports_with_mdns = FirewallPorts {
+            include_mdns: true,
+            ..FirewallPorts::default()
+        };
+        let ports_no_mdns = FirewallPorts::default();
+
         // Non-TTY (GUI/AppImage launch): prefers single batched `pkexec sh -c ...` instead of `sudo -n`.
-        let res = open_ports_with_runner(
-            &runner, 4713, 47777, false, true, false, false, false, false,
-        );
+        let res =
+            open_ports_with_runner(&runner, &ports_with_mdns, false, false, false, false, false);
         assert!(res.ok);
         assert!(res.ran);
         assert_eq!(res.firewall.ports_allowed, Some(true));
@@ -1776,7 +1993,7 @@ Action:                               Block
         assert_eq!(res.commands[0][2], "-c");
         assert_eq!(
             res.commands[0][3],
-            "ufw allow 4713/tcp && ufw allow 47777/udp && ufw allow 5353/udp"
+            "ufw allow 4713/tcp && ufw allow 4714/tcp && ufw allow 4715/tcp && ufw allow 4716/udp && ufw allow 47777/udp && ufw allow 5353/udp"
         );
 
         let calls = invoked.lock().unwrap().clone();
@@ -1795,22 +2012,139 @@ Action:                               Block
 
         // TTY + interactive: still uses interactive `sudo`.
         let tty_res =
-            open_ports_with_runner(&runner, 4713, 47777, true, false, true, false, true, false);
-        assert_eq!(tty_res.commands.len(), 2);
+            open_ports_with_runner(&runner, &ports_no_mdns, true, true, false, true, false);
+        assert_eq!(tty_res.commands.len(), 5);
         assert_eq!(
             tty_res.commands[0],
             vec!["sudo", "ufw", "allow", "4713/tcp"]
         );
+        assert_eq!(
+            tty_res.commands[3],
+            vec!["sudo", "ufw", "allow", "4716/udp"]
+        );
 
         // Non-TTY without `pkexec`: falls back to `sudo -n`.
         runner.available_commands.lock().unwrap().remove("pkexec");
-        let fallback_res = open_ports_with_runner(
-            &runner, 4713, 47777, true, false, false, false, false, false,
-        );
-        assert_eq!(fallback_res.commands.len(), 2);
+        let fallback_res =
+            open_ports_with_runner(&runner, &ports_no_mdns, true, false, false, false, false);
+        assert_eq!(fallback_res.commands.len(), 5);
         assert_eq!(
             fallback_res.commands[0],
             vec!["sudo", "-n", "ufw", "allow", "4713/tcp"]
         );
+    }
+
+    #[test]
+    #[cfg(not(windows))]
+    fn test_firewalld_and_nftables_multi_port_commands() {
+        let fw_runner = MockRunner::new(|args, _| {
+            if args.first().map(|s| s.as_str()) == Some("systemctl") {
+                return Ok(CommandResult {
+                    args: args.to_vec(),
+                    returncode: 0,
+                    stdout: String::new(),
+                    stderr: String::new(),
+                });
+            }
+            Ok(CommandResult {
+                args: args.to_vec(),
+                returncode: 1,
+                stdout: "no\n".to_string(),
+                stderr: String::new(),
+            })
+        });
+        fw_runner
+            .available_commands
+            .lock()
+            .unwrap()
+            .insert("firewall-cmd".to_string());
+
+        let paired_with_mdns = FirewallPorts {
+            legacy_audio_tcp: None,
+            include_mdns: true,
+            ..FirewallPorts::default()
+        };
+        let fw_res = open_ports_with_runner(
+            &fw_runner,
+            &paired_with_mdns,
+            true,
+            false,
+            true,
+            false,
+            false,
+        );
+        assert_eq!(
+            fw_res.commands,
+            vec![
+                vec!["firewall-cmd", "--add-port=4714/tcp", "--permanent"],
+                vec!["firewall-cmd", "--add-port=4715/tcp", "--permanent"],
+                vec!["firewall-cmd", "--add-port=4716/udp", "--permanent"],
+                vec!["firewall-cmd", "--add-port=47777/udp", "--permanent"],
+                vec!["firewall-cmd", "--add-port=5353/udp", "--permanent"],
+                vec!["firewall-cmd", "--add-service=mdns", "--permanent"],
+                vec!["firewall-cmd", "--reload"],
+            ]
+        );
+
+        let close_res = close_ports_with_runner(
+            &fw_runner,
+            &FirewallPorts::default(),
+            true,
+            false,
+            true,
+            false,
+            false,
+        );
+        assert_eq!(
+            close_res.commands,
+            vec![
+                vec!["firewall-cmd", "--remove-port=4713/tcp", "--permanent"],
+                vec!["firewall-cmd", "--remove-port=4714/tcp", "--permanent"],
+                vec!["firewall-cmd", "--remove-port=4715/tcp", "--permanent"],
+                vec!["firewall-cmd", "--remove-port=4716/udp", "--permanent"],
+                vec!["firewall-cmd", "--remove-port=47777/udp", "--permanent"],
+                vec!["firewall-cmd", "--reload"],
+            ]
+        );
+
+        let nft_runner = MockRunner::new(|args, _| {
+            Ok(CommandResult {
+                args: args.to_vec(),
+                returncode: 0,
+                stdout: String::new(),
+                stderr: String::new(),
+            })
+        });
+        nft_runner
+            .available_commands
+            .lock()
+            .unwrap()
+            .insert("nft".to_string());
+
+        let nft_res = open_ports_with_runner(
+            &nft_runner,
+            &paired_with_mdns,
+            false,
+            false,
+            true,
+            false,
+            false,
+        );
+        assert!(!nft_res.note.contains("tcp dport 4713"));
+        assert!(nft_res
+            .note
+            .contains("nft add rule inet filter input tcp dport 4714 accept"));
+        assert!(nft_res
+            .note
+            .contains("nft add rule inet filter input tcp dport 4715 accept"));
+        assert!(nft_res
+            .note
+            .contains("nft add rule inet filter input udp dport 4716 accept"));
+        assert!(nft_res
+            .note
+            .contains("nft add rule inet filter input udp dport 47777 accept"));
+        assert!(nft_res
+            .note
+            .contains("nft add rule inet filter input udp dport 5353 accept"));
     }
 }

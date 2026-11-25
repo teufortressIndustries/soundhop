@@ -8,7 +8,7 @@ use clap_complete::{generate, shells};
 use soundhop_core::constants::{PROTOCOL_VERSION, VERSION};
 use soundhop_core::controller::Controller;
 use soundhop_core::daemon::Daemon;
-use soundhop_core::firewall::{detect as detect_firewall, open_ports};
+use soundhop_core::firewall::{detect_for_config, open_ports_for_config};
 use soundhop_core::service::{
     install as install_service, restart_service, start_service, status as service_status,
     stop_service, sync_appimage_paths_if_installed, uninstall as uninstall_service,
@@ -56,12 +56,7 @@ pub fn handle_setup(controller: &Arc<Controller>, args: &SetupArgs, json_out: bo
     let cfg = lock_or_recover(&controller.config).clone();
 
     let fw_res = if !args.skip_firewall {
-        Some(open_ports(
-            cfg.sharing.port,
-            cfg.discovery.port,
-            false,
-            cfg.discovery.mdns,
-        ))
+        Some(open_ports_for_config(&cfg, false))
     } else {
         None
     };
@@ -432,12 +427,7 @@ pub fn handle_firewall(controller: &Arc<Controller>, args: &FirewallArgs, json_o
     let act = args.action.trim().to_lowercase();
     match act.as_str() {
         "open" => {
-            let res = open_ports(
-                cfg.sharing.port,
-                cfg.discovery.port,
-                false,
-                cfg.discovery.mdns,
-            );
+            let res = open_ports_for_config(&cfg, false);
             if json_out {
                 print_json(&res.to_json());
             } else if res.ok {
@@ -459,7 +449,7 @@ pub fn handle_firewall(controller: &Arc<Controller>, args: &FirewallArgs, json_o
             }
         }
         "status" => {
-            let st = detect_firewall();
+            let st = detect_for_config(&cfg);
             if json_out {
                 print_json(&st);
             } else {

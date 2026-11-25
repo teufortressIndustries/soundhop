@@ -269,10 +269,26 @@ pub struct BeaconV3Meta {
 }
 
 impl BeaconV3Meta {
+    /// Extract optional v3 / Pairing v2 metadata from a decoded [`BeaconPacket`].
+    pub fn from_packet(pkt: &BeaconPacket) -> Self {
+        Self {
+            v3_port: pkt.v3_port,
+            pair_port: pkt.pair_port,
+            pub_fp: pkt.pub_fp.clone(),
+            caps: pkt.caps.clone(),
+        }
+    }
+
     /// Returns `true` when the peer advertises a valid SHT3 TCP port and the `"sht3"` capability.
     pub fn supports_sht3(&self) -> bool {
         self.v3_port.is_some_and(|p| p > 0)
             && self.caps.iter().any(|c| c.eq_ignore_ascii_case("sht3"))
+    }
+
+    /// Returns `true` when the peer advertises a valid v3 control port and the `"gst-srtp"` capability.
+    pub fn supports_gst_srtp(&self) -> bool {
+        self.v3_port.is_some_and(|p| p > 0)
+            && self.caps.iter().any(|c| c.eq_ignore_ascii_case("gst-srtp"))
     }
 
     pub fn is_empty(&self) -> bool {
@@ -1058,6 +1074,20 @@ pub fn discover_once_with_psk(
     own_id: &str,
     psk_key: Option<&str>,
 ) -> Vec<Peer> {
+    discover_once_with_meta(timeout_secs, discovery_port, own_id, psk_key)
+        .into_iter()
+        .map(|(peer, _)| peer)
+        .collect()
+}
+
+/// Perform a one-shot discovery scan, enforcing HMAC verification when `psk_key` is set,
+/// and returning each discovered [`Peer`] alongside any advertised [`BeaconV3Meta`].
+pub fn discover_once_with_meta(
+    timeout_secs: f64,
+    discovery_port: u16,
+    own_id: &str,
+    psk_key: Option<&str>,
+) -> Vec<(Peer, Option<BeaconV3Meta>)> {
     let store = PeerStore::new(PEER_TIMEOUT_SECS);
     let Ok(sock) = bind_udp_reusable(0) else {
         return Vec::new();
@@ -1089,15 +1119,24 @@ pub fn discover_once_with_psk(
     while Instant::now() < deadline {
         if let Ok((len, sender)) = sock.recv_from(&mut buf) {
             let host = sender.ip().to_string();
-            let (_, peer_opt) = parse_beacon(&buf[..len], &host, "udp", psk_clean);
-            if let Some(peer) = peer_opt {
+            let (pkt_opt, peer_opt) = parse_beacon(&buf[..len], &host, "udp", psk_clean);
+            if let (Some(pkt), Some(peer)) = (pkt_opt, peer_opt) {
                 if peer.id != own_id {
+                    let meta = BeaconV3Meta::from_packet(&pkt);
+                    store.update_v3_meta(&peer.id, meta);
                     store.update(peer);
                 }
             }
         }
     }
-    store.snapshot(true)
+    store
+        .snapshot(true)
+        .into_iter()
+        .map(|peer| {
+            let meta = store.v3_meta(&peer.id);
+            (peer, meta)
+        })
+        .collect()
 }
 
 #[cfg(test)]
@@ -1377,5 +1416,130 @@ mod tests {
         }
         mgr.stop();
         assert!(lock_or_recover(&mgr.mdns_fullname).is_none());
+    }
+
+    #[test]
+    fn test_beacon_v3_meta_supports_gst_srtp() {
+        let mut meta = BeaconV3Meta {
+            v3_port: Some(4714),
+            pair_port: Some(4715),
+            pub_fp: Some("AA11-BB22-CC33-DD44".to_string()),
+            caps: vec!["gst-srtp".to_string(), "opus".to_string()],
+        };
+        assert!(meta.supports_gst_srtp());
+        assert!(!meta.supports_sht3());
+
+        // Case-insensitive capability matching
+        meta.caps = vec!["GST-SRTP".to_string(), "sht3".to_string()];
+        assert!(meta.supports_gst_srtp());
+        assert!(meta.supports_sht3());
+
+        // Missing or zero v3_port must return false
+        meta.v3_port = Some(0);
+        assert!(!meta.supports_gst_srtp());
+        meta.v3_port = None;
+        assert!(!meta.supports_gst_srtp());
+
+        // Absent gst-srtp capability must return false
+        meta.v3_port = Some(4714);
+        meta.caps = default_v3_caps();
+        assert!(meta.supports_sht3());
+        assert!(!meta.supports_gst_srtp());
+    }
+
+    #[test]
+    fn test_discover_once_with_meta_preserves_v3_metadata_and_legacy_none() {
+        let responder = UdpSocket::bind("127.0.0.1:0").expect("bind loopback responder");
+        let port = responder.local_addr().unwrap().port();
+        responder
+            .set_read_timeout(Some(Duration::from_millis(50)))
+            .unwrap();
+
+        let expected_meta = BeaconV3Meta {
+            v3_port: Some(4714),
+            pair_port: Some(4715),
+            pub_fp: Some("1122-3344-5566-7788".to_string()),
+            caps: vec![
+                "gst-srtp".to_string(),
+                "sht3".to_string(),
+                "opus".to_string(),
+            ],
+        };
+        let meta_for_thread = expected_meta.clone();
+        let stop = Arc::new(AtomicBool::new(false));
+        let stop_thread = Arc::clone(&stop);
+
+        let handle = thread::spawn(move || {
+            let mut buf = [0u8; 4096];
+            while !stop_thread.load(Ordering::SeqCst) {
+                if let Ok((len, sender)) = responder.recv_from(&mut buf) {
+                    let (pkt_opt, _) = parse_beacon(&buf[..len], "127.0.0.1", "udp", None);
+                    if let Some(pkt) = pkt_opt {
+                        if pkt.msg_type == "probe" {
+                            let reply_target = pkt
+                                .reply_port
+                                .filter(|&p| p > 0)
+                                .map(|rp| SocketAddr::new(sender.ip(), rp))
+                                .unwrap_or(sender);
+                            let v3_offer = make_beacon_v3(
+                                "peer-gst-1",
+                                "Studio GST",
+                                4713,
+                                "trusted-lan",
+                                "offer",
+                                None,
+                                Some(pkt.ts_us),
+                                None,
+                                &meta_for_thread,
+                            );
+                            let _ = responder.send_to(&v3_offer, reply_target);
+
+                            let legacy_offer = make_beacon(
+                                "peer-legacy-1",
+                                "Legacy Speaker",
+                                4713,
+                                "trusted-lan",
+                                "offer",
+                                None,
+                                Some(pkt.ts_us),
+                            );
+                            let _ = responder.send_to(&legacy_offer, reply_target);
+                        }
+                    }
+                }
+            }
+        });
+
+        let found_with_meta = discover_once_with_meta(0.3, port, "scanner-self", None);
+        let found_peers_only = discover_once_with_psk(0.3, port, "scanner-self", None);
+        stop.store(true, Ordering::SeqCst);
+        let _ = handle.join();
+
+        let v3_entry = found_with_meta
+            .iter()
+            .find(|(p, _)| p.id == "peer-gst-1")
+            .expect("expected peer-gst-1 in discover_once_with_meta result");
+        assert_eq!(v3_entry.0.name, "Studio GST");
+        let meta = v3_entry
+            .1
+            .as_ref()
+            .expect("expected BeaconV3Meta to be preserved");
+        assert_eq!(meta, &expected_meta);
+        assert!(meta.supports_gst_srtp());
+        assert!(meta.supports_sht3());
+
+        let legacy_entry = found_with_meta
+            .iter()
+            .find(|(p, _)| p.id == "peer-legacy-1")
+            .expect("expected peer-legacy-1 in discover_once_with_meta result");
+        assert!(
+            legacy_entry.1.is_none(),
+            "legacy v2 peer without v3 fields should have None metadata"
+        );
+
+        assert!(
+            found_peers_only.iter().any(|p| p.id == "peer-gst-1"),
+            "discover_once_with_psk wrapper should return discovered peers"
+        );
     }
 }

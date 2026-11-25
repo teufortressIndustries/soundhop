@@ -1414,11 +1414,7 @@ impl Daemon {
             }
             "firewall_status" => {
                 let cfg = lock_or_recover(&self.controller.config).clone();
-                let st = crate::firewall::detect_for_ports(
-                    cfg.sharing.port,
-                    cfg.discovery.port,
-                    cfg.discovery.mdns,
-                );
+                let st = crate::firewall::detect_for_config(&cfg);
                 serde_json::json!({
                     "ok": true,
                     "kind": st.kind,
@@ -1434,12 +1430,7 @@ impl Daemon {
                     .lock()
                     .unwrap_or_else(|e| e.into_inner())
                     .clone();
-                let res = crate::firewall::open_ports_non_interactive(
-                    cfg.sharing.port,
-                    cfg.discovery.port,
-                    false,
-                    cfg.discovery.mdns,
-                );
+                let res = crate::firewall::open_ports_for_config_non_interactive(&cfg, false);
                 res.to_json()
             }
             "mic" => {

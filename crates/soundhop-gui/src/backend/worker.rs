@@ -8,7 +8,7 @@ use eframe::egui;
 use soundhop_core::constants::{PROTOCOL_VERSION, VERSION};
 use soundhop_core::controller::Controller;
 use soundhop_core::discovery::{discover_once_with_psk, Peer};
-use soundhop_core::firewall::{detect_for_ports, open_ports};
+use soundhop_core::firewall::{detect_for_config, open_ports_for_config};
 use soundhop_core::ipc::{is_running as ipc_is_running, request as ipc_request};
 use soundhop_core::service::{
     install as install_service, status as service_status, uninstall as uninstall_service,
@@ -124,37 +124,36 @@ impl WorkerState {
 
     pub(super) fn refresh_system(&mut self) {
         let cfg = lock_or_recover(&self.controller.config).clone();
-        let (fw_kind, fw_active, fw_detail, fw_ports_allowed) = if self.use_ipc
-            && ipc_is_running(None)
-        {
-            if let Ok(resp) = ipc_request(
-                "firewall_status",
-                serde_json::json!({}),
-                None,
-                Duration::from_millis(700),
-            ) {
-                (
-                    resp.get("kind")
-                        .and_then(|v| v.as_str())
-                        .unwrap_or("none")
-                        .to_string(),
-                    resp.get("active")
-                        .and_then(|v| v.as_bool())
-                        .unwrap_or(false),
-                    resp.get("detail")
-                        .and_then(|v| v.as_str())
-                        .unwrap_or("")
-                        .to_string(),
-                    resp.get("ports_allowed").and_then(|v| v.as_bool()),
-                )
+        let (fw_kind, fw_active, fw_detail, fw_ports_allowed) =
+            if self.use_ipc && ipc_is_running(None) {
+                if let Ok(resp) = ipc_request(
+                    "firewall_status",
+                    serde_json::json!({}),
+                    None,
+                    Duration::from_millis(700),
+                ) {
+                    (
+                        resp.get("kind")
+                            .and_then(|v| v.as_str())
+                            .unwrap_or("none")
+                            .to_string(),
+                        resp.get("active")
+                            .and_then(|v| v.as_bool())
+                            .unwrap_or(false),
+                        resp.get("detail")
+                            .and_then(|v| v.as_str())
+                            .unwrap_or("")
+                            .to_string(),
+                        resp.get("ports_allowed").and_then(|v| v.as_bool()),
+                    )
+                } else {
+                    let fw = detect_for_config(&cfg);
+                    (fw.kind, fw.active, fw.detail, fw.ports_allowed)
+                }
             } else {
-                let fw = detect_for_ports(cfg.sharing.port, cfg.discovery.port, cfg.discovery.mdns);
+                let fw = detect_for_config(&cfg);
                 (fw.kind, fw.active, fw.detail, fw.ports_allowed)
-            }
-        } else {
-            let fw = detect_for_ports(cfg.sharing.port, cfg.discovery.port, cfg.discovery.mdns);
-            (fw.kind, fw.active, fw.detail, fw.ports_allowed)
-        };
+            };
 
         let svc = service_status();
         let mut guard = write_or_recover(&self.snapshot);
@@ -444,13 +443,7 @@ impl WorkerState {
             .unwrap_or(false)
         } else {
             let cfg = lock_or_recover(&self.controller.config).clone();
-            open_ports(
-                cfg.sharing.port,
-                cfg.discovery.port,
-                false,
-                cfg.discovery.mdns,
-            )
-            .ok
+            open_ports_for_config(&cfg, false).ok
         };
         self.set_busy(None);
         if ok {
@@ -489,7 +482,7 @@ impl WorkerState {
             }
         }
 
-        let mut fw = detect_for_ports(cfg.sharing.port, cfg.discovery.port, cfg.discovery.mdns);
+        let mut fw = detect_for_config(&cfg);
         if fix && fw.active && fw.ports_allowed != Some(true) {
             let fw_ok = if self.use_ipc && ipc_is_running(None) {
                 ipc_request(
@@ -501,20 +494,14 @@ impl WorkerState {
                 .map(|v| v.get("ok").and_then(|x| x.as_bool()).unwrap_or(false))
                 .unwrap_or(false)
             } else {
-                open_ports(
-                    cfg.sharing.port,
-                    cfg.discovery.port,
-                    false,
-                    cfg.discovery.mdns,
-                )
-                .ok
+                open_ports_for_config(&cfg, false).ok
             };
             if fw_ok {
                 fixed_actions.push(format!("Opened firewall ports on {}", fw.kind));
             } else {
                 fix_errors.push(format!("Could not open firewall ports on {}", fw.kind));
             }
-            fw = detect_for_ports(cfg.sharing.port, cfg.discovery.port, cfg.discovery.mdns);
+            fw = detect_for_config(&cfg);
         }
 
         let mut svc = service_status();
@@ -636,7 +623,7 @@ impl WorkerState {
             let _sync = lock_or_recover(&self.controller_sync_lock);
             self.controller.status(None)
         };
-        let fw = detect_for_ports(cfg.sharing.port, cfg.discovery.port, cfg.discovery.mdns);
+        let fw = detect_for_config(&cfg);
         let svc = service_status();
         let daemon_log = log_path();
         let recent_logs: Vec<String> = std::fs::read_to_string(&daemon_log)
@@ -809,13 +796,7 @@ impl WorkerState {
                 .unwrap_or(false)
             } else {
                 let cfg = lock_or_recover(&self.controller.config).clone();
-                open_ports(
-                    cfg.sharing.port,
-                    cfg.discovery.port,
-                    false,
-                    cfg.discovery.mdns,
-                )
-                .ok
+                open_ports_for_config(&cfg, false).ok
             };
             if !fw_ok {
                 failures.push("firewall rules");

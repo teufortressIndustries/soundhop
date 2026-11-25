@@ -16,6 +16,13 @@ use crate::pairing::DEFAULT_PAIR_PORT;
 use crate::transport::DEFAULT_V3_PORT;
 use crate::util::{atomic_write, config_path, hostname_name, new_device_id};
 
+/// Default UDP port for encrypted RTP/SRTP media streams.
+pub const DEFAULT_RTP_PORT: u16 = 4716;
+
+fn default_rtp_port() -> u16 {
+    DEFAULT_RTP_PORT
+}
+
 /// Valid values for `audio.profile`.
 pub const VALID_AUDIO_PROFILES: &[&str] = &[
     "opus-balanced",
@@ -65,6 +72,9 @@ pub struct SharingConfig {
     pub v3_port: u16,
     /// Pairing v2 interactive handshake TCP port (default `4715`).
     pub pair_port: u16,
+    /// Encrypted RTP/SRTP media UDP port (default `4716`).
+    #[serde(default = "default_rtp_port")]
+    pub rtp_port: u16,
     pub security: String,
     pub allowed_networks: Vec<String>,
     /// Optional SHA-256 / HMAC pre-shared key hash for `psk` / `pin` security mode.
@@ -78,6 +88,7 @@ impl Default for SharingConfig {
             port: DEFAULT_AUDIO_PORT,
             v3_port: DEFAULT_V3_PORT,
             pair_port: DEFAULT_PAIR_PORT,
+            rtp_port: DEFAULT_RTP_PORT,
             security: "trusted-lan".to_string(),
             allowed_networks: DEFAULT_LAN_NETWORKS
                 .iter()
@@ -315,6 +326,9 @@ impl Config {
         }
         if self.sharing.pair_port == 0 {
             self.sharing.pair_port = DEFAULT_PAIR_PORT;
+        }
+        if self.sharing.rtp_port == 0 {
+            self.sharing.rtp_port = DEFAULT_RTP_PORT;
         }
         self.sharing.security = normalize_security(&self.sharing.security)?;
         self.sharing.psk_hash = self.sharing.psk_hash.trim().to_string();
@@ -750,7 +764,43 @@ mod tests {
 
         cfg.set_dotted("sharing.v3_port", "4724").unwrap();
         cfg.set_dotted("sharing.pair_port", "4725").unwrap();
+        cfg.set_dotted("sharing.rtp_port", "4726").unwrap();
         assert_eq!(cfg.sharing.v3_port, 4724);
         assert_eq!(cfg.sharing.pair_port, 4725);
+        assert_eq!(cfg.sharing.rtp_port, 4726);
+    }
+
+    #[test]
+    fn test_rtp_port_default_backwards_compat_and_round_trip() {
+        assert_eq!(DEFAULT_RTP_PORT, 4716);
+        let default_cfg = Config::default();
+        assert_eq!(default_cfg.sharing.rtp_port, DEFAULT_RTP_PORT);
+
+        // Existing config.toml omitting sharing.rtp_port deserializes with DEFAULT_RTP_PORT.
+        let dir = tempfile::tempdir().unwrap();
+        let legacy_file = dir.path().join("legacy_sharing.toml");
+        fs::write(
+            &legacy_file,
+            "[sharing]\nenabled = true\nport = 4713\nv3_port = 4714\npair_port = 4715\nsecurity = \"psk\"\n",
+        )
+        .unwrap();
+        let mut loaded = Config::load(Some(&legacy_file)).unwrap();
+        assert_eq!(loaded.sharing.rtp_port, DEFAULT_RTP_PORT);
+
+        // Zero rtp_port normalizes back to DEFAULT_RTP_PORT.
+        loaded.sharing.rtp_port = 0;
+        loaded.normalize().unwrap();
+        assert_eq!(loaded.sharing.rtp_port, DEFAULT_RTP_PORT);
+
+        // Custom rtp_port round-trips through save/load and dotted accessors.
+        loaded.set_dotted("sharing.rtp_port", "4816").unwrap();
+        assert_eq!(
+            loaded.get_dotted("sharing.rtp_port").unwrap(),
+            serde_json::json!(4816)
+        );
+        loaded.save(None).unwrap();
+
+        let reloaded = Config::load(Some(&legacy_file)).unwrap();
+        assert_eq!(reloaded.sharing.rtp_port, 4816);
     }
 }
