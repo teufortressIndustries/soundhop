@@ -1,4 +1,6 @@
 app-id: io.github.soundhop
+# org.freedesktop.Platform/Sdk 24.08 includes GStreamer 1.24 dev headers and
+# base/good/bad plugins (opus, rtp, rtpmanager, udp, pulseaudio, and srtp via libsrtp2).
 runtime: org.freedesktop.Platform
 runtime-version: '24.08'
 sdk: org.freedesktop.Sdk
@@ -12,7 +14,8 @@ build-options:
     CARGO_HOME: /run/build/soundhop/cargo
 
 finish-args:
-  # Network access for UDP 47777 discovery and TCP 4713 audio streaming
+  # Network access for UDP 47777 discovery, TCP 4714/4715 control/pairing,
+  # UDP 4716 SRTP/Opus audio streaming, and legacy TCP 4713 compatibility
   - --share=network
   # Audio system access (PulseAudio & PipeWire compatibility socket)
   - --socket=pulseaudio

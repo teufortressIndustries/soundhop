@@ -9,6 +9,10 @@
   #define BuildDir "..\..\target\release"
 #endif
 
+#ifndef StageDir
+  #define StageDir BuildDir
+#endif
+
 #ifndef OutputDirPath
   #define OutputDirPath "..\..\dist"
 #endif
@@ -55,8 +59,10 @@ Name: "autostart"; Description: "Start SoundHop when Windows starts"; GroupDescr
 Name: "addtopath"; Description: "Add CLI (soundhop.exe) to user PATH"; GroupDescription: "Startup & Integration:"
 
 [Files]
-Source: "{#BuildDir}\{#MyAppExeName}"; DestDir: "{app}"; Flags: ignoreversion
-Source: "{#BuildDir}\{#MyAppCliName}"; DestDir: "{app}"; Flags: ignoreversion
+Source: "{#StageDir}\{#MyAppExeName}"; DestDir: "{app}"; Flags: ignoreversion
+Source: "{#StageDir}\{#MyAppCliName}"; DestDir: "{app}"; Flags: ignoreversion
+Source: "{#StageDir}\*.dll"; DestDir: "{app}"; Flags: ignoreversion
+Source: "{#StageDir}\lib\gstreamer-1.0\*.dll"; DestDir: "{app}\lib\gstreamer-1.0"; Flags: ignoreversion
 Source: "..\..\LICENSE"; DestDir: "{app}"; Flags: ignoreversion
 Source: "..\..\README.md"; DestDir: "{app}"; Flags: ignoreversion
 

@@ -266,6 +266,47 @@ else
     fi
 fi
 
+# 7. Verify bundled GStreamer plugins & runtime hook
+echo "7. Checking bundled GStreamer plugins..."
+GST_PLUGIN_DIR="$EXTRACTED_DIR/lib/gstreamer-1.0"
+GST_REQUIRED_PLUGINS=(
+    libgstcoreelements.so
+    libgstaudioconvert.so
+    libgstaudioresample.so
+    libgstvolume.so
+    libgstopus.so
+    libgstrtp.so
+    libgstrtpmanager.so
+    libgstsrtp.so
+    libgstudp.so
+    libgstpulseaudio.so
+    libgstaudiotestsrc.so
+    libgstapp.so
+)
+if [[ ! -d "$GST_PLUGIN_DIR" ]]; then
+    fail "Missing bundled GStreamer plugin directory: lib/gstreamer-1.0"
+else
+    missing_plugins=0
+    for plugin in "${GST_REQUIRED_PLUGINS[@]}"; do
+        if [[ -s "$GST_PLUGIN_DIR/$plugin" ]]; then
+            pass "Bundled GStreamer plugin present: lib/gstreamer-1.0/$plugin"
+        else
+            fail "Missing or empty bundled GStreamer plugin: lib/gstreamer-1.0/$plugin"
+            missing_plugins=$((missing_plugins + 1))
+        fi
+    done
+    if [[ "$missing_plugins" -eq 0 ]]; then
+        pass "All ${#GST_REQUIRED_PLUGINS[@]} required GStreamer plugins verified"
+    fi
+fi
+
+GST_HOOK="$EXTRACTED_DIR/bin/soundhop-gst.hook"
+if [[ -s "$GST_HOOK" ]] && grep -Fq "GST_PLUGIN_PATH_1_0" "$GST_HOOK" && grep -Fq "GST_REGISTRY_FORK=no" "$GST_HOOK"; then
+    pass "Bundled GStreamer environment hook present: bin/soundhop-gst.hook"
+else
+    fail "Missing or incomplete GStreamer environment hook: bin/soundhop-gst.hook"
+fi
+
 if [[ "$FAILURES" -gt 0 ]]; then
     echo "=== Verification FAILED ($FAILURES check(s) failed) ===" >&2
     exit 1

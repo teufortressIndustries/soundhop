@@ -9,6 +9,9 @@ Source0:        %{name}-%{version}.tar.gz
 
 BuildRequires:  cargo
 BuildRequires:  rust
+BuildRequires:  pkgconfig
+BuildRequires:  gstreamer1-devel
+BuildRequires:  gstreamer1-plugins-base-devel
 BuildRequires:  gtk3-devel
 BuildRequires:  libappindicator-gtk3-devel
 BuildRequires:  libxdo-devel
@@ -18,6 +21,11 @@ BuildRequires:  wayland-devel
 BuildRequires:  mesa-libGL-devel
 
 Requires:       pipewire-pulseaudio
+Requires:       gstreamer1
+Requires:       gstreamer1-plugins-base
+# gstreamer1-plugins-good provides libgstpulseaudio.so, rtp, rtpmanager, udp, and volume on Fedora
+Requires:       gstreamer1-plugins-good
+Requires:       gstreamer1-plugins-bad-free
 Requires:       gtk3
 Requires:       libappindicator-gtk3
 Requires:       libxdo

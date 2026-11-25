@@ -53,7 +53,10 @@ if [ "$(id -u)" -ne 0 ] && command -v sudo >/dev/null 2>&1; then
 fi
 
 # Bootstrap Arch Linux build dependencies if running in an un-warmed container
-if ! command -v patchelf >/dev/null 2>&1 || ! command -v zsyncmake >/dev/null 2>&1 || ! pkg-config --exists gtk+-3.0 xcursor xi xrandr 2>/dev/null; then
+if ! command -v patchelf >/dev/null 2>&1 || \
+   ! command -v zsyncmake >/dev/null 2>&1 || \
+   ! pkg-config --exists gtk+-3.0 xcursor xi xrandr gstreamer-1.0 gstreamer-audio-1.0 gstreamer-rtp-1.0 gstreamer-app-1.0 2>/dev/null || \
+   ! [[ -f /usr/lib/gstreamer-1.0/libgstsrtp.so ]]; then
     echo "0. Installing Arch Linux build dependencies..."
     for i in 1 2 3; do
         $SUDO pacman -Sy --noconfirm --needed archlinux-keyring && \
@@ -61,7 +64,8 @@ if ! command -v patchelf >/dev/null 2>&1 || ! command -v zsyncmake >/dev/null 2>
             base-devel rustup pkgconf wget curl file strace binutils patchelf zsync \
             squashfs-tools desktop-file-utils appstream xorg-server-xvfb \
             gtk3 libayatana-appindicator xdotool libxcb libxcursor libxi libxrandr \
-            libxkbcommon libxkbcommon-x11 wayland mesa && break || sleep 3
+            libxkbcommon libxkbcommon-x11 wayland mesa \
+            gstreamer gst-plugins-base-libs gst-plugins-base gst-plugins-good gst-plugins-bad && break || sleep 3
     done
 fi
 
@@ -171,7 +175,33 @@ rm -f "$OUTPUT_FILE" "$OUTPUT_FILE.zsync"
 trap 'rm -f "$OUTPUT_FILE" "$OUTPUT_FILE.zsync"' ERR INT TERM
 
 echo "4. Deploying SoundHop & libraries with quick-sharun..."
-# Pass soundhop plus dlopened tray, X11, and Wayland helper libraries so they are always bundled
+GST_PLUGIN_DIR="/usr/lib/gstreamer-1.0"
+GST_REQUIRED_PLUGINS=(
+    libgstcoreelements.so
+    libgstaudioconvert.so
+    libgstaudioresample.so
+    libgstvolume.so
+    libgstopus.so
+    libgstrtp.so
+    libgstrtpmanager.so
+    libgstsrtp.so
+    libgstudp.so
+    libgstpulseaudio.so
+    libgstaudiotestsrc.so
+    libgstapp.so
+)
+GST_PLUGIN_PATHS=()
+for plugin in "${GST_REQUIRED_PLUGINS[@]}"; do
+    plugin_path="$GST_PLUGIN_DIR/$plugin"
+    if [[ ! -f "$plugin_path" ]]; then
+        echo "Error: Required GStreamer plugin not found in container: $plugin_path" >&2
+        exit 1
+    fi
+    GST_PLUGIN_PATHS+=("$plugin_path")
+done
+
+# Pass soundhop plus dlopened tray, X11, Wayland, and minimal GStreamer plugin libraries
+# so quick-sharun deploys both the plugins and all of their transitive shared library deps.
 "$QUICK_SHARUN" \
     /usr/bin/soundhop \
     /usr/lib/libayatana-appindicator3.so* \
@@ -182,10 +212,50 @@ echo "4. Deploying SoundHop & libraries with quick-sharun..."
     /usr/lib/libXrandr.so* \
     /usr/lib/libxkbcommon-x11.so* \
     /usr/lib/libwayland-egl.so* \
-    /usr/lib/libwayland-cursor.so*
+    /usr/lib/libwayland-cursor.so* \
+    "${GST_PLUGIN_PATHS[@]}"
+
+# Ensure all required GStreamer plugins are accessible under $APP_DIR/lib/gstreamer-1.0/
+# regardless of whether quick-sharun preserved the gstreamer-1.0/ subdirectory or flattened it.
+mkdir -p "$APP_DIR/lib/gstreamer-1.0"
+for plugin in "${GST_REQUIRED_PLUGINS[@]}"; do
+    if [[ -e "$APP_DIR/lib/gstreamer-1.0/$plugin" ]]; then
+        continue
+    elif [[ -e "$APP_DIR/shared/lib/gstreamer-1.0/$plugin" ]]; then
+        ln -sf "../../shared/lib/gstreamer-1.0/$plugin" "$APP_DIR/lib/gstreamer-1.0/$plugin"
+    elif [[ -e "$APP_DIR/lib/$plugin" ]]; then
+        ln -sf "../$plugin" "$APP_DIR/lib/gstreamer-1.0/$plugin"
+    elif [[ -e "$APP_DIR/shared/lib/$plugin" ]]; then
+        ln -sf "../../shared/lib/$plugin" "$APP_DIR/lib/gstreamer-1.0/$plugin"
+    else
+        echo "Error: Required GStreamer plugin was not deployed into AppDir: $plugin" >&2
+        exit 1
+    fi
+done
 
 # Preserve quick-sharun's generated AppRun.sh, AppRun.lib, and path-mapping hooks;
-# add SoundHop's GUI/status default-dispatch logic as a hook in bin/.
+# add SoundHop's GStreamer environment and GUI/status default-dispatch hooks in bin/.
+cat << EOF > "$APP_DIR/bin/soundhop-gst.hook"
+#!/bin/sh
+# Point GStreamer at the AppImage's bundled plugins and disable registry forking
+# so cross-distro hosts never load ABI-incompatible system GStreamer plugins.
+_sh_appdir="\${APPDIR:-\${CURRENTDIR:-}}"
+if [ -n "\$_sh_appdir" ] && [ -d "\$_sh_appdir/lib/gstreamer-1.0" ]; then
+    export GST_PLUGIN_SYSTEM_PATH_1_0=""
+    export GST_PLUGIN_SYSTEM_PATH=""
+    if [ -z "\${GST_PLUGIN_PATH_1_0:-}" ]; then
+        export GST_PLUGIN_PATH_1_0="\$_sh_appdir/lib/gstreamer-1.0"
+    fi
+    export GST_REGISTRY_FORK=no
+    if [ -z "\${GST_REGISTRY_1_0:-}" ]; then
+        _sh_cache="\${XDG_CACHE_HOME:-\${HOME:-/tmp}/.cache}/soundhop"
+        mkdir -p "\$_sh_cache" 2>/dev/null || true
+        export GST_REGISTRY_1_0="\$_sh_cache/gst-registry-appimage-${VERSION}.bin"
+    fi
+fi
+EOF
+chmod +x "$APP_DIR/bin/soundhop-gst.hook"
+
 cat << 'EOF' > "$APP_DIR/bin/soundhop-dispatch.hook"
 #!/bin/sh
 # Default to launching the Control Center (which also starts the tray) on graphical

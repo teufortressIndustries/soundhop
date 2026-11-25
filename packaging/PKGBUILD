@@ -6,7 +6,22 @@ pkgdesc="Seamless cross-distro local network audio sharing, multi-room broadcast
 arch=('x86_64' 'aarch64')
 url="https://github.com/teufortressIndustries/soundhop"
 license=('MIT')
-depends=('pipewire-pulse' 'gtk3' 'libappindicator-gtk3' 'libxdo' 'libxcb' 'libxkbcommon' 'libxkbcommon-x11' 'wayland' 'libglvnd')
+depends=(
+    'pipewire-pulse'
+    'gstreamer'
+    'gst-plugins-base-libs'
+    'gst-plugins-base'
+    'gst-plugins-good'
+    'gst-plugins-bad'
+    'gtk3'
+    'libappindicator-gtk3'
+    'libxdo'
+    'libxcb'
+    'libxkbcommon'
+    'libxkbcommon-x11'
+    'wayland'
+    'libglvnd'
+)
 optdepends=(
     'libnotify: desktop notifications'
     'scrcpy: Android audio capture bridge'

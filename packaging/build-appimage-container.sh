@@ -21,7 +21,7 @@ fi
 
 echo "=== Building SoundHop v2.0 AnyLinux AppImage using Arch Linux ($CONTAINER_CMD) ==="
 
-IMAGE_NAME="soundhop-anylinux-builder:v3"
+IMAGE_NAME="soundhop-anylinux-builder:v4"
 
 # Pre-warm Arch Linux builder image once to eliminate pacman/rustup delays
 if ! $CONTAINER_CMD image exists "$IMAGE_NAME" 2>/dev/null; then
@@ -36,7 +36,8 @@ RUN printf 'Server = https://mirrors.kernel.org/archlinux/$repo/os/$arch\nServer
         rustup pkgconf wget curl file strace binutils patchelf zsync \
         squashfs-tools desktop-file-utils appstream xorg-server-xvfb \
         gtk3 libayatana-appindicator xdotool libxcb libxcursor libxi libxrandr \
-        libxkbcommon libxkbcommon-x11 wayland mesa && break || sleep 3; \
+        libxkbcommon libxkbcommon-x11 wayland mesa \
+        gstreamer gst-plugins-base-libs gst-plugins-base gst-plugins-good gst-plugins-bad && break || sleep 3; \
     done \
     && mkdir -p /tmp/debloated-pkgs \
     && host_arch="$(uname -m)" \

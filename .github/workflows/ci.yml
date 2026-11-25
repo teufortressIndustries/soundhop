@@ -54,8 +54,59 @@ jobs:
             sudo DEBIAN_FRONTEND=noninteractive NEEDRESTART_MODE=l apt-get install -y --no-install-recommends \
               pkg-config libgtk-3-dev libayatana-appindicator3-dev libxdo-dev \
               libxcb1-dev libxkbcommon-dev libxkbcommon-x11-dev libwayland-dev \
-              libgl1-mesa-dev && break || sleep 3
+              libgl1-mesa-dev \
+              libgstreamer1.0-dev libgstreamer-plugins-base1.0-dev \
+              gstreamer1.0-plugins-base gstreamer1.0-plugins-good \
+              gstreamer1.0-plugins-bad gstreamer1.0-pulseaudio && break || sleep 3
           done
+
+      - name: Install GStreamer (MSVC x86_64)
+        if: runner.os == 'Windows'
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = "Stop"
+          $gstVersion = "1.24.13"
+          $gstRoot = "C:\gstreamer\1.0\msvc_x86_64"
+          $baseUrl = "https://gstreamer.freedesktop.org/data/pkg/windows/$gstVersion/msvc"
+          $runtimeMsi = Join-Path $env:RUNNER_TEMP "gstreamer-1.0-msvc-x86_64-$gstVersion.msi"
+          $develMsi = Join-Path $env:RUNNER_TEMP "gstreamer-1.0-devel-msvc-x86_64-$gstVersion.msi"
+
+          foreach ($item in @(
+            @{ Url = "$baseUrl/gstreamer-1.0-msvc-x86_64-$gstVersion.msi"; Out = $runtimeMsi; Label = "runtime" },
+            @{ Url = "$baseUrl/gstreamer-1.0-devel-msvc-x86_64-$gstVersion.msi"; Out = $develMsi; Label = "devel" }
+          )) {
+            for ($attempt = 1; $attempt -le 3; $attempt++) {
+              try {
+                Write-Host "Downloading GStreamer $($item.Label) MSI (attempt $attempt)..."
+                Invoke-WebRequest -Uri $item.Url -OutFile $item.Out -UseBasicParsing
+                break
+              } catch {
+                if ($attempt -eq 3) { throw }
+                Start-Sleep -Seconds 5
+              }
+            }
+          }
+
+          Write-Host "Installing GStreamer runtime MSI..."
+          $p1 = Start-Process msiexec.exe -ArgumentList "/i", "`"$runtimeMsi`"", "ADDLOCAL=ALL", "/qn", "/norestart" -Wait -PassThru -NoNewWindow
+          if ($p1.ExitCode -ne 0) { throw "GStreamer runtime MSI install failed with exit code $($p1.ExitCode)" }
+
+          Write-Host "Installing GStreamer devel MSI..."
+          $p2 = Start-Process msiexec.exe -ArgumentList "/i", "`"$develMsi`"", "ADDLOCAL=ALL", "/qn", "/norestart" -Wait -PassThru -NoNewWindow
+          if ($p2.ExitCode -ne 0) { throw "GStreamer devel MSI install failed with exit code $($p2.ExitCode)" }
+
+          if (-not (Test-Path "$gstRoot\lib\pkgconfig\gstreamer-1.0.pc")) {
+            throw "Expected gstreamer-1.0.pc not found under $gstRoot\lib\pkgconfig"
+          }
+
+          "GSTREAMER_1_0_ROOT_MSVC_X86_64=$gstRoot" | Out-File -FilePath $env:GITHUB_ENV -Encoding utf8 -Append
+          "PKG_CONFIG_PATH=$gstRoot\lib\pkgconfig" | Out-File -FilePath $env:GITHUB_ENV -Encoding utf8 -Append
+          if (Test-Path "$gstRoot\bin\pkg-config.exe") {
+            "PKG_CONFIG=$gstRoot\bin\pkg-config.exe" | Out-File -FilePath $env:GITHUB_ENV -Encoding utf8 -Append
+          }
+          "$gstRoot\bin" | Out-File -FilePath $env:GITHUB_PATH -Encoding utf8 -Append
+          & "$gstRoot\bin\gst-inspect-1.0.exe" --version
+          Remove-Item -Force $runtimeMsi, $develMsi -ErrorAction SilentlyContinue
 
       - name: Install Rust toolchain
         uses: dtolnay/rust-toolchain@stable
@@ -103,7 +154,9 @@ jobs:
               base-devel rustup pkgconf wget curl file strace binutils patchelf zsync \
               squashfs-tools desktop-file-utils appstream xorg-server-xvfb \
               gtk3 libayatana-appindicator xdotool libxcb libxcursor libxi libxrandr \
-              libxkbcommon libxkbcommon-x11 wayland mesa git && break || sleep 3
+              libxkbcommon libxkbcommon-x11 wayland mesa \
+              gstreamer gst-plugins-base-libs gst-plugins-base gst-plugins-good gst-plugins-bad \
+              git && break || sleep 3
           done
 
       - name: Initialize Rust toolchain
@@ -154,6 +207,53 @@ jobs:
     steps:
       - uses: actions/checkout@v4
 
+      - name: Install GStreamer (MSVC x86_64)
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = "Stop"
+          $gstVersion = "1.24.13"
+          $gstRoot = "C:\gstreamer\1.0\msvc_x86_64"
+          $baseUrl = "https://gstreamer.freedesktop.org/data/pkg/windows/$gstVersion/msvc"
+          $runtimeMsi = Join-Path $env:RUNNER_TEMP "gstreamer-1.0-msvc-x86_64-$gstVersion.msi"
+          $develMsi = Join-Path $env:RUNNER_TEMP "gstreamer-1.0-devel-msvc-x86_64-$gstVersion.msi"
+
+          foreach ($item in @(
+            @{ Url = "$baseUrl/gstreamer-1.0-msvc-x86_64-$gstVersion.msi"; Out = $runtimeMsi; Label = "runtime" },
+            @{ Url = "$baseUrl/gstreamer-1.0-devel-msvc-x86_64-$gstVersion.msi"; Out = $develMsi; Label = "devel" }
+          )) {
+            for ($attempt = 1; $attempt -le 3; $attempt++) {
+              try {
+                Write-Host "Downloading GStreamer $($item.Label) MSI (attempt $attempt)..."
+                Invoke-WebRequest -Uri $item.Url -OutFile $item.Out -UseBasicParsing
+                break
+              } catch {
+                if ($attempt -eq 3) { throw }
+                Start-Sleep -Seconds 5
+              }
+            }
+          }
+
+          Write-Host "Installing GStreamer runtime MSI..."
+          $p1 = Start-Process msiexec.exe -ArgumentList "/i", "`"$runtimeMsi`"", "ADDLOCAL=ALL", "/qn", "/norestart" -Wait -PassThru -NoNewWindow
+          if ($p1.ExitCode -ne 0) { throw "GStreamer runtime MSI install failed with exit code $($p1.ExitCode)" }
+
+          Write-Host "Installing GStreamer devel MSI..."
+          $p2 = Start-Process msiexec.exe -ArgumentList "/i", "`"$develMsi`"", "ADDLOCAL=ALL", "/qn", "/norestart" -Wait -PassThru -NoNewWindow
+          if ($p2.ExitCode -ne 0) { throw "GStreamer devel MSI install failed with exit code $($p2.ExitCode)" }
+
+          if (-not (Test-Path "$gstRoot\lib\pkgconfig\gstreamer-1.0.pc")) {
+            throw "Expected gstreamer-1.0.pc not found under $gstRoot\lib\pkgconfig"
+          }
+
+          "GSTREAMER_1_0_ROOT_MSVC_X86_64=$gstRoot" | Out-File -FilePath $env:GITHUB_ENV -Encoding utf8 -Append
+          "PKG_CONFIG_PATH=$gstRoot\lib\pkgconfig" | Out-File -FilePath $env:GITHUB_ENV -Encoding utf8 -Append
+          if (Test-Path "$gstRoot\bin\pkg-config.exe") {
+            "PKG_CONFIG=$gstRoot\bin\pkg-config.exe" | Out-File -FilePath $env:GITHUB_ENV -Encoding utf8 -Append
+          }
+          "$gstRoot\bin" | Out-File -FilePath $env:GITHUB_PATH -Encoding utf8 -Append
+          & "$gstRoot\bin\gst-inspect-1.0.exe" --version
+          Remove-Item -Force $runtimeMsi, $develMsi -ErrorAction SilentlyContinue
+
       - name: Install Rust toolchain
         uses: dtolnay/rust-toolchain@stable
 
@@ -186,8 +286,30 @@ jobs:
           if (-not $cli) { throw "soundhop.exe missing from portable zip!" }
           if (-not $gui) { throw "soundhop-gui.exe missing from portable zip!" }
 
-          & $cli.FullName --version
-          if ($LASTEXITCODE -ne 0) { throw "soundhop.exe --version failed!" }
+          $pkgRoot = $cli.Directory.FullName
+          $pluginDir = Join-Path $pkgRoot "lib\gstreamer-1.0"
+          foreach ($plugin in @(
+            "gstcoreelements.dll", "gstaudioconvert.dll", "gstaudioresample.dll",
+            "gstvolume.dll", "gstopus.dll", "gstrtp.dll", "gstrtpmanager.dll",
+            "gstsrtp.dll", "gstudp.dll", "gstwasapi2.dll", "gstapp.dll"
+          )) {
+            if (-not (Test-Path (Join-Path $pluginDir $plugin))) {
+              throw "Bundled GStreamer plugin missing from portable zip: lib\gstreamer-1.0\$plugin"
+            }
+          }
+
+          # Run smoke test with a stripped PATH (no system GStreamer) to prove self-contained DLL resolution
+          $savedPath = $env:PATH
+          $savedGstRoot = $env:GSTREAMER_1_0_ROOT_MSVC_X86_64
+          try {
+            $env:PATH = "$env:SystemRoot\System32;$env:SystemRoot"
+            Remove-Item Env:GSTREAMER_1_0_ROOT_MSVC_X86_64 -ErrorAction SilentlyContinue
+            & $cli.FullName --version
+            if ($LASTEXITCODE -ne 0) { throw "soundhop.exe --version failed with stripped PATH!" }
+          } finally {
+            $env:PATH = $savedPath
+            if ($null -ne $savedGstRoot) { $env:GSTREAMER_1_0_ROOT_MSVC_X86_64 = $savedGstRoot }
+          }
 
       - name: Upload Windows Artifacts
         uses: actions/upload-artifact@v4
@@ -206,6 +328,16 @@ jobs:
     steps:
       - uses: actions/checkout@v4
 
+      - name: Install Linux aarch64 GStreamer dependencies
+        run: |
+          for i in 1 2 3; do
+            sudo DEBIAN_FRONTEND=noninteractive NEEDRESTART_MODE=l apt-get update -qq && \
+            sudo DEBIAN_FRONTEND=noninteractive NEEDRESTART_MODE=l apt-get install -y --no-install-recommends \
+              pkg-config libgstreamer1.0-dev libgstreamer-plugins-base1.0-dev \
+              gstreamer1.0-plugins-base gstreamer1.0-plugins-good \
+              gstreamer1.0-plugins-bad gstreamer1.0-pulseaudio && break || sleep 3
+          done
+
       - name: Install Rust toolchain
         uses: dtolnay/rust-toolchain@stable
 
@@ -213,7 +345,7 @@ jobs:
         uses: Swatinem/rust-cache@v2
 
       - name: Build headless CLI binary (aarch64-unknown-linux-gnu)
-        run: cargo build --release -p soundhop-cli --no-default-features --bin soundhop --locked
+        run: cargo build --release -p soundhop-cli --no-default-features --features gstreamer --bin soundhop --locked
 
       - name: Smoke test & package headless tarball
         run: |
@@ -229,6 +361,23 @@ jobs:
           install -Dm644 README.md "dist/${PKG_DIR}/README.md"
           install -Dm644 LICENSE "dist/${PKG_DIR}/LICENSE"
           install -Dm644 CHANGELOG.md "dist/${PKG_DIR}/CHANGELOG.md"
+          cat << 'EOF' > "dist/${PKG_DIR}/README-HEADLESS.txt"
+          SoundHop Linux aarch64 Headless CLI
+          ===================================
+
+          Runtime Dependencies (Debian / Ubuntu / Raspberry Pi OS):
+            sudo apt-get update
+            sudo apt-get install -y \
+              libgstreamer1.0-0 \
+              gstreamer1.0-plugins-base \
+              gstreamer1.0-plugins-good \
+              gstreamer1.0-plugins-bad \
+              gstreamer1.0-pulseaudio \
+              pipewire-pulse
+
+          Verify runtime readiness:
+            ./soundhop doctor
+          EOF
           tar -C dist -czf "dist/${PKG_DIR}.tar.gz" "${PKG_DIR}"
           rm -rf "dist/${PKG_DIR}"
           ls -lh "dist/${PKG_DIR}.tar.gz"
