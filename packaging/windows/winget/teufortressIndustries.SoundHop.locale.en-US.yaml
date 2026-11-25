@@ -1,6 +1,6 @@
 # yaml-language-server: $schema=https://aka.ms/winget-manifest.defaultLocale.1.6.0.schema.json
 PackageIdentifier: teufortressIndustries.SoundHop
-PackageVersion: 2.6.2
+PackageVersion: 2.7.0
 PackageLocale: en-US
 Publisher: SoundHop Contributors
 PublisherUrl: https://github.com/teufortressIndustries/soundhop
@@ -23,6 +23,6 @@ Tags:
   - wasapi
   - pipewire
   - pulseaudio
-ReleaseNotesUrl: https://github.com/teufortressIndustries/soundhop/releases/tag/v2.6.2
+ReleaseNotesUrl: https://github.com/teufortressIndustries/soundhop/releases/tag/v2.7.0
 ManifestType: defaultLocale
 ManifestVersion: 1.6.0

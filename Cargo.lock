@@ -4138,7 +4138,7 @@ dependencies = [
 
 [[package]]
 name = "soundhop-cli"
-version = "2.6.2"
+version = "2.7.0"
 dependencies = [
  "clap",
  "clap_complete",
@@ -4159,7 +4159,7 @@ dependencies = [
 
 [[package]]
 name = "soundhop-core"
-version = "2.6.2"
+version = "2.7.0"
 dependencies = [
  "chacha20poly1305",
  "cpal",
@@ -4194,7 +4194,7 @@ dependencies = [
 
 [[package]]
 name = "soundhop-gui"
-version = "2.6.2"
+version = "2.7.0"
 dependencies = [
  "core-foundation",
  "eframe",

@@ -7,6 +7,17 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [2.7.0] - 2026-11-25
+
+### Changed
+- **GStreamer SRTP/Opus Audio Transport (Replaces SHT3)**: Replaced custom TCP-based SHT3 audio streaming (`opus2`/`mousiki`, `DriftController`, `AdaptiveResampler`, `parec`/`pacat` bridges) with a GStreamer 1.20+ pipeline (`srtpenc`/`srtpdec` `aes-128-icm` + `hmac-sha1-80`, `rtpjitterbuffer mode=slave`, `opusenc`/`opusdec` with in-band FEC and PLC, and `rtpL16pay`/`rtpL16depay` for `pcm-lossless`) paired with the authenticated v4 `X25519` + `K_pair` TCP control channel.
+- **Preferences Overhaul**: Reorganized `soundhop-gui` Preferences into 4 sub-tabs (`General`, `Audio & Sync`, `Privacy & Devices`, `Network & Health`) with live GStreamer runtime status, GStreamer-tuned jitter buffer controls (`20 / 40 / 80 / 150 ms`), full 5-port configuration (`4714/tcp`, `4715/tcp`, `4716/udp`, `47777/udp`, `4713/tcp`), and live transport telemetry.
+- **Packaging & CI**: Added GStreamer dependencies and runtime plugin bundling across GitHub Actions CI, AnyLinux AppImage, `PKGBUILD`, `soundhop.spec`, Flatpak, and Windows Inno Setup / portable ZIP builds.
+
+### Added
+- **UDP SRTP Media Port & Multi-Port Firewall**: Added `sharing.rtp_port` (`4716/udp`), `gst-srtp` capability advertisement in discovery metadata (`discover_once_with_meta`), and multi-port TCP/UDP firewall rule management across UFW, firewalld, nftables, and Windows Defender.
+- **Headless `netsim` Verification**: Added deterministic `audiotestsrc` -> `netsim` -> `appsink` regression tests covering packet drops, jitter spikes, reordering, live volume/mute, telemetry, and SRTP key zeroization.
+
 ## [2.6.0] - 2026-11-25
 
 ### Added

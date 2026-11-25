@@ -1,11 +1,11 @@
 {
-    "version": "2.6.2",
+    "version": "2.7.0",
     "description": "Seamless cross-platform local network audio sharing, multi-room broadcast, and Android bridge",
     "homepage": "https://github.com/teufortressIndustries/soundhop",
     "license": "MIT",
     "architecture": {
         "64bit": {
-            "url": "https://github.com/teufortressIndustries/soundhop/releases/download/v2.6.2/SoundHop-2.6.2-windows-x86_64-portable.zip",
+            "url": "https://github.com/teufortressIndustries/soundhop/releases/download/v2.7.0/SoundHop-2.7.0-windows-x86_64-portable.zip",
             "hash": "REPLACE_WITH_RELEASE_SHA256"
         }
     },
