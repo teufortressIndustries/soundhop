@@ -606,10 +606,12 @@ fn start_broadcaster_pipeline(
     let tee = make_element("tee", Some("fanout"))?;
     tee.set_property("allow-not-linked", true);
 
-    // Opus branch: leaky queue -> opusenc (20ms) -> appsink
+    // Opus branch: leaky queue -> opusenc (20ms) -> appsink.
+    // A deeper queue absorbs short CPU spikes without dropping encoded frames;
+    // each dropped frame would otherwise force a gap in the RTP timeline.
     let opus_queue = make_element("queue", Some("opus_queue"))?;
     opus_queue.set_property_from_str("leaky", "downstream");
-    opus_queue.set_property("max-size-buffers", 4u32);
+    opus_queue.set_property("max-size-buffers", 16u32);
     opus_queue.set_property("max-size-bytes", 0u32);
     opus_queue.set_property("max-size-time", 0u64);
 
@@ -617,7 +619,9 @@ fn start_broadcaster_pipeline(
     opusenc.set_property_from_str("audio-type", "generic");
     opusenc.set_property_from_str("bandwidth", "fullband");
     opusenc.set_property_from_str("bitrate-type", "constrained-vbr");
-    opusenc.set_property("complexity", 10i32);
+    // Complexity 8 is close to max quality but notably cheaper, reducing the
+    // chance of encoder overruns that starve the downstream appsink.
+    opusenc.set_property("complexity", 8i32);
     opusenc.set_property("dtx", false);
     opusenc.set_property("inband-fec", true);
     opusenc.set_property("packet-loss-percentage", 10i32);

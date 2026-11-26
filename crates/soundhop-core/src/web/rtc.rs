@@ -96,7 +96,13 @@ struct PeerRtc {
     connected_at: Option<Instant>,
     handshake_deadline: Instant,
     next_timeout: Instant,
-    sample_idx: u64,
+    /// Offset added to `BroadcastFrame::pts_samples` to produce RTP timestamps.
+    /// Kept monotonic across pipeline restarts so the browser sees a forward jump.
+    sample_offset: u64,
+    /// Last source audio sample position observed from the broadcast pipeline.
+    last_frame_pts: Option<u64>,
+    /// Set when a write fails so the next frame carries an RTP marker bit.
+    force_discontinuity: bool,
     remote_addr: String,
     user_agent: String,
     connected_since: f64,
@@ -295,7 +301,9 @@ impl RtcMuxHandle {
             connected_at: None,
             handshake_deadline: now + DEFAULT_HANDSHAKE_TIMEOUT,
             next_timeout,
-            sample_idx: 0,
+            sample_offset: 0,
+            last_frame_pts: None,
+            force_discontinuity: false,
             remote_addr: req.remote_addr.to_string(),
             user_agent: label,
             connected_since: now_secs(),
@@ -594,16 +602,31 @@ impl MuxState {
                 continue;
             };
 
-            let rtp_time = MediaTime::new(peer.sample_idx, Frequency::FORTY_EIGHT_KHZ);
-            peer.sample_idx = peer
-                .sample_idx
-                .saturating_add(u64::from(frame.duration_samples));
+            // Derive the RTP timestamp from the source audio timeline rather than
+            // from a per-delivery counter. This keeps playback rate correct even
+            // when upstream frames are dropped by the leaky queues or subscriber
+            // channel (a delivery counter would make RTP time advance slower than
+            // wall clock, causing browser playout-rate adaptation / time stretching).
+            let (rtp_samples, discontinuity) = next_rtp_timestamp(
+                &mut peer.sample_offset,
+                &mut peer.last_frame_pts,
+                peer.force_discontinuity,
+                frame,
+            );
+            peer.force_discontinuity = false;
 
+            let rtp_time = MediaTime::new(rtp_samples, Frequency::FORTY_EIGHT_KHZ);
+
+            // The RTP marker bit tells the browser this is a discontinuity /
+            // start of a new talkspurt, so it resets concealment instead of
+            // trying to splice across a gap.
+            let writer = writer.start_of_talkspurt(discontinuity);
             if writer
                 .write(pt, frame.captured_at, rtp_time, Arc::clone(&frame.data))
                 .is_err()
             {
                 peer.dropped_frames = peer.dropped_frames.saturating_add(1);
+                peer.force_discontinuity = true;
             }
 
             let keep_alive = drain_peer_output(peer, &self.udp_socket);
@@ -793,6 +816,40 @@ impl MuxState {
         self.ufrag_to_peer.clear();
         self.sync_snapshot();
     }
+}
+
+/// Compute the next RTP timestamp (in 48 kHz samples) and whether the frame
+/// should carry the RTP marker bit to signal a timeline discontinuity.
+///
+/// RTP time follows `BroadcastFrame::pts_samples` — the real position of the
+/// audio in the source timeline — so dropped or skipped frames leave visible
+/// gaps instead of compressing the RTP timeline (which would make browsers
+/// adapt playback rate and produce audible time stretching).
+fn next_rtp_timestamp(
+    sample_offset: &mut u64,
+    last_frame_pts: &mut Option<u64>,
+    force_discontinuity: bool,
+    frame: &BroadcastFrame,
+) -> (u64, bool) {
+    let pts = frame.pts_samples;
+    let mut discontinuity = force_discontinuity;
+
+    if let Some(last_pts) = *last_frame_pts {
+        if pts < last_pts {
+            // Pipeline restart: `pts_samples` reset to zero. Advance the offset
+            // past the old timeline so RTP timestamps stay monotonic.
+            *sample_offset = sample_offset
+                .saturating_add(last_pts)
+                .saturating_add(u64::from(frame.duration_samples));
+            discontinuity = true;
+        } else if pts != last_pts.saturating_add(u64::from(frame.duration_samples)) {
+            // Gap in the source timeline (upstream drop or write failure).
+            discontinuity = true;
+        }
+    }
+    *last_frame_pts = Some(pts);
+
+    (sample_offset.saturating_add(pts), discontinuity)
 }
 
 fn build_local_candidates(bind_ip: IpAddr, udp_port: u16) -> Vec<Candidate> {
@@ -1054,6 +1111,103 @@ mod tests {
                 label: "test-sine-440".into(),
             })
         })
+    }
+
+    fn make_broadcast_frame(pts_samples: u64) -> BroadcastFrame {
+        BroadcastFrame {
+            seq: 0,
+            pts_samples,
+            duration_samples: 960,
+            captured_at: Instant::now(),
+            data: Arc::from(Vec::<u8>::new()),
+        }
+    }
+
+    #[test]
+    fn rtp_timestamps_follow_source_pts_without_drift() {
+        let mut offset = 0;
+        let mut last_pts = None;
+        let frames: Vec<_> = [0, 960, 1920]
+            .into_iter()
+            .map(make_broadcast_frame)
+            .collect();
+
+        assert_eq!(
+            next_rtp_timestamp(&mut offset, &mut last_pts, false, &frames[0]),
+            (0, false)
+        );
+        assert_eq!(
+            next_rtp_timestamp(&mut offset, &mut last_pts, false, &frames[1]),
+            (960, false)
+        );
+        assert_eq!(
+            next_rtp_timestamp(&mut offset, &mut last_pts, false, &frames[2]),
+            (1920, false)
+        );
+    }
+
+    #[test]
+    fn rtp_timestamps_preserve_gaps_and_mark_discontinuity() {
+        let mut offset = 0;
+        let mut last_pts = None;
+        let frame0 = make_broadcast_frame(0);
+        // Frame at pts 960 was dropped; RTP time must jump to 1920 and flag it.
+        let frame2 = make_broadcast_frame(1920);
+
+        assert_eq!(
+            next_rtp_timestamp(&mut offset, &mut last_pts, false, &frame0),
+            (0, false)
+        );
+        assert_eq!(
+            next_rtp_timestamp(&mut offset, &mut last_pts, false, &frame2),
+            (1920, true)
+        );
+    }
+
+    #[test]
+    fn rtp_timestamps_stay_monotonic_across_pipeline_restart() {
+        let mut offset = 0;
+        let mut last_pts = None;
+        let old_frame = make_broadcast_frame(48_000);
+        let restarted_frame = make_broadcast_frame(0);
+
+        let (old_rtp, _) = next_rtp_timestamp(&mut offset, &mut last_pts, false, &old_frame);
+        assert_eq!(old_rtp, 48_000);
+
+        let (new_rtp, discontinuity) =
+            next_rtp_timestamp(&mut offset, &mut last_pts, false, &restarted_frame);
+        assert!(
+            new_rtp > old_rtp,
+            "restart must not move RTP time backwards"
+        );
+        assert!(discontinuity);
+        assert_eq!(new_rtp, 48_960);
+
+        // Following frame continues from the new timeline normally.
+        let next_frame = make_broadcast_frame(960);
+        assert_eq!(
+            next_rtp_timestamp(&mut offset, &mut last_pts, false, &next_frame),
+            (49_920, false)
+        );
+    }
+
+    #[test]
+    fn rtp_timestamps_propagate_forced_discontinuity_from_write_failure() {
+        let mut offset = 0;
+        let mut last_pts = None;
+        let frame0 = make_broadcast_frame(0);
+        let frame1 = make_broadcast_frame(960);
+
+        assert_eq!(
+            next_rtp_timestamp(&mut offset, &mut last_pts, false, &frame0),
+            (0, false)
+        );
+        // Simulate a failed write: next frame carries the marker bit even
+        // though its source timeline is contiguous.
+        assert_eq!(
+            next_rtp_timestamp(&mut offset, &mut last_pts, true, &frame1),
+            (960, true)
+        );
     }
 
     fn build_stun_binding_request(username: &str) -> Vec<u8> {

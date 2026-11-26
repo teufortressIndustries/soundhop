@@ -694,9 +694,8 @@
             this.writeIdx = 0;
             this.count = 0;
             this.targetFrames = 2880;   // 60 ms
-            this.driftHighFrames = 6720; // 140 ms
             this.hardMaxFrames = 7680;  // 160 ms
-            this.fadeFrames = 240;      // 5 ms
+            this.fadeFrames = 480;      // 10 ms — smoother fades on trim/underrun
             this.priming = true;
             this.fadeInRemaining = 0;
             this.fadeOutRemaining = 0;
@@ -814,9 +813,10 @@
               }
             }
 
-            const baseRatio = 48000 / sampleRate;
-            const driftFactor = this.count > this.driftHighFrames ? 1.005 : 1.0;
-            const step = baseRatio * driftFactor;
+            // Play at the exact audio clock rate. The previous 0.5% speed-up
+            // above the drift threshold caused audible time stretching / pitch
+            // shifts on buffer growth; the hard trim below handles overflow.
+            const step = 48000 / sampleRate;
 
             for (let i = 0; i < quantum; i++) {
               if (this.count < 2) {
