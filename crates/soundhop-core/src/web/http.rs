@@ -1327,6 +1327,15 @@ mod tests {
     }
 
     #[test]
+    fn root_html_offers_native_camera_capture_fallback() {
+        // getUserMedia is blocked on plain-HTTP LAN origins, so the scanner must
+        // also offer the native camera app via a capture file input.
+        assert!(WEB_PLAYER_HTML.contains("id=\"scannerCapture\""));
+        assert!(WEB_PLAYER_HTML.contains("capture=\"environment\""));
+        assert!(WEB_PLAYER_HTML.contains("handleScannerFile(els.scannerCapture)"));
+    }
+
+    #[test]
     fn get_jsqr_asset_is_served_without_auth() {
         let (mgr, port, _) = start_test_manager(true);
         let req = format!("GET /jsqr.js HTTP/1.1\r\nHost: 127.0.0.1:{port}\r\n\r\n");

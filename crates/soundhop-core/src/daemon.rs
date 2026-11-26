@@ -389,9 +389,32 @@ impl Daemon {
         if !needs_rebind {
             return;
         }
-        let prev_serials = self.controller.web_broadcast_status().adb_reversed_serials;
+        // `Config::apply_patch()` normalizes zero ports back to defaults. Treat that
+        // normalization as "no explicit port change" so token/keep-local/max-client
+        // patches keep the session on its original (possibly ephemeral) ports.
+        let web_port_changed = if old_cfg.web_port == 0 {
+            new_cfg.web_port != crate::constants::DEFAULT_WEB_PORT
+        } else {
+            old_cfg.web_port != new_cfg.web_port
+        };
+        let rtc_port_changed = if old_cfg.webrtc_port == 0 {
+            new_cfg.webrtc_port != crate::constants::DEFAULT_WEBRTC_PORT
+        } else {
+            old_cfg.webrtc_port != new_cfg.webrtc_port
+        };
+
+        let prev_status = self.controller.web_broadcast_status();
+        let prev_serials = prev_status.adb_reversed_serials.clone();
         let _ = self.controller.stop_web_broadcast();
-        match self.controller.start_web_broadcast(None, None, None) {
+        let restarted = if web_port_changed || rtc_port_changed {
+            self.controller.start_web_broadcast(None, None, None)
+        } else {
+            self.controller.restart_web_broadcast_preserving_ports(
+                prev_status.http_port,
+                prev_status.webrtc_udp_port,
+            )
+        };
+        match restarted {
             Ok(st) => {
                 for serial in prev_serials {
                     let _ = self.controller.web_adb_reverse(
@@ -1821,6 +1844,11 @@ impl Daemon {
                     .get("port")
                     .and_then(|v| v.as_u64())
                     .and_then(|p| u16::try_from(p).ok());
+                let webrtc_port = req
+                    .get("webrtc_port")
+                    .and_then(|v| v.as_u64())
+                    .and_then(|p| u16::try_from(p).ok())
+                    .or_else(|| (port == Some(0)).then_some(0));
                 let keep_local = req.get("keep_local").and_then(|v| v.as_bool());
                 let require_token = req.get("require_token").and_then(|v| v.as_bool());
                 let adb_reverse_opt = req.get("adb_reverse").and_then(|v| v.as_bool());
@@ -1834,10 +1862,12 @@ impl Daemon {
                     .and_then(|v| v.as_bool())
                     .unwrap_or(false);
 
-                match self
-                    .controller
-                    .start_web_broadcast(port, keep_local, require_token)
-                {
+                match self.controller.start_web_broadcast_with_ports(
+                    port,
+                    webrtc_port,
+                    keep_local,
+                    require_token,
+                ) {
                     Ok(mut status) => {
                         if adb_reverse_opt == Some(true) {
                             match self.controller.web_adb_reverse(

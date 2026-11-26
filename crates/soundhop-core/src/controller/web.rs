@@ -27,12 +27,37 @@ impl Controller {
         require_token: Option<bool>,
     ) -> Result<WebBroadcastStatus, ControllerError> {
         let _op_guard = lock_or_recover(&self.connect_lock);
-        self.start_web_broadcast_internal(port, keep_local, require_token)
+        self.start_web_broadcast_internal(port, None, keep_local, require_token)
+    }
+
+    /// Start with explicit bind ports. `port: 0` and `webrtc_port: 0` request
+    /// ephemeral ports for the corresponding listener.
+    pub(crate) fn start_web_broadcast_with_ports(
+        &self,
+        port: Option<u16>,
+        webrtc_port: Option<u16>,
+        keep_local: Option<bool>,
+        require_token: Option<bool>,
+    ) -> Result<WebBroadcastStatus, ControllerError> {
+        let _op_guard = lock_or_recover(&self.connect_lock);
+        self.start_web_broadcast_internal(port, webrtc_port, keep_local, require_token)
+    }
+
+    /// Restart after a config change while keeping the ports that were actually
+    /// bound before the restart. Config patches may normalize zero ports back to
+    /// defaults, but an ephemeral session must not suddenly move to `4717/4718`.
+    pub(crate) fn restart_web_broadcast_preserving_ports(
+        &self,
+        http_port: u16,
+        webrtc_udp_port: u16,
+    ) -> Result<WebBroadcastStatus, ControllerError> {
+        self.start_web_broadcast_with_ports(Some(http_port), Some(webrtc_udp_port), None, None)
     }
 
     pub(super) fn start_web_broadcast_internal(
         &self,
         port: Option<u16>,
+        webrtc_port: Option<u16>,
         keep_local: Option<bool>,
         require_token: Option<bool>,
     ) -> Result<WebBroadcastStatus, ControllerError> {
@@ -60,6 +85,9 @@ impl Controller {
         let mut web_cfg = WebBroadcastConfig::from_app_config(&cfg, audio_params, "");
         if let Some(p) = port {
             web_cfg.http_port = p;
+        }
+        if let Some(p) = webrtc_port {
+            web_cfg.webrtc_udp_port = p;
         }
         web_cfg.keep_local = eff_keep_local;
         web_cfg.require_token = eff_require_token;

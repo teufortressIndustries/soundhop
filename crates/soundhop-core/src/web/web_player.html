@@ -792,12 +792,13 @@
   <div id="scannerOverlay" class="scanner-overlay" hidden>
     <div class="scanner-dialog" role="dialog" aria-modal="true" aria-label="Scan SoundHop QR code">
       <div class="scanner-title">Scan SoundHop QR</div>
-      <div class="scanner-desc">Point the camera at the QR code on your PC, or choose a saved QR image. Only the token is used — the scanned link is never opened.</div>
+      <div class="scanner-desc">Point the camera at the QR code on your PC. If live camera access is unavailable, take a photo or choose a saved QR image. Only the token is used — the scanned link is never opened.</div>
       <div id="scannerView" class="scanner-view">
         <video id="scannerVideo" playsinline muted></video>
         <div id="scannerStatus" class="scanner-status">Starting camera…</div>
       </div>
       <div class="scanner-actions">
+        <label class="btn-secondary">Take photo<input id="scannerCapture" type="file" accept="image/*" capture="environment" hidden></label>
         <label class="btn-secondary">Choose image<input id="scannerFile" type="file" accept="image/*" hidden></label>
         <button id="scannerCancel" class="btn-secondary" type="button">Cancel</button>
       </div>
@@ -1057,6 +1058,7 @@
         scannerOverlay: document.getElementById("scannerOverlay"),
         scannerView: document.getElementById("scannerView"),
         scannerVideo: document.getElementById("scannerVideo"),
+        scannerCapture: document.getElementById("scannerCapture"),
         scannerFile: document.getElementById("scannerFile"),
         scannerStatus: document.getElementById("scannerStatus"),
         scannerError: document.getElementById("scannerError"),
@@ -1328,6 +1330,7 @@
         stopScannerStream();
         els.scannerOverlay.hidden = true;
         els.scannerFile.value = "";
+        els.scannerCapture.value = "";
       }
 
       function scannerTick() {
@@ -1361,7 +1364,9 @@
         }
         if (!navigator.mediaDevices || !navigator.mediaDevices.getUserMedia) {
           els.scannerView.classList.add("no-camera");
-          els.scannerStatus.textContent = "Camera API unavailable — choose a QR image";
+          els.scannerStatus.textContent = window.isSecureContext
+            ? "Camera API unavailable — take a photo or choose a QR image"
+            : "Live camera needs HTTPS or localhost — take a photo or choose a QR image";
           return;
         }
         try {
@@ -1379,8 +1384,9 @@
           scannerTick();
         } catch (err) {
           const name = err && err.name ? err.name : "error";
+          const reason = name === "NotAllowedError" ? "Camera permission denied" : "Camera unavailable (" + name + ")";
           els.scannerView.classList.add("no-camera");
-          els.scannerStatus.textContent = "Camera unavailable (" + name + ") — choose a QR image";
+          els.scannerStatus.textContent = reason + " — take a photo or choose a QR image";
         }
       }
 
@@ -1410,10 +1416,14 @@
       document.addEventListener("keydown", (event) => {
         if (scannerOpen && event.key === "Escape") closeQrScanner();
       });
-      els.scannerFile.addEventListener("change", async () => {
-        const file = els.scannerFile.files && els.scannerFile.files[0];
+      async function handleScannerFile(input) {
+        const file = input.files && input.files[0];
         if (!file) return;
+        // Allow retrying the same photo/image after a decode failure.
+        input.value = "";
         els.scannerStatus.textContent = "Decoding image…";
+        els.scannerError.textContent = "";
+        els.scannerError.classList.remove("visible");
         try {
           const image = await loadImageFile(file);
           const token = await decodeImageForToken(image);
@@ -1421,7 +1431,7 @@
           if (!token) {
             els.scannerError.textContent = "No SoundHop QR token found in that image.";
             els.scannerError.classList.add("visible");
-            els.scannerStatus.textContent = "Choose another QR image or cancel";
+            els.scannerStatus.textContent = "Try another photo/image or cancel";
             return;
           }
           closeQrScanner();
@@ -1431,6 +1441,13 @@
             "Could not read that image: " + (err && err.message ? err.message : "error");
           els.scannerError.classList.add("visible");
         }
+      }
+
+      els.scannerCapture.addEventListener("change", () => {
+        void handleScannerFile(els.scannerCapture);
+      });
+      els.scannerFile.addEventListener("change", () => {
+        void handleScannerFile(els.scannerFile);
       });
 
       function updateVolumeUI() {

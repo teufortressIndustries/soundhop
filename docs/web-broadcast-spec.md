@@ -446,7 +446,7 @@ Because all browser peers share `0.0.0.0:<webrtc_udp_port>`:
 - **SPA extraction & forwarding**:
   - On load, JS extracts `#t=` (also accepting `#token=` as a lenient alias) from `window.location.hash`, stores it in memory, and immediately strips the hash via `history.replaceState(null, "", location.pathname + location.search)`.
   - If no token is present and `/api/info` returns `authRequired: true`, the SPA shows a manual token prompt box with a **Scan QR** button.
-  - **QR re-pairing**: The header scan button (and the auth-panel button) opens a scanner overlay. Live camera preview uses `getUserMedia` where available; a `BarcodeDetector` and the vendored jsQR decoder (`GET /jsqr.js`) decode camera frames or a user-selected image file. Only a 32-hex lowercase token, or a same-scheme/same-port URL with `#t=`/`#token=` carrying one, is accepted — the scanned URL is never navigated to. Applying a scanned token re-validates it via `/api/info`; if the device had been listening or kicked, playback resumes automatically. This is the recovery path after a host token rotation or a host-initiated kick.
+  - **QR re-pairing**: The header scan button (and the auth-panel button) opens a scanner overlay. Live camera preview uses `getUserMedia` where available. Browsers block that API on plain-HTTP LAN origins (it requires HTTPS or `localhost`), so the overlay also offers **Take photo** (`<input type="file" capture="environment">`, which opens the native camera app without `getUserMedia`) and **Choose image**; both decode locally with the vendored jsQR decoder (`GET /jsqr.js`), optionally assisted by `BarcodeDetector`. Only a 32-hex lowercase token, or a same-scheme/same-port URL with `#t=`/`#token=` carrying one, is accepted — the scanned URL is never navigated to. Applying a scanned token re-validates it via `/api/info`; if the device had been listening or kicked, playback resumes automatically. This is the recovery path after a host token rotation or a host-initiated kick.
   - All HTTP API requests (`GET /api/info`, `POST /webrtc/offer`, `DELETE /webrtc/peer/:id`) carry `Authorization: Bearer <token>`.
   - Browser `WebSocket` constructors cannot set custom `Authorization` headers; `/ws` authenticates via **`Sec-WebSocket-Protocol: soundhop.v1, auth.<token>`** (server echoes `Sec-WebSocket-Protocol: soundhop.v1`) OR, if `auth.<token>` subprotocol is absent, awaits a single JSON text frame `{"type":"auth","token":"<token>"}` within `2 s` before sending audio frames. If the `2 s` deadline expires, a non-auth frame arrives first, or the token is invalid, the server sends a WebSocket Close frame (`1008` Policy Violation) and closes the socket. A **host-initiated kick** instead uses close code `4003` (reason `kicked by host`), which the SPA treats as terminal.
   - All token comparisons use `crate::security::constant_time_eq` (`crates/soundhop-core/src/security.rs:59`).
@@ -602,7 +602,7 @@ Add `Daemon::handle_ipc()` (`daemon.rs:1061`) match arms (canonical `web_*` name
 
 | IPC `"cmd"` | Request Fields | Response Payload |
 | :--- | :--- | :--- |
-| `"web_start"` / `"broadcast_start"` | `{ port?: u16, keep_local?: bool, require_token?: bool, adb_reverse?: bool, serial?: String, open_browser?: bool }` | `{ ok: true, web_broadcast: WebBroadcastStatus }` |
+| `"web_start"` / `"broadcast_start"` | `{ port?: u16, webrtc_port?: u16, keep_local?: bool, require_token?: bool, adb_reverse?: bool, serial?: String, open_browser?: bool }` (`port: 0` also requests an ephemeral WebRTC UDP port unless `webrtc_port` is given) | `{ ok: true, web_broadcast: WebBroadcastStatus }` |
 | `"web_stop"` / `"broadcast_stop"` | `{}` (removes any tracked `adb reverse` tunnels and stops server + pipeline) | `{ ok: true, web_broadcast: WebBroadcastStatus }` |
 | `"web_status"` / `"broadcast_status"` | `{}` | `{ ok: true, web_broadcast: WebBroadcastStatus }` |
 | `"web_rotate_token"` | `{}` | `{ ok: true, token: Option<String>, urls: Vec<String>, web_broadcast: WebBroadcastStatus }` |
@@ -612,7 +612,7 @@ Add `Daemon::handle_ipc()` (`daemon.rs:1061`) match arms (canonical `web_*` name
 Additional daemon hooks:
 - `Daemon::startup()` / `setup_sharing()`: If `cfg.sharing.web_enabled == true`, auto-start Web Broadcast; also clean up any leftover `state.web_adb_reverse_serials` from an unclean prior shutdown if `web_enabled == false`.
 - `Daemon::shutdown()` (`daemon.rs:261-299`): Remove active `adb reverse` tunnels and call `self.controller.stop_web_broadcast()`.
-- `Daemon::handle_ipc()` `"config_patch"` / `"reload"` (`daemon.rs:1514-1536`): Restart/rebind `web_broadcast` if `sharing.web_port`, `sharing.webrtc_port`, or `sharing.web_require_token` changed while active.
+- `Daemon::handle_ipc()` `"config_patch"` / `"reload"` (`daemon.rs:1514-1536`): Restart/rebind `web_broadcast` if `sharing.web_port`, `sharing.webrtc_port`, or `sharing.web_require_token` changed while active. Non-port changes (for example toggling `web_require_token`) preserve the ports that were actually bound before the restart, so an ephemeral `0`-port session does not jump to the defaults or drop existing QR URLs.
 - `Daemon::run_android_supervisor_tick()` (`daemon.rs:562`): Prune `web_adb_reverse_serials` if a tracked USB serial disappears from `list_devices()`.
 
 ### 7.3 `AndroidManager` `adb reverse` (Decoupled from `scrcpy`)
