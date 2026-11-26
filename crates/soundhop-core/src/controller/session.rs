@@ -903,7 +903,12 @@ impl Controller {
             let _ = self.android_session.stop();
         }
         let st_snapshot = lock_or_recover(&self.state).clone();
-        if st_snapshot.connected_peer == "web-broadcast" && self.web_broadcast.is_active() {
+        // Web Broadcast owns the connection state on Linux, but on Windows (and while
+        // coexisting with a peer session) it may leave `connected_peer` untouched. Treat
+        // any active broadcast without a real peer session as a no-op disconnect.
+        let web_broadcast_only = self.web_broadcast.is_active()
+            && (st_snapshot.connected_peer == "web-broadcast" || !st_snapshot.is_connected());
+        if web_broadcast_only {
             return Ok(serde_json::json!({
                 "disconnected": false,
                 "peer": st_snapshot.connected_name,
