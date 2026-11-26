@@ -96,9 +96,17 @@ pub(super) fn apply_optimistic_update(snap: &mut GuiSnapshot, cmd: &GuiCommand) 
             }
         }
         GuiCommand::SaveConfigPatch { patch, .. } => {
+            // Only mirror settings this patch actually touches. An unrelated config
+            // save must not overwrite the live broadcast state shown in the UI.
+            let keep_local_changed = patch
+                .get("sharing")
+                .and_then(|sharing| sharing.get("web_keep_local"))
+                .is_some();
             let _ = snap.config.apply_patch(patch);
             snap.audio_profile = snap.config.audio.profile.clone();
-            snap.web_keep_local = snap.config.sharing.web_keep_local;
+            if keep_local_changed {
+                snap.web_keep_local = snap.config.sharing.web_keep_local;
+            }
         }
         GuiCommand::ApplyPairingPin { pin } => {
             if pin.trim().len() >= 6 {
@@ -263,6 +271,19 @@ mod tests {
         });
         assert_eq!(gui_backend.read().config.ui.theme, "light");
         assert_eq!(gui_backend.read().audio_profile, "opus-low-latency");
+
+        gui_backend.send(GuiCommand::SaveConfigPatch {
+            patch: serde_json::json!({ "ui": { "theme": "dark" } }),
+            toast: None,
+        });
+        // An unrelated patch must not overwrite live Web Broadcast state.
+        assert!(gui_backend.read().web_keep_local);
+
+        gui_backend.send(GuiCommand::SaveConfigPatch {
+            patch: serde_json::json!({ "sharing": { "web_keep_local": false } }),
+            toast: None,
+        });
+        assert!(!gui_backend.read().web_keep_local);
 
         gui_backend.send(GuiCommand::RefreshPeers);
         assert!(gui_backend.read().refreshing_peers);

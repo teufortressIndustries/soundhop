@@ -320,6 +320,122 @@
       display: block;
     }
 
+    .header-actions {
+      display: flex;
+      align-items: center;
+      gap: 8px;
+      flex-shrink: 0;
+    }
+
+    .icon-btn {
+      width: 34px;
+      height: 34px;
+      display: inline-flex;
+      align-items: center;
+      justify-content: center;
+      background: var(--surface-hover);
+      border: 1px solid var(--card-border);
+      border-radius: 10px;
+      color: var(--text);
+      cursor: pointer;
+    }
+
+    .icon-btn:active {
+      transform: scale(0.96);
+    }
+
+    .auth-scan-row {
+      justify-content: flex-start;
+    }
+
+    .auth-scan-row .btn-secondary {
+      width: 100%;
+    }
+
+    .scanner-overlay {
+      position: fixed;
+      inset: 0;
+      z-index: 50;
+      display: flex;
+      align-items: center;
+      justify-content: center;
+      padding: 20px;
+      background: rgba(3, 6, 12, 0.82);
+    }
+
+    .scanner-overlay[hidden] {
+      display: none;
+    }
+
+    .scanner-dialog {
+      width: min(420px, 100%);
+      display: flex;
+      flex-direction: column;
+      gap: 12px;
+      background: var(--card-bg);
+      border: 1px solid var(--card-border);
+      border-radius: var(--radius);
+      padding: 18px;
+    }
+
+    .scanner-title {
+      font-size: 1rem;
+      font-weight: 700;
+      color: var(--text);
+    }
+
+    .scanner-desc {
+      font-size: 0.8rem;
+      color: var(--text-muted);
+    }
+
+    .scanner-view {
+      position: relative;
+      width: 100%;
+      aspect-ratio: 4 / 3;
+      overflow: hidden;
+      border-radius: var(--radius-sm);
+      background: #05080e;
+      border: 1px solid var(--card-border);
+    }
+
+    #scannerVideo {
+      width: 100%;
+      height: 100%;
+      object-fit: cover;
+    }
+
+    .scanner-status {
+      position: absolute;
+      left: 10px;
+      right: 10px;
+      bottom: 10px;
+      padding: 8px 10px;
+      border-radius: 8px;
+      background: rgba(3, 6, 12, 0.78);
+      color: var(--text);
+      font-size: 0.78rem;
+      text-align: center;
+    }
+
+    .scanner-view.no-camera .scanner-status {
+      top: 10px;
+      bottom: 10px;
+      display: flex;
+      align-items: center;
+      justify-content: center;
+    }
+
+    .scanner-actions {
+      display: flex;
+      gap: 8px;
+    }
+
+    .scanner-actions > * {
+      flex: 1;
+      text-align: center;
+    }
+
     .listen-btn {
       width: 100%;
       min-height: 60px;
@@ -576,9 +692,17 @@
             <div class="brand-sub">Web Broadcast Listener</div>
           </div>
         </div>
-        <div id="transportBadge" class="pill" role="status" aria-live="polite">
-          <span class="pill-dot"></span>
-          <span id="transportBadgeText">Standby</span>
+        <div class="header-actions">
+          <button id="scanQrBtn" class="icon-btn" type="button" aria-label="Scan QR token" title="Scan QR token">
+            <svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
+              <path d="M4 4h6v6H4zM14 4h6v6h-6zM4 14h6v6H4z"/>
+              <path d="M14 14h2v2h-2zM18 14h2v2h-2zM14 18h2v2h-2zM18 18h2v2h-2z"/>
+            </svg>
+          </button>
+          <div id="transportBadge" class="pill" role="status" aria-live="polite">
+            <span class="pill-dot"></span>
+            <span id="transportBadgeText">Standby</span>
+          </div>
         </div>
       </header>
 
@@ -596,6 +720,9 @@
         <div class="auth-row">
           <input id="tokenInput" class="input" type="password" inputmode="text" spellcheck="false" autocomplete="off" placeholder="Paste token…" aria-label="Session token">
           <button id="tokenSubmitBtn" class="btn-secondary" type="submit">Unlock</button>
+        </div>
+        <div class="auth-row auth-scan-row">
+          <button id="authScanBtn" class="btn-secondary" type="button">Scan QR code</button>
         </div>
         <div id="authError" class="auth-error"></div>
       </form>
@@ -662,8 +789,25 @@
     <div id="statusLine" class="status-line" role="status" aria-live="polite"></div>
   </main>
 
+  <div id="scannerOverlay" class="scanner-overlay" hidden>
+    <div class="scanner-dialog" role="dialog" aria-modal="true" aria-label="Scan SoundHop QR code">
+      <div class="scanner-title">Scan SoundHop QR</div>
+      <div class="scanner-desc">Point the camera at the QR code on your PC, or choose a saved QR image. Only the token is used — the scanned link is never opened.</div>
+      <div id="scannerView" class="scanner-view">
+        <video id="scannerVideo" playsinline muted></video>
+        <div id="scannerStatus" class="scanner-status">Starting camera…</div>
+      </div>
+      <div class="scanner-actions">
+        <label class="btn-secondary">Choose image<input id="scannerFile" type="file" accept="image/*" hidden></label>
+        <button id="scannerCancel" class="btn-secondary" type="button">Cancel</button>
+      </div>
+      <div id="scannerError" class="auth-error"></div>
+    </div>
+  </div>
+
   <audio id="playerAudio" class="sr-audio" playsinline></audio>
 
+  <script src="/jsqr.js"></script>
   <script>
     (() => {
       "use strict";
@@ -682,6 +826,11 @@
       const WEBRTC_FALLBACK_MS = 3000;
       const BACKOFF_STEPS_MS = [500, 1000, 2000, 5000];
       const PING_INTERVAL_MS = 2000;
+      // Terminal host-initiated disconnect codes / signals. The browser must not
+      // reconnect after any of these, otherwise the Kick button is ineffective.
+      const WS_KICK_CODE = 4003;
+      const WEBRTC_CONTROL_CHANNEL = "sh-control";
+      const SESSION_TOKEN_RE = /^[0-9a-f]{32}$/i;
 
       // Inline AudioWorkletProcessor used when window.isSecureContext is true (e.g. http://localhost via adb reverse).
       const WORKLET_JS = `
@@ -903,6 +1052,15 @@
         tokenInput: document.getElementById("tokenInput"),
         tokenSubmitBtn: document.getElementById("tokenSubmitBtn"),
         authError: document.getElementById("authError"),
+        authScanBtn: document.getElementById("authScanBtn"),
+        scanQrBtn: document.getElementById("scanQrBtn"),
+        scannerOverlay: document.getElementById("scannerOverlay"),
+        scannerView: document.getElementById("scannerView"),
+        scannerVideo: document.getElementById("scannerVideo"),
+        scannerFile: document.getElementById("scannerFile"),
+        scannerStatus: document.getElementById("scannerStatus"),
+        scannerError: document.getElementById("scannerError"),
+        scannerCancel: document.getElementById("scannerCancel"),
         listenBtn: document.getElementById("listenBtn"),
         listenIcon: document.getElementById("listenIcon"),
         listenBtnLabel: document.getElementById("listenBtnLabel"),
@@ -923,6 +1081,7 @@
       let authToken = extractAndStripToken();
       let serverInfo = null;
       let shouldListen = false;
+      let kickedByHost = false;
       let sessionSeq = 0;
       let transportPref = loadPref("soundhop_transport", "auto") === "ws" ? "ws" : "auto";
       let directOutput = loadPref("soundhop_direct_output", "0") === "1";
@@ -939,6 +1098,7 @@
 
       let activePc = null;
       let activePeerId = null;
+      let activeControlChannel = null;
       let activeOfferAbort = null;
       let webrtcFallbackTimer = null;
       let webrtcDisconnectTimer = null;
@@ -952,6 +1112,10 @@
       let reconnectAttempt = 0;
       let reconnectTimer = null;
       let isWaitingReconnect = false;
+
+      let scannerOpen = false;
+      let scannerStream = null;
+      let scannerTimer = 0;
 
       function clampNumber(val, min, max, fallback) {
         return Number.isFinite(val) ? Math.min(max, Math.max(min, val)) : fallback;
@@ -1064,6 +1228,210 @@
         els.authError.textContent = "";
         els.authError.classList.remove("visible");
       }
+
+      // Accept only SoundHop QR payloads: the 32-hex token itself or a URL on
+      // the same scheme/port with the token in its fragment. Never navigate to
+      // the scanned URL — only the token is copied into this session.
+      function tokenFromQrText(text) {
+        const value = String(text || "").trim();
+        if (!value) return "";
+        if (SESSION_TOKEN_RE.test(value)) return value.toLowerCase();
+        let url;
+        try {
+          url = new URL(value);
+        } catch (_) {
+          return "";
+        }
+        if (url.protocol !== window.location.protocol || url.port !== window.location.port) return "";
+        if (url.username || url.password) return "";
+        const frag = url.hash && url.hash.startsWith("#") ? url.hash.slice(1) : "";
+        const params = new URLSearchParams(frag);
+        const tok = (params.get("t") || params.get("token") || "").trim();
+        return SESSION_TOKEN_RE.test(tok) ? tok.toLowerCase() : "";
+      }
+
+      async function applySessionToken(token, successLabel) {
+        if (!SESSION_TOKEN_RE.test(token || "")) {
+          setStatusLine("No valid SoundHop token found", true);
+          return false;
+        }
+        const resume = shouldListen || kickedByHost || els.authPanel.classList.contains("visible");
+        authToken = token.toLowerCase();
+        els.tokenInput.value = "";
+        // Applying a fresh token re-pairs this device after a host kick.
+        kickedByHost = false;
+        serverInfo = null;
+        const res = await fetchServerInfo();
+        if (!res.ok) {
+          if (res.authFailed) {
+            showAuthPrompt("Token rejected. Scan the current QR code or paste its token.");
+          } else {
+            setStatusLine("Host unreachable while checking token", true);
+          }
+          return false;
+        }
+        hideAuthPrompt();
+        setStatusLine(successLabel || "Token updated", false);
+        if (resume) startListening();
+        return true;
+      }
+
+      async function decodeImageForToken(source) {
+        const w = source.naturalWidth || source.videoWidth || source.width;
+        const h = source.naturalHeight || source.videoHeight || source.height;
+        if (!w || !h) return "";
+        const scale = Math.min(1, 720 / Math.max(w, h));
+        const cw = Math.max(1, Math.round(w * scale));
+        const ch = Math.max(1, Math.round(h * scale));
+        const canvas = document.createElement("canvas");
+        canvas.width = cw;
+        canvas.height = ch;
+        const ctx = canvas.getContext("2d", { willReadFrequently: true });
+        if (!ctx) return "";
+        ctx.drawImage(source, 0, 0, cw, ch);
+
+        let raw = "";
+        if (typeof window.jsQR === "function") {
+          try {
+            const image = ctx.getImageData(0, 0, cw, ch);
+            const code = window.jsQR(image.data, cw, ch, { inversionAttempts: "dontInvert" });
+            if (code && code.data) raw = String(code.data);
+          } catch (_) {}
+        }
+        if (!raw && typeof window.BarcodeDetector === "function") {
+          try {
+            const detector = new window.BarcodeDetector({ formats: ["qr_code"] });
+            const codes = await detector.detect(canvas);
+            if (codes && codes.length) raw = String(codes[0].rawValue || "");
+          } catch (_) {}
+        }
+        return tokenFromQrText(raw);
+      }
+
+      function stopScannerStream() {
+        if (scannerTimer) {
+          clearTimeout(scannerTimer);
+          scannerTimer = 0;
+        }
+        if (scannerStream) {
+          for (const track of scannerStream.getTracks()) {
+            try { track.stop(); } catch (_) {}
+          }
+          scannerStream = null;
+        }
+        try { els.scannerVideo.pause(); } catch (_) {}
+        els.scannerVideo.srcObject = null;
+      }
+
+      function closeQrScanner() {
+        scannerOpen = false;
+        stopScannerStream();
+        els.scannerOverlay.hidden = true;
+        els.scannerFile.value = "";
+      }
+
+      function scannerTick() {
+        if (!scannerOpen) return;
+        const video = els.scannerVideo;
+        if (video.readyState >= 2 && video.videoWidth > 0) {
+          decodeImageForToken(video).then((token) => {
+            if (!scannerOpen || !token) return;
+            closeQrScanner();
+            applySessionToken(token, "Token updated from QR code");
+          }).catch(() => {});
+        }
+        scannerTimer = window.setTimeout(scannerTick, 250);
+      }
+
+      async function openQrScanner() {
+        if (scannerOpen) return;
+        scannerOpen = true;
+        els.scannerOverlay.hidden = false;
+        els.scannerView.classList.remove("no-camera");
+        els.scannerStatus.textContent = "Starting camera…";
+        els.scannerError.textContent = "";
+        els.scannerError.classList.remove("visible");
+
+        const hasDecoder =
+          typeof window.jsQR === "function" || typeof window.BarcodeDetector === "function";
+        if (!hasDecoder) {
+          els.scannerView.classList.add("no-camera");
+          els.scannerStatus.textContent = "Scanner unavailable — paste the token instead";
+          return;
+        }
+        if (!navigator.mediaDevices || !navigator.mediaDevices.getUserMedia) {
+          els.scannerView.classList.add("no-camera");
+          els.scannerStatus.textContent = "Camera API unavailable — choose a QR image";
+          return;
+        }
+        try {
+          scannerStream = await navigator.mediaDevices.getUserMedia({
+            audio: false,
+            video: { facingMode: { ideal: "environment" } }
+          });
+          if (!scannerOpen) {
+            stopScannerStream();
+            return;
+          }
+          els.scannerVideo.srcObject = scannerStream;
+          await els.scannerVideo.play();
+          els.scannerStatus.textContent = "Point at the QR code on your PC";
+          scannerTick();
+        } catch (err) {
+          const name = err && err.name ? err.name : "error";
+          els.scannerView.classList.add("no-camera");
+          els.scannerStatus.textContent = "Camera unavailable (" + name + ") — choose a QR image";
+        }
+      }
+
+      async function loadImageFile(file) {
+        if (typeof createImageBitmap === "function") return await createImageBitmap(file);
+        return await new Promise((resolve, reject) => {
+          const url = URL.createObjectURL(file);
+          const img = new Image();
+          img.onload = () => {
+            URL.revokeObjectURL(url);
+            resolve(img);
+          };
+          img.onerror = () => {
+            URL.revokeObjectURL(url);
+            reject(new Error("image decode failed"));
+          };
+          img.src = url;
+        });
+      }
+
+      els.scanQrBtn.addEventListener("click", openQrScanner);
+      els.authScanBtn.addEventListener("click", openQrScanner);
+      els.scannerCancel.addEventListener("click", closeQrScanner);
+      els.scannerOverlay.addEventListener("click", (event) => {
+        if (event.target === els.scannerOverlay) closeQrScanner();
+      });
+      document.addEventListener("keydown", (event) => {
+        if (scannerOpen && event.key === "Escape") closeQrScanner();
+      });
+      els.scannerFile.addEventListener("change", async () => {
+        const file = els.scannerFile.files && els.scannerFile.files[0];
+        if (!file) return;
+        els.scannerStatus.textContent = "Decoding image…";
+        try {
+          const image = await loadImageFile(file);
+          const token = await decodeImageForToken(image);
+          if (image.close) image.close();
+          if (!token) {
+            els.scannerError.textContent = "No SoundHop QR token found in that image.";
+            els.scannerError.classList.add("visible");
+            els.scannerStatus.textContent = "Choose another QR image or cancel";
+            return;
+          }
+          closeQrScanner();
+          await applySessionToken(token, "Token updated from QR code");
+        } catch (err) {
+          els.scannerError.textContent =
+            "Could not read that image: " + (err && err.message ? err.message : "error");
+          els.scannerError.classList.add("visible");
+        }
+      });
 
       function updateVolumeUI() {
         const pct = Math.round(volume * 100);
@@ -1289,6 +1657,11 @@
           activeOfferAbort = null;
         }
 
+        if (activeControlChannel) {
+          try { activeControlChannel.onmessage = null; } catch (_) {}
+          activeControlChannel = null;
+        }
+
         const peerToDelete = activePeerId;
         activePeerId = null;
         if (sendDelete && peerToDelete) {
@@ -1354,7 +1727,8 @@
         }
       }
 
-      function stopListening(reason) {
+      function stopListening(reason, kicked) {
+        kickedByHost = Boolean(kicked);
         shouldListen = false;
         sessionSeq++;
         reconnectAttempt = 0;
@@ -1369,7 +1743,7 @@
       }
 
       function scheduleReconnect(reason) {
-        if (!shouldListen) return;
+        if (!shouldListen || kickedByHost) return;
         cleanupAllTransports(true);
         isWaitingReconnect = true;
         const delay = BACKOFF_STEPS_MS[Math.min(reconnectAttempt, BACKOFF_STEPS_MS.length - 1)];
@@ -1390,7 +1764,7 @@
       }
 
       function handleUnexpectedDrop(mySeq, reason) {
-        if (mySeq !== sessionSeq || !shouldListen) return;
+        if (mySeq !== sessionSeq || !shouldListen || kickedByHost) return;
         sessionSeq++;
         scheduleReconnect(reason);
       }
@@ -1400,6 +1774,9 @@
         unlockAudioElementSync();
         registerMediaSessionSync();
 
+        // An explicit Listen tap clears a previous host kick so the user can
+        // retry after the host re-allows this device.
+        kickedByHost = false;
         shouldListen = true;
         reconnectAttempt = 0;
         cleanupAllTransports(true);
@@ -1521,6 +1898,22 @@
         }, WEBRTC_FALLBACK_MS);
 
         pc.addTransceiver("audio", { direction: "recvonly" });
+
+        // The host sends a terminal "kicked" message on this channel before
+        // closing the peer, so treat it as a stop instead of a network drop.
+        try {
+          activeControlChannel = pc.createDataChannel(WEBRTC_CONTROL_CHANNEL, { ordered: true });
+          activeControlChannel.onmessage = (event) => {
+            if (mySeq !== sessionSeq || activePc !== pc) return;
+            let msg = null;
+            try { msg = JSON.parse(event.data); } catch (_) {}
+            if (msg && msg.type === "kicked") {
+              stopListening("Removed by host", true);
+            }
+          };
+        } catch (_) {
+          activeControlChannel = null;
+        }
 
         pc.ontrack = (event) => {
           if (mySeq !== sessionSeq || activePc !== pc) return;
@@ -1863,6 +2256,10 @@
           wsPingTimer = null;
           activeWs = null;
 
+          if (event.code === WS_KICK_CODE) {
+            stopListening("Removed by host", true);
+            return;
+          }
           if (event.code === 1008) {
             authToken = "";
             showAuthPrompt("Token rejected or expired (1008). Enter new token.");
@@ -1892,12 +2289,7 @@
           showAuthPrompt("Please enter a valid token.");
           return;
         }
-        authToken = candidate;
-        els.tokenInput.value = "";
-        const res = await fetchServerInfo();
-        if (res.ok) {
-          setStatusLine("Token accepted", false);
-        }
+        await applySessionToken(candidate, "Token accepted");
       });
 
       els.muteBtn.addEventListener("click", () => {

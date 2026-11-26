@@ -445,9 +445,10 @@ Because all browser peers share `0.0.0.0:<webrtc_udp_port>`:
   - When `web_require_token == false`: `http://<lan-ip>:<web_port>/`.
 - **SPA extraction & forwarding**:
   - On load, JS extracts `#t=` (also accepting `#token=` as a lenient alias) from `window.location.hash`, stores it in memory, and immediately strips the hash via `history.replaceState(null, "", location.pathname + location.search)`.
-  - If no token is present and `/api/info` returns `authRequired: true`, the SPA shows a manual token prompt box.
+  - If no token is present and `/api/info` returns `authRequired: true`, the SPA shows a manual token prompt box with a **Scan QR** button.
+  - **QR re-pairing**: The header scan button (and the auth-panel button) opens a scanner overlay. Live camera preview uses `getUserMedia` where available; a `BarcodeDetector` and the vendored jsQR decoder (`GET /jsqr.js`) decode camera frames or a user-selected image file. Only a 32-hex lowercase token, or a same-scheme/same-port URL with `#t=`/`#token=` carrying one, is accepted — the scanned URL is never navigated to. Applying a scanned token re-validates it via `/api/info`; if the device had been listening or kicked, playback resumes automatically. This is the recovery path after a host token rotation or a host-initiated kick.
   - All HTTP API requests (`GET /api/info`, `POST /webrtc/offer`, `DELETE /webrtc/peer/:id`) carry `Authorization: Bearer <token>`.
-  - Browser `WebSocket` constructors cannot set custom `Authorization` headers; `/ws` authenticates via **`Sec-WebSocket-Protocol: soundhop.v1, auth.<token>`** (server echoes `Sec-WebSocket-Protocol: soundhop.v1`) OR, if `auth.<token>` subprotocol is absent, awaits a single JSON text frame `{"type":"auth","token":"<token>"}` within `2 s` before sending audio frames. If the `2 s` deadline expires, a non-auth frame arrives first, or the token is invalid, the server sends a WebSocket Close frame (`1008` Policy Violation) and closes the socket.
+  - Browser `WebSocket` constructors cannot set custom `Authorization` headers; `/ws` authenticates via **`Sec-WebSocket-Protocol: soundhop.v1, auth.<token>`** (server echoes `Sec-WebSocket-Protocol: soundhop.v1`) OR, if `auth.<token>` subprotocol is absent, awaits a single JSON text frame `{"type":"auth","token":"<token>"}` within `2 s` before sending audio frames. If the `2 s` deadline expires, a non-auth frame arrives first, or the token is invalid, the server sends a WebSocket Close frame (`1008` Policy Violation) and closes the socket. A **host-initiated kick** instead uses close code `4003` (reason `kicked by host`), which the SPA treats as terminal.
   - All token comparisons use `crate::security::constant_time_eq` (`crates/soundhop-core/src/security.rs:59`).
 
 #### HTTP Endpoints
@@ -455,6 +456,7 @@ Because all browser peers share `0.0.0.0:<webrtc_udp_port>`:
 | Method & Path | Auth | Request / Response |
 | :--- | :--- | :--- |
 | `GET /` | Public | `200 OK`, `Content-Type: text/html; charset=utf-8`, `Cache-Control: no-store`, `X-Content-Type-Options: nosniff` -> embedded `web_player.html` |
+| `GET /jsqr.js` | Public | `200 OK`, `Content-Type: application/javascript; charset=utf-8` -> vendored jsQR decoder used by the QR scanner |
 | `GET /api/info` | Bearer (if `authRequired`, returns minimal `{"authRequired":true}` when header absent—see note below) | `200 OK` JSON: `{"version": VERSION /* crate::constants::VERSION */,"deviceName":"...","sampleRate":48000,"channels":2,"frameSamples":960,"codec":"opus","wsCodec":"pcm16le","webrtc":true,"ws":true,"authRequired":bool}` |
 | `POST /webrtc/offer` | Bearer | Req (`<= 64 KiB`): `{"type":"offer","sdp":"...","clientName":"Android Chrome"}` <br> `200 OK`: `{"type":"answer","sdp":"...","peerId":"<id>","iceLite":true}` <br> `400` invalid SDP, `401` bad token, `429` rate limit, `503` max clients or GStreamer disabled |
 | `DELETE /webrtc/peer/<id>` | Bearer | `204 No Content` (called via `fetch(..., { keepalive: true })` on `pagehide` / Stop) |
@@ -542,6 +544,7 @@ The SPA selects the WebSocket audio renderer based on `window.isSecureContext`:
   - Track ring fill in samples; drop/skip oldest frames or apply `1.005x` linear resampling when fill exceeds `140 ms`; output smooth `5 ms` faded silence on underrun and re-prime to `60 ms` before unmuting.
 - **Reconnect & Controls UX**:
   - Exponential backoff on unexpected drop: `0.5 s -> 1 s -> 2 s -> 5 s` (capped at `5 s`), with immediate retry on `document.visibilitychange` (`visible`) and `window.online`.
+  - **Kick is terminal**: WS close `4003` and the in-band WebRTC control-channel message `{"type":"kicked"}` (sent on the browser-created `sh-control` data channel before the host closes the peer) both call `stopListening(..., true)`. That clears `shouldListen` and sets `kickedByHost`, so no reconnect path — backoff, `visibilitychange`, `online`, or transport fallback — can resurrect the session. The user must tap Listen (or scan a fresh QR token) to resume.
   - Live transport pill badge: `WebRTC · Opus`, `WS · PCM`, or `WS Worklet · USB`.
   - Live buffer/RTT readout, volume slider + mute button, manual transport switcher (`Auto` / `Force WS`), and `pagehide` cleanup (`fetch('/webrtc/peer/' + peerId, { method: 'DELETE', keepalive: true, headers })`).
 

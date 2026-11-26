@@ -10,6 +10,7 @@ use std::thread::{self, JoinHandle};
 use std::time::{Duration, Instant};
 
 use str0m::change::SdpOffer;
+use str0m::channel::ChannelId;
 use str0m::format::Codec;
 use str0m::media::{Frequency, MediaKind, MediaTime, Mid, Pt, Writer};
 use str0m::net::{Protocol, Receive, Transmit};
@@ -43,6 +44,10 @@ const STUN_MAGIC_COOKIE: [u8; 4] = [0x21, 0x12, 0xA4, 0x42];
 const STUN_BINDING_REQUEST: u16 = 0x0001;
 /// STUN `USERNAME` attribute type (RFC 5389 §15.3).
 const STUN_ATTR_USERNAME: u16 = 0x0006;
+/// Data channel created by the browser for host control messages (kick).
+const WEBRTC_CONTROL_CHANNEL: &str = "sh-control";
+/// Terminal in-band signal sent on the control channel before a kicked peer is closed.
+const WEBRTC_KICK_MESSAGE: &[u8] = br#"{"type":"kicked"}"#;
 
 /// Configuration for starting the `web-rtc-mux` thread.
 #[derive(Clone)]
@@ -78,6 +83,7 @@ enum MuxCommand {
     RemovePeer {
         peer_id: String,
         send_close: bool,
+        kick: bool,
         reply_tx: SyncSender<bool>,
     },
     ListClients {
@@ -103,6 +109,8 @@ struct PeerRtc {
     last_frame_pts: Option<u64>,
     /// Set when a write fails so the next frame carries an RTP marker bit.
     force_discontinuity: bool,
+    /// Browser-created control channel, used to deliver a terminal kick signal.
+    control_channel: Option<ChannelId>,
     remote_addr: String,
     user_agent: String,
     connected_since: f64,
@@ -304,6 +312,7 @@ impl RtcMuxHandle {
             sample_offset: 0,
             last_frame_pts: None,
             force_discontinuity: false,
+            control_channel: None,
             remote_addr: req.remote_addr.to_string(),
             user_agent: label,
             connected_since: now_secs(),
@@ -331,12 +340,12 @@ impl RtcMuxHandle {
 
     /// Remove a peer (for example on `DELETE /webrtc/peer/:id`). Returns `true` if found.
     pub fn remove_peer(&self, peer_id: &str) -> bool {
-        self.remove_peer_internal(peer_id, true)
+        self.remove_peer_internal(peer_id, true, false)
     }
 
     /// Forcefully disconnect and evict a peer by ID. Returns `true` if found.
     pub fn kick_peer(&self, peer_id: &str) -> bool {
-        self.remove_peer_internal(peer_id, true)
+        self.remove_peer_internal(peer_id, true, true)
     }
 
     /// Snapshot currently active WebRTC peers.
@@ -371,7 +380,7 @@ impl RtcMuxHandle {
         }
     }
 
-    fn remove_peer_internal(&self, peer_id: &str, send_close: bool) -> bool {
+    fn remove_peer_internal(&self, peer_id: &str, send_close: bool, kick: bool) -> bool {
         if self.stopped.load(Ordering::Acquire) {
             return false;
         }
@@ -380,6 +389,7 @@ impl RtcMuxHandle {
             .send_cmd(MuxCommand::RemovePeer {
                 peer_id: peer_id.to_string(),
                 send_close,
+                kick,
                 reply_tx,
             })
             .is_err()
@@ -521,9 +531,10 @@ impl MuxState {
                 Ok(MuxCommand::RemovePeer {
                     peer_id,
                     send_close,
+                    kick,
                     reply_tx,
                 }) => {
-                    let removed = self.remove_peer_internal(&peer_id, send_close);
+                    let removed = self.remove_peer_internal(&peer_id, send_close, kick);
                     if removed {
                         changed = true;
                     }
@@ -638,7 +649,7 @@ impl MuxState {
         }
 
         for peer_id in failed_peers {
-            self.remove_peer_internal(&peer_id, false);
+            self.remove_peer_internal(&peer_id, false, false);
         }
 
         any_sent
@@ -658,12 +669,12 @@ impl MuxState {
                 continue;
             };
             if peer.rtc.handle_input(Input::Timeout(now)).is_err() {
-                self.remove_peer_internal(&peer_id, false);
+                self.remove_peer_internal(&peer_id, false, false);
                 removed_any = true;
                 continue;
             }
             if !drain_peer_output(peer, &self.udp_socket) {
-                self.remove_peer_internal(&peer_id, false);
+                self.remove_peer_internal(&peer_id, false, false);
                 removed_any = true;
             }
         }
@@ -687,7 +698,7 @@ impl MuxState {
 
         let mut changed = false;
         for peer_id in to_evict {
-            if self.remove_peer_internal(&peer_id, false) {
+            if self.remove_peer_internal(&peer_id, false, false) {
                 changed = true;
             }
         }
@@ -723,12 +734,12 @@ impl MuxState {
         }
 
         if peer.rtc.handle_input(input).is_err() {
-            self.remove_peer_internal(&peer_id, false);
+            self.remove_peer_internal(&peer_id, false, false);
             return true;
         }
 
         if !drain_peer_output(peer, &self.udp_socket) {
-            self.remove_peer_internal(&peer_id, false);
+            self.remove_peer_internal(&peer_id, false, false);
             return true;
         }
 
@@ -759,11 +770,21 @@ impl MuxState {
             .unwrap_or(MAX_IDLE_POLL_TIMEOUT)
     }
 
-    fn remove_peer_internal(&mut self, peer_id: &str, send_close: bool) -> bool {
+    fn remove_peer_internal(&mut self, peer_id: &str, send_close: bool, kick: bool) -> bool {
         let Some(mut peer) = self.peers.remove(peer_id) else {
             return false;
         };
         if send_close {
+            if kick {
+                // Notify the browser before tearing down DTLS. Without this
+                // in-band signal it sees a generic disconnect and reconnects.
+                if let Some(channel_id) = peer.control_channel {
+                    if let Some(mut channel) = peer.rtc.channel(channel_id) {
+                        let _ = channel.write(false, WEBRTC_KICK_MESSAGE);
+                    }
+                }
+                let _ = drain_peer_output(&mut peer, &self.udp_socket);
+            }
             let _ = peer.rtc.close();
             let _ = drain_peer_output(&mut peer, &self.udp_socket);
         }
@@ -809,7 +830,7 @@ impl MuxState {
     fn shutdown(&mut self) {
         let peer_ids: Vec<String> = self.peers.keys().cloned().collect();
         for peer_id in peer_ids {
-            self.remove_peer_internal(&peer_id, true);
+            self.remove_peer_internal(&peer_id, true, false);
         }
         self.opus_sub = None;
         self.addr_to_peer.clear();
@@ -967,6 +988,16 @@ fn drain_peer_output(peer: &mut PeerRtc, udp_socket: &UdpSocket) -> bool {
                     });
                     if let Some(rtt) = rtt {
                         peer.rtt_ms = Some(rtt.as_secs_f64() * 1000.0);
+                    }
+                }
+                Event::ChannelOpen(id, label) => {
+                    if label == WEBRTC_CONTROL_CHANNEL {
+                        peer.control_channel = Some(id);
+                    }
+                }
+                Event::ChannelClose(id) => {
+                    if peer.control_channel == Some(id) {
+                        peer.control_channel = None;
                     }
                 }
                 Event::Closed => {

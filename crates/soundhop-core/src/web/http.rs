@@ -19,6 +19,9 @@ use super::{BearerAuthResult, BroadcastRuntime, WebError, WebResult};
 
 /// Embedded single-page browser player HTML served at `GET /`.
 const WEB_PLAYER_HTML: &str = include_str!("web_player.html");
+/// Vendored jsQR decoder served at `GET /jsqr.js`. Kept local so QR pairing
+/// works on plain-HTTP LAN addresses without a CDN or secure context.
+const JSQR_JS: &str = include_str!("jsqr.min.js");
 
 /// Maximum concurrent HTTP worker threads.
 const MAX_HTTP_WORKERS: usize = 16;
@@ -403,6 +406,16 @@ fn dispatch_request(
                 WEB_PLAYER_HTML.as_bytes(),
             );
         }
+        ("GET", "/jsqr.js") => {
+            let _ = send_response(
+                &mut stream,
+                200,
+                "OK",
+                "application/javascript; charset=utf-8",
+                &[],
+                JSQR_JS.as_bytes(),
+            );
+        }
         ("GET", "/api/info") => {
             handle_api_info(&mut stream, &req, &ctx.runtime);
         }
@@ -415,9 +428,9 @@ fn dispatch_request(
         ("GET", "/ws") => {
             handle_ws_upgrade(stream, peer_addr, req, ctx);
         }
-        (_, "/") | (_, "/api/info") | (_, "/webrtc/offer") | (_, "/ws") => {
+        (_, "/") | (_, "/jsqr.js") | (_, "/api/info") | (_, "/webrtc/offer") | (_, "/ws") => {
             let allow = match req.path.as_str() {
-                "/" | "/api/info" | "/ws" => "GET",
+                "/" | "/jsqr.js" | "/api/info" | "/ws" => "GET",
                 "/webrtc/offer" => "POST",
                 _ => "GET",
             };
@@ -1310,6 +1323,21 @@ mod tests {
         assert_eq!(resp.header("x-content-type-options"), Some("nosniff"));
         assert!(resp.body_str().contains("SoundHop"));
         assert_eq!(resp.body_str(), WEB_PLAYER_HTML);
+        mgr.stop();
+    }
+
+    #[test]
+    fn get_jsqr_asset_is_served_without_auth() {
+        let (mgr, port, _) = start_test_manager(true);
+        let req = format!("GET /jsqr.js HTTP/1.1\r\nHost: 127.0.0.1:{port}\r\n\r\n");
+        let resp = send_raw_http(port, req.as_bytes());
+        assert_eq!(resp.status, 200);
+        assert_eq!(
+            resp.header("content-type"),
+            Some("application/javascript; charset=utf-8")
+        );
+        assert_eq!(resp.header("cache-control"), Some("no-store"));
+        assert!(resp.body_str().contains("jsQR"));
         mgr.stop();
     }
 

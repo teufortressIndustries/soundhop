@@ -3,7 +3,7 @@
 use std::collections::HashMap;
 use std::io::{self, Cursor, Read, Write};
 use std::net::{Shutdown, SocketAddr, TcpStream};
-use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU16, AtomicU32, AtomicU64, Ordering};
 use std::sync::mpsc::RecvTimeoutError;
 use std::sync::{Arc, Mutex};
 use std::thread::{self, JoinHandle};
@@ -33,6 +33,10 @@ pub const WS_FLAG_DISCONTINUITY: u8 = 0x02;
 pub const WS_HEADER_LEN: usize = 16;
 /// Negotiated WebSocket subprotocol echoed in `Sec-WebSocket-Protocol`.
 pub const WS_SUBPROTOCOL: &str = "soundhop.v1";
+/// Terminal close code sent when the host kicks a listener. The browser must
+/// treat this as a permanent stop and must not auto-reconnect.
+pub const WS_KICK_CLOSE_CODE: u16 = 4003;
+pub const WS_KICK_REASON: &str = "kicked by host";
 
 const WS_AUTH_TIMEOUT: Duration = Duration::from_secs(2);
 const WS_AUTH_POLL_INTERVAL: Duration = Duration::from_millis(100);
@@ -146,6 +150,9 @@ struct WsClientState {
     local_dropped_frames: AtomicU32,
     sub_stats: Arc<SubscriberStats>,
     kicked: AtomicBool,
+    /// Non-zero when this client was explicitly kicked by the host (vs. a
+    /// normal shutdown), so the wire loop can send a terminal close frame.
+    kick_code: AtomicU16,
     stream: TcpStream,
 }
 
@@ -265,6 +272,7 @@ impl WsFanoutHandle {
             local_dropped_frames: AtomicU32::new(0),
             sub_stats: Arc::clone(sub.stats()),
             kicked: AtomicBool::new(false),
+            kick_code: AtomicU16::new(0),
             stream: kick_stream,
         });
 
@@ -304,11 +312,16 @@ impl WsFanoutHandle {
     }
 
     /// Forcefully close and remove a WebSocket client by ID. Returns `true` if found.
+    ///
+    /// The wire loop sends a terminal close frame (`WS_KICK_CLOSE_CODE`) before
+    /// tearing down the socket so the browser stops instead of reconnecting.
     pub fn kick_client(&self, client_id: &str) -> bool {
         let removed = lock_or_recover(&self.clients).remove(client_id);
         if let Some(client) = removed {
+            client
+                .kick_code
+                .store(WS_KICK_CLOSE_CODE, Ordering::Release);
             client.kicked.store(true, Ordering::Release);
-            let _ = client.stream.shutdown(Shutdown::Both);
             true
         } else {
             false
@@ -563,7 +576,10 @@ fn run_ws_client_loop(
     }
 
     lock_or_recover(&clients).remove(&state.id);
-    if send_close_on_exit && !state.kicked.load(Ordering::Acquire) {
+    let kick_code = state.kick_code.load(Ordering::Acquire);
+    if kick_code != 0 {
+        send_close_and_drain(&mut ws, CloseCode::from(kick_code), WS_KICK_REASON);
+    } else if send_close_on_exit && !state.kicked.load(Ordering::Acquire) {
         send_close_and_drain(&mut ws, CloseCode::Normal, "stream ended");
     } else {
         let _ = ws.get_mut().inner_mut().shutdown(Shutdown::Both);
@@ -988,7 +1004,19 @@ mod tests {
         assert!(ws_fanout.kick_client(&client_id));
         assert!(!ws_fanout.kick_client(&client_id));
         assert_eq!(ws_fanout.client_count(), 0);
-        let _ = client_ws.close(None);
+
+        // A kicked client receives a distinct terminal close code so the browser
+        // does not treat it as a network drop and auto-reconnect.
+        let close_watch = thread::spawn(move || loop {
+            match client_ws.read() {
+                Ok(Message::Close(Some(frame))) => break frame,
+                Ok(_) => continue,
+                Err(err) => panic!("expected kick close frame, got {err}"),
+            }
+        });
+        let close_frame = close_watch.join().expect("kick close frame");
+        assert_eq!(close_frame.code, CloseCode::from(WS_KICK_CLOSE_CODE));
+        assert_eq!(close_frame.reason, WS_KICK_REASON);
 
         ws_fanout.stop();
         mgr.stop();

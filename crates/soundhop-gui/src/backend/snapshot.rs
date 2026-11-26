@@ -634,10 +634,16 @@ impl RefreshUpdate {
             .and_then(|v| v.as_str())
             .unwrap_or("")
             .to_string();
-        let web_token_required = web_obj
-            .and_then(|w| w.get("token_required"))
-            .and_then(|v| v.as_bool())
-            .unwrap_or(cfg.sharing.web_require_token);
+        // While inactive, status reports the *last started* session's cached settings,
+        // which can be stale. The saved config is the source of truth in that case.
+        let web_token_required = if web_broadcast_active {
+            web_obj
+                .and_then(|w| w.get("token_required"))
+                .and_then(|v| v.as_bool())
+                .unwrap_or(cfg.sharing.web_require_token)
+        } else {
+            cfg.sharing.web_require_token
+        };
         let web_token = web_obj
             .and_then(|w| w.get("token"))
             .and_then(|v| v.as_str())
@@ -661,10 +667,14 @@ impl RefreshUpdate {
                     .collect()
             })
             .unwrap_or_else(|| st.web_adb_reverse_serials.clone());
-        let web_keep_local = web_obj
-            .and_then(|w| w.get("keep_local"))
-            .and_then(|v| v.as_bool())
-            .unwrap_or(cfg.sharing.web_keep_local);
+        let web_keep_local = if web_broadcast_active {
+            web_obj
+                .and_then(|w| w.get("keep_local"))
+                .and_then(|v| v.as_bool())
+                .unwrap_or(cfg.sharing.web_keep_local)
+        } else {
+            cfg.sharing.web_keep_local
+        };
 
         // Audio level (prefer local telemetry if active, else daemon snapshot)
         let daemon_audio = status_json.get("telemetry").and_then(|t| t.get("audio"));
@@ -1210,5 +1220,57 @@ mod tests {
             Vec::new(),
         );
         assert!(!update_same.apply_to(&mut guard, false));
+    }
+
+    #[test]
+    fn test_inactive_web_status_uses_saved_config_for_keep_local_and_token() {
+        let mut cfg = Config::default();
+        cfg.sharing.web_keep_local = false;
+        cfg.sharing.web_require_token = false;
+
+        // Status for an inactive broadcast reports the last session's cached
+        // settings; those must not override the saved config in the UI.
+        let stale_status = serde_json::json!({
+            "web_broadcast": {
+                "active": false,
+                "keep_local": true,
+                "token_required": true
+            }
+        });
+        let update = RefreshUpdate::from_status(
+            true,
+            cfg.clone(),
+            State::default(),
+            empty_telemetry(),
+            &stale_status,
+            Vec::new(),
+            &[],
+            Vec::new(),
+            Vec::new(),
+        );
+        assert!(!update.web_keep_local);
+        assert!(!update.web_token_required);
+
+        // While a broadcast is live, the running session is authoritative.
+        let live_status = serde_json::json!({
+            "web_broadcast": {
+                "active": true,
+                "keep_local": true,
+                "token_required": true
+            }
+        });
+        let update_live = RefreshUpdate::from_status(
+            true,
+            cfg,
+            State::default(),
+            empty_telemetry(),
+            &live_status,
+            Vec::new(),
+            &[],
+            Vec::new(),
+            Vec::new(),
+        );
+        assert!(update_live.web_keep_local);
+        assert!(update_live.web_token_required);
     }
 }
