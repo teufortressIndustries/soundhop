@@ -1,0 +1,1982 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
+  <meta name="theme-color" content="#0b0f17">
+  <meta name="apple-mobile-web-app-capable" content="yes">
+  <meta name="apple-mobile-web-app-status-bar-style" content="black-translucent">
+  <title>SoundHop — Web Broadcast</title>
+  <style>
+    :root {
+      color-scheme: dark;
+      --bg: #0b0f17;
+      --bg-accent: radial-gradient(120% 80% at 50% -10%, rgba(45, 212, 191, 0.16), transparent 60%),
+                   radial-gradient(90% 70% at 100% 100%, rgba(99, 102, 241, 0.14), transparent 55%);
+      --card: rgba(17, 24, 39, 0.86);
+      --card-border: rgba(255, 255, 255, 0.09);
+      --surface: rgba(255, 255, 255, 0.045);
+      --surface-hover: rgba(255, 255, 255, 0.08);
+      --text: #f3f6fc;
+      --text-muted: #94a3b8;
+      --text-dim: #64748b;
+      --accent: #2dd4bf;
+      --accent-strong: #14b8a6;
+      --accent-soft: rgba(45, 212, 191, 0.14);
+      --emerald: #34d399;
+      --emerald-soft: rgba(52, 211, 153, 0.14);
+      --sky: #38bdf8;
+      --sky-soft: rgba(56, 189, 248, 0.14);
+      --violet: #a78bfa;
+      --violet-soft: rgba(167, 139, 250, 0.16);
+      --amber: #fbbf24;
+      --amber-soft: rgba(251, 191, 36, 0.14);
+      --rose: #fb7185;
+      --rose-soft: rgba(251, 113, 133, 0.14);
+      --radius: 20px;
+      --radius-sm: 12px;
+      --shadow: 0 24px 60px rgba(0, 0, 0, 0.45);
+      --font: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, Inter, system-ui, sans-serif;
+      --mono: ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, monospace;
+    }
+
+    * {
+      box-sizing: border-box;
+      -webkit-tap-highlight-color: transparent;
+    }
+
+    html, body {
+      margin: 0;
+      padding: 0;
+      min-height: 100%;
+      background-color: var(--bg);
+      background-image: var(--bg-accent);
+      color: var(--text);
+      font-family: var(--font);
+      line-height: 1.45;
+    }
+
+    body {
+      display: flex;
+      justify-content: center;
+      align-items: center;
+      padding: max(16px, env(safe-area-inset-top))
+               max(16px, env(safe-area-inset-right))
+               max(20px, env(safe-area-inset-bottom))
+               max(16px, env(safe-area-inset-left));
+    }
+
+    .app-shell {
+      width: 100%;
+      max-width: 440px;
+      display: flex;
+      flex-direction: column;
+      gap: 14px;
+    }
+
+    .card {
+      background: var(--card);
+      border: 1px solid var(--card-border);
+      border-radius: var(--radius);
+      box-shadow: var(--shadow);
+      backdrop-filter: blur(18px);
+      -webkit-backdrop-filter: blur(18px);
+      padding: 20px;
+    }
+
+    .header {
+      display: flex;
+      align-items: center;
+      justify-content: space-between;
+      gap: 12px;
+      margin-bottom: 18px;
+    }
+
+    .brand {
+      display: flex;
+      align-items: center;
+      gap: 12px;
+      min-width: 0;
+    }
+
+    .logo {
+      width: 40px;
+      height: 40px;
+      border-radius: 12px;
+      background: linear-gradient(135deg, rgba(45, 212, 191, 0.22), rgba(99, 102, 241, 0.22));
+      border: 1px solid rgba(45, 212, 191, 0.35);
+      display: grid;
+      place-items: center;
+      flex-shrink: 0;
+      color: var(--accent);
+    }
+
+    .brand-text {
+      min-width: 0;
+    }
+
+    .brand-title {
+      font-size: 1.05rem;
+      font-weight: 700;
+      letter-spacing: -0.01em;
+      display: flex;
+      align-items: center;
+      gap: 6px;
+    }
+
+    .version-tag {
+      font-size: 0.7rem;
+      font-weight: 600;
+      color: var(--text-muted);
+      background: var(--surface);
+      border: 1px solid var(--card-border);
+      border-radius: 999px;
+      padding: 1px 7px;
+      font-family: var(--mono);
+    }
+
+    .brand-sub {
+      font-size: 0.8rem;
+      color: var(--text-muted);
+      white-space: nowrap;
+      overflow: hidden;
+      text-overflow: ellipsis;
+    }
+
+    .pill {
+      display: inline-flex;
+      align-items: center;
+      gap: 7px;
+      font-size: 0.75rem;
+      font-weight: 600;
+      padding: 6px 11px;
+      border-radius: 999px;
+      border: 1px solid var(--card-border);
+      background: var(--surface);
+      color: var(--text-muted);
+      white-space: nowrap;
+      flex-shrink: 0;
+      transition: background 0.2s ease, color 0.2s ease, border-color 0.2s ease;
+    }
+
+    .pill-dot {
+      width: 7px;
+      height: 7px;
+      border-radius: 50%;
+      background: currentColor;
+    }
+
+    .pill.webrtc {
+      color: var(--emerald);
+      background: var(--emerald-soft);
+      border-color: rgba(52, 211, 153, 0.35);
+    }
+
+    .pill.ws {
+      color: var(--sky);
+      background: var(--sky-soft);
+      border-color: rgba(56, 189, 248, 0.35);
+    }
+
+    .pill.worklet {
+      color: var(--violet);
+      background: var(--violet-soft);
+      border-color: rgba(167, 139, 250, 0.38);
+    }
+
+    .pill.connecting {
+      color: var(--amber);
+      background: var(--amber-soft);
+      border-color: rgba(251, 191, 36, 0.35);
+    }
+
+    .pill.connecting .pill-dot,
+    .pill.webrtc .pill-dot,
+    .pill.ws .pill-dot,
+    .pill.worklet .pill-dot {
+      animation: pulse-dot 1.8s ease-in-out infinite;
+    }
+
+    .pill.error {
+      color: var(--rose);
+      background: var(--rose-soft);
+      border-color: rgba(251, 113, 133, 0.35);
+    }
+
+    @keyframes pulse-dot {
+      0%, 100% { opacity: 1; transform: scale(1); }
+      50% { opacity: 0.45; transform: scale(0.8); }
+    }
+
+    .source-box {
+      display: flex;
+      align-items: center;
+      justify-content: space-between;
+      gap: 10px;
+      background: var(--surface);
+      border: 1px solid var(--card-border);
+      border-radius: var(--radius-sm);
+      padding: 12px 14px;
+      margin-bottom: 16px;
+    }
+
+    .source-label {
+      font-size: 0.72rem;
+      text-transform: uppercase;
+      letter-spacing: 0.06em;
+      color: var(--text-dim);
+      margin-bottom: 2px;
+    }
+
+    .source-name {
+      font-size: 0.96rem;
+      font-weight: 600;
+      color: var(--text);
+      overflow: hidden;
+      text-overflow: ellipsis;
+      white-space: nowrap;
+    }
+
+    .source-format {
+      font-family: var(--mono);
+      font-size: 0.74rem;
+      color: var(--text-muted);
+      flex-shrink: 0;
+      text-align: right;
+    }
+
+    .auth-panel {
+      display: none;
+      flex-direction: column;
+      gap: 10px;
+      background: rgba(251, 191, 36, 0.08);
+      border: 1px solid rgba(251, 191, 36, 0.28);
+      border-radius: var(--radius-sm);
+      padding: 14px;
+      margin-bottom: 16px;
+    }
+
+    .auth-panel.visible {
+      display: flex;
+    }
+
+    .auth-title {
+      font-size: 0.86rem;
+      font-weight: 600;
+      color: var(--amber);
+    }
+
+    .auth-desc {
+      font-size: 0.8rem;
+      color: var(--text-muted);
+    }
+
+    .auth-row {
+      display: flex;
+      gap: 8px;
+    }
+
+    .input {
+      flex: 1;
+      min-width: 0;
+      background: rgba(11, 15, 23, 0.85);
+      border: 1px solid var(--card-border);
+      border-radius: 10px;
+      color: var(--text);
+      font-family: var(--mono);
+      font-size: 0.86rem;
+      padding: 10px 12px;
+      outline: none;
+      transition: border-color 0.15s ease;
+    }
+
+    .input:focus {
+      border-color: var(--accent);
+    }
+
+    .btn-secondary {
+      background: var(--surface-hover);
+      border: 1px solid var(--card-border);
+      color: var(--text);
+      border-radius: 10px;
+      padding: 10px 14px;
+      font-size: 0.85rem;
+      font-weight: 600;
+      cursor: pointer;
+      white-space: nowrap;
+    }
+
+    .btn-secondary:active {
+      transform: scale(0.98);
+    }
+
+    .auth-error {
+      font-size: 0.78rem;
+      color: var(--rose);
+      display: none;
+    }
+
+    .auth-error.visible {
+      display: block;
+    }
+
+    .listen-btn {
+      width: 100%;
+      min-height: 60px;
+      border: none;
+      border-radius: 16px;
+      font-family: inherit;
+      font-size: 1.05rem;
+      font-weight: 700;
+      letter-spacing: 0.01em;
+      cursor: pointer;
+      display: flex;
+      align-items: center;
+      justify-content: center;
+      gap: 10px;
+      color: #041311;
+      background: linear-gradient(135deg, #2dd4bf, #38bdf8);
+      box-shadow: 0 10px 28px rgba(45, 212, 191, 0.28);
+      transition: transform 0.12s ease, box-shadow 0.2s ease, background 0.2s ease, opacity 0.2s ease;
+    }
+
+    .listen-btn:active {
+      transform: scale(0.985);
+    }
+
+    .listen-btn.live {
+      color: var(--text);
+      background: linear-gradient(135deg, rgba(251, 113, 133, 0.22), rgba(225, 29, 72, 0.26));
+      border: 1px solid rgba(251, 113, 133, 0.45);
+      box-shadow: 0 10px 24px rgba(225, 29, 72, 0.16);
+    }
+
+    .listen-btn.connecting {
+      color: var(--amber);
+      background: rgba(251, 191, 36, 0.15);
+      border: 1px solid rgba(251, 191, 36, 0.4);
+      box-shadow: none;
+    }
+
+    .stats-grid {
+      display: grid;
+      grid-template-columns: repeat(3, 1fr);
+      gap: 8px;
+      margin-top: 16px;
+    }
+
+    .stat-tile {
+      background: var(--surface);
+      border: 1px solid var(--card-border);
+      border-radius: var(--radius-sm);
+      padding: 10px 10px;
+      text-align: center;
+    }
+
+    .stat-label {
+      font-size: 0.7rem;
+      text-transform: uppercase;
+      letter-spacing: 0.06em;
+      color: var(--text-dim);
+      margin-bottom: 3px;
+    }
+
+    .stat-value {
+      font-family: var(--mono);
+      font-size: 0.88rem;
+      font-weight: 600;
+      color: var(--text);
+      white-space: nowrap;
+      overflow: hidden;
+      text-overflow: ellipsis;
+    }
+
+    .volume-row {
+      display: flex;
+      align-items: center;
+      gap: 12px;
+      margin-top: 16px;
+      padding: 10px 12px;
+      background: var(--surface);
+      border: 1px solid var(--card-border);
+      border-radius: var(--radius-sm);
+    }
+
+    .mute-btn {
+      width: 40px;
+      height: 40px;
+      border-radius: 10px;
+      border: 1px solid var(--card-border);
+      background: rgba(255, 255, 255, 0.04);
+      color: var(--text);
+      display: grid;
+      place-items: center;
+      cursor: pointer;
+      flex-shrink: 0;
+    }
+
+    .mute-btn.muted {
+      color: var(--rose);
+      border-color: rgba(251, 113, 133, 0.35);
+      background: var(--rose-soft);
+    }
+
+    .volume-slider {
+      flex: 1;
+      accent-color: var(--accent);
+      height: 6px;
+      cursor: pointer;
+    }
+
+    .volume-pct {
+      font-family: var(--mono);
+      font-size: 0.8rem;
+      color: var(--text-muted);
+      width: 40px;
+      text-align: right;
+      flex-shrink: 0;
+    }
+
+    .controls-card {
+      padding: 16px 20px;
+      display: flex;
+      flex-direction: column;
+      gap: 14px;
+    }
+
+    .control-row {
+      display: flex;
+      align-items: center;
+      justify-content: space-between;
+      gap: 12px;
+    }
+
+    .control-title {
+      font-size: 0.88rem;
+      font-weight: 600;
+    }
+
+    .control-hint {
+      font-size: 0.75rem;
+      color: var(--text-dim);
+    }
+
+    .segmented {
+      display: inline-flex;
+      background: rgba(11, 15, 23, 0.7);
+      border: 1px solid var(--card-border);
+      border-radius: 10px;
+      padding: 3px;
+      gap: 3px;
+      flex-shrink: 0;
+    }
+
+    .seg-btn {
+      border: none;
+      background: transparent;
+      color: var(--text-muted);
+      font-family: inherit;
+      font-size: 0.78rem;
+      font-weight: 600;
+      padding: 6px 11px;
+      border-radius: 7px;
+      cursor: pointer;
+      transition: background 0.15s ease, color 0.15s ease;
+    }
+
+    .seg-btn.active {
+      background: var(--accent-soft);
+      color: var(--accent);
+    }
+
+    .switch {
+      position: relative;
+      display: inline-block;
+      width: 46px;
+      height: 26px;
+      flex-shrink: 0;
+    }
+
+    .switch input {
+      opacity: 0;
+      width: 0;
+      height: 0;
+    }
+
+    .switch-track {
+      position: absolute;
+      inset: 0;
+      border-radius: 999px;
+      background: rgba(255, 255, 255, 0.12);
+      border: 1px solid var(--card-border);
+      cursor: pointer;
+      transition: background 0.2s ease, border-color 0.2s ease;
+    }
+
+    .switch-track::after {
+      content: "";
+      position: absolute;
+      width: 20px;
+      height: 20px;
+      left: 2px;
+      top: 2px;
+      border-radius: 50%;
+      background: #fff;
+      transition: transform 0.2s ease;
+    }
+
+    .switch input:checked + .switch-track {
+      background: var(--accent-strong);
+      border-color: var(--accent);
+    }
+
+    .switch input:checked + .switch-track::after {
+      transform: translateX(20px);
+    }
+
+    .status-line {
+      font-size: 0.78rem;
+      color: var(--text-muted);
+      text-align: center;
+      min-height: 1.2em;
+      padding: 0 8px;
+    }
+
+    .status-line.error {
+      color: var(--rose);
+    }
+
+    .sr-audio {
+      position: fixed;
+      width: 1px;
+      height: 1px;
+      opacity: 0.001;
+      pointer-events: none;
+      left: -10px;
+      top: -10px;
+    }
+  </style>
+</head>
+<body>
+  <main class="app-shell">
+    <section class="card" aria-label="SoundHop Web Player">
+      <header class="header">
+        <div class="brand">
+          <div class="logo" aria-hidden="true">
+            <svg width="22" height="22" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
+              <path d="M3 18v-6a9 9 0 0 1 18 0v6"/>
+              <path d="M21 19a2 2 0 0 1-2 2h-1a2 2 0 0 1-2-2v-3a2 2 0 0 1 2-2h3zM3 19a2 2 0 0 0 2 2h1a2 2 0 0 0 2-2v-3a2 2 0 0 0-2-2H3z"/>
+            </svg>
+          </div>
+          <div class="brand-text">
+            <div class="brand-title">
+              <span>SoundHop</span>
+              <span id="versionTag" class="version-tag" hidden></span>
+            </div>
+            <div class="brand-sub">Web Broadcast Listener</div>
+          </div>
+        </div>
+        <div id="transportBadge" class="pill" role="status" aria-live="polite">
+          <span class="pill-dot"></span>
+          <span id="transportBadgeText">Standby</span>
+        </div>
+      </header>
+
+      <div class="source-box">
+        <div style="min-width: 0;">
+          <div class="source-label">Broadcast Source</div>
+          <div id="deviceName" class="source-name">Connecting to host…</div>
+        </div>
+        <div id="formatInfo" class="source-format">48 kHz · Stereo</div>
+      </div>
+
+      <form id="authPanel" class="auth-panel" autocomplete="off">
+        <div class="auth-title">Session Token Required</div>
+        <div class="auth-desc">Enter the 32-character access token from SoundHop or scan the QR link.</div>
+        <div class="auth-row">
+          <input id="tokenInput" class="input" type="password" inputmode="text" spellcheck="false" autocomplete="off" placeholder="Paste token…" aria-label="Session token">
+          <button id="tokenSubmitBtn" class="btn-secondary" type="submit">Unlock</button>
+        </div>
+        <div id="authError" class="auth-error"></div>
+      </form>
+
+      <button id="listenBtn" class="listen-btn" type="button">
+        <svg id="listenIcon" width="20" height="20" viewBox="0 0 24 24" fill="currentColor" aria-hidden="true">
+          <polygon points="6 4 20 12 6 20 6 4"/>
+        </svg>
+        <span id="listenBtnLabel">Listen</span>
+      </button>
+
+      <div class="stats-grid" aria-label="Stream Telemetry">
+        <div class="stat-tile">
+          <div class="stat-label">Buffer</div>
+          <div id="bufferReadout" class="stat-value">--</div>
+        </div>
+        <div class="stat-tile">
+          <div class="stat-label">RTT</div>
+          <div id="rttReadout" class="stat-value">--</div>
+        </div>
+        <div class="stat-tile">
+          <div class="stat-label">State</div>
+          <div id="stateReadout" class="stat-value">Stopped</div>
+        </div>
+      </div>
+
+      <div class="volume-row">
+        <button id="muteBtn" class="mute-btn" type="button" aria-label="Mute audio" aria-pressed="false">
+          <svg id="volumeIcon" width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
+            <polygon points="11 5 6 9 2 9 2 15 6 15 11 19 11 5"/>
+            <path d="M15.54 8.46a5 5 0 0 1 0 7.07"/>
+            <path d="M19.07 4.93a10 10 0 0 1 0 14.14"/>
+          </svg>
+        </button>
+        <input id="volumeSlider" class="volume-slider" type="range" min="0" max="100" value="100" aria-label="Playback volume">
+        <span id="volumePct" class="volume-pct">100%</span>
+      </div>
+    </section>
+
+    <section class="card controls-card" aria-label="Transport Options">
+      <div class="control-row">
+        <div>
+          <div class="control-title">Transport</div>
+          <div class="control-hint">Auto tries WebRTC Opus, then WS PCM</div>
+        </div>
+        <div class="segmented" role="group" aria-label="Transport selection">
+          <button id="modeAutoBtn" class="seg-btn active" type="button" data-mode="auto">Auto</button>
+          <button id="modeWsBtn" class="seg-btn" type="button" data-mode="ws">Force WS</button>
+        </div>
+      </div>
+
+      <div class="control-row">
+        <div>
+          <div class="control-title">Direct Output (WS)</div>
+          <div class="control-hint">Bypass &lt;audio&gt; element if mobile audio glitches</div>
+        </div>
+        <label class="switch" aria-label="Direct Output">
+          <input id="directOutputToggle" type="checkbox">
+          <span class="switch-track"></span>
+        </label>
+      </div>
+    </section>
+
+    <div id="statusLine" class="status-line" role="status" aria-live="polite"></div>
+  </main>
+
+  <audio id="playerAudio" class="sr-audio" playsinline></audio>
+
+  <script>
+    (() => {
+      "use strict";
+
+      const TARGET_SAMPLE_RATE = 48000;
+      const FRAME_SAMPLES = 960;
+      const SH_MAGIC_0 = 0x53;
+      const SH_MAGIC_1 = 0x48;
+      const SH_VERSION = 0x01;
+      const WS_FLAG_DISCONTINUITY = 0x02;
+      const TARGET_BUFFER_SEC = 0.060;
+      const MIN_BUFFER_SEC = 0.015;
+      const MAX_BUFFER_SEC = 0.160;
+      const HARD_REANCHOR_SEC = 0.260;
+      const WEBRTC_GATHER_CAP_MS = 400;
+      const WEBRTC_FALLBACK_MS = 3000;
+      const BACKOFF_STEPS_MS = [500, 1000, 2000, 5000];
+      const PING_INTERVAL_MS = 2000;
+
+      // Inline AudioWorkletProcessor used when window.isSecureContext is true (e.g. http://localhost via adb reverse).
+      const WORKLET_JS = `
+        class SoundHopPcmProcessor extends AudioWorkletProcessor {
+          constructor() {
+            super();
+            this.capacity = 16384; // stereo frames (~341 ms @ 48 kHz)
+            this.ring = new Float32Array(this.capacity * 2);
+            this.readIdx = 0;
+            this.writeIdx = 0;
+            this.count = 0;
+            this.targetFrames = 2880;   // 60 ms
+            this.driftHighFrames = 6720; // 140 ms
+            this.hardMaxFrames = 7680;  // 160 ms
+            this.fadeFrames = 240;      // 5 ms
+            this.priming = true;
+            this.fadeInRemaining = 0;
+            this.fadeOutRemaining = 0;
+            this.lastL = 0;
+            this.lastR = 0;
+            this.phase = 0;
+            this.underruns = 0;
+            this.overflows = 0;
+            this.quantaSinceStats = 0;
+
+            this.port.onmessage = (ev) => {
+              const msg = ev.data;
+              if (!msg) return;
+              if (msg.type === "reset") {
+                this.resetBuffer();
+                return;
+              }
+              if (msg.type === "pcm" && msg.samples) {
+                if (msg.discontinuity) {
+                  this.resetBuffer();
+                }
+                this.pushInterleaved(msg.samples);
+              }
+            };
+          }
+
+          resetBuffer() {
+            this.readIdx = 0;
+            this.writeIdx = 0;
+            this.count = 0;
+            this.priming = true;
+            this.fadeInRemaining = 0;
+            this.fadeOutRemaining = 0;
+            this.phase = 0;
+          }
+
+          pushInterleaved(samples) {
+            const frames = (samples.length / 2) | 0;
+            if (frames <= 0) return;
+
+            if (frames >= this.capacity) {
+              const offset = (frames - this.capacity) * 2;
+              for (let i = 0; i < this.capacity; i++) {
+                this.ring[i * 2] = samples[offset + i * 2];
+                this.ring[i * 2 + 1] = samples[offset + i * 2 + 1];
+              }
+              this.readIdx = 0;
+              this.writeIdx = 0;
+              this.count = this.capacity;
+              this.overflows++;
+              return;
+            }
+
+            if (this.count + frames > this.capacity) {
+              const drop = this.count + frames - this.capacity;
+              this.readIdx = (this.readIdx + drop) % this.capacity;
+              this.count -= drop;
+              this.overflows++;
+            }
+
+            for (let i = 0; i < frames; i++) {
+              const w = this.writeIdx * 2;
+              this.ring[w] = samples[i * 2];
+              this.ring[w + 1] = samples[i * 2 + 1];
+              this.writeIdx = (this.writeIdx + 1) % this.capacity;
+            }
+            this.count += frames;
+
+            if (this.count > this.hardMaxFrames) {
+              const trim = this.count - this.targetFrames;
+              this.readIdx = (this.readIdx + trim) % this.capacity;
+              this.count = this.targetFrames;
+              this.fadeInRemaining = this.fadeFrames;
+              this.overflows++;
+            }
+          }
+
+          readSampleAt(offsetFrames) {
+            const idx = ((this.readIdx + offsetFrames) % this.capacity) * 2;
+            return idx;
+          }
+
+          advanceRead(frames) {
+            const step = Math.min(frames, this.count);
+            this.readIdx = (this.readIdx + step) % this.capacity;
+            this.count -= step;
+          }
+
+          process(_inputs, outputs) {
+            const output = outputs[0];
+            if (!output || output.length === 0) return true;
+            const outL = output[0];
+            const outR = output[1] || outL;
+            const quantum = outL.length;
+
+            if (this.priming) {
+              if (this.count >= this.targetFrames) {
+                this.priming = false;
+                this.fadeInRemaining = this.fadeFrames;
+                this.phase = 0;
+              } else {
+                for (let i = 0; i < quantum; i++) {
+                  if (this.fadeOutRemaining > 0) {
+                    const g = this.fadeOutRemaining / this.fadeFrames;
+                    outL[i] = this.lastL * g;
+                    outR[i] = this.lastR * g;
+                    this.fadeOutRemaining--;
+                  } else {
+                    outL[i] = 0;
+                    outR[i] = 0;
+                  }
+                }
+                this.emitStats();
+                return true;
+              }
+            }
+
+            const baseRatio = 48000 / sampleRate;
+            const driftFactor = this.count > this.driftHighFrames ? 1.005 : 1.0;
+            const step = baseRatio * driftFactor;
+
+            for (let i = 0; i < quantum; i++) {
+              if (this.count < 2) {
+                this.underruns++;
+                this.priming = true;
+                this.fadeOutRemaining = this.fadeFrames;
+                for (let j = i; j < quantum; j++) {
+                  if (this.fadeOutRemaining > 0) {
+                    const g = this.fadeOutRemaining / this.fadeFrames;
+                    outL[j] = this.lastL * g;
+                    outR[j] = this.lastR * g;
+                    this.fadeOutRemaining--;
+                  } else {
+                    outL[j] = 0;
+                    outR[j] = 0;
+                  }
+                }
+                break;
+              }
+
+              let l;
+              let r;
+              if (step === 1.0 && this.phase === 0) {
+                const idx = this.readIdx * 2;
+                l = this.ring[idx];
+                r = this.ring[idx + 1];
+                this.readIdx = (this.readIdx + 1) % this.capacity;
+                this.count--;
+              } else {
+                const idx0 = this.readSampleAt(0);
+                const idx1 = this.readSampleAt(1);
+                const frac = this.phase;
+                l = this.ring[idx0] + (this.ring[idx1] - this.ring[idx0]) * frac;
+                r = this.ring[idx0 + 1] + (this.ring[idx1 + 1] - this.ring[idx0 + 1]) * frac;
+                this.phase += step;
+                const adv = Math.floor(this.phase);
+                if (adv > 0) {
+                  this.phase -= adv;
+                  this.advanceRead(adv);
+                }
+              }
+
+              if (this.fadeInRemaining > 0) {
+                const g = 1 - (this.fadeInRemaining / this.fadeFrames);
+                l *= g;
+                r *= g;
+                this.fadeInRemaining--;
+              }
+
+              this.lastL = l;
+              this.lastR = r;
+              outL[i] = l;
+              outR[i] = r;
+            }
+
+            this.emitStats();
+            return true;
+          }
+
+          emitStats() {
+            this.quantaSinceStats++;
+            if (this.quantaSinceStats >= 75) {
+              this.quantaSinceStats = 0;
+              this.port.postMessage({
+                type: "stats",
+                bufferedFrames: this.count,
+                priming: this.priming,
+                underruns: this.underruns,
+                overflows: this.overflows
+              });
+            }
+          }
+        }
+        registerProcessor("soundhop-pcm-processor", SoundHopPcmProcessor);
+      `;
+
+      const els = {
+        versionTag: document.getElementById("versionTag"),
+        transportBadge: document.getElementById("transportBadge"),
+        transportBadgeText: document.getElementById("transportBadgeText"),
+        deviceName: document.getElementById("deviceName"),
+        formatInfo: document.getElementById("formatInfo"),
+        authPanel: document.getElementById("authPanel"),
+        tokenInput: document.getElementById("tokenInput"),
+        tokenSubmitBtn: document.getElementById("tokenSubmitBtn"),
+        authError: document.getElementById("authError"),
+        listenBtn: document.getElementById("listenBtn"),
+        listenIcon: document.getElementById("listenIcon"),
+        listenBtnLabel: document.getElementById("listenBtnLabel"),
+        bufferReadout: document.getElementById("bufferReadout"),
+        rttReadout: document.getElementById("rttReadout"),
+        stateReadout: document.getElementById("stateReadout"),
+        muteBtn: document.getElementById("muteBtn"),
+        volumeIcon: document.getElementById("volumeIcon"),
+        volumeSlider: document.getElementById("volumeSlider"),
+        volumePct: document.getElementById("volumePct"),
+        modeAutoBtn: document.getElementById("modeAutoBtn"),
+        modeWsBtn: document.getElementById("modeWsBtn"),
+        directOutputToggle: document.getElementById("directOutputToggle"),
+        statusLine: document.getElementById("statusLine"),
+        playerAudio: document.getElementById("playerAudio")
+      };
+
+      let authToken = extractAndStripToken();
+      let serverInfo = null;
+      let shouldListen = false;
+      let sessionSeq = 0;
+      let transportPref = loadPref("soundhop_transport", "auto") === "ws" ? "ws" : "auto";
+      let directOutput = loadPref("soundhop_direct_output", "0") === "1";
+      let volume = clampNumber(parseFloat(loadPref("soundhop_volume", "1")), 0, 1, 1);
+      let muted = false;
+
+      let audioCtx = null;
+      let fadeGain = null;
+      let masterGain = null;
+      let mediaDest = null;
+      let workletLoadedForCtx = null;
+      let workletNode = null;
+      let activeSources = new Set();
+
+      let activePc = null;
+      let activePeerId = null;
+      let activeOfferAbort = null;
+      let webrtcFallbackTimer = null;
+      let webrtcDisconnectTimer = null;
+      let webrtcStatsTimer = null;
+
+      let activeWs = null;
+      let wsPingTimer = null;
+      let nextPlayTime = 0;
+      let wsBufferMode = "none"; // "none" | "pcm" | "worklet"
+
+      let reconnectAttempt = 0;
+      let reconnectTimer = null;
+      let isWaitingReconnect = false;
+
+      function clampNumber(val, min, max, fallback) {
+        return Number.isFinite(val) ? Math.min(max, Math.max(min, val)) : fallback;
+      }
+
+      function loadPref(key, fallback) {
+        try {
+          const val = window.localStorage.getItem(key);
+          return val !== null ? val : fallback;
+        } catch (_) {
+          return fallback;
+        }
+      }
+
+      function savePref(key, value) {
+        try {
+          window.localStorage.setItem(key, String(value));
+        } catch (_) {}
+      }
+
+      function extractAndStripToken() {
+        const hash = window.location.hash || "";
+        if (!hash || hash === "#") return "";
+        const raw = hash.slice(1);
+        const params = new URLSearchParams(raw);
+        const tok = (params.get("t") || params.get("token") || "").trim();
+        try {
+          history.replaceState(null, "", window.location.pathname + window.location.search);
+        } catch (_) {}
+        return tok;
+      }
+
+      function buildAuthHeaders(extra) {
+        const headers = Object.assign({}, extra || {});
+        if (authToken) {
+          headers["Authorization"] = "Bearer " + authToken;
+        }
+        return headers;
+      }
+
+      function detectClientName() {
+        const ua = navigator.userAgent || "";
+        const os = /Android/i.test(ua)
+          ? "Android"
+          : /iPhone|iPad|iPod/i.test(ua)
+            ? "iOS"
+            : /Windows/i.test(ua)
+              ? "Windows"
+              : /Mac OS X/i.test(ua)
+                ? "macOS"
+                : /Linux/i.test(ua)
+                  ? "Linux"
+                  : "Browser";
+        const browser = /Firefox/i.test(ua)
+          ? "Firefox"
+          : /Edg/i.test(ua)
+            ? "Edge"
+            : /Chrome|CriOS/i.test(ua)
+              ? "Chrome"
+              : /Safari/i.test(ua)
+                ? "Safari"
+                : "Web";
+        return os + " " + browser;
+      }
+
+      function setStatusLine(text, isError) {
+        els.statusLine.textContent = text || "";
+        els.statusLine.classList.toggle("error", Boolean(isError));
+      }
+
+      function setBadge(kind, label) {
+        els.transportBadge.className = "pill" + (kind ? " " + kind : "");
+        els.transportBadgeText.textContent = label;
+      }
+
+      function setStateReadout(text) {
+        els.stateReadout.textContent = text;
+      }
+
+      function setListenButtonMode(mode) {
+        // mode: "idle" | "connecting" | "live"
+        els.listenBtn.classList.remove("live", "connecting");
+        if (mode === "live") {
+          els.listenBtn.classList.add("live");
+          els.listenBtnLabel.textContent = "Stop Listening";
+          els.listenIcon.innerHTML = '<rect x="5" y="5" width="14" height="14" rx="2"/>';
+        } else if (mode === "connecting") {
+          els.listenBtn.classList.add("connecting");
+          els.listenBtnLabel.textContent = "Cancel";
+          els.listenIcon.innerHTML = '<rect x="5" y="5" width="14" height="14" rx="2"/>';
+        } else {
+          els.listenBtnLabel.textContent = "Listen";
+          els.listenIcon.innerHTML = '<polygon points="6 4 20 12 6 20 6 4"/>';
+        }
+      }
+
+      function showAuthPrompt(errorMessage) {
+        els.authPanel.classList.add("visible");
+        if (errorMessage) {
+          els.authError.textContent = errorMessage;
+          els.authError.classList.add("visible");
+        } else {
+          els.authError.textContent = "";
+          els.authError.classList.remove("visible");
+        }
+      }
+
+      function hideAuthPrompt() {
+        els.authPanel.classList.remove("visible");
+        els.authError.textContent = "";
+        els.authError.classList.remove("visible");
+      }
+
+      function updateVolumeUI() {
+        const pct = Math.round(volume * 100);
+        els.volumeSlider.value = String(pct);
+        els.volumePct.textContent = muted ? "Muted" : pct + "%";
+        els.muteBtn.classList.toggle("muted", muted || volume === 0);
+        els.muteBtn.setAttribute("aria-pressed", String(muted));
+
+        if (muted || volume === 0) {
+          els.volumeIcon.innerHTML =
+            '<polygon points="11 5 6 9 2 9 2 15 6 15 11 19 11 5"/>' +
+            '<line x1="23" y1="9" x2="17" y2="15"/>' +
+            '<line x1="17" y1="9" x2="23" y2="15"/>';
+        } else {
+          els.volumeIcon.innerHTML =
+            '<polygon points="11 5 6 9 2 9 2 15 6 15 11 19 11 5"/>' +
+            '<path d="M15.54 8.46a5 5 0 0 1 0 7.07"/>' +
+            '<path d="M19.07 4.93a10 10 0 0 1 0 14.14"/>';
+        }
+
+        const effectiveGain = muted ? 0 : volume;
+        if (masterGain && audioCtx) {
+          masterGain.gain.setTargetAtTime(effectiveGain, audioCtx.currentTime, 0.015);
+        }
+        els.playerAudio.muted = muted;
+        try {
+          els.playerAudio.volume = effectiveGain;
+        } catch (_) {}
+
+        updateMediaSessionPlaybackState();
+      }
+
+      function updateTransportPrefUI() {
+        els.modeAutoBtn.classList.toggle("active", transportPref === "auto");
+        els.modeWsBtn.classList.toggle("active", transportPref === "ws");
+        els.directOutputToggle.checked = directOutput;
+      }
+
+      function ensureAudioGraphSync() {
+        if (!audioCtx) {
+          const Ctx = window.AudioContext || window.webkitAudioContext;
+          try {
+            audioCtx = new Ctx({ latencyHint: "interactive", sampleRate: TARGET_SAMPLE_RATE });
+          } catch (_) {
+            audioCtx = new Ctx();
+          }
+          fadeGain = audioCtx.createGain();
+          fadeGain.gain.value = 1;
+          masterGain = audioCtx.createGain();
+          masterGain.gain.value = muted ? 0 : volume;
+          fadeGain.connect(masterGain);
+
+          if (typeof audioCtx.createMediaStreamDestination === "function") {
+            mediaDest = audioCtx.createMediaStreamDestination();
+          }
+          applyWsOutputRouting();
+        }
+        if (audioCtx.state === "suspended") {
+          audioCtx.resume().catch(() => {});
+        }
+      }
+
+      function unlockAudioElementSync() {
+        const audio = els.playerAudio;
+        audio.setAttribute("playsinline", "");
+        audio.playsInline = true;
+        audio.muted = muted;
+        try {
+          audio.volume = muted ? 0 : volume;
+        } catch (_) {}
+
+        if (mediaDest && !activePc) {
+          if (audio.srcObject !== mediaDest.stream) {
+            audio.srcObject = mediaDest.stream;
+          }
+          audio.play().catch(() => {});
+        }
+      }
+
+      function applyWsOutputRouting() {
+        if (!masterGain || !audioCtx) return;
+        try {
+          masterGain.disconnect();
+        } catch (_) {}
+
+        if (!directOutput && mediaDest) {
+          masterGain.connect(mediaDest);
+          if (!activePc && shouldListen) {
+            if (els.playerAudio.srcObject !== mediaDest.stream) {
+              els.playerAudio.srcObject = mediaDest.stream;
+            }
+            els.playerAudio.play().catch(() => {});
+          }
+        } else {
+          masterGain.connect(audioCtx.destination);
+          if (!activePc && els.playerAudio.srcObject === (mediaDest && mediaDest.stream)) {
+            els.playerAudio.pause();
+            els.playerAudio.srcObject = null;
+          }
+        }
+      }
+
+      function updateMediaSessionMetadata() {
+        if (!("mediaSession" in navigator) || typeof MediaMetadata !== "function") return;
+        const title = (serverInfo && serverInfo.deviceName) ? serverInfo.deviceName : "SoundHop PC";
+        try {
+          navigator.mediaSession.metadata = new MediaMetadata({
+            title,
+            artist: "SoundHop Web Broadcast",
+            album: "Live Audio"
+          });
+        } catch (_) {}
+      }
+
+      function updateMediaSessionPlaybackState() {
+        if (!("mediaSession" in navigator)) return;
+        try {
+          if (!shouldListen) {
+            navigator.mediaSession.playbackState = "none";
+          } else if (muted) {
+            navigator.mediaSession.playbackState = "paused";
+          } else {
+            navigator.mediaSession.playbackState = "playing";
+          }
+        } catch (_) {}
+      }
+
+      function registerMediaSessionSync() {
+        if (!("mediaSession" in navigator)) return;
+        updateMediaSessionMetadata();
+        const safeAction = (name, fn) => {
+          try {
+            navigator.mediaSession.setActionHandler(name, fn);
+          } catch (_) {}
+        };
+        safeAction("play", () => {
+          if (!shouldListen) {
+            startListening();
+            return;
+          }
+          muted = false;
+          if (audioCtx && audioCtx.state === "suspended") {
+            audioCtx.resume().catch(() => {});
+          }
+          els.playerAudio.play().catch(() => {});
+          updateVolumeUI();
+        });
+        safeAction("pause", () => {
+          if (!shouldListen) return;
+          muted = true;
+          updateVolumeUI();
+        });
+        safeAction("stop", () => {
+          stopListening("Stopped via media controls");
+        });
+      }
+
+      async function fetchServerInfo() {
+        try {
+          const res = await fetch("/api/info", {
+            method: "GET",
+            headers: buildAuthHeaders(),
+            cache: "no-store"
+          });
+          if (res.status === 401) {
+            authToken = "";
+            showAuthPrompt("Token rejected. Please enter the current session token.");
+            els.deviceName.textContent = "Authentication required";
+            return { ok: false, authFailed: true };
+          }
+          if (!res.ok) {
+            els.deviceName.textContent = "Host unavailable (" + res.status + ")";
+            return { ok: false, authFailed: false };
+          }
+          const data = await res.json();
+          serverInfo = data;
+
+          if (data.authRequired && !authToken) {
+            showAuthPrompt("");
+            els.deviceName.textContent = "Authentication required";
+            return { ok: false, authFailed: true };
+          }
+
+          hideAuthPrompt();
+          if (data.version) {
+            els.versionTag.textContent = "v" + data.version;
+            els.versionTag.hidden = false;
+          }
+          els.deviceName.textContent = data.deviceName || "SoundHop PC";
+          const rateKhz = ((data.sampleRate || 48000) / 1000).toFixed(0);
+          const chLabel = (data.channels || 2) === 2 ? "Stereo" : "Mono";
+          els.formatInfo.textContent = rateKhz + " kHz · " + chLabel;
+          updateMediaSessionMetadata();
+          return { ok: true, data };
+        } catch (err) {
+          els.deviceName.textContent = "Unable to reach SoundHop";
+          setStatusLine("Host unreachable: " + (err && err.message ? err.message : "network error"), true);
+          return { ok: false, authFailed: false };
+        }
+      }
+
+      function deletePeer(peerId, keepalive) {
+        if (!peerId) return;
+        try {
+          fetch("/webrtc/peer/" + encodeURIComponent(peerId), {
+            method: "DELETE",
+            keepalive: Boolean(keepalive),
+            headers: buildAuthHeaders()
+          }).catch(() => {});
+        } catch (_) {}
+      }
+
+      function cleanupWebRTC(sendDelete) {
+        clearTimeout(webrtcFallbackTimer);
+        webrtcFallbackTimer = null;
+        clearTimeout(webrtcDisconnectTimer);
+        webrtcDisconnectTimer = null;
+        clearInterval(webrtcStatsTimer);
+        webrtcStatsTimer = null;
+
+        if (activeOfferAbort) {
+          try { activeOfferAbort.abort(); } catch (_) {}
+          activeOfferAbort = null;
+        }
+
+        const peerToDelete = activePeerId;
+        activePeerId = null;
+        if (sendDelete && peerToDelete) {
+          deletePeer(peerToDelete, false);
+        }
+
+        if (activePc) {
+          try {
+            activePc.ontrack = null;
+            activePc.oniceconnectionstatechange = null;
+            activePc.onconnectionstatechange = null;
+            activePc.onicegatheringstatechange = null;
+            activePc.close();
+          } catch (_) {}
+          activePc = null;
+        }
+      }
+
+      function cleanupAudioSources() {
+        for (const src of activeSources) {
+          try { src.onended = null; src.stop(); } catch (_) {}
+          try { src.disconnect(); } catch (_) {}
+        }
+        activeSources.clear();
+        nextPlayTime = 0;
+
+        if (workletNode) {
+          try { workletNode.port.postMessage({ type: "reset" }); } catch (_) {}
+          try { workletNode.disconnect(); } catch (_) {}
+        }
+      }
+
+      function cleanupWebSocket() {
+        clearInterval(wsPingTimer);
+        wsPingTimer = null;
+        wsBufferMode = "none";
+
+        if (activeWs) {
+          try {
+            activeWs.onopen = null;
+            activeWs.onmessage = null;
+            activeWs.onerror = null;
+            activeWs.onclose = null;
+            if (activeWs.readyState === WebSocket.OPEN || activeWs.readyState === WebSocket.CONNECTING) {
+              activeWs.close(1000, "client stop");
+            }
+          } catch (_) {}
+          activeWs = null;
+        }
+        cleanupAudioSources();
+      }
+
+      function cleanupAllTransports(sendDelete) {
+        clearTimeout(reconnectTimer);
+        reconnectTimer = null;
+        isWaitingReconnect = false;
+        cleanupWebRTC(sendDelete);
+        cleanupWebSocket();
+
+        if (els.playerAudio) {
+          try { els.playerAudio.pause(); } catch (_) {}
+          els.playerAudio.srcObject = null;
+        }
+      }
+
+      function stopListening(reason) {
+        shouldListen = false;
+        sessionSeq++;
+        reconnectAttempt = 0;
+        cleanupAllTransports(true);
+        setListenButtonMode("idle");
+        setBadge("", "Standby");
+        setStateReadout("Stopped");
+        els.bufferReadout.textContent = "--";
+        els.rttReadout.textContent = "--";
+        setStatusLine(reason || "", false);
+        updateMediaSessionPlaybackState();
+      }
+
+      function scheduleReconnect(reason) {
+        if (!shouldListen) return;
+        cleanupAllTransports(true);
+        isWaitingReconnect = true;
+        const delay = BACKOFF_STEPS_MS[Math.min(reconnectAttempt, BACKOFF_STEPS_MS.length - 1)];
+        reconnectAttempt++;
+
+        setListenButtonMode("connecting");
+        setBadge("connecting", "Reconnecting");
+        setStateReadout("Retry " + (delay / 1000).toFixed(1) + "s");
+        els.bufferReadout.textContent = "--";
+        setStatusLine((reason ? reason + " — " : "") + "retrying in " + (delay / 1000).toFixed(1) + "s", true);
+
+        const scheduledSeq = sessionSeq;
+        reconnectTimer = setTimeout(() => {
+          if (!shouldListen || scheduledSeq !== sessionSeq) return;
+          isWaitingReconnect = false;
+          connectFlow(++sessionSeq);
+        }, delay);
+      }
+
+      function handleUnexpectedDrop(mySeq, reason) {
+        if (mySeq !== sessionSeq || !shouldListen) return;
+        sessionSeq++;
+        scheduleReconnect(reason);
+      }
+
+      function startListening() {
+        ensureAudioGraphSync();
+        unlockAudioElementSync();
+        registerMediaSessionSync();
+
+        shouldListen = true;
+        reconnectAttempt = 0;
+        cleanupAllTransports(true);
+        const mySeq = ++sessionSeq;
+        setListenButtonMode("connecting");
+        setBadge("connecting", "Connecting");
+        setStateReadout("Connecting");
+        setStatusLine("Negotiating audio stream…", false);
+        updateMediaSessionPlaybackState();
+
+        connectFlow(mySeq);
+      }
+
+      async function connectFlow(mySeq) {
+        if (mySeq !== sessionSeq || !shouldListen) return;
+
+        if (!serverInfo || (serverInfo.authRequired && !authToken)) {
+          const infoRes = await fetchServerInfo();
+          if (mySeq !== sessionSeq || !shouldListen) return;
+          if (!infoRes.ok) {
+            if (infoRes.authFailed) {
+              stopListening("Enter session token to listen");
+            } else {
+              scheduleReconnect("Host unreachable");
+            }
+            return;
+          }
+        }
+
+        const canWebRtc =
+          transportPref === "auto" &&
+          typeof window.RTCPeerConnection === "function" &&
+          (!serverInfo || serverInfo.webrtc !== false);
+
+        if (canWebRtc) {
+          await connectWebRTC(mySeq);
+        } else {
+          await connectWebSocket(mySeq);
+        }
+      }
+
+      function waitForIceGatheringCap(pc, capMs) {
+        if (pc.iceGatheringState === "complete") {
+          return Promise.resolve();
+        }
+        return new Promise((resolve) => {
+          let done = false;
+          const finish = () => {
+            if (done) return;
+            done = true;
+            clearTimeout(timer);
+            pc.removeEventListener("icegatheringstatechange", onGather);
+            resolve();
+          };
+          const onGather = () => {
+            if (pc.iceGatheringState === "complete") finish();
+          };
+          const timer = setTimeout(finish, capMs);
+          pc.addEventListener("icegatheringstatechange", onGather);
+        });
+      }
+
+      async function pollWebRtcStats(pc, mySeq) {
+        if (mySeq !== sessionSeq || activePc !== pc) return;
+        try {
+          const stats = await pc.getStats();
+          if (mySeq !== sessionSeq || activePc !== pc) return;
+          let rttMs = null;
+          let bufMs = null;
+          stats.forEach((report) => {
+            if (
+              report.type === "candidate-pair" &&
+              (report.nominated || report.state === "succeeded") &&
+              typeof report.currentRoundTripTime === "number"
+            ) {
+              rttMs = report.currentRoundTripTime * 1000;
+            }
+            if (
+              report.type === "inbound-rtp" &&
+              report.kind === "audio" &&
+              typeof report.jitterBufferDelay === "number" &&
+              report.jitterBufferEmittedCount > 0
+            ) {
+              bufMs = (report.jitterBufferDelay / report.jitterBufferEmittedCount) * 1000;
+            }
+          });
+          if (rttMs !== null) {
+            els.rttReadout.textContent = rttMs.toFixed(1) + " ms";
+          }
+          if (bufMs !== null) {
+            els.bufferReadout.textContent = Math.round(bufMs) + " ms";
+          } else {
+            els.bufferReadout.textContent = "~50 ms";
+          }
+        } catch (_) {}
+      }
+
+      async function connectWebRTC(mySeq) {
+        if (mySeq !== sessionSeq || !shouldListen) return;
+
+        setBadge("connecting", "WebRTC…");
+        setStateReadout("ICE/DTLS");
+        setStatusLine("Connecting low-latency WebRTC Opus…", false);
+
+        const pc = new RTCPeerConnection({ iceServers: [] });
+        activePc = pc;
+        let settled = false;
+
+        const fallbackToWs = (reason) => {
+          if (settled || mySeq !== sessionSeq || !shouldListen) return;
+          settled = true;
+          cleanupWebRTC(true);
+          setStatusLine("WebRTC fallback (" + reason + ") -> switching to WebSocket", false);
+          connectWebSocket(mySeq);
+        };
+
+        webrtcFallbackTimer = setTimeout(() => {
+          fallbackToWs("3.0s timeout");
+        }, WEBRTC_FALLBACK_MS);
+
+        pc.addTransceiver("audio", { direction: "recvonly" });
+
+        pc.ontrack = (event) => {
+          if (mySeq !== sessionSeq || activePc !== pc) return;
+          if (event.receiver && "playoutDelayHint" in event.receiver) {
+            try {
+              event.receiver.playoutDelayHint = 0.05;
+            } catch (_) {}
+          }
+          const stream = event.streams && event.streams[0]
+            ? event.streams[0]
+            : new MediaStream([event.track]);
+          els.playerAudio.srcObject = stream;
+          els.playerAudio.muted = muted;
+          try { els.playerAudio.volume = muted ? 0 : volume; } catch (_) {}
+          els.playerAudio.play().catch((err) => {
+            setStatusLine("Tap audio play if blocked: " + (err && err.message ? err.message : "autoplay"), true);
+          });
+        };
+
+        const handleStateChange = () => {
+          if (mySeq !== sessionSeq || activePc !== pc) return;
+          const ice = pc.iceConnectionState;
+          const conn = pc.connectionState;
+
+          if (ice === "connected" || ice === "completed" || conn === "connected") {
+            clearTimeout(webrtcDisconnectTimer);
+            webrtcDisconnectTimer = null;
+            if (!settled) {
+              settled = true;
+              clearTimeout(webrtcFallbackTimer);
+              webrtcFallbackTimer = null;
+              reconnectAttempt = 0;
+              setListenButtonMode("live");
+              setBadge("webrtc", "WebRTC · Opus");
+              setStateReadout("Live");
+              els.bufferReadout.textContent = "~50 ms";
+              setStatusLine("Streaming 48 kHz stereo Opus via WebRTC", false);
+              updateMediaSessionPlaybackState();
+              clearInterval(webrtcStatsTimer);
+              webrtcStatsTimer = setInterval(() => pollWebRtcStats(pc, mySeq), 1000);
+            }
+            return;
+          }
+
+          if (!settled) {
+            if (ice === "failed" || ice === "disconnected" || conn === "failed" || conn === "disconnected" || conn === "closed") {
+              fallbackToWs(conn || ice);
+            }
+            return;
+          }
+
+          if (ice === "failed" || conn === "failed" || conn === "closed") {
+            handleUnexpectedDrop(mySeq, "WebRTC " + (conn || ice));
+          } else if (ice === "disconnected" || conn === "disconnected") {
+            if (!webrtcDisconnectTimer) {
+              webrtcDisconnectTimer = setTimeout(() => {
+                if (mySeq === sessionSeq && activePc === pc) {
+                  handleUnexpectedDrop(mySeq, "WebRTC disconnected");
+                }
+              }, 2500);
+            }
+          }
+        };
+
+        pc.oniceconnectionstatechange = handleStateChange;
+        pc.onconnectionstatechange = handleStateChange;
+
+        try {
+          const offer = await pc.createOffer();
+          if (mySeq !== sessionSeq || settled || activePc !== pc) return;
+          await pc.setLocalDescription(offer);
+          await waitForIceGatheringCap(pc, WEBRTC_GATHER_CAP_MS);
+          if (mySeq !== sessionSeq || settled || activePc !== pc) return;
+
+          activeOfferAbort = new AbortController();
+          const res = await fetch("/webrtc/offer", {
+            method: "POST",
+            headers: buildAuthHeaders({ "Content-Type": "application/json" }),
+            body: JSON.stringify({
+              type: pc.localDescription.type,
+              sdp: pc.localDescription.sdp,
+              clientName: detectClientName()
+            }),
+            signal: activeOfferAbort.signal
+          });
+          activeOfferAbort = null;
+
+          if (res.status === 401) {
+            settled = true;
+            authToken = "";
+            showAuthPrompt("Session token rejected. Please enter the current token.");
+            stopListening("Authentication required");
+            return;
+          }
+
+          if (!res.ok) {
+            fallbackToWs("HTTP " + res.status);
+            return;
+          }
+
+          const answer = await res.json();
+          if (mySeq !== sessionSeq || settled || activePc !== pc) {
+            if (answer && answer.peerId) deletePeer(answer.peerId, false);
+            return;
+          }
+
+          activePeerId = answer.peerId || null;
+          await pc.setRemoteDescription({
+            type: answer.type || "answer",
+            sdp: answer.sdp
+          });
+          handleStateChange();
+        } catch (err) {
+          if (err && err.name === "AbortError") return;
+          fallbackToWs(err && err.message ? err.message : "offer error");
+        }
+      }
+
+      async function ensureWorkletReady() {
+        if (!audioCtx || !window.isSecureContext || !audioCtx.audioWorklet || typeof AudioWorkletNode !== "function") {
+          return false;
+        }
+        if (workletLoadedForCtx !== audioCtx) {
+          const blob = new Blob([WORKLET_JS], { type: "application/javascript" });
+          const blobUrl = URL.createObjectURL(blob);
+          try {
+            await audioCtx.audioWorklet.addModule(blobUrl);
+            workletLoadedForCtx = audioCtx;
+          } finally {
+            URL.revokeObjectURL(blobUrl);
+          }
+        }
+        if (!workletNode) {
+          workletNode = new AudioWorkletNode(audioCtx, "soundhop-pcm-processor", {
+            numberOfInputs: 0,
+            numberOfOutputs: 1,
+            outputChannelCount: [2]
+          });
+          workletNode.port.onmessage = (ev) => {
+            const msg = ev.data;
+            if (!msg || msg.type !== "stats" || wsBufferMode !== "worklet") return;
+            const ms = Math.round((msg.bufferedFrames / TARGET_SAMPLE_RATE) * 1000);
+            els.bufferReadout.textContent = ms + " ms";
+            if (msg.priming) {
+              setStateReadout("Priming");
+            } else {
+              setStateReadout("Live");
+            }
+          };
+        }
+        try { workletNode.disconnect(); } catch (_) {}
+        workletNode.connect(fadeGain);
+        workletNode.port.postMessage({ type: "reset" });
+        return true;
+      }
+
+      function pushPcmToWorklet(view, numFrames, discontinuity) {
+        if (!workletNode) return;
+        const interleaved = new Float32Array(numFrames * 2);
+        for (let i = 0; i < numFrames * 2; i++) {
+          interleaved[i] = view.getInt16(16 + i * 2, true) / 32768.0;
+        }
+        workletNode.port.postMessage(
+          { type: "pcm", samples: interleaved, discontinuity },
+          [interleaved.buffer]
+        );
+      }
+
+      function schedulePcmBuffer(view, numFrames, discontinuity) {
+        if (!audioCtx || !fadeGain) return;
+        const now = audioCtx.currentTime;
+
+        if (discontinuity || nextPlayTime === 0) {
+          nextPlayTime = now + TARGET_BUFFER_SEC;
+          fadeGain.gain.cancelScheduledValues(now);
+          fadeGain.gain.setValueAtTime(0.001, nextPlayTime);
+          fadeGain.gain.linearRampToValueAtTime(1.0, nextPlayTime + 0.005);
+        }
+
+        const lead = nextPlayTime - now;
+
+        if (lead < MIN_BUFFER_SEC) {
+          // Underrun: re-anchor to 60ms target with 5ms micro-fade.
+          nextPlayTime = now + TARGET_BUFFER_SEC;
+          fadeGain.gain.cancelScheduledValues(now);
+          fadeGain.gain.setValueAtTime(0.001, nextPlayTime);
+          fadeGain.gain.linearRampToValueAtTime(1.0, nextPlayTime + 0.005);
+        } else if (lead > HARD_REANCHOR_SEC) {
+          // Severe bloat: 5ms micro-fade out & re-anchor.
+          fadeGain.gain.cancelScheduledValues(now);
+          fadeGain.gain.setValueAtTime(fadeGain.gain.value, now);
+          fadeGain.gain.linearRampToValueAtTime(0.001, now + 0.005);
+          nextPlayTime = now + TARGET_BUFFER_SEC;
+          fadeGain.gain.setValueAtTime(0.001, nextPlayTime);
+          fadeGain.gain.linearRampToValueAtTime(1.0, nextPlayTime + 0.005);
+        } else if (lead > MAX_BUFFER_SEC) {
+          // Moderate drift above 160ms: drop incoming frame to drain toward 60ms.
+          els.bufferReadout.textContent = Math.round(lead * 1000) + " ms";
+          return;
+        }
+
+        const audioBuf = audioCtx.createBuffer(2, numFrames, TARGET_SAMPLE_RATE);
+        const chL = audioBuf.getChannelData(0);
+        const chR = audioBuf.getChannelData(1);
+        for (let i = 0; i < numFrames; i++) {
+          const base = 16 + i * 4;
+          chL[i] = view.getInt16(base, true) / 32768.0;
+          chR[i] = view.getInt16(base + 2, true) / 32768.0;
+        }
+
+        const src = audioCtx.createBufferSource();
+        src.buffer = audioBuf;
+        src.connect(fadeGain);
+        src.onended = () => {
+          activeSources.delete(src);
+          try { src.disconnect(); } catch (_) {}
+        };
+        activeSources.add(src);
+
+        const startAt = nextPlayTime;
+        src.start(startAt);
+        nextPlayTime = startAt + numFrames / TARGET_SAMPLE_RATE;
+
+        const bufMs = Math.max(0, Math.round((nextPlayTime - now) * 1000));
+        els.bufferReadout.textContent = bufMs + " ms";
+      }
+
+      function handleWsBinaryFrame(buf) {
+        if (buf.byteLength < 20) return;
+        const view = new DataView(buf);
+        if (view.getUint8(0) !== SH_MAGIC_0 || view.getUint8(1) !== SH_MAGIC_1) return;
+        if (view.getUint8(2) !== SH_VERSION) return;
+
+        const flags = view.getUint8(3);
+        const discontinuity = (flags & WS_FLAG_DISCONTINUITY) !== 0;
+        const payloadBytes = buf.byteLength - 16;
+        const numFrames = (payloadBytes / 4) | 0;
+        if (numFrames <= 0) return;
+
+        if (wsBufferMode === "worklet") {
+          pushPcmToWorklet(view, numFrames, discontinuity);
+        } else {
+          schedulePcmBuffer(view, numFrames, discontinuity);
+        }
+      }
+
+      async function connectWebSocket(mySeq) {
+        if (mySeq !== sessionSeq || !shouldListen) return;
+
+        ensureAudioGraphSync();
+        let useWorklet = false;
+        try {
+          useWorklet = await ensureWorkletReady();
+        } catch (_) {
+          useWorklet = false;
+        }
+        if (mySeq !== sessionSeq || !shouldListen) return;
+
+        wsBufferMode = useWorklet ? "worklet" : "pcm";
+        applyWsOutputRouting();
+        nextPlayTime = 0;
+
+        const wsProto = window.location.protocol === "https:" ? "wss://" : "ws://";
+        const wsUrl = wsProto + window.location.host + "/ws";
+        const protocols = authToken ? ["soundhop.v1", "auth." + authToken] : ["soundhop.v1"];
+
+        setBadge("connecting", "WS Connecting…");
+        setStateReadout("WS Handshake");
+
+        let ws;
+        try {
+          ws = new WebSocket(wsUrl, protocols);
+        } catch (err) {
+          handleUnexpectedDrop(mySeq, err && err.message ? err.message : "WS init failed");
+          return;
+        }
+        ws.binaryType = "arraybuffer";
+        activeWs = ws;
+
+        ws.onopen = () => {
+          if (mySeq !== sessionSeq || activeWs !== ws) return;
+          reconnectAttempt = 0;
+          setListenButtonMode("live");
+          if (wsBufferMode === "worklet") {
+            setBadge("worklet", "WS Worklet · USB");
+            setStatusLine("Streaming PCM16LE via AudioWorklet ring buffer", false);
+          } else {
+            setBadge("ws", "WS · PCM");
+            setStatusLine("Streaming PCM16LE via WebSocket", false);
+          }
+          setStateReadout("Live");
+          els.bufferReadout.textContent = "60 ms";
+          updateMediaSessionPlaybackState();
+
+          if (audioCtx && audioCtx.state === "suspended") {
+            audioCtx.resume().catch(() => {});
+          }
+          if (!directOutput && mediaDest) {
+            els.playerAudio.srcObject = mediaDest.stream;
+            els.playerAudio.play().catch(() => {});
+          }
+
+          clearInterval(wsPingTimer);
+          const sendPing = () => {
+            if (ws.readyState === WebSocket.OPEN) {
+              try {
+                ws.send(JSON.stringify({ type: "ping", t: performance.now() }));
+              } catch (_) {}
+            }
+          };
+          sendPing();
+          wsPingTimer = setInterval(sendPing, PING_INTERVAL_MS);
+        };
+
+        ws.onmessage = (event) => {
+          if (mySeq !== sessionSeq || activeWs !== ws) return;
+          if (event.data instanceof ArrayBuffer) {
+            handleWsBinaryFrame(event.data);
+          } else if (typeof event.data === "string") {
+            try {
+              const msg = JSON.parse(event.data);
+              if (msg && msg.type === "pong" && typeof msg.t === "number") {
+                const rttMs = Math.max(0, performance.now() - msg.t);
+                els.rttReadout.textContent = rttMs.toFixed(1) + " ms";
+                if (ws.readyState === WebSocket.OPEN) {
+                  ws.send(JSON.stringify({ type: "stats", rttMs: Number(rttMs.toFixed(1)) }));
+                }
+              }
+            } catch (_) {}
+          }
+        };
+
+        ws.onerror = () => {
+          // Handled cleanly by onclose
+        };
+
+        ws.onclose = (event) => {
+          if (mySeq !== sessionSeq || activeWs !== ws) return;
+          clearInterval(wsPingTimer);
+          wsPingTimer = null;
+          activeWs = null;
+
+          if (event.code === 1008) {
+            authToken = "";
+            showAuthPrompt("Token rejected or expired (1008). Enter new token.");
+            stopListening("Authentication rejected");
+            return;
+          }
+          if (shouldListen) {
+            handleUnexpectedDrop(mySeq, "WS closed (" + (event.code || 1006) + ")");
+          }
+        };
+      }
+
+      // --- UI & Lifecycle Event Wiring ---
+
+      els.listenBtn.addEventListener("click", () => {
+        if (shouldListen) {
+          stopListening("Stopped");
+        } else {
+          startListening();
+        }
+      });
+
+      els.authPanel.addEventListener("submit", async (e) => {
+        e.preventDefault();
+        const candidate = els.tokenInput.value.trim();
+        if (!candidate) {
+          showAuthPrompt("Please enter a valid token.");
+          return;
+        }
+        authToken = candidate;
+        els.tokenInput.value = "";
+        const res = await fetchServerInfo();
+        if (res.ok) {
+          setStatusLine("Token accepted", false);
+        }
+      });
+
+      els.muteBtn.addEventListener("click", () => {
+        muted = !muted;
+        updateVolumeUI();
+      });
+
+      els.volumeSlider.addEventListener("input", () => {
+        volume = clampNumber(parseFloat(els.volumeSlider.value) / 100, 0, 1, 1);
+        if (volume > 0 && muted) muted = false;
+        savePref("soundhop_volume", volume);
+        updateVolumeUI();
+      });
+
+      function setTransportPref(mode) {
+        if (transportPref === mode) return;
+        transportPref = mode;
+        savePref("soundhop_transport", mode);
+        updateTransportPrefUI();
+        if (shouldListen) {
+          startListening();
+        }
+      }
+
+      els.modeAutoBtn.addEventListener("click", () => setTransportPref("auto"));
+      els.modeWsBtn.addEventListener("click", () => setTransportPref("ws"));
+
+      els.directOutputToggle.addEventListener("change", () => {
+        directOutput = Boolean(els.directOutputToggle.checked);
+        savePref("soundhop_direct_output", directOutput ? "1" : "0");
+        applyWsOutputRouting();
+      });
+
+      window.addEventListener("hashchange", () => {
+        const nextTok = extractAndStripToken();
+        if (nextTok) {
+          authToken = nextTok;
+          fetchServerInfo().then((res) => {
+            if (res.ok && shouldListen) startListening();
+          });
+        }
+      });
+
+      document.addEventListener("visibilitychange", () => {
+        if (document.visibilityState !== "visible") return;
+        if (audioCtx && audioCtx.state === "suspended" && shouldListen) {
+          audioCtx.resume().catch(() => {});
+        }
+        if (shouldListen && isWaitingReconnect) {
+          clearTimeout(reconnectTimer);
+          reconnectTimer = null;
+          isWaitingReconnect = false;
+          reconnectAttempt = 0;
+          connectFlow(++sessionSeq);
+        }
+      });
+
+      window.addEventListener("online", () => {
+        if (shouldListen && isWaitingReconnect) {
+          clearTimeout(reconnectTimer);
+          reconnectTimer = null;
+          isWaitingReconnect = false;
+          reconnectAttempt = 0;
+          connectFlow(++sessionSeq);
+        }
+      });
+
+      window.addEventListener("pagehide", () => {
+        if (activePeerId) {
+          const peer = activePeerId;
+          activePeerId = null;
+          deletePeer(peer, true);
+        }
+      });
+
+      updateTransportPrefUI();
+      updateVolumeUI();
+      fetchServerInfo();
+    })();
+  </script>
+</body>
+</html>

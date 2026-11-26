@@ -167,6 +167,14 @@ pub struct State {
     pub android_source: String,
     pub android_pid: u32,
     pub android_since: f64,
+    #[serde(default)]
+    pub web_broadcast_active: bool,
+    #[serde(default)]
+    pub web_port: u16,
+    #[serde(default)]
+    pub web_null_module: u32,
+    #[serde(default)]
+    pub web_adb_reverse_serials: Vec<String>,
 }
 
 impl Default for State {
@@ -214,6 +222,10 @@ impl Default for State {
             android_source: String::new(),
             android_pid: 0,
             android_since: 0.0,
+            web_broadcast_active: false,
+            web_port: 0,
+            web_null_module: 0,
+            web_adb_reverse_serials: Vec::new(),
         }
     }
 }
@@ -311,6 +323,13 @@ impl State {
         self.local_mic_loopback_module = 0;
         self.connected_since = 0.0;
         self.connected_by = "manual".to_string();
+    }
+
+    pub fn clear_web_broadcast(&mut self) {
+        self.web_broadcast_active = false;
+        self.web_port = 0;
+        self.web_null_module = 0;
+        self.web_adb_reverse_serials.clear();
     }
 
     pub fn remember_peer(&mut self, peer: KnownPeer) {
@@ -499,5 +518,46 @@ mod tests {
         let reloaded = State::try_load(Some(&path)).unwrap();
         assert_eq!(reloaded.trusted_peers.len(), 1);
         assert_eq!(reloaded.find_trusted_peer("dev-123"), Some(&tp));
+    }
+
+    #[test]
+    fn test_state_web_broadcast_backwards_compat_and_clear() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("state_legacy.json");
+        let legacy_json = serde_json::json!({
+            "connected_peer": "peer-1",
+            "connected_sink": "soundhop_peer_1"
+        });
+        fs::write(&path, serde_json::to_string_pretty(&legacy_json).unwrap()).unwrap();
+
+        let mut loaded = State::try_load(Some(&path)).unwrap();
+        assert!(!loaded.web_broadcast_active);
+        assert_eq!(loaded.web_port, 0);
+        assert_eq!(loaded.web_null_module, 0);
+        assert!(loaded.web_adb_reverse_serials.is_empty());
+
+        loaded.web_broadcast_active = true;
+        loaded.web_port = 4717;
+        loaded.web_null_module = 42;
+        loaded.web_adb_reverse_serials = vec!["SERIAL123".to_string()];
+        loaded.save(Some(&path)).unwrap();
+
+        let mut reloaded = State::try_load(Some(&path)).unwrap();
+        assert!(reloaded.web_broadcast_active);
+        assert_eq!(reloaded.web_port, 4717);
+        assert_eq!(reloaded.web_null_module, 42);
+        assert_eq!(
+            reloaded.web_adb_reverse_serials,
+            vec!["SERIAL123".to_string()]
+        );
+
+        reloaded.clear_web_broadcast();
+        assert!(!reloaded.web_broadcast_active);
+        assert_eq!(reloaded.web_port, 0);
+        assert_eq!(reloaded.web_null_module, 0);
+        assert!(reloaded.web_adb_reverse_serials.is_empty());
+        // Peer connection fields remain untouched.
+        assert_eq!(reloaded.connected_peer, "peer-1");
+        assert_eq!(reloaded.connected_sink, "soundhop_peer_1");
     }
 }

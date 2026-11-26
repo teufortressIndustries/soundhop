@@ -13,6 +13,8 @@ impl Controller {
             "adb_path": st.adb_path,
             "adb_version": st.adb_version,
             "is_managed": st.is_managed,
+            "adb_ready": st.adb_ready(),
+            "scrcpy_ready": st.scrcpy_ready(),
             "ready": st.ready(),
         })
     }

@@ -38,7 +38,7 @@ use crate::core_cmds::{
     handle_apps, handle_auto, handle_completions, handle_config, handle_connect, handle_daemon,
     handle_disconnect, handle_discover, handle_firewall, handle_logs, handle_mic, handle_pair,
     handle_route, handle_service, handle_setup, handle_share, handle_status, handle_stop,
-    handle_unroute, handle_version, handle_volume,
+    handle_unroute, handle_version, handle_volume, handle_web,
 };
 use crate::doctor::{run_bug_report, run_doctor};
 use crate::parser::{Cli, Commands};
@@ -177,6 +177,7 @@ fn run_cli_parsed(cli: Cli, gui_default: bool) -> i32 {
         Some(Commands::BugReport) => run_bug_report(&controller, cli.json),
         Some(Commands::Completions(ref args)) => handle_completions(args),
         Some(Commands::Android(ref args)) => handle_android(&controller, args, cli.json),
+        Some(Commands::Web(ref args)) => handle_web(&controller, args, cli.json),
         Some(Commands::Version) => handle_version(cli.json),
         None => {
             if gui_default {
@@ -334,6 +335,108 @@ mod tests {
 
         let c5 = Cli::try_parse_from(["soundhop", "--gui-tab", "phone"]).unwrap();
         assert_eq!(c5.gui_tab.as_deref(), Some("phone"));
+    }
+
+    #[test]
+    fn test_cli_parse_web_subcommands_and_alias() {
+        use crate::parser::WebAction;
+
+        let start = Cli::try_parse_from([
+            "soundhop",
+            "web",
+            "start",
+            "--port",
+            "4817",
+            "--no-keep-local",
+            "--no-token",
+            "--adb",
+            "--serial",
+            "USB123",
+            "--open",
+        ])
+        .unwrap();
+        match start.command {
+            Some(Commands::Web(args)) => match args.action {
+                Some(WebAction::Start {
+                    port,
+                    keep_local,
+                    no_keep_local,
+                    no_token,
+                    adb,
+                    serial,
+                    open,
+                }) => {
+                    assert_eq!(port, Some(4817));
+                    assert!(!keep_local);
+                    assert!(no_keep_local);
+                    assert!(no_token);
+                    assert!(adb);
+                    assert_eq!(serial.as_deref(), Some("USB123"));
+                    assert!(open);
+                }
+                other => panic!("Expected WebAction::Start, got {other:?}"),
+            },
+            other => panic!("Expected Commands::Web, got {other:?}"),
+        }
+
+        // Verify visible alias `broadcast` and `--keep-local`
+        let alias_start =
+            Cli::try_parse_from(["soundhop", "broadcast", "start", "--keep-local"]).unwrap();
+        assert!(matches!(
+            alias_start.command,
+            Some(Commands::Web(ref w))
+                if matches!(w.action, Some(WebAction::Start { keep_local: true, no_keep_local: false, .. }))
+        ));
+
+        // `--keep-local` and `--no-keep-local` conflict
+        assert!(Cli::try_parse_from([
+            "soundhop",
+            "web",
+            "start",
+            "--keep-local",
+            "--no-keep-local"
+        ])
+        .is_err());
+
+        let qr = Cli::try_parse_from(["soundhop", "--json", "web", "qr", "--adb"]).unwrap();
+        assert!(qr.json);
+        assert!(matches!(
+            qr.command,
+            Some(Commands::Web(ref w)) if matches!(w.action, Some(WebAction::Qr { adb: true }))
+        ));
+
+        let rot = Cli::try_parse_from(["soundhop", "broadcast", "rotate-token"]).unwrap();
+        assert!(matches!(
+            rot.command,
+            Some(Commands::Web(ref w)) if matches!(w.action, Some(WebAction::RotateToken))
+        ));
+
+        let kick = Cli::try_parse_from(["soundhop", "web", "kick", "rtc-7"]).unwrap();
+        match kick.command {
+            Some(Commands::Web(args)) => match args.action {
+                Some(WebAction::Kick { client_id }) => assert_eq!(client_id, "rtc-7"),
+                other => panic!("Expected Kick, got {other:?}"),
+            },
+            other => panic!("Expected Web, got {other:?}"),
+        }
+
+        let stop = Cli::try_parse_from(["soundhop", "web", "stop"]).unwrap();
+        assert!(matches!(
+            stop.command,
+            Some(Commands::Web(ref w)) if matches!(w.action, Some(WebAction::Stop))
+        ));
+
+        let status = Cli::try_parse_from(["soundhop", "web", "status"]).unwrap();
+        assert!(matches!(
+            status.command,
+            Some(Commands::Web(ref w)) if matches!(w.action, Some(WebAction::Status))
+        ));
+
+        let bare = Cli::try_parse_from(["soundhop", "web"]).unwrap();
+        assert!(matches!(
+            bare.command,
+            Some(Commands::Web(ref w)) if w.action.is_none()
+        ));
     }
 
     #[cfg(feature = "gui")]

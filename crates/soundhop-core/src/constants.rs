@@ -31,6 +31,17 @@ pub const MODULE_PREFIX: &str = "soundhop_";
 pub const SINK_PREFIX: &str = "soundhop_";
 pub const SOURCE_PREFIX: &str = "soundhop_source_";
 pub const MULTIROOM_SINK_NAME: &str = "soundhop_multiroom";
+/// Virtual PulseAudio/PipeWire null-sink name for Web Broadcast audio capture.
+pub const WEB_BROADCAST_SINK_NAME: &str = "soundhop_web_broadcast";
+
+/// Default HTTP + WebSocket TCP port for Web Broadcast.
+pub const DEFAULT_WEB_PORT: u16 = 4717;
+
+/// Default single multiplexed UDP port for Web Broadcast WebRTC (ICE-Lite/DTLS/SRTP).
+pub const DEFAULT_WEBRTC_PORT: u16 = 4718;
+
+/// Default maximum concurrent browser listeners.
+pub const DEFAULT_WEB_MAX_CLIENTS: u16 = 8;
 
 /// How often a daemon announces itself, and how long a peer is considered online.
 pub const BEACON_INTERVAL_SECS: f64 = 3.0;

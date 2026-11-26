@@ -7,6 +7,7 @@ mod pairing;
 mod routing;
 mod session;
 mod volume;
+mod web;
 
 use std::collections::HashMap;
 use std::path::PathBuf;
@@ -32,6 +33,7 @@ use crate::util::{
     format_duration, is_own_non_loopback_ip, local_addresses, lock_or_recover, now_secs, short_id,
     slugify,
 };
+use crate::web::WebBroadcastManager;
 
 pub use session::parse_audio_profile;
 
@@ -98,6 +100,7 @@ pub struct Controller {
     pub android_session: Arc<AndroidCaptureSession>,
     pub telemetry: Arc<TelemetryTracker>,
     pub sht3_manager: Arc<Sht3SessionManager>,
+    pub web_broadcast: Arc<WebBroadcastManager>,
     pub(super) sht3_outbounds: Mutex<HashMap<String, OutboundSessionHandle>>,
     pub(super) sht3_mode_active: AtomicBool,
     pub(super) peer_v3_meta: Mutex<HashMap<String, BeaconV3Meta>>,
@@ -150,6 +153,7 @@ impl Controller {
             android_session: sess,
             telemetry: Arc::new(TelemetryTracker::new()),
             sht3_manager: Arc::new(Sht3SessionManager::new()),
+            web_broadcast: Arc::new(WebBroadcastManager::new()),
             sht3_outbounds: Mutex::new(HashMap::new()),
             sht3_mode_active: AtomicBool::new(false),
             peer_v3_meta: Mutex::new(HashMap::new()),
@@ -503,7 +507,7 @@ impl Controller {
             serde_json::json!({ "available": false })
         };
 
-        let connection_json = if st.is_connected() {
+        let connection_json = if st.is_connected() && st.connected_peer != "web-broadcast" {
             let sht3_out_active = self.sht3_outbound_active();
             let sink_present = self
                 .backend
@@ -611,6 +615,7 @@ impl Controller {
                 "always_local": cfg.routing.always_local,
             },
             "android": self.android_session.status(),
+            "web_broadcast": self.web_broadcast_status(),
             "connection": connection_json,
             "volume": volume_json,
             "telemetry": self.telemetry.snapshot(),
@@ -645,7 +650,71 @@ impl Controller {
             });
         }
         let st_snap = lock_or_recover(&self.state).clone();
-        if st_snap.is_connected() && self.has_dead_sht3_session() {
+        if st_snap.connected_peer == "web-broadcast" {
+            if !cfg!(target_os = "linux") || !self.web_broadcast.is_active() {
+                if st_snap.combine_module > 0 {
+                    let _ = self.backend.unload_module(st_snap.combine_module, true);
+                }
+                if st_snap.web_null_module > 0 {
+                    let _ = self.backend.unload_module(st_snap.web_null_module, true);
+                }
+                if st_snap.connected_module > 0
+                    && st_snap.connected_module != st_snap.web_null_module
+                    && st_snap.connected_module != st_snap.combine_module
+                {
+                    let _ = self.backend.unload_module(st_snap.connected_module, true);
+                }
+                {
+                    let mut st = lock_or_recover(&self.state);
+                    st.clear_connection();
+                    st.clear_web_broadcast();
+                }
+                actions.push("cleared stale web-broadcast state".to_string());
+                if lock_or_recover(&self.config).connection.restore_default {
+                    let cand = self.local_default_candidate(&st_snap.previous_default_sink);
+                    if !cand.is_empty() && self.backend.set_default_sink(&cand).is_ok() {
+                        actions.push(format!("restored default sink to {cand}"));
+                    }
+                }
+                self.save();
+            } else {
+                let sink_ok = self
+                    .backend
+                    .sink_exists(&st_snap.connected_sink)
+                    .unwrap_or(false);
+                let mod_ok = st_snap.connected_module > 0
+                    && self
+                        .backend
+                        .module(st_snap.connected_module)
+                        .ok()
+                        .flatten()
+                        .is_some();
+                let combine_ok = st_snap.combine_module == 0
+                    || self
+                        .backend
+                        .module(st_snap.combine_module)
+                        .ok()
+                        .flatten()
+                        .is_some();
+                if !sink_ok || !mod_ok || !combine_ok {
+                    if st_snap.combine_module > 0 {
+                        let _ = self.backend.unload_module(st_snap.combine_module, true);
+                    }
+                    if st_snap.web_null_module > 0 {
+                        let _ = self.backend.unload_module(st_snap.web_null_module, true);
+                    }
+                    lock_or_recover(&self.state).clear_connection();
+                    actions.push("cleared stale web-broadcast connection state".to_string());
+                    if lock_or_recover(&self.config).connection.restore_default {
+                        let cand = self.local_default_candidate(&st_snap.previous_default_sink);
+                        if !cand.is_empty() && self.backend.set_default_sink(&cand).is_ok() {
+                            actions.push(format!("restored default sink to {cand}"));
+                        }
+                    }
+                    self.save();
+                }
+            }
+        } else if st_snap.is_connected() && self.has_dead_sht3_session() {
             if let Ok(Some(res)) = self.teardown_dead_sht3_session() {
                 actions.push("cleared dead SRTP session".to_string());
                 if let Some(restored) = res.get("restored_to").and_then(|v| v.as_str()) {
@@ -687,6 +756,17 @@ impl Controller {
                 }
                 self.save();
             }
+        }
+        if !self.web_broadcast.is_active() && st_snap.web_null_module > 0 {
+            let _ = self.backend.unload_module(st_snap.web_null_module, true);
+            {
+                let mut st = lock_or_recover(&self.state);
+                st.web_null_module = 0;
+                st.web_broadcast_active = false;
+                st.web_port = 0;
+            }
+            actions.push("cleaned up stale web-broadcast null sink".to_string());
+            self.save();
         }
         self.reconcile_listener();
         let cfg_snap = lock_or_recover(&self.config).clone();

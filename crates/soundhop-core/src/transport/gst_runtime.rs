@@ -30,6 +30,9 @@ const REQUIRED_CORE_ELEMENTS: &[&str] = &[
     "volume",
     "udpsrc",
     "udpsink",
+    "tee",
+    "queue",
+    "appsink",
 ];
 
 /// Diagnostic status of the GStreamer runtime and required audio/SRTP plugins.

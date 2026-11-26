@@ -16,7 +16,9 @@ use soundhop_core::controller::Controller;
 use crate::{lock_or_recover, read_or_recover, write_or_recover};
 
 pub use commands::GuiCommand;
-pub use snapshot::{security_friendly_label, AppStreamView, GuiSnapshot, GuiToast, PeerView};
+pub use snapshot::{
+    security_friendly_label, AppStreamView, GuiSnapshot, GuiToast, PeerView, WebClientView,
+};
 
 use commands::is_mutating_command;
 use optimistic::apply_optimistic_update;
@@ -169,7 +171,10 @@ impl GuiBackend {
                     changed |= poller_worker.refresh_fast(false);
                     let active = {
                         let snap = read_or_recover(&poller_worker.snapshot);
-                        snap.connected || snap.audio_active || snap.busy_message.is_some()
+                        snap.connected
+                            || snap.audio_active
+                            || snap.web_broadcast_active
+                            || snap.busy_message.is_some()
                     };
                     let fast_interval = if active {
                         Duration::from_millis(1500)

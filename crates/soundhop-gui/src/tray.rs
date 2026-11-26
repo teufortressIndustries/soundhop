@@ -3,7 +3,8 @@
 //! child dialog launchers.
 
 use std::collections::HashSet;
-use std::process::Command;
+use std::io::Write;
+use std::process::{Command, Stdio};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{mpsc, Arc, OnceLock};
 use std::time::{Duration, Instant};
@@ -24,6 +25,7 @@ use soundhop_core::service::sync_appimage_paths_if_installed;
 use soundhop_core::util::{
     is_own_non_loopback_ip, is_private_address, now_secs, replace_stale_instance, InstanceLockInfo,
 };
+use soundhop_core::web::WebBroadcastStatus;
 use tray_icon::{Icon, TrayIconBuilder, TrayIconEvent};
 
 const EMBEDDED_PNG: &[u8] = include_bytes!("../../../assets/soundhop.png");
@@ -228,13 +230,15 @@ pub fn build_tray_menu(controller: &Controller, peers: &[Peer]) -> Menu {
     let streams = controller.list_apps();
     let and_running = controller.android_session.is_active();
     let pending_pair_requests = controller.pending_pair_requests();
-    let snap = TrayMenuSnapshot::from_parts(
+    let web_status = controller.web_broadcast_status();
+    let snap = TrayMenuSnapshot::from_parts_with_web(
         peers.to_vec(),
         streams,
         st,
         cfg,
         and_running,
         pending_pair_requests,
+        web_status,
     );
     build_tray_menu_from_snapshot(&snap)
 }
@@ -257,11 +261,24 @@ struct TrayMenuSnapshot {
     routed_apps_lower: HashSet<String>,
     android_active: bool,
     pending_pair_requests: Vec<PendingPairRequest>,
+    web_broadcast_active: bool,
+    web_urls: Vec<String>,
+    web_localhost_url: String,
+    web_client_count: usize,
     badge: TrayBadgeState,
     signature: String,
 }
 
 impl TrayMenuSnapshot {
+    fn primary_web_url(&self) -> &str {
+        self.web_urls
+            .first()
+            .map(String::as_str)
+            .filter(|s| !s.is_empty())
+            .unwrap_or(self.web_localhost_url.as_str())
+    }
+
+    #[cfg(test)]
     fn from_parts(
         peers: Vec<Peer>,
         streams: Vec<serde_json::Value>,
@@ -269,6 +286,26 @@ impl TrayMenuSnapshot {
         cfg: soundhop_core::config::Config,
         android_active: bool,
         pending_pair_requests: Vec<PendingPairRequest>,
+    ) -> Self {
+        Self::from_parts_with_web(
+            peers,
+            streams,
+            st,
+            cfg,
+            android_active,
+            pending_pair_requests,
+            WebBroadcastStatus::default(),
+        )
+    }
+
+    fn from_parts_with_web(
+        peers: Vec<Peer>,
+        streams: Vec<serde_json::Value>,
+        st: soundhop_core::state::State,
+        cfg: soundhop_core::config::Config,
+        android_active: bool,
+        pending_pair_requests: Vec<PendingPairRequest>,
+        web_status: WebBroadcastStatus,
     ) -> Self {
         let connected = st.is_connected();
         let multiroom = st.is_multiroom();
@@ -281,15 +318,24 @@ impl TrayMenuSnapshot {
         let auto_enabled = cfg.connection.auto_connect && !st.auto_paused;
         let mic_active = !st.connected_source.is_empty();
         let routed_apps_lower: HashSet<String> = st.routed_apps.keys().cloned().collect();
+        let web_broadcast_active = web_status.active;
+        let web_urls = web_status.urls;
+        let web_localhost_url = web_status.localhost_url;
+        let web_client_count = web_status.clients.len();
         let badge = if multiroom {
             TrayBadgeState::MultiRoom
         } else if connected {
             TrayBadgeState::Connected
-        } else if sharing_enabled {
+        } else if sharing_enabled || web_broadcast_active {
             TrayBadgeState::Sharing
         } else {
             TrayBadgeState::Idle
         };
+        let primary_web = web_urls
+            .first()
+            .map(String::as_str)
+            .filter(|s| !s.is_empty())
+            .unwrap_or(web_localhost_url.as_str());
         let signature = compute_menu_signature(
             &peers,
             &streams,
@@ -303,6 +349,9 @@ impl TrayMenuSnapshot {
             &st.mic_direction,
             android_active,
             &pending_pair_requests,
+            web_broadcast_active,
+            web_client_count,
+            primary_web,
         );
         Self {
             peers,
@@ -321,10 +370,40 @@ impl TrayMenuSnapshot {
             routed_apps_lower,
             android_active,
             pending_pair_requests,
+            web_broadcast_active,
+            web_urls,
+            web_localhost_url,
+            web_client_count,
             badge,
             signature,
         }
     }
+}
+
+fn web_broadcast_menu_items(
+    snap: &TrayMenuSnapshot,
+) -> Vec<(&'static str, String, bool, Option<bool>)> {
+    let mut items = vec![(
+        "toggle_web_broadcast",
+        "Web Broadcast (Listen on Phone)".to_string(),
+        true,
+        Some(snap.web_broadcast_active),
+    )];
+    if snap.web_broadcast_active {
+        items.push((
+            "copy_web_url",
+            "Copy Listen URL".to_string(),
+            !snap.primary_web_url().is_empty(),
+            None,
+        ));
+        items.push((
+            "noop_web_listeners",
+            format!("Web Listeners: {}", snap.web_client_count),
+            false,
+            None,
+        ));
+    }
+    items
 }
 
 fn build_tray_menu_from_snapshot(snap: &TrayMenuSnapshot) -> Menu {
@@ -490,6 +569,16 @@ fn build_tray_menu_from_snapshot(snap: &TrayMenuSnapshot) -> Menu {
     );
     let _ = menu.append(&auto_chk);
 
+    for (id, label, enabled, checked_opt) in web_broadcast_menu_items(snap) {
+        if let Some(checked) = checked_opt {
+            let item = CheckMenuItem::with_id(MenuId::new(id), label, enabled, checked, None);
+            let _ = menu.append(&item);
+        } else {
+            let item = MenuItem::with_id(MenuId::new(id), label, enabled, None);
+            let _ = menu.append(&item);
+        }
+    }
+
     // Apps submenu (plain labels, no & mnemonics)
     let app_sub = Submenu::new("Apps", true);
     if snap.streams.is_empty() {
@@ -611,6 +700,11 @@ fn build_tray_menu_from_snapshot(snap: &TrayMenuSnapshot) -> Menu {
 }
 
 fn format_tray_tooltip(snap: &TrayMenuSnapshot) -> String {
+    let web_suffix = if snap.web_broadcast_active {
+        format!(" + Web ({})", snap.web_client_count)
+    } else {
+        String::new()
+    };
     let raw = if !snap.pending_pair_requests.is_empty() {
         let count = snap.pending_pair_requests.len();
         if count == 1 {
@@ -623,21 +717,39 @@ fn format_tray_tooltip(snap: &TrayMenuSnapshot) -> String {
         }
     } else if snap.multiroom && !snap.multiroom_peer_ids.is_empty() {
         if !snap.connected_name.is_empty() {
-            format!("SoundHop — Streaming to {}", snap.connected_name)
+            format!(
+                "SoundHop — Streaming to {}{web_suffix}",
+                snap.connected_name
+            )
         } else {
             format!(
-                "SoundHop — Streaming to {} speakers",
+                "SoundHop — Streaming to {} speakers{web_suffix}",
                 snap.multiroom_peer_ids.len()
             )
         }
     } else if snap.connected {
         if !snap.connected_name.is_empty() {
-            format!("SoundHop — Streaming to {}", snap.connected_name)
+            format!(
+                "SoundHop — Streaming to {}{web_suffix}",
+                snap.connected_name
+            )
         } else {
-            "SoundHop — Streaming".to_string()
+            format!("SoundHop — Streaming{web_suffix}")
         }
     } else if snap.android_active {
-        "SoundHop — Receiving phone audio".to_string()
+        format!("SoundHop — Receiving phone audio{web_suffix}")
+    } else if snap.web_broadcast_active {
+        let listeners = snap.web_client_count;
+        let noun = if listeners == 1 {
+            "listener"
+        } else {
+            "listeners"
+        };
+        if snap.sharing_enabled {
+            format!("SoundHop — Web Broadcast ({listeners} {noun}) • Sharing speakers")
+        } else {
+            format!("SoundHop — Web Broadcast ({listeners} {noun})")
+        }
     } else if snap.sharing_enabled {
         "SoundHop — Sharing speakers".to_string()
     } else {
@@ -789,6 +901,30 @@ fn collect_tray_snapshot(daemon: &Daemon) -> TrayMenuSnapshot {
                 .and_then(|a| a.get("active"))
                 .and_then(|v| v.as_bool())
                 .unwrap_or(false);
+            let wb = st_json.get("web_broadcast").filter(|w| !w.is_null());
+            let web_broadcast_active = wb
+                .and_then(|w| w.get("active"))
+                .and_then(|v| v.as_bool())
+                .unwrap_or(false);
+            let web_urls: Vec<String> = wb
+                .and_then(|w| w.get("urls"))
+                .and_then(|v| v.as_array())
+                .map(|arr| {
+                    arr.iter()
+                        .filter_map(|x| x.as_str().map(String::from))
+                        .collect()
+                })
+                .unwrap_or_default();
+            let web_localhost_url = wb
+                .and_then(|w| w.get("localhost_url"))
+                .and_then(|v| v.as_str())
+                .unwrap_or("")
+                .to_string();
+            let web_client_count = wb
+                .and_then(|w| w.get("clients"))
+                .and_then(|v| v.as_array())
+                .map(|arr| arr.len())
+                .unwrap_or(0);
             let routed_apps_lower: HashSet<String> = apps
                 .iter()
                 .filter(|a| {
@@ -810,11 +946,16 @@ fn collect_tray_snapshot(daemon: &Daemon) -> TrayMenuSnapshot {
                 TrayBadgeState::MultiRoom
             } else if connected {
                 TrayBadgeState::Connected
-            } else if sharing_enabled {
+            } else if sharing_enabled || web_broadcast_active {
                 TrayBadgeState::Sharing
             } else {
                 TrayBadgeState::Idle
             };
+            let primary_web = web_urls
+                .first()
+                .map(String::as_str)
+                .filter(|s| !s.is_empty())
+                .unwrap_or(web_localhost_url.as_str());
             let signature = compute_menu_signature(
                 &peers,
                 &apps,
@@ -828,6 +969,9 @@ fn collect_tray_snapshot(daemon: &Daemon) -> TrayMenuSnapshot {
                 &mic_direction,
                 android_active,
                 &pending_pair_requests,
+                web_broadcast_active,
+                web_client_count,
+                primary_web,
             );
             return TrayMenuSnapshot {
                 peers,
@@ -846,6 +990,10 @@ fn collect_tray_snapshot(daemon: &Daemon) -> TrayMenuSnapshot {
                 routed_apps_lower,
                 android_active,
                 pending_pair_requests,
+                web_broadcast_active,
+                web_urls,
+                web_localhost_url,
+                web_client_count,
                 badge,
                 signature,
             };
@@ -858,7 +1006,16 @@ fn collect_tray_snapshot(daemon: &Daemon) -> TrayMenuSnapshot {
     let streams = ctrl.list_apps();
     let and_running = ctrl.android_session.is_active();
     let pending_pair_requests = ctrl.pending_pair_requests();
-    TrayMenuSnapshot::from_parts(peers, streams, st, cfg, and_running, pending_pair_requests)
+    let web_status = ctrl.web_broadcast_status();
+    TrayMenuSnapshot::from_parts_with_web(
+        peers,
+        streams,
+        st,
+        cfg,
+        and_running,
+        pending_pair_requests,
+        web_status,
+    )
 }
 
 fn handle_menu_action(
@@ -994,6 +1151,70 @@ fn handle_menu_action(
         } else {
             let cur = lock_or_recover(&ctrl.config).connection.auto_connect;
             let _ = ctrl.set_auto(!cur);
+        }
+        return;
+    }
+    if id_str == "toggle_web_broadcast" {
+        if external {
+            let currently_active = ipc_request(
+                "web_status",
+                serde_json::json!({}),
+                None,
+                Duration::from_millis(600),
+            )
+            .ok()
+            .and_then(|v| {
+                v.get("web_broadcast")
+                    .and_then(|w| w.get("active"))
+                    .and_then(|b| b.as_bool())
+            })
+            .unwrap_or(false);
+            let cmd = if currently_active {
+                "web_stop"
+            } else {
+                "web_start"
+            };
+            let _ = ipc_request(cmd, serde_json::json!({}), None, Duration::from_secs(6));
+        } else if ctrl.web_broadcast.is_active() {
+            let _ = ctrl.stop_web_broadcast();
+        } else {
+            let _ = ctrl.start_web_broadcast(None, None, None);
+        }
+        return;
+    }
+    if id_str == "copy_web_url" {
+        let url_opt = if external {
+            ipc_request(
+                "web_status",
+                serde_json::json!({}),
+                None,
+                Duration::from_millis(600),
+            )
+            .ok()
+            .and_then(|v| {
+                let wb = v.get("web_broadcast")?;
+                wb.get("urls")
+                    .and_then(|u| u.as_array())
+                    .and_then(|arr| arr.first())
+                    .and_then(|s| s.as_str())
+                    .filter(|s| !s.is_empty())
+                    .map(String::from)
+                    .or_else(|| {
+                        wb.get("localhost_url")
+                            .and_then(|s| s.as_str())
+                            .filter(|s| !s.is_empty())
+                            .map(String::from)
+                    })
+            })
+        } else {
+            let st = ctrl.web_broadcast_status();
+            st.urls
+                .into_iter()
+                .find(|s| !s.is_empty())
+                .or_else(|| (!st.localhost_url.is_empty()).then_some(st.localhost_url))
+        };
+        if let Some(url) = url_opt {
+            let _ = copy_text_to_clipboard(&url);
         }
         return;
     }
@@ -1333,6 +1554,39 @@ fn handle_menu_action(
     }
 }
 
+fn copy_text_to_clipboard(text: &str) -> bool {
+    let candidates: &[(&str, &[&str])] = if cfg!(target_os = "windows") {
+        &[("clip.exe", &[])]
+    } else if cfg!(target_os = "macos") {
+        &[("pbcopy", &[])]
+    } else {
+        &[
+            ("wl-copy", &[]),
+            ("xclip", &["-selection", "clipboard"]),
+            ("xsel", &["--clipboard", "--input"]),
+        ]
+    };
+    for (bin, args) in candidates {
+        let mut cmd = Command::new(bin);
+        cmd.args(*args)
+            .stdin(Stdio::piped())
+            .stdout(Stdio::null())
+            .stderr(Stdio::null());
+        soundhop_core::util::close_fds_pre_exec(&mut cmd);
+        if let Ok(mut child) = cmd.spawn() {
+            if let Some(mut stdin) = child.stdin.take() {
+                let _ = stdin.write_all(text.as_bytes());
+            }
+            if let Ok(status) = child.wait() {
+                if status.success() {
+                    return true;
+                }
+            }
+        }
+    }
+    false
+}
+
 #[allow(clippy::too_many_arguments)]
 fn compute_menu_signature(
     peers: &[Peer],
@@ -1347,6 +1601,9 @@ fn compute_menu_signature(
     mic_direction: &str,
     android_active: bool,
     pending_pair_requests: &[PendingPairRequest],
+    web_broadcast_active: bool,
+    web_client_count: usize,
+    web_primary_url: &str,
 ) -> String {
     let peer_sig: Vec<String> = peers
         .iter()
@@ -1372,7 +1629,7 @@ fn compute_menu_signature(
         .map(|r| format!("{}:{}", r.request_id, r.sas_code))
         .collect();
     format!(
-        "peers={}|apps={}|conn={}|cname={}|multi={}|share={}|auto={}|keep={}|mic_on={}|mic={}|and={}|pair={}",
+        "peers={}|apps={}|conn={}|cname={}|multi={}|share={}|auto={}|keep={}|mic_on={}|mic={}|and={}|pair={}|web={}:{}:{}",
         peer_sig.join(","),
         app_sig.join(","),
         connected_peer,
@@ -1385,6 +1642,9 @@ fn compute_menu_signature(
         mic_direction,
         android_active,
         pair_sig.join(","),
+        web_broadcast_active,
+        web_client_count,
+        web_primary_url,
     )
 }
 
@@ -1646,13 +1906,14 @@ pub fn run_tray(verbose: bool) -> Result<i32, String> {
     let ctrl = Arc::clone(&daemon.controller);
     let initial_st = lock_or_recover(&ctrl.state).clone();
     let initial_cfg = lock_or_recover(&ctrl.config).clone();
-    let initial_snap = TrayMenuSnapshot::from_parts(
+    let initial_snap = TrayMenuSnapshot::from_parts_with_web(
         Vec::new(),
         Vec::new(),
         initial_st,
         initial_cfg,
         ctrl.android_session.is_active(),
         ctrl.pending_pair_requests(),
+        ctrl.web_broadcast_status(),
     );
     let initial_icon = build_tray_icon(initial_snap.badge);
     let initial_menu = build_tray_menu_from_snapshot(&initial_snap);
@@ -1824,6 +2085,9 @@ mod tests {
             "",
             false,
             &[],
+            false,
+            0,
+            "",
         );
         let s2 = compute_menu_signature(
             &[],
@@ -1843,6 +2107,9 @@ mod tests {
             "",
             false,
             &[],
+            false,
+            0,
+            "",
         );
         let s3 = compute_menu_signature(
             &[],
@@ -1857,6 +2124,9 @@ mod tests {
             "",
             true,
             &[],
+            false,
+            0,
+            "",
         );
         assert_ne!(s1, s2);
         assert_ne!(s1, s3);
@@ -1877,6 +2147,9 @@ mod tests {
             "send",
             false,
             &[],
+            false,
+            0,
+            "",
         );
         // Same count of multiroom peers, different peer IDs
         let diff_multi = compute_menu_signature(
@@ -1892,6 +2165,9 @@ mod tests {
             "send",
             false,
             &[],
+            false,
+            0,
+            "",
         );
         assert_ne!(base, diff_multi);
 
@@ -1909,6 +2185,9 @@ mod tests {
             "send",
             false,
             &[],
+            false,
+            0,
+            "",
         );
         assert_ne!(base, diff_mic);
 
@@ -1926,6 +2205,9 @@ mod tests {
             "send",
             false,
             &[],
+            false,
+            0,
+            "",
         );
         assert_ne!(base, diff_name);
     }
@@ -2050,5 +2332,124 @@ mod tests {
         assert_eq!(resolve_gui_executable_from(&cli_exe), cli_exe);
 
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn test_web_broadcast_tray_menu_snapshot_signature_and_tooltip() {
+        use soundhop_core::web::WebClientInfo;
+
+        let st = soundhop_core::state::State::default();
+        let mut cfg = soundhop_core::config::Config::default();
+        cfg.sharing.enabled = false;
+
+        let inactive = TrayMenuSnapshot::from_parts_with_web(
+            Vec::new(),
+            Vec::new(),
+            st.clone(),
+            cfg.clone(),
+            false,
+            Vec::new(),
+            WebBroadcastStatus::default(),
+        );
+        assert!(!inactive.web_broadcast_active);
+        assert_eq!(inactive.badge, TrayBadgeState::Idle);
+        let inactive_items = web_broadcast_menu_items(&inactive);
+        assert_eq!(inactive_items.len(), 1);
+        assert_eq!(inactive_items[0].0, "toggle_web_broadcast");
+        assert_eq!(inactive_items[0].1, "Web Broadcast (Listen on Phone)");
+        assert_eq!(inactive_items[0].3, Some(false));
+
+        let active_one = TrayMenuSnapshot::from_parts_with_web(
+            Vec::new(),
+            Vec::new(),
+            st.clone(),
+            cfg.clone(),
+            false,
+            Vec::new(),
+            WebBroadcastStatus {
+                active: true,
+                http_port: 4717,
+                webrtc_udp_port: 4718,
+                urls: vec!["http://192.168.1.42:4717/#t=tok1".to_string()],
+                localhost_url: "http://localhost:4717/#t=tok1".to_string(),
+                token_required: true,
+                token: Some("tok1".to_string()),
+                clients: vec![WebClientInfo {
+                    id: "c1".to_string(),
+                    remote_addr: "192.168.1.99:12345".to_string(),
+                    transport: "webrtc".to_string(),
+                    user_agent: "Chrome".to_string(),
+                    connected_since: 1.0,
+                    bytes_sent: 512,
+                    rtt_ms: Some(9.0),
+                    dropped_frames: 0,
+                }],
+                adb_reversed_serials: Vec::new(),
+                keep_local: true,
+                pipeline_running: true,
+                capture_source: "soundhop_web_broadcast.monitor".to_string(),
+            },
+        );
+        assert!(active_one.web_broadcast_active);
+        assert_eq!(active_one.badge, TrayBadgeState::Sharing);
+        assert_ne!(inactive.signature, active_one.signature);
+        assert_eq!(
+            format_tray_tooltip(&active_one),
+            "SoundHop — Web Broadcast (1 listener)"
+        );
+
+        let active_items = web_broadcast_menu_items(&active_one);
+        assert_eq!(active_items.len(), 3);
+        assert_eq!(active_items[0].0, "toggle_web_broadcast");
+        assert_eq!(active_items[0].1, "Web Broadcast (Listen on Phone)");
+        assert_eq!(active_items[0].3, Some(true));
+        assert_eq!(active_items[1].0, "copy_web_url");
+        assert_eq!(active_items[1].1, "Copy Listen URL");
+        assert!(active_items[1].2);
+        assert_eq!(active_items[2].0, "noop_web_listeners");
+        assert_eq!(active_items[2].1, "Web Listeners: 1");
+        assert!(!active_items[2].2);
+
+        // Token rotation updates signature even with same listener count
+        let mut rotated_status = WebBroadcastStatus {
+            active: true,
+            http_port: 4717,
+            webrtc_udp_port: 4718,
+            urls: vec!["http://192.168.1.42:4717/#t=tok2".to_string()],
+            localhost_url: "http://localhost:4717/#t=tok2".to_string(),
+            token_required: true,
+            token: Some("tok2".to_string()),
+            clients: Vec::new(),
+            adb_reversed_serials: Vec::new(),
+            keep_local: true,
+            pipeline_running: false,
+            capture_source: String::new(),
+        };
+        let active_zero = TrayMenuSnapshot::from_parts_with_web(
+            Vec::new(),
+            Vec::new(),
+            st.clone(),
+            cfg.clone(),
+            false,
+            Vec::new(),
+            rotated_status.clone(),
+        );
+        assert_ne!(active_one.signature, active_zero.signature);
+        assert_eq!(
+            format_tray_tooltip(&active_zero),
+            "SoundHop — Web Broadcast (0 listeners)"
+        );
+
+        rotated_status.urls = vec!["http://192.168.1.42:4717/#t=tok3".to_string()];
+        let active_rotated = TrayMenuSnapshot::from_parts_with_web(
+            Vec::new(),
+            Vec::new(),
+            st,
+            cfg,
+            false,
+            Vec::new(),
+            rotated_status,
+        );
+        assert_ne!(active_zero.signature, active_rotated.signature);
     }
 }

@@ -1,12 +1,13 @@
 //! Core CLI subcommand handlers (`setup`, `status`, `discover`, `connect`, `disconnect`,
 //! `share`, `pair`, `apps`, `route`, `unroute`, `mic`, `volume`, `auto`, `daemon`, `stop`,
-//! `service`, `firewall`, `config`, `logs`, `completions`, `version`).
+//! `service`, `firewall`, `config`, `logs`, `completions`, `web`, `version`).
 
 mod config;
 mod connect;
 mod routing;
 mod share_pair;
 mod system;
+mod web;
 
 use std::time::Duration;
 
@@ -22,6 +23,8 @@ pub use system::{
     handle_completions, handle_daemon, handle_firewall, handle_service, handle_setup, handle_stop,
     handle_version,
 };
+pub(crate) use web::format_bytes;
+pub use web::handle_web;
 
 pub(crate) fn try_ipc(
     command: &str,

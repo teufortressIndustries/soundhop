@@ -317,6 +317,15 @@ impl eframe::App for ControlCenterApp {
 
                     ui.add_space(6.0);
 
+                    if snap.web_broadcast_active {
+                        pill_badge(
+                            ui,
+                            &format!("Web Broadcast Live ({})", snap.web_clients.len()),
+                            pal.accent,
+                            pal.accent_soft,
+                        );
+                        ui.add_space(4.0);
+                    }
                     if snap.android_session_active {
                         pill_badge(ui, "Phone Audio Live", pal.success, pal.success_soft);
                         ui.add_space(4.0);
@@ -334,7 +343,7 @@ impl eframe::App for ControlCenterApp {
                         );
                     } else if snap.sharing_enabled {
                         pill_badge(ui, "Sharing Speakers", pal.accent, pal.accent_soft);
-                    } else {
+                    } else if !snap.web_broadcast_active {
                         pill_badge(ui, "Ready", pal.text_muted, pal.card);
                     }
                 });

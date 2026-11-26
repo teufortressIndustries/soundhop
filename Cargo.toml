@@ -46,6 +46,9 @@ gstreamer-app = { version = "0.24", features = ["v1_20"] }
 hex = "0.4"
 rand = "0.8"
 ureq = { version = "2.10", default-features = false, features = ["tls"] }
+str0m = { version = "0.25", default-features = false, features = ["rust-crypto"] }
+tungstenite = { version = "0.30", default-features = false, features = ["handshake"] }
+qrcode = { version = "0.15", default-features = false }
 flate2 = "1.0"
 tar = "0.4"
 zip = { version = "2.2", default-features = false, features = ["deflate"] }

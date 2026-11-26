@@ -202,6 +202,8 @@ begin
   Exec(NetshPath, 'advfirewall firewall delete rule name="SoundHop Control (4714/tcp)"', '', SW_HIDE, ewWaitUntilTerminated, ResultCode);
   Exec(NetshPath, 'advfirewall firewall delete rule name="SoundHop Pairing (4715/tcp)"', '', SW_HIDE, ewWaitUntilTerminated, ResultCode);
   Exec(NetshPath, 'advfirewall firewall delete rule name="SoundHop RTP (4716/udp)"', '', SW_HIDE, ewWaitUntilTerminated, ResultCode);
+  Exec(NetshPath, 'advfirewall firewall delete rule name="SoundHop Web (4717/tcp)"', '', SW_HIDE, ewWaitUntilTerminated, ResultCode);
+  Exec(NetshPath, 'advfirewall firewall delete rule name="SoundHop WebRTC (4718/udp)"', '', SW_HIDE, ewWaitUntilTerminated, ResultCode);
   Exec(NetshPath, 'advfirewall firewall delete rule name="SoundHop Discovery (47777/udp)"', '', SW_HIDE, ewWaitUntilTerminated, ResultCode);
   Exec(NetshPath, 'advfirewall firewall delete rule name="SoundHop mDNS (5353/udp)"', '', SW_HIDE, ewWaitUntilTerminated, ResultCode);
 end;

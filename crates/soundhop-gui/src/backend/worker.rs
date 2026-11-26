@@ -105,23 +105,40 @@ impl WorkerState {
     }
 
     pub(super) fn refresh_android(&mut self) {
-        let tools = self.controller.android_manager.get_tool_status();
+        let mut tools = self.controller.android_manager.get_tool_status();
         let devices = self.controller.android_manager.list_devices();
+        let mut adb_ready_opt: Option<bool> = None;
+        let mut scrcpy_ready_opt: Option<bool> = None;
         let history = if self.use_ipc && ipc_is_running(None) {
-            ipc_request(
+            if let Ok(resp) = ipc_request(
                 "android_status",
                 serde_json::json!({}),
                 None,
                 Duration::from_millis(800),
-            )
-            .ok()
-            .and_then(|resp| resp.get("history").and_then(|v| v.as_array()).cloned())
-            .map(parse_android_history)
-            .unwrap_or_else(|| parse_android_history(self.controller.android_history()))
+            ) {
+                if let Some(t_val) = resp.get("tools") {
+                    adb_ready_opt = t_val.get("adb_ready").and_then(|v| v.as_bool());
+                    scrcpy_ready_opt = t_val.get("scrcpy_ready").and_then(|v| v.as_bool());
+                    if let Ok(parsed) =
+                        serde_json::from_value::<soundhop_core::android::ToolStatus>(t_val.clone())
+                    {
+                        tools = parsed;
+                    }
+                }
+                resp.get("history")
+                    .and_then(|v| v.as_array())
+                    .cloned()
+                    .map(parse_android_history)
+                    .unwrap_or_else(|| parse_android_history(self.controller.android_history()))
+            } else {
+                parse_android_history(self.controller.android_history())
+            }
         } else {
             parse_android_history(self.controller.android_history())
         };
         let mut guard = write_or_recover(&self.snapshot);
+        guard.adb_ready = adb_ready_opt.unwrap_or_else(|| tools.adb_ready());
+        guard.scrcpy_ready = scrcpy_ready_opt.unwrap_or_else(|| tools.scrcpy_ready());
         guard.android_tools = tools;
         guard.android_devices = devices;
         guard.android_history = history;
@@ -630,10 +647,11 @@ impl WorkerState {
     pub(super) fn handle_export_bug_report(&mut self) {
         self.set_busy(Some("Collecting bug report...".to_string()));
         let cfg = lock_or_recover(&self.controller.config).clone();
-        let st = {
+        let mut st = {
             let _sync = lock_or_recover(&self.controller_sync_lock);
             self.controller.status(None)
         };
+        soundhop_core::web::redact_web_broadcast_status_json(&mut st);
         let fw = detect_for_config(&cfg);
         let svc = service_status();
         let daemon_log = log_path();
@@ -642,7 +660,10 @@ impl WorkerState {
             .map(|content| {
                 let all: Vec<&str> = content.lines().collect();
                 let start = all.len().saturating_sub(50);
-                all[start..].iter().map(|s| (*s).to_string()).collect()
+                all[start..]
+                    .iter()
+                    .map(|s| redact_log_line_web_tokens(s))
+                    .collect()
             })
             .unwrap_or_default();
 
@@ -850,25 +871,70 @@ impl WorkerState {
             })
         } else {
             let _sync = lock_or_recover(&self.controller_sync_lock);
-            let (prev_security, prev_port) = {
+            let (
+                prev_security,
+                prev_port,
+                prev_web_port,
+                prev_webrtc_port,
+                prev_web_token,
+                prev_web_keep_local,
+            ) = {
                 let cfg = lock_or_recover(&self.controller.config);
-                (cfg.sharing.security.clone(), cfg.sharing.port)
+                (
+                    cfg.sharing.security.clone(),
+                    cfg.sharing.port,
+                    cfg.sharing.web_port,
+                    cfg.sharing.webrtc_port,
+                    cfg.sharing.web_require_token,
+                    cfg.sharing.web_keep_local,
+                )
             };
             let r = lock_or_recover(&self.controller.config).apply_patch(&patch);
             if r.is_ok() {
                 self.controller.save();
-                let (sharing_enabled, new_security, new_port) = {
+                let (
+                    sharing_enabled,
+                    new_security,
+                    new_port,
+                    new_web_port,
+                    new_webrtc_port,
+                    new_web_token,
+                    new_web_keep_local,
+                ) = {
                     let cfg = lock_or_recover(&self.controller.config);
                     (
                         cfg.sharing.enabled,
                         cfg.sharing.security.clone(),
                         cfg.sharing.port,
+                        cfg.sharing.web_port,
+                        cfg.sharing.webrtc_port,
+                        cfg.sharing.web_require_token,
+                        cfg.sharing.web_keep_local,
                     )
                 };
                 if (new_security != prev_security || new_port != prev_port)
                     && (sharing_enabled || self.controller.listener_running())
                 {
                     let _ = self.controller.start_listener(Some(false));
+                }
+                if (new_web_port != prev_web_port
+                    || new_webrtc_port != prev_webrtc_port
+                    || new_web_token != prev_web_token
+                    || new_web_keep_local != prev_web_keep_local)
+                    && self.controller.web_broadcast.is_active()
+                {
+                    let prev_serials = self.controller.web_broadcast_status().adb_reversed_serials;
+                    let _ = self.controller.stop_web_broadcast();
+                    if let Ok(st) = self.controller.start_web_broadcast(None, None, None) {
+                        for serial in prev_serials {
+                            let _ = self.controller.web_adb_reverse(
+                                Some(&serial),
+                                Some(st.http_port),
+                                true,
+                                false,
+                            );
+                        }
+                    }
                 }
                 let _ = self.controller.enforce_routed_apps();
             }
@@ -884,6 +950,42 @@ impl WorkerState {
         }
         self.refresh_fast(true);
     }
+}
+
+fn redact_log_line_web_tokens(line: &str) -> String {
+    let mut out = String::with_capacity(line.len());
+    let mut rest = line;
+    while !rest.is_empty() {
+        let next_t = rest.find("#t=");
+        let next_tok = rest.find("#token=");
+        let hit = match (next_t, next_tok) {
+            (Some(a), Some(b)) => {
+                if a <= b {
+                    Some((a, "#t="))
+                } else {
+                    Some((b, "#token="))
+                }
+            }
+            (Some(a), None) => Some((a, "#t=")),
+            (None, Some(b)) => Some((b, "#token=")),
+            (None, None) => None,
+        };
+        let Some((idx, prefix)) = hit else {
+            out.push_str(rest);
+            break;
+        };
+        out.push_str(&rest[..idx]);
+        out.push_str(prefix);
+        let after = &rest[idx + prefix.len()..];
+        let end = after
+            .find(|c: char| c.is_whitespace() || matches!(c, '&' | '\'' | '"' | ')' | '>'))
+            .unwrap_or(after.len());
+        if end > 0 {
+            out.push_str("[REDACTED]");
+        }
+        rest = &after[end..];
+    }
+    out
 }
 
 #[cfg(test)]
@@ -1045,5 +1147,67 @@ mod tests {
             assert_eq!(parsed["version"], VERSION);
             assert_eq!(parsed["config"]["has_psk_hash"], true);
         }
+    }
+
+    #[test]
+    fn test_export_bug_report_redacts_web_broadcast_token() {
+        use soundhop_core::web::{WebBroadcastConfig, WebError};
+        use std::net::{IpAddr, Ipv4Addr};
+
+        let (_dir, mut worker) = make_worker_with_temp_config("wb-redact");
+        let started = worker
+            .controller
+            .web_broadcast
+            .start(
+                WebBroadcastConfig {
+                    http_port: 0,
+                    webrtc_udp_port: 0,
+                    bind_ip: IpAddr::V4(Ipv4Addr::LOCALHOST),
+                    require_token: true,
+                    capture_source_label: "mock.monitor".to_string(),
+                    ..Default::default()
+                },
+                Arc::new(|| Err(WebError::NotRunning)),
+            )
+            .expect("web broadcast start succeeds");
+        let secret_token = started.token.expect("active web broadcast must have token");
+
+        worker.handle_command(GuiCommand::ExportBugReport);
+        worker.controller.web_broadcast.stop();
+
+        let snap = worker.snapshot.read().unwrap();
+        let json_str = snap
+            .bug_report_json
+            .as_deref()
+            .expect("bug report JSON populated");
+        assert!(
+            !json_str.contains(&secret_token),
+            "web_broadcast token must be redacted from GUI bug report"
+        );
+        let parsed: serde_json::Value = serde_json::from_str(json_str).unwrap();
+        assert_eq!(parsed["version"], VERSION);
+        let wb = &parsed["status"]["web_broadcast"];
+        assert_eq!(wb["active"], true);
+        assert_eq!(wb["http_port"], started.http_port);
+        assert_eq!(wb["webrtc_udp_port"], started.webrtc_udp_port);
+        assert_eq!(wb["token_required"], true);
+        assert_eq!(wb["capture_source"], "mock.monitor");
+        assert_eq!(wb["token"], "[REDACTED]");
+        let localhost_url = wb["localhost_url"].as_str().unwrap();
+        assert!(localhost_url.ends_with("/#t=[REDACTED]"));
+        for url in wb["urls"].as_array().unwrap() {
+            let s = url.as_str().unwrap();
+            assert!(!s.contains(&secret_token));
+            assert!(s.ends_with("/#t=[REDACTED]"));
+        }
+
+        assert_eq!(
+            redact_log_line_web_tokens("opened http://localhost:4717/#t=secret123&mode=rtc"),
+            "opened http://localhost:4717/#t=[REDACTED]&mode=rtc"
+        );
+        assert_eq!(
+            redact_log_line_web_tokens("opened 'http://192.168.1.2:4717/#token=secret123'"),
+            "opened 'http://192.168.1.2:4717/#token=[REDACTED]'"
+        );
     }
 }

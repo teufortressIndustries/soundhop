@@ -7,7 +7,9 @@ use std::path::Path;
 use std::time::Duration;
 
 use crate::config::{is_paired_security_mode, Config, DEFAULT_RTP_PORT};
-use crate::constants::{DEFAULT_AUDIO_PORT, DEFAULT_DISCOVERY_PORT, MDNS_PORT};
+use crate::constants::{
+    DEFAULT_AUDIO_PORT, DEFAULT_DISCOVERY_PORT, DEFAULT_WEBRTC_PORT, DEFAULT_WEB_PORT, MDNS_PORT,
+};
 use crate::pairing::DEFAULT_PAIR_PORT;
 use crate::transport::DEFAULT_V3_PORT;
 use crate::util::{ProcessRunner, SystemRunner};
@@ -91,6 +93,12 @@ pub struct FirewallPorts {
     pub discovery_udp: u16,
     /// Whether to include mDNS (`5353/udp`).
     pub include_mdns: bool,
+    /// Web Broadcast HTTP/WS TCP port (`None` when Web Broadcast is disabled).
+    #[serde(default)]
+    pub web_tcp: Option<u16>,
+    /// Web Broadcast WebRTC ICE-Lite UDP port (`None` when Web Broadcast is disabled).
+    #[serde(default)]
+    pub webrtc_udp: Option<u16>,
 }
 
 impl Default for FirewallPorts {
@@ -102,6 +110,8 @@ impl Default for FirewallPorts {
             rtp_udp: DEFAULT_RTP_PORT,
             discovery_udp: DEFAULT_DISCOVERY_PORT,
             include_mdns: false,
+            web_tcp: None,
+            webrtc_udp: None,
         }
     }
 }
@@ -112,6 +122,22 @@ impl FirewallPorts {
     /// Omits the legacy PulseAudio TCP port (`sharing.port`) when paired/PSK security
     /// mode is active, since paired mode does not expose unauthenticated PA-TCP.
     pub fn from_config(cfg: &Config) -> Self {
+        Self::from_config_with_web(
+            cfg,
+            cfg.sharing.web_enabled,
+            cfg.sharing.web_port,
+            cfg.sharing.webrtc_port,
+        )
+    }
+
+    /// Build the required firewall port set from a SoundHop [`Config`] while overriding
+    /// whether Web Broadcast ports are active (e.g., for ad-hoc starts).
+    pub fn from_config_with_web(
+        cfg: &Config,
+        web_active: bool,
+        web_port: u16,
+        webrtc_port: u16,
+    ) -> Self {
         let legacy_audio_tcp = if is_paired_security_mode(&cfg.sharing.security) {
             None
         } else {
@@ -124,6 +150,8 @@ impl FirewallPorts {
             rtp_udp: cfg.sharing.rtp_port,
             discovery_udp: cfg.discovery.port,
             include_mdns: cfg.discovery.mdns,
+            web_tcp: web_active.then_some(web_port),
+            webrtc_udp: web_active.then_some(webrtc_port),
         }
     }
 
@@ -166,14 +194,22 @@ impl FirewallPorts {
         if self.include_mdns {
             push_unique(FirewallPortSpec::mdns());
         }
+        if let Some(port) = self.web_tcp {
+            push_unique(FirewallPortSpec::new(port, PortProtocol::Tcp, "Web"));
+        }
+        if let Some(port) = self.webrtc_udp {
+            push_unique(FirewallPortSpec::new(port, PortProtocol::Udp, "WebRTC"));
+        }
         out
     }
 
     /// Port specifications to delete on Windows Defender cleanup (always includes the
-    /// SoundHop-scoped mDNS rule so previously created rules are cleaned up).
+    /// SoundHop-scoped mDNS and Web Broadcast rules so previously created rules are cleaned up).
     pub fn windows_close_specs(&self) -> Vec<FirewallPortSpec> {
         let mut copy = self.clone();
         copy.include_mdns = true;
+        copy.web_tcp.get_or_insert(DEFAULT_WEB_PORT);
+        copy.webrtc_udp.get_or_insert(DEFAULT_WEBRTC_PORT);
         copy.specs()
     }
 }
@@ -1620,7 +1656,7 @@ State                                 ON
     fn test_build_windows_close_commands_includes_mdns() {
         let ports = FirewallPorts::default();
         let cmds = build_windows_close_commands(&ports.windows_close_specs());
-        assert_eq!(cmds.len(), 6);
+        assert_eq!(cmds.len(), 8);
         assert!(cmds.iter().all(|c| is_netsh_delete_rule(c)));
         let names: Vec<Option<&str>> = cmds.iter().map(|c| extract_netsh_rule_name(c)).collect();
         assert_eq!(
@@ -1632,6 +1668,8 @@ State                                 ON
                 Some("SoundHop RTP (4716/udp)"),
                 Some("SoundHop Discovery (47777/udp)"),
                 Some("SoundHop mDNS (5353/udp)"),
+                Some("SoundHop Web (4717/tcp)"),
+                Some("SoundHop WebRTC (4718/udp)"),
             ]
         );
     }
@@ -1663,6 +1701,10 @@ State                                 ON
         assert!(close_params.contains("show rule name=\"SoundHop RTP (4716/udp)\""));
         assert!(close_params.contains("show rule name=\"SoundHop mDNS (5353/udp)\""));
         assert!(close_params.contains("delete rule name=\"SoundHop mDNS (5353/udp)\""));
+        assert!(close_params.contains("show rule name=\"SoundHop Web (4717/tcp)\""));
+        assert!(close_params.contains("delete rule name=\"SoundHop Web (4717/tcp)\""));
+        assert!(close_params.contains("show rule name=\"SoundHop WebRTC (4718/udp)\""));
+        assert!(close_params.contains("delete rule name=\"SoundHop WebRTC (4718/udp)\""));
     }
 
     #[test]
@@ -2146,5 +2188,66 @@ Action:                               Block
         assert!(nft_res
             .note
             .contains("nft add rule inet filter input udp dport 5353 accept"));
+    }
+
+    #[test]
+    fn test_firewall_ports_web_broadcast_from_config_specs_and_cleanup() {
+        let mut cfg = Config::default();
+        assert!(!cfg.sharing.web_enabled);
+        let disabled = FirewallPorts::from_config(&cfg);
+        assert_eq!(disabled.web_tcp, None);
+        assert_eq!(disabled.webrtc_udp, None);
+        assert!(disabled
+            .specs()
+            .iter()
+            .all(|s| s.port != DEFAULT_WEB_PORT && s.port != DEFAULT_WEBRTC_PORT));
+
+        // Ad-hoc override opens Web + WebRTC ports even when sharing.web_enabled is false.
+        let adhoc = FirewallPorts::from_config_with_web(&cfg, true, 4917, 4918);
+        assert_eq!(adhoc.web_tcp, Some(4917));
+        assert_eq!(adhoc.webrtc_udp, Some(4918));
+        let adhoc_specs: Vec<(String, String)> = adhoc
+            .specs()
+            .into_iter()
+            .map(|s| (s.port_proto(), s.windows_rule_name()))
+            .collect();
+        assert!(adhoc_specs.contains(&(
+            "4917/tcp".to_string(),
+            "SoundHop Web (4917/tcp)".to_string()
+        )));
+        assert!(adhoc_specs.contains(&(
+            "4918/udp".to_string(),
+            "SoundHop WebRTC (4918/udp)".to_string()
+        )));
+
+        // Config-enabled Web Broadcast includes default 4717/tcp and 4718/udp.
+        cfg.sharing.web_enabled = true;
+        let enabled = FirewallPorts::from_config(&cfg);
+        assert_eq!(enabled.web_tcp, Some(DEFAULT_WEB_PORT));
+        assert_eq!(enabled.webrtc_udp, Some(DEFAULT_WEBRTC_PORT));
+        let enabled_rules: Vec<String> = enabled
+            .specs()
+            .into_iter()
+            .map(|s| s.windows_rule_name())
+            .collect();
+        assert!(enabled_rules.contains(&"SoundHop Web (4717/tcp)".to_string()));
+        assert!(enabled_rules.contains(&"SoundHop WebRTC (4718/udp)".to_string()));
+
+        // windows_close_specs preserves custom ports when set and populates defaults when None.
+        let custom_close_rules: Vec<String> = adhoc
+            .windows_close_specs()
+            .into_iter()
+            .map(|s| s.windows_rule_name())
+            .collect();
+        assert!(custom_close_rules.contains(&"SoundHop Web (4917/tcp)".to_string()));
+        assert!(custom_close_rules.contains(&"SoundHop WebRTC (4918/udp)".to_string()));
+
+        let default_close_rules: Vec<String> = FirewallPorts::default()
+            .windows_close_specs()
+            .into_iter()
+            .map(|s| s.windows_rule_name())
+            .collect();
+        assert!(default_close_rules.contains(&"SoundHop Web (4717/tcp)".to_string()));
+        assert!(default_close_rules.contains(&"SoundHop WebRTC (4718/udp)".to_string()));
     }
 }

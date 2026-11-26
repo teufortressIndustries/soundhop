@@ -120,6 +120,10 @@ pub enum Commands {
     /// Stream audio or microphone from an Android phone over USB or Wi-Fi ADB (`scrcpy`)
     Android(AndroidArgs),
 
+    /// Broadcast PC audio to phones and browsers over Wi-Fi or USB (`adb reverse`)
+    #[command(visible_alias = "broadcast")]
+    Web(WebArgs),
+
     /// Print version and protocol information
     Version,
 }
@@ -406,4 +410,62 @@ pub struct AndroidArgs {
     /// Run capture in the foreground until Ctrl-C
     #[arg(short, long)]
     pub foreground: bool,
+}
+
+#[derive(Debug, Args)]
+pub struct WebArgs {
+    #[command(subcommand)]
+    pub action: Option<WebAction>,
+}
+
+#[derive(Debug, Subcommand)]
+pub enum WebAction {
+    /// Start the Web Broadcast HTTP/WebSocket/WebRTC audio server
+    Start {
+        /// Override HTTP/WebSocket TCP port (default: 4717)
+        #[arg(short, long)]
+        port: Option<u16>,
+
+        /// Keep playing audio on local PC speakers while broadcasting
+        #[arg(long, conflicts_with = "no_keep_local")]
+        keep_local: bool,
+
+        /// Mute local PC speakers while broadcasting (phone/browser only)
+        #[arg(long, conflicts_with = "keep_local")]
+        no_keep_local: bool,
+
+        /// Disable per-session bearer token authentication
+        #[arg(long)]
+        no_token: bool,
+
+        /// Establish a USB `adb reverse` tunnel for low-latency localhost listening
+        #[arg(long)]
+        adb: bool,
+
+        /// Target Android ADB device serial when setting up `adb reverse`
+        #[arg(long)]
+        serial: Option<String>,
+
+        /// Open the Web Broadcast URL in the Android phone browser (implies `--adb`)
+        #[arg(long)]
+        open: bool,
+    },
+    /// Stop Web Broadcast and remove any active USB `adb reverse` tunnels
+    Stop,
+    /// Show Web Broadcast status, URLs, token, and connected listeners
+    Status,
+    /// Render a compact UTF-8 half-block QR code for the active Web Broadcast URL
+    Qr {
+        /// Render the `http://localhost:<port>` URL for USB `adb reverse` instead of LAN IP
+        #[arg(long)]
+        adb: bool,
+    },
+    /// Rotate the ephemeral Web Broadcast bearer token
+    #[command(name = "rotate-token")]
+    RotateToken,
+    /// Disconnect a connected WebRTC or WebSocket listener by client ID
+    Kick {
+        /// Client ID shown by `soundhop web status`
+        client_id: String,
+    },
 }

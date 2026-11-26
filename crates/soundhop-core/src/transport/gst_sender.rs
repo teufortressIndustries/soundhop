@@ -451,7 +451,7 @@ impl Drop for GstAudioSender {
     }
 }
 
-fn build_capture_source(
+pub(crate) fn build_capture_source(
     endpoint: &CaptureEndpoint,
     audio_params: &AudioParams,
 ) -> TransportResult<(gst::Element, Option<NetsimConfig>)> {

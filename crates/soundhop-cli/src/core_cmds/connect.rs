@@ -89,6 +89,12 @@ pub fn handle_status(controller: &Arc<Controller>, json_out: bool) -> i32 {
         info("Connection: Not connected (playing on local output)");
     }
 
+    if let Some(wb) = st.get("web_broadcast") {
+        if let Some(line) = format_web_broadcast_status_line(wb) {
+            ok(&line);
+        }
+    }
+
     if let Some(vol) = st.get("volume").filter(|v| !v.is_null()) {
         let lvl = vol.get("level").and_then(|v| v.as_u64()).unwrap_or(100);
         let mute = vol.get("mute").and_then(|v| v.as_bool()).unwrap_or(false);
@@ -99,6 +105,46 @@ pub fn handle_status(controller: &Arc<Controller>, json_out: bool) -> i32 {
     }
 
     0
+}
+
+pub(crate) fn format_web_broadcast_status_line(wb: &serde_json::Value) -> Option<String> {
+    if wb.is_null() {
+        return None;
+    }
+    let active = wb.get("active").and_then(|v| v.as_bool()).unwrap_or(false);
+    if !active {
+        return None;
+    }
+    let http_port = wb.get("http_port").and_then(|v| v.as_u64()).unwrap_or(4717);
+    let webrtc_port = wb
+        .get("webrtc_udp_port")
+        .and_then(|v| v.as_u64())
+        .unwrap_or(4718);
+    let listeners = wb
+        .get("clients")
+        .and_then(|v| v.as_array())
+        .map_or(0, Vec::len);
+    let primary_url = wb
+        .get("urls")
+        .and_then(|v| v.as_array())
+        .and_then(|arr| arr.first())
+        .and_then(|v| v.as_str())
+        .filter(|s| !s.is_empty())
+        .or_else(|| {
+            wb.get("localhost_url")
+                .and_then(|v| v.as_str())
+                .filter(|s| !s.is_empty())
+        })
+        .unwrap_or("");
+    if primary_url.is_empty() {
+        Some(format!(
+            "Web Broadcast: Active (HTTP :{http_port}, WebRTC UDP :{webrtc_port}, {listeners} listener(s))"
+        ))
+    } else {
+        Some(format!(
+            "Web Broadcast: Active — {primary_url} (HTTP :{http_port}, WebRTC UDP :{webrtc_port}, {listeners} listener(s))"
+        ))
+    }
 }
 
 pub fn handle_discover(controller: &Arc<Controller>, args: &DiscoverArgs, json_out: bool) -> i32 {
@@ -568,5 +614,43 @@ mod tests {
         assert!(resolve_cli_peer(&ctrl, "   ").is_err());
         let p = resolve_cli_peer(&ctrl, "Room").unwrap();
         assert_eq!(p.id, "a-id");
+    }
+
+    #[test]
+    fn test_format_web_broadcast_status_line() {
+        assert_eq!(
+            format_web_broadcast_status_line(&serde_json::Value::Null),
+            None
+        );
+        assert_eq!(
+            format_web_broadcast_status_line(&serde_json::json!({ "active": false })),
+            None
+        );
+
+        let active_lan = serde_json::json!({
+            "active": true,
+            "http_port": 4717,
+            "webrtc_udp_port": 4718,
+            "urls": ["http://192.168.1.42:4717/#t=abc"],
+            "localhost_url": "http://localhost:4717/#t=abc",
+            "clients": [{ "id": "c1" }, { "id": "c2" }],
+        });
+        let line = format_web_broadcast_status_line(&active_lan).unwrap();
+        assert!(line.contains("http://192.168.1.42:4717/#t=abc"));
+        assert!(line.contains("HTTP :4717"));
+        assert!(line.contains("WebRTC UDP :4718"));
+        assert!(line.contains("2 listener(s)"));
+
+        let active_localhost_only = serde_json::json!({
+            "active": true,
+            "http_port": 4800,
+            "webrtc_udp_port": 4801,
+            "urls": [],
+            "localhost_url": "http://localhost:4800/",
+            "clients": [],
+        });
+        let line2 = format_web_broadcast_status_line(&active_localhost_only).unwrap();
+        assert!(line2.contains("http://localhost:4800/"));
+        assert!(line2.contains("0 listener(s)"));
     }
 }

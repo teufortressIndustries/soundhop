@@ -97,6 +97,19 @@ pub enum GuiCommand {
         as_mic: bool,
     },
     AndroidStop,
+    StartWebBroadcast {
+        keep_local: bool,
+    },
+    StopWebBroadcast,
+    RotateWebToken,
+    KickWebClient {
+        client_id: String,
+    },
+    WebAdbReverse {
+        serial: String,
+        enable: bool,
+        open_browser: bool,
+    },
     OpenFirewall,
     RunDiagnostics {
         fix: bool,
@@ -236,6 +249,17 @@ impl WorkerState {
                 as_mic,
             ),
             GuiCommand::AndroidStop => self.handle_android_stop(),
+            GuiCommand::StartWebBroadcast { keep_local } => {
+                self.handle_start_web_broadcast(keep_local)
+            }
+            GuiCommand::StopWebBroadcast => self.handle_stop_web_broadcast(),
+            GuiCommand::RotateWebToken => self.handle_rotate_web_token(),
+            GuiCommand::KickWebClient { client_id } => self.handle_kick_web_client(client_id),
+            GuiCommand::WebAdbReverse {
+                serial,
+                enable,
+                open_browser,
+            } => self.handle_web_adb_reverse(serial, enable, open_browser),
             GuiCommand::OpenFirewall => self.handle_open_firewall(),
             GuiCommand::RunDiagnostics { fix } => self.handle_run_diagnostics(fix),
             GuiCommand::ExportBugReport => self.handle_export_bug_report(),
@@ -888,6 +912,120 @@ impl WorkerState {
                 .map_err(|e| e.to_string())
         };
         self.finish_with_toast(res, "Trusted device revoked.");
+    }
+
+    fn handle_start_web_broadcast(&mut self, keep_local: bool) {
+        let res = if self.use_ipc && ipc_is_running(None) {
+            ipc_checked(
+                "web_start",
+                serde_json::json!({ "keep_local": keep_local }),
+                Duration::from_secs(6),
+                "Failed to start Web Broadcast",
+            )
+            .map(|_| ())
+        } else {
+            let _sync = lock_or_recover(&self.controller_sync_lock);
+            self.controller
+                .start_web_broadcast(None, Some(keep_local), None)
+                .map(|_| ())
+                .map_err(|e| e.to_string())
+        };
+        self.finish_with_toast(
+            res,
+            "Web Broadcast is live — scan the QR code on your phone.",
+        );
+    }
+
+    fn handle_stop_web_broadcast(&mut self) {
+        let res = if self.use_ipc && ipc_is_running(None) {
+            ipc_checked(
+                "web_stop",
+                serde_json::json!({}),
+                Duration::from_secs(6),
+                "Failed to stop Web Broadcast",
+            )
+            .map(|_| ())
+        } else {
+            let _sync = lock_or_recover(&self.controller_sync_lock);
+            self.controller
+                .stop_web_broadcast()
+                .map(|_| ())
+                .map_err(|e| e.to_string())
+        };
+        self.finish_with_toast(res, "Web Broadcast stopped.");
+    }
+
+    fn handle_rotate_web_token(&mut self) {
+        let res = if self.use_ipc && ipc_is_running(None) {
+            ipc_checked(
+                "web_rotate_token",
+                serde_json::json!({}),
+                Duration::from_secs(4),
+                "Failed to rotate Web Broadcast token",
+            )
+            .map(|_| ())
+        } else {
+            let _sync = lock_or_recover(&self.controller_sync_lock);
+            self.controller
+                .rotate_web_token()
+                .map(|_| ())
+                .map_err(|e| e.to_string())
+        };
+        self.finish_with_toast(res, "Rotated Web Broadcast link and QR code.");
+    }
+
+    fn handle_kick_web_client(&mut self, client_id: String) {
+        let res = if self.use_ipc && ipc_is_running(None) {
+            ipc_checked(
+                "web_kick",
+                serde_json::json!({ "client_id": client_id }),
+                Duration::from_secs(4),
+                "Failed to disconnect listener",
+            )
+            .map(|_| ())
+        } else {
+            let _sync = lock_or_recover(&self.controller_sync_lock);
+            self.controller
+                .kick_web_client(&client_id)
+                .map(|_| ())
+                .map_err(|e| e.to_string())
+        };
+        self.finish_with_toast(res, "Listener disconnected.");
+    }
+
+    fn handle_web_adb_reverse(&mut self, serial: String, enable: bool, open_browser: bool) {
+        let trimmed = serial.trim().to_string();
+        let res = if self.use_ipc && ipc_is_running(None) {
+            let mut payload = serde_json::json!({
+                "enable": enable,
+                "open_browser": open_browser,
+            });
+            if !trimmed.is_empty() {
+                payload["serial"] = serde_json::json!(trimmed);
+            }
+            ipc_checked(
+                "web_adb_reverse",
+                payload,
+                Duration::from_secs(8),
+                "USB adb reverse failed",
+            )
+            .map(|_| ())
+        } else {
+            let _sync = lock_or_recover(&self.controller_sync_lock);
+            let serial_opt = (!trimmed.is_empty()).then_some(trimmed.as_str());
+            self.controller
+                .web_adb_reverse(serial_opt, None, enable, open_browser)
+                .map(|_| ())
+                .map_err(|e| e.to_string())
+        };
+        let msg = if enable && open_browser {
+            "USB tunnel enabled and opened SoundHop in phone browser."
+        } else if enable {
+            "USB low-latency tunnel (adb reverse) enabled."
+        } else {
+            "USB low-latency tunnel disabled."
+        };
+        self.finish_with_toast(res, msg);
     }
 
     fn handle_quit_all(&mut self) {

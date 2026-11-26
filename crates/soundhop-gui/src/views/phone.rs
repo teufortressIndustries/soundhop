@@ -60,6 +60,13 @@ impl PhoneViewState {
     }
 }
 
+pub(crate) fn can_use_usb_web_reverse(
+    snap: &GuiSnapshot,
+    dev: &soundhop_core::android::AdbDevice,
+) -> bool {
+    (snap.adb_ready || snap.android_tools.adb_ready()) && !dev.is_wifi && dev.is_ready()
+}
+
 pub(crate) fn reconnectable_wifi_history(snap: &GuiSnapshot) -> Vec<(&KnownAndroidDevice, String)> {
     let mut out = Vec::new();
     let mut seen_targets = HashSet::new();
@@ -354,6 +361,42 @@ pub fn render(
                         }
                     });
                 });
+
+                if can_use_usb_web_reverse(snap, dev) {
+                    ui.add_space(8.0);
+                    ui.separator();
+                    ui.add_space(6.0);
+                    ui.horizontal(|ui| {
+                        let mut reversed = snap.web_adb_reversed.iter().any(|s| s == &dev.serial);
+                        if toggle_switch(ui, pal, &mut reversed).changed() {
+                            backend.send(GuiCommand::WebAdbReverse {
+                                serial: dev.serial.clone(),
+                                enable: reversed,
+                                open_browser: false,
+                            });
+                        }
+                        ui.label(
+                            RichText::new("adb reverse (USB Low-Latency)")
+                                .color(pal.text_secondary)
+                                .size(12.5),
+                        );
+
+                        ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                            if secondary_button(ui, pal, "Open in Phone Browser").clicked() {
+                                if !snap.web_broadcast_active {
+                                    backend.send(GuiCommand::StartWebBroadcast {
+                                        keep_local: snap.web_keep_local,
+                                    });
+                                }
+                                backend.send(GuiCommand::WebAdbReverse {
+                                    serial: dev.serial.clone(),
+                                    enable: true,
+                                    open_browser: true,
+                                });
+                            }
+                        });
+                    });
+                }
             });
             ui.add_space(6.0);
         }
@@ -746,5 +789,41 @@ mod tests {
         assert_eq!(history.len(), 1);
         assert_eq!(history[0].0.display_name(), "Google Pixel 8");
         assert_eq!(history[0].1, "192.168.1.99:5555");
+    }
+
+    #[test]
+    fn test_usb_web_reverse_gated_on_adb_ready_without_scrcpy() {
+        let mut snap = test_snapshot(Config::default(), State::default());
+        snap.android_tools.adb_path = Some(std::path::PathBuf::from("/usr/bin/adb"));
+        snap.android_tools.scrcpy_path = None;
+        assert!(snap.android_tools.adb_ready());
+        assert!(!snap.android_tools.ready());
+
+        let usb_ready = AdbDevice {
+            serial: "USB123".to_string(),
+            state: "device".to_string(),
+            model: "Pixel".to_string(),
+            product: "pixel".to_string(),
+            device: "pixel".to_string(),
+            transport_id: "1".to_string(),
+            manufacturer: "Google".to_string(),
+            android_version: "14".to_string(),
+            sdk_version: 34,
+            is_wifi: false,
+            ip: String::new(),
+            port: 5555,
+        };
+        let mut wifi_dev = usb_ready.clone();
+        wifi_dev.is_wifi = true;
+        let mut unauthorized_usb = usb_ready.clone();
+        unauthorized_usb.state = "unauthorized".to_string();
+
+        assert!(can_use_usb_web_reverse(&snap, &usb_ready));
+        assert!(!can_use_usb_web_reverse(&snap, &wifi_dev));
+        assert!(!can_use_usb_web_reverse(&snap, &unauthorized_usb));
+
+        snap.android_tools.adb_path = None;
+        snap.adb_ready = false;
+        assert!(!can_use_usb_web_reverse(&snap, &usb_ready));
     }
 }

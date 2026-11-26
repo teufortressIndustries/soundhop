@@ -10,8 +10,8 @@ use crate::theme::Palette;
 #[cfg(not(target_os = "windows"))]
 use crate::widgets::segmented_control;
 use crate::widgets::{
-    audio_wave_indicator, callout_card, card, danger_button, pill_badge, primary_button,
-    secondary_button, section_header, toggle_switch,
+    audio_wave_indicator, callout_card, card, compact_button, danger_button, pill_badge,
+    primary_button, secondary_button, section_header, toggle_switch,
 };
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -39,6 +39,8 @@ pub struct HomeViewState {
     pub show_manual_connect: bool,
     pub manual_address: String,
     pub local_volume_drag: Option<u32>,
+    qr_texture: Option<egui::TextureHandle>,
+    qr_cache_key: Option<(String, Option<String>)>,
     initialized_from_snap: bool,
 }
 
@@ -65,10 +67,59 @@ impl HomeViewState {
 }
 
 pub(crate) fn should_show_firewall_banner(snap: &GuiSnapshot) -> bool {
-    snap.sharing_enabled
+    (snap.sharing_enabled || snap.web_broadcast_active)
         && snap.firewall_active
         && snap.firewall_kind != "none"
         && snap.firewall_ports_allowed != Some(true)
+}
+
+pub(crate) fn summarize_user_agent(ua: &str) -> String {
+    let trimmed = ua.trim();
+    if trimmed.is_empty() {
+        return "Browser".to_string();
+    }
+    let lower = trimmed.to_ascii_lowercase();
+    let browser = if lower.contains("edg") {
+        "Edge"
+    } else if lower.contains("firefox") || lower.contains("fxios") {
+        "Firefox"
+    } else if lower.contains("crios") || lower.contains("chrome") {
+        "Chrome"
+    } else if lower.contains("safari") {
+        "Safari"
+    } else {
+        "Browser"
+    };
+    let os = if lower.contains("android") {
+        "Android"
+    } else if lower.contains("iphone") || lower.contains("ipad") {
+        "iOS"
+    } else if lower.contains("windows") {
+        "Windows"
+    } else if lower.contains("mac os") || lower.contains("macintosh") {
+        "macOS"
+    } else if lower.contains("linux") {
+        "Linux"
+    } else {
+        ""
+    };
+    if os.is_empty() {
+        browser.to_string()
+    } else {
+        format!("{browser} · {os}")
+    }
+}
+
+pub(crate) fn primary_web_broadcast_url(snap: &GuiSnapshot) -> Option<String> {
+    snap.web_urls
+        .first()
+        .map(|s| s.trim())
+        .filter(|s| !s.is_empty())
+        .map(str::to_string)
+        .or_else(|| {
+            let localhost = snap.web_localhost_url.trim();
+            (!localhost.is_empty()).then(|| localhost.to_string())
+        })
 }
 
 pub fn render(
@@ -576,7 +627,238 @@ pub fn render(
         }
     });
 
-    // 4. Quick Microphone Card (Linux PulseAudio/PipeWire pass-through only)
+    ui.add_space(14.0);
+
+    // 4. Web Broadcast (Listen on Phone) Card
+    let web_border = if snap.web_broadcast_active {
+        Some(pal.accent)
+    } else {
+        None
+    };
+    card(ui, pal, web_border, |ui| {
+        ui.horizontal(|ui| {
+            ui.vertical(|ui| {
+                ui.horizontal(|ui| {
+                    ui.label(
+                        RichText::new("Web Broadcast (Listen on Phone)")
+                            .color(pal.text)
+                            .size(14.5)
+                            .strong(),
+                    );
+                    if snap.web_broadcast_active {
+                        pill_badge(
+                            ui,
+                            &format!("Live ({})", snap.web_clients.len()),
+                            pal.success,
+                            pal.success_soft,
+                        );
+                    }
+                });
+                let sub = if snap.web_broadcast_active {
+                    format!(
+                        "Listening on port {} (WebRTC UDP {}) • Scan QR or open link in your mobile browser",
+                        snap.web_http_port, snap.web_webrtc_port
+                    )
+                } else {
+                    "Stream PC audio to any phone or tablet browser over Wi-Fi or USB—no app install required."
+                        .to_string()
+                };
+                ui.label(RichText::new(sub).color(pal.text_muted).size(12.0));
+            });
+
+            ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                let mut web_on = snap.web_broadcast_active;
+                if toggle_switch(ui, pal, &mut web_on).changed() {
+                    if web_on {
+                        backend.send(GuiCommand::StartWebBroadcast {
+                            keep_local: snap.web_keep_local,
+                        });
+                    } else {
+                        backend.send(GuiCommand::StopWebBroadcast);
+                    }
+                }
+            });
+        });
+
+        ui.add_space(8.0);
+        let mut keep_local = snap.web_keep_local;
+        if ui.checkbox(&mut keep_local, "Keep playing on PC").changed() {
+            backend.send(GuiCommand::SaveConfigPatch {
+                patch: serde_json::json!({
+                    "sharing": { "web_keep_local": keep_local }
+                }),
+                toast: None,
+            });
+        }
+
+        if snap.web_broadcast_active {
+            if let Some(primary_url) = primary_web_broadcast_url(snap) {
+                let cache_key = (primary_url.clone(), snap.web_token.clone());
+                if state.qr_cache_key.as_ref() != Some(&cache_key) {
+                    state.qr_texture =
+                        match soundhop_core::web::qr::encode_qr_rgba(&primary_url, 6, 2) {
+                            Ok((px_w, rgba)) => {
+                                let img =
+                                    egui::ColorImage::from_rgba_unmultiplied([px_w, px_w], &rgba);
+                                Some(ui.ctx().load_texture(
+                                    "web_broadcast_qr",
+                                    img,
+                                    egui::TextureOptions::NEAREST,
+                                ))
+                            }
+                            Err(_) => None,
+                        };
+                    state.qr_cache_key = Some(cache_key);
+                }
+
+                ui.add_space(10.0);
+                ui.separator();
+                ui.add_space(10.0);
+
+                ui.horizontal(|ui| {
+                    if let Some(ref tex) = state.qr_texture {
+                        ui.add(
+                            egui::Image::new(tex)
+                                .fit_to_exact_size(egui::vec2(148.0, 148.0))
+                                .corner_radius(egui::CornerRadius::same(6)),
+                        )
+                        .on_hover_text(
+                            "Scan with your phone camera to open the SoundHop Web Player",
+                        );
+                        ui.add_space(12.0);
+                    }
+
+                    ui.vertical(|ui| {
+                        ui.label(
+                            RichText::new("Listen URL")
+                                .color(pal.text_secondary)
+                                .size(12.5)
+                                .strong(),
+                        );
+                        ui.add_space(2.0);
+                        let url_resp = ui.add(
+                            egui::Label::new(
+                                RichText::new(&primary_url)
+                                    .color(pal.accent)
+                                    .size(12.0)
+                                    .monospace(),
+                            )
+                            .sense(egui::Sense::click()),
+                        );
+                        if url_resp.on_hover_text("Click to copy Listen URL").clicked() {
+                            ui.ctx().copy_text(primary_url.clone());
+                        }
+
+                        if !snap.web_adb_reversed.is_empty() && !snap.web_localhost_url.is_empty() {
+                            ui.add_space(4.0);
+                            ui.horizontal(|ui| {
+                                pill_badge(ui, "USB Tunnel", pal.success, pal.success_soft);
+                                if ui
+                                    .add(
+                                        egui::Label::new(
+                                            RichText::new(&snap.web_localhost_url)
+                                                .color(pal.text_secondary)
+                                                .size(11.5)
+                                                .monospace(),
+                                        )
+                                        .sense(egui::Sense::click()),
+                                    )
+                                    .on_hover_text("Click to copy USB localhost URL")
+                                    .clicked()
+                                {
+                                    ui.ctx().copy_text(snap.web_localhost_url.clone());
+                                }
+                            });
+                        }
+
+                        ui.add_space(8.0);
+                        ui.horizontal(|ui| {
+                            if secondary_button(ui, pal, "Copy URL").clicked() {
+                                ui.ctx().copy_text(primary_url.clone());
+                            }
+                            if snap.web_token_required
+                                && secondary_button(ui, pal, "Rotate Token").clicked()
+                            {
+                                backend.send(GuiCommand::RotateWebToken);
+                            }
+                        });
+                    });
+                });
+            } else {
+                state.qr_texture = None;
+                state.qr_cache_key = None;
+            }
+
+            ui.add_space(10.0);
+            ui.separator();
+            ui.add_space(8.0);
+
+            ui.label(
+                RichText::new(format!("Listeners ({})", snap.web_clients.len()))
+                    .color(pal.text_secondary)
+                    .size(12.5)
+                    .strong(),
+            );
+            ui.add_space(4.0);
+
+            if snap.web_clients.is_empty() {
+                ui.label(
+                    RichText::new(
+                        "No browsers connected yet. Scan the QR code or open the URL on your phone.",
+                    )
+                    .color(pal.text_muted)
+                    .size(12.0),
+                );
+            } else {
+                for client in &snap.web_clients {
+                    ui.horizontal(|ui| {
+                        if client.transport.eq_ignore_ascii_case("webrtc") {
+                            pill_badge(ui, "WebRTC", pal.success, pal.success_soft);
+                        } else {
+                            pill_badge(ui, "WebSocket", pal.warning, pal.warning_soft);
+                        }
+                        ui.label(
+                            RichText::new(&client.remote_addr)
+                                .color(pal.text)
+                                .size(12.5)
+                                .strong(),
+                        );
+                        let ua_summary = summarize_user_agent(&client.user_agent);
+                        let ua_lbl =
+                            ui.label(RichText::new(ua_summary).color(pal.text_muted).size(12.0));
+                        if !client.user_agent.is_empty() {
+                            ua_lbl.on_hover_text(&client.user_agent);
+                        }
+                        let rtt_text = client
+                            .rtt_ms
+                            .map(|r| format!("{r:.0} ms RTT"))
+                            .unwrap_or_else(|| "— RTT".to_string());
+                        ui.label(
+                            RichText::new(format!(
+                                "• {rtt_text} • {} dropped",
+                                client.dropped_frames
+                            ))
+                            .color(pal.text_muted)
+                            .size(11.5),
+                        );
+                        ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                            if compact_button(ui, pal, "Kick").clicked() {
+                                backend.send(GuiCommand::KickWebClient {
+                                    client_id: client.id.clone(),
+                                });
+                            }
+                        });
+                    });
+                    ui.add_space(4.0);
+                }
+            }
+        } else {
+            state.qr_texture = None;
+            state.qr_cache_key = None;
+        }
+    });
+
+    // 5. Quick Microphone Card (Linux PulseAudio/PipeWire pass-through only)
     #[cfg(not(target_os = "windows"))]
     if snap.connected || snap.mic_enabled {
         ui.add_space(14.0);
@@ -739,5 +1021,32 @@ mod tests {
 
         p.paired = true;
         assert_eq!(peer_trust_state(&p), PeerTrustState::Trusted);
+    }
+
+    #[test]
+    fn test_web_broadcast_home_helpers() {
+        let mut snap = test_snapshot();
+        assert!(primary_web_broadcast_url(&snap).is_none());
+
+        snap.web_localhost_url = "http://localhost:4717/#t=tok".to_string();
+        assert_eq!(
+            primary_web_broadcast_url(&snap).as_deref(),
+            Some("http://localhost:4717/#t=tok")
+        );
+
+        snap.web_urls = vec!["http://192.168.1.42:4717/#t=tok".to_string()];
+        assert_eq!(
+            primary_web_broadcast_url(&snap).as_deref(),
+            Some("http://192.168.1.42:4717/#t=tok")
+        );
+
+        assert_eq!(
+            summarize_user_agent("Mozilla/5.0 (Linux; Android 14) Chrome/124.0"),
+            "Chrome · Android"
+        );
+        assert_eq!(
+            summarize_user_agent("Mozilla/5.0 (iPhone; CPU iPhone OS 17_0) Safari/604.1"),
+            "Safari · iOS"
+        );
     }
 }

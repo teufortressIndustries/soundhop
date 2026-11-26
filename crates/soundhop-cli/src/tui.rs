@@ -3,6 +3,7 @@
 //! - Tab 1: Peers & Multi-Room Broadcast (`Space` to toggle peer in multi-room group, `Enter` to connect, `c`/`i` manual IP connect, `d` to disconnect, `s` to toggle speaker sharing)
 //! - Tab 2: Per-App Mixer & Persistent Routing (`Enter` to toggle remote/local routing, `p` to save persistent rule in `config.toml`)
 //! - Tab 3: Microphone Pass-Through & Android Audio Bridge (`s` send mic, `r` receive mic, `o` stop mic, `a` start/stop Android stream, `w` switch USB Android device to Wi-Fi)
+//! - Tab 4: Web Broadcast (`b` toggle broadcast, `t` rotate token, `r` toggle USB `adb reverse` + open browser, live QR code + listener list)
 //! - Bottom Telemetry Bar: Live Stereo Peak/RMS VU gauge + dBFS + Network RTT/Jitter (`ms`)
 
 use std::collections::HashSet;
@@ -29,7 +30,10 @@ use soundhop_core::util::{
     install_signal_handlers, is_own_non_loopback_ip, is_private_address, now_secs,
     signal_stop_requested, split_host_port,
 };
+use soundhop_core::web::qr::render_terminal_qr;
+use soundhop_core::web::WebClientInfo;
 
+use crate::core_cmds::format_bytes;
 use crate::ui::lock_or_recover;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -37,6 +41,7 @@ pub enum TuiTab {
     PeersAndMultiRoom,
     AppMixerAndRouting,
     MicAndAndroid,
+    WebBroadcast,
 }
 
 impl TuiTab {
@@ -44,7 +49,8 @@ impl TuiTab {
         match self {
             Self::PeersAndMultiRoom => Self::AppMixerAndRouting,
             Self::AppMixerAndRouting => Self::MicAndAndroid,
-            Self::MicAndAndroid => Self::PeersAndMultiRoom,
+            Self::MicAndAndroid => Self::WebBroadcast,
+            Self::WebBroadcast => Self::PeersAndMultiRoom,
         }
     }
 
@@ -53,6 +59,7 @@ impl TuiTab {
             Self::PeersAndMultiRoom => 0,
             Self::AppMixerAndRouting => 1,
             Self::MicAndAndroid => 2,
+            Self::WebBroadcast => 3,
         }
     }
 }
@@ -66,6 +73,7 @@ pub struct TuiState {
     pub keep_local: bool,
     pub apps: Vec<serde_json::Value>,
     pub selected_app_idx: usize,
+    pub selected_web_client_idx: usize,
     pub manual_ip_prompt: Option<String>,
     pub pending_pair_requests: Vec<PendingPairRequest>,
     pub status_message: String,
@@ -111,6 +119,7 @@ impl TuiState {
             keep_local: st.keep_local,
             apps,
             selected_app_idx: 0,
+            selected_web_client_idx: 0,
             manual_ip_prompt: None,
             pending_pair_requests,
             status_message: "Press Tab to switch views, Space to select multi-room peers, Enter to apply, c/i for manual IP, q to quit.".to_string(),
@@ -149,6 +158,12 @@ impl TuiState {
         }
         if self.selected_app_idx >= self.apps.len() && !self.apps.is_empty() {
             self.selected_app_idx = self.apps.len() - 1;
+        }
+        let web_client_count = self.controller.list_web_clients().len();
+        if web_client_count == 0 {
+            self.selected_web_client_idx = 0;
+        } else if self.selected_web_client_idx >= web_client_count {
+            self.selected_web_client_idx = web_client_count - 1;
         }
     }
 
@@ -202,6 +217,7 @@ impl TuiState {
             KeyCode::Char('1') => self.tab = TuiTab::PeersAndMultiRoom,
             KeyCode::Char('2') => self.tab = TuiTab::AppMixerAndRouting,
             KeyCode::Char('3') => self.tab = TuiTab::MicAndAndroid,
+            KeyCode::Char('4') => self.tab = TuiTab::WebBroadcast,
             KeyCode::Char('+') | KeyCode::Char('=') => {
                 let v = self.controller.get_volume();
                 let cur = v.get("volume").and_then(|x| x.as_u64()).unwrap_or(100) as u32;
@@ -226,6 +242,7 @@ impl TuiState {
                 TuiTab::PeersAndMultiRoom => self.handle_peers_key(code),
                 TuiTab::AppMixerAndRouting => self.handle_apps_key(code),
                 TuiTab::MicAndAndroid => self.handle_mic_android_key(code),
+                TuiTab::WebBroadcast => self.handle_web_broadcast_key(code),
             },
         }
     }
@@ -566,6 +583,123 @@ impl TuiState {
             _ => {}
         }
     }
+
+    fn handle_web_broadcast_key(&mut self, code: KeyCode) {
+        match code {
+            KeyCode::Char('b') => {
+                if self.controller.web_broadcast.is_active() {
+                    match self.controller.stop_web_broadcast() {
+                        Ok(_) => self.status_message = "Web Broadcast stopped.".to_string(),
+                        Err(e) => {
+                            self.status_message = format!("Web Broadcast stop error: {e}");
+                        }
+                    }
+                } else {
+                    match self
+                        .controller
+                        .start_web_broadcast(None, Some(self.keep_local), None)
+                    {
+                        Ok(st) => {
+                            self.status_message = format!(
+                                "Web Broadcast started on HTTP :{} / WebRTC UDP :{}",
+                                st.http_port, st.webrtc_udp_port
+                            );
+                        }
+                        Err(e) => {
+                            self.status_message = format!("Web Broadcast start error: {e}");
+                        }
+                    }
+                }
+            }
+            KeyCode::Char('t') => match self.controller.rotate_web_token() {
+                Ok(_) => {
+                    self.status_message = "Rotated Web Broadcast session token.".to_string();
+                }
+                Err(e) => {
+                    self.status_message = format!("Rotate token error: {e}");
+                }
+            },
+            KeyCode::Char('r') => {
+                let st = self.controller.web_broadcast_status();
+                if !st.adb_reversed_serials.is_empty() {
+                    match self.controller.web_adb_reverse(None, None, false, false) {
+                        Ok(_) => {
+                            self.status_message = "Disabled USB adb reverse tunnel.".to_string();
+                        }
+                        Err(e) => {
+                            self.status_message = format!("ADB reverse error: {e}");
+                        }
+                    }
+                } else if !st.active {
+                    self.status_message =
+                        "Start Web Broadcast ([b]) first before enabling USB adb reverse."
+                            .to_string();
+                } else {
+                    match self
+                        .controller
+                        .web_adb_reverse(None, Some(st.http_port), true, true)
+                    {
+                        Ok(next) => {
+                            let target = if next.adb_reversed_serials.is_empty() {
+                                "phone".to_string()
+                            } else {
+                                next.adb_reversed_serials.join(", ")
+                            };
+                            self.status_message = format!(
+                                "Enabled USB adb reverse ({target}) & opened phone browser."
+                            );
+                        }
+                        Err(e) => {
+                            self.status_message = format!("ADB reverse error: {e}");
+                        }
+                    }
+                }
+            }
+            KeyCode::Char('l') => {
+                self.keep_local = !self.keep_local;
+                self.status_message = if self.controller.web_broadcast.is_active() {
+                    format!(
+                        "Keep local speakers: {} (restart broadcast to apply)",
+                        self.keep_local
+                    )
+                } else {
+                    format!("Keep local speakers: {}", self.keep_local)
+                };
+            }
+            KeyCode::Up | KeyCode::Char('k') => {
+                if self.selected_web_client_idx > 0 {
+                    self.selected_web_client_idx -= 1;
+                }
+            }
+            KeyCode::Down | KeyCode::Char('j') => {
+                let count = self.controller.list_web_clients().len();
+                if self.selected_web_client_idx + 1 < count {
+                    self.selected_web_client_idx += 1;
+                }
+            }
+            KeyCode::Char('x') => {
+                let clients = self.controller.list_web_clients();
+                if let Some(client) = clients.get(self.selected_web_client_idx) {
+                    match self.controller.kick_web_client(&client.id) {
+                        Ok(true) => {
+                            self.status_message =
+                                format!("Disconnected listener {}.", client.remote_addr);
+                        }
+                        Ok(false) => {
+                            self.status_message =
+                                format!("Listener {} already disconnected.", client.id);
+                        }
+                        Err(e) => {
+                            self.status_message = format!("Kick listener error: {e}");
+                        }
+                    }
+                } else {
+                    self.status_message = "No Web Broadcast listener selected.".to_string();
+                }
+            }
+            _ => {}
+        }
+    }
 }
 
 pub fn draw_tui(frame: &mut Frame<'_>, state: &TuiState) {
@@ -584,6 +718,7 @@ pub fn draw_tui(frame: &mut Frame<'_>, state: &TuiState) {
         TuiTab::PeersAndMultiRoom => draw_peers_tab(frame, chunks[1], state),
         TuiTab::AppMixerAndRouting => draw_apps_tab(frame, chunks[1], state),
         TuiTab::MicAndAndroid => draw_mic_android_tab(frame, chunks[1], state),
+        TuiTab::WebBroadcast => draw_web_broadcast_tab(frame, chunks[1], state),
     }
     draw_telemetry_bar(frame, chunks[2], state);
     draw_footer_bar(frame, chunks[3], state);
@@ -705,6 +840,7 @@ fn draw_top_bar(frame: &mut Frame<'_>, area: Rect, state: &TuiState) {
         Line::from(" [1] Speakers "),
         Line::from(" [2] Apps "),
         Line::from(" [3] Phone & Mic "),
+        Line::from(" [4] Web Broadcast "),
     ];
     let tabs = Tabs::new(titles)
         .block(
@@ -981,6 +1117,192 @@ fn draw_mic_android_tab(frame: &mut Frame<'_>, area: Rect, state: &TuiState) {
             .title(" Phone Audio & Microphone Sharing "),
     );
     frame.render_widget(block, area);
+}
+
+fn format_web_client_row(client: &WebClientInfo, selected: bool) -> String {
+    let cursor = if selected { ">" } else { " " };
+    let badge = if client.transport.eq_ignore_ascii_case("webrtc") {
+        "[WebRTC]"
+    } else if client.transport.eq_ignore_ascii_case("ws") {
+        "[WS]"
+    } else {
+        "[OTHER]"
+    };
+    let rtt = client
+        .rtt_ms
+        .map(|r| format!("{r:.1} ms"))
+        .unwrap_or_else(|| "-".to_string());
+    format!(
+        "{cursor} {badge:<8} {:<20} RTT: {:<7}  {}",
+        client.remote_addr,
+        rtt,
+        format_bytes(client.bytes_sent)
+    )
+}
+
+fn draw_web_broadcast_tab(frame: &mut Frame<'_>, area: Rect, state: &TuiState) {
+    let wb = state.controller.web_broadcast_status();
+    let cols = Layout::default()
+        .direction(Direction::Horizontal)
+        .constraints([Constraint::Percentage(46), Constraint::Percentage(54)])
+        .split(area);
+
+    let primary_url = if !wb.adb_reversed_serials.is_empty() && !wb.localhost_url.is_empty() {
+        wb.localhost_url.clone()
+    } else {
+        wb.urls
+            .first()
+            .cloned()
+            .unwrap_or_else(|| wb.localhost_url.clone())
+    };
+
+    let qr_lines: Vec<Line<'_>> = if wb.active && !primary_url.is_empty() {
+        match render_terminal_qr(&primary_url) {
+            Ok(qr) => qr
+                .lines()
+                .map(|l| Line::from(Span::raw(l.to_string())))
+                .collect(),
+            Err(e) => vec![Line::from(Span::styled(
+                format!("QR error: {e}"),
+                Style::default().fg(Color::Red),
+            ))],
+        }
+    } else {
+        vec![
+            Line::from(""),
+            Line::from(Span::styled(
+                "Web Broadcast is Off.",
+                Style::default().fg(Color::DarkGray),
+            )),
+            Line::from(""),
+            Line::from("Press [b] to start broadcasting"),
+            Line::from("PC audio to phone/browser listeners."),
+        ]
+    };
+
+    let qr_block = Paragraph::new(qr_lines).alignment(Alignment::Center).block(
+        Block::default()
+            .borders(Borders::ALL)
+            .title(" Listen QR Code "),
+    );
+    frame.render_widget(qr_block, cols[0]);
+
+    let right_rows = Layout::default()
+        .direction(Direction::Vertical)
+        .constraints([Constraint::Length(10), Constraint::Min(4)])
+        .split(cols[1]);
+
+    let state_span = if wb.active {
+        Span::styled(
+            format!(
+                "On (HTTP :{} | WebRTC UDP :{})",
+                wb.http_port, wb.webrtc_udp_port
+            ),
+            Style::default()
+                .fg(Color::Green)
+                .add_modifier(Modifier::BOLD),
+        )
+    } else {
+        Span::styled(
+            "Off",
+            Style::default().fg(Color::Red).add_modifier(Modifier::BOLD),
+        )
+    };
+    let pipeline_label = if wb.active {
+        if wb.pipeline_running {
+            "Running"
+        } else {
+            "Idle (0 listeners)"
+        }
+    } else {
+        "Stopped"
+    };
+    let token_label = if !wb.active {
+        "-".to_string()
+    } else if wb.token_required {
+        wb.token.clone().unwrap_or_else(|| "<hidden>".to_string())
+    } else {
+        "Disabled".to_string()
+    };
+    let url_display = if wb.active && !primary_url.is_empty() {
+        primary_url
+    } else {
+        "(inactive)".to_string()
+    };
+    let adb_label = if wb.adb_reversed_serials.is_empty() {
+        "Off".to_string()
+    } else {
+        format!("On ({})", wb.adb_reversed_serials.join(", "))
+    };
+    let keep_local_display = if wb.active {
+        wb.keep_local
+    } else {
+        state.keep_local
+    };
+
+    let info_lines = vec![
+        Line::from(vec![
+            Span::styled("Web Broadcast: ", Style::default().fg(Color::Gray)),
+            state_span,
+        ]),
+        Line::from(format!(
+            "Pipeline: {pipeline_label} | Keep Local (l): {}",
+            if keep_local_display { "Yes" } else { "No" }
+        )),
+        Line::from(format!("Token: {token_label}")),
+        Line::from(vec![
+            Span::styled("URL: ", Style::default().fg(Color::Gray)),
+            Span::styled(url_display, Style::default().fg(Color::Cyan)),
+        ]),
+        Line::from(format!(
+            "Localhost: {}",
+            if wb.localhost_url.is_empty() {
+                "-"
+            } else {
+                &wb.localhost_url
+            }
+        )),
+        Line::from(format!("ADB Reverse: {adb_label}")),
+        Line::from(Span::styled(
+            "Keys: [b] Toggle  [t] Rotate Token  [r] ADB Reverse+Open  [x] Kick",
+            Style::default().fg(Color::Yellow),
+        )),
+    ];
+    let info_block = Paragraph::new(info_lines).block(
+        Block::default()
+            .borders(Borders::ALL)
+            .title(" Web Broadcast (Listen on Phone) "),
+    );
+    frame.render_widget(info_block, right_rows[0]);
+
+    let listener_items: Vec<ListItem<'_>> = if wb.clients.is_empty() {
+        vec![ListItem::new("  No browser listeners connected.")]
+    } else {
+        wb.clients
+            .iter()
+            .enumerate()
+            .map(|(idx, client)| {
+                let selected = idx == state.selected_web_client_idx;
+                let row = format_web_client_row(client, selected);
+                let style = if selected {
+                    Style::default()
+                        .fg(Color::Yellow)
+                        .add_modifier(Modifier::BOLD)
+                } else if client.transport.eq_ignore_ascii_case("webrtc") {
+                    Style::default().fg(Color::Green)
+                } else {
+                    Style::default().fg(Color::Cyan)
+                };
+                ListItem::new(Line::from(Span::styled(row, style)))
+            })
+            .collect()
+    };
+    let listeners_block = List::new(listener_items).block(
+        Block::default()
+            .borders(Borders::ALL)
+            .title(format!(" Listeners ({}) ", wb.clients.len())),
+    );
+    frame.render_widget(listeners_block, right_rows[1]);
 }
 
 fn draw_telemetry_bar(frame: &mut Frame<'_>, area: Rect, state: &TuiState) {
@@ -1268,6 +1590,9 @@ pub fn run_tui(controller: Arc<Controller>) -> Result<i32, String> {
         Ok(())
     })();
 
+    if controller.web_broadcast.is_active() {
+        let _ = controller.stop_web_broadcast();
+    }
     telem_monitor.stop();
     disc.stop();
     drop(_term_guard);
@@ -1668,5 +1993,175 @@ mod tests {
         assert!(is_terminal_disconnect_error(&io::Error::from_raw_os_error(
             libc::EIO
         )));
+    }
+
+    #[test]
+    fn test_tui_web_broadcast_tab_render_and_keybindings() {
+        use soundhop_core::android::AndroidManager;
+
+        let dir = tempfile::tempdir().unwrap();
+        let fake_adb = dir.path().join("adb");
+        std::fs::write(&fake_adb, b"#!/bin/sh\n").unwrap();
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            std::fs::set_permissions(&fake_adb, std::fs::Permissions::from_mode(0o755)).unwrap();
+        }
+
+        let adb_calls = Arc::new(std::sync::Mutex::new(Vec::<Vec<String>>::new()));
+        let adb_calls_cb = Arc::clone(&adb_calls);
+        let adb_runner = Arc::new(MockRunner::new(move |args, _| {
+            adb_calls_cb.lock().unwrap().push(args.to_vec());
+            let joined = args.join(" ");
+            let stdout = if joined.contains("devices -l") {
+                "List of devices attached\nUSB777                 device usb:1-1 product:lynx model:Pixel_7a device:lynx\n"
+                    .to_string()
+            } else if joined.contains("ro.product.manufacturer") {
+                "Google\n".to_string()
+            } else if joined.contains("ro.build.version.release") {
+                "14\n".to_string()
+            } else {
+                String::new()
+            };
+            Ok(CommandResult {
+                args: args.to_vec(),
+                returncode: 0,
+                stdout,
+                stderr: String::new(),
+            })
+        }));
+
+        let audio_runner = Arc::new(MockRunner::new(|args, _| {
+            let joined = args.join(" ");
+            let stdout = if joined.ends_with(" info") {
+                "Server Name: PulseAudio (on PipeWire 1.2.0)\nDefault Sink: alsa_output.pci\n"
+                    .to_string()
+            } else if joined.contains("load-module") {
+                "201\n".to_string()
+            } else {
+                String::new()
+            };
+            Ok(CommandResult {
+                args: args.to_vec(),
+                returncode: 0,
+                stdout,
+                stderr: String::new(),
+            })
+        }));
+        let backend = Arc::new(LinuxAudioBackend::with_runner(audio_runner));
+        let mut cfg = Config::default();
+        cfg.sharing.web_port = 0;
+        cfg.sharing.webrtc_port = 0;
+
+        let mut ctrl = Controller::new(
+            Some(cfg),
+            Some(State::default()),
+            Some(backend),
+            None,
+            None,
+            false,
+        );
+        ctrl.android_manager = Arc::new(AndroidManager::with_runner(
+            "",
+            &fake_adb.to_string_lossy(),
+            adb_runner,
+        ));
+        let ctrl = Arc::new(ctrl);
+        ctrl.set_save_enabled(false);
+
+        let mut tui_state = TuiState::new(Arc::clone(&ctrl));
+        let test_backend = TestBackend::new(110, 32);
+        let mut terminal = Terminal::new(test_backend).unwrap();
+
+        // Switch via '4' to Web Broadcast tab
+        tui_state.handle_key(KeyCode::Char('4'));
+        assert_eq!(tui_state.tab, TuiTab::WebBroadcast);
+
+        // Press 'b' to start Web Broadcast
+        tui_state.handle_key(KeyCode::Char('b'));
+        let started = ctrl.web_broadcast_status();
+        assert!(started.active);
+        let first_tok = started.token.clone().expect("token should be generated");
+
+        terminal.draw(|f| draw_tui(f, &tui_state)).unwrap();
+        let buf_text: String = terminal
+            .backend()
+            .buffer()
+            .content()
+            .iter()
+            .map(|c| c.symbol())
+            .collect();
+        assert!(buf_text.contains("[4] Web Broadcast"));
+        assert!(buf_text.contains("On (HTTP :"));
+        assert!(buf_text.contains("[b] Toggle"));
+        assert!(buf_text.contains("[t] Rotate Token"));
+        assert!(buf_text.contains("[r] ADB Reverse+Open"));
+        assert!(
+            buf_text.chars().any(|c| matches!(c, '▀' | '▄' | '█')),
+            "expected UTF-8 half-block QR code in Web Broadcast tab"
+        );
+
+        // Press 't' to rotate token
+        tui_state.handle_key(KeyCode::Char('t'));
+        let rotated = ctrl.web_broadcast_status();
+        assert_ne!(rotated.token.as_deref(), Some(first_tok.as_str()));
+
+        // Press 'r' to enable USB adb reverse + open phone browser, then 'r' again to disable
+        tui_state.handle_key(KeyCode::Char('r'));
+        assert!(ctrl
+            .web_broadcast_status()
+            .adb_reversed_serials
+            .contains(&"USB777".to_string()));
+        {
+            let calls = adb_calls.lock().unwrap();
+            assert!(calls.iter().any(|c| c.join(" ").contains("reverse tcp:")));
+            assert!(calls
+                .iter()
+                .any(|c| c.join(" ").contains("android.intent.action.VIEW")));
+        }
+
+        tui_state.handle_key(KeyCode::Char('r'));
+        assert!(ctrl.web_broadcast_status().adb_reversed_serials.is_empty());
+
+        // Press 'b' to stop Web Broadcast
+        tui_state.handle_key(KeyCode::Char('b'));
+        assert!(!ctrl.web_broadcast_status().active);
+
+        // Verify listener row formatting
+        let webrtc_row = format_web_client_row(
+            &WebClientInfo {
+                id: "rtc-1".to_string(),
+                remote_addr: "192.168.1.50:55555".to_string(),
+                transport: "webrtc".to_string(),
+                user_agent: "Chrome".to_string(),
+                connected_since: 1.0,
+                bytes_sent: 2048,
+                rtt_ms: Some(12.4),
+                dropped_frames: 0,
+            },
+            true,
+        );
+        assert!(webrtc_row.starts_with('>'));
+        assert!(webrtc_row.contains("[WebRTC]"));
+        assert!(webrtc_row.contains("192.168.1.50:55555"));
+        assert!(webrtc_row.contains("12.4 ms"));
+        assert!(webrtc_row.contains("2.0 KiB"));
+
+        let ws_row = format_web_client_row(
+            &WebClientInfo {
+                id: "ws-2".to_string(),
+                remote_addr: "127.0.0.1:41000".to_string(),
+                transport: "ws".to_string(),
+                user_agent: "Firefox".to_string(),
+                connected_since: 2.0,
+                bytes_sent: 512,
+                rtt_ms: None,
+                dropped_frames: 1,
+            },
+            false,
+        );
+        assert!(ws_row.starts_with(' '));
+        assert!(ws_row.contains("[WS]"));
+        assert!(ws_row.contains("512 B"));
     }
 }

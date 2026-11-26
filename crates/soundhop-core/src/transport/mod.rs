@@ -9,6 +9,7 @@
 
 pub mod client;
 pub mod crypto;
+pub mod gst_broadcaster;
 #[cfg(feature = "gstreamer")]
 pub mod gst_receiver;
 #[cfg(feature = "gstreamer")]
@@ -39,6 +40,12 @@ use zeroize::Zeroizing;
 pub use crate::pairing::{InMemoryTrustStore, TrustLookup};
 pub use client::{Sht3ClientConfig, Sht3ClientConnection, Sht3ClientReader, Sht3ClientWriter};
 pub use crypto::{AeadSession, EphemeralKeypair, Role, SessionKeys};
+pub use gst_broadcaster::{
+    udp_poke_hook, BroadcastFrame, BroadcastSubscription, GstBroadcaster, SubscriberId,
+    SubscriberRegistry, SubscriberStats, WakeupHook, BROADCAST_CHANNELS, BROADCAST_FRAME_SAMPLES,
+    BROADCAST_PCM_FRAME_BYTES, BROADCAST_SAMPLE_RATE, SLOW_SUBSCRIBER_MAX_CONSECUTIVE_DROPS,
+    SUBSCRIBER_CHANNEL_CAPACITY,
+};
 #[cfg(feature = "gstreamer")]
 pub use gst_receiver::{
     GstAudioReceiver, PlaybackEndpoint, PlaybackEndpointFactory, PreparedGstReceiver,

@@ -342,7 +342,8 @@ fn collect_doctor_report(
 
 fn collect_bug_report(controller: &Arc<Controller>, env: &dyn DoctorEnv) -> serde_json::Value {
     let cfg = lock_or_recover(&controller.config).clone();
-    let st = controller.status(None);
+    let mut st = controller.status(None);
+    soundhop_core::web::redact_web_broadcast_status_json(&mut st);
     let fw = env.detect_firewall(&FirewallPorts::from_config(&cfg));
     let svc = env.service_status();
     serde_json::json!({
@@ -827,6 +828,8 @@ mod tests {
                 rtp_udp: 4716,
                 discovery_udp: 47777,
                 include_mdns: true,
+                web_tcp: None,
+                webrtc_udp: None,
             }]
         );
         assert!(outcome
@@ -903,5 +906,54 @@ mod tests {
         assert_eq!(bundle["firewall"]["kind"], "ufw");
         assert_eq!(bundle["firewall"]["active"], false);
         assert_eq!(bundle["service"]["active"], true);
+    }
+
+    #[test]
+    fn test_collect_bug_report_redacts_web_broadcast_token() {
+        use soundhop_core::web::{WebBroadcastConfig, WebError};
+        use std::net::{IpAddr, Ipv4Addr};
+
+        let (_dir, ctrl) = make_test_controller(true);
+        let env = MockDoctorEnv::default();
+
+        let started = ctrl
+            .web_broadcast
+            .start(
+                WebBroadcastConfig {
+                    http_port: 0,
+                    webrtc_udp_port: 0,
+                    bind_ip: IpAddr::V4(Ipv4Addr::LOCALHOST),
+                    require_token: true,
+                    capture_source_label: "mock.monitor".to_string(),
+                    ..Default::default()
+                },
+                Arc::new(|| Err(WebError::NotRunning)),
+            )
+            .expect("web broadcast start succeeds");
+        let secret_token = started.token.expect("active web broadcast must have token");
+
+        let bundle = collect_bug_report(&ctrl, &env);
+        ctrl.web_broadcast.stop();
+
+        let serialized = serde_json::to_string(&bundle).unwrap();
+        assert!(
+            !serialized.contains(&secret_token),
+            "web_broadcast token must be redacted from bug report"
+        );
+
+        let wb = &bundle["status"]["web_broadcast"];
+        assert_eq!(wb["active"], true);
+        assert_eq!(wb["http_port"], started.http_port);
+        assert_eq!(wb["webrtc_udp_port"], started.webrtc_udp_port);
+        assert_eq!(wb["token_required"], true);
+        assert_eq!(wb["capture_source"], "mock.monitor");
+        assert_eq!(wb["token"], "[REDACTED]");
+        let localhost_url = wb["localhost_url"].as_str().unwrap();
+        assert!(localhost_url.ends_with("/#t=[REDACTED]"));
+        for url in wb["urls"].as_array().unwrap() {
+            let s = url.as_str().unwrap();
+            assert!(!s.contains(&secret_token));
+            assert!(s.ends_with("/#t=[REDACTED]"));
+        }
     }
 }

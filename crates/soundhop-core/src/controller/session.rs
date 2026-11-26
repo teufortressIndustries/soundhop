@@ -164,7 +164,9 @@ impl Controller {
             )));
         }
 
-        if lock_or_recover(&self.state).is_connected() {
+        if lock_or_recover(&self.state).connected_peer == "web-broadcast" {
+            let _ = self.stop_web_broadcast_internal();
+        } else if lock_or_recover(&self.state).is_connected() {
             let _ = self.disconnect_internal(false, false, false, Some(false), true, false, false);
         }
 
@@ -358,7 +360,9 @@ impl Controller {
             )));
         }
 
-        if lock_or_recover(&self.state).is_connected()
+        if lock_or_recover(&self.state).connected_peer == "web-broadcast" {
+            let _ = self.stop_web_broadcast_internal();
+        } else if lock_or_recover(&self.state).is_connected()
             || self.sht3_mode_active.load(Ordering::Acquire)
         {
             let _ = self.disconnect_internal(false, false, false, Some(false), true, false, false);
@@ -572,7 +576,9 @@ impl Controller {
             }
         }
 
-        if lock_or_recover(&self.state).is_connected()
+        if lock_or_recover(&self.state).connected_peer == "web-broadcast" {
+            let _ = self.stop_web_broadcast_internal();
+        } else if lock_or_recover(&self.state).is_connected()
             || self.sht3_mode_active.load(Ordering::Acquire)
         {
             let _ = self.disconnect_internal(false, false, false, Some(false), true, false, false);
@@ -839,6 +845,17 @@ impl Controller {
             let _ = self.android_session.stop();
         }
         let st_snapshot = lock_or_recover(&self.state).clone();
+        if st_snapshot.connected_peer == "web-broadcast" && self.web_broadcast.is_active() {
+            return Ok(serde_json::json!({
+                "disconnected": false,
+                "peer": st_snapshot.connected_name,
+                "removed_modules": [],
+                "restored_to": "",
+                "forgotten": false,
+                "auto_paused": st_snapshot.auto_paused,
+                "note": "Web Broadcast is active; stop it with web_stop",
+            }));
+        }
         if st_snapshot.combine_module > 0 {
             if let Ok(true) = self.backend.unload_module(st_snapshot.combine_module, true) {
                 removed.push(st_snapshot.combine_module);
@@ -857,6 +874,17 @@ impl Controller {
                 .unload_module(st_snapshot.connected_module, true)
             {
                 removed.push(st_snapshot.connected_module);
+            }
+        }
+        if st_snapshot.web_null_module > 0
+            && !removed.contains(&st_snapshot.web_null_module)
+            && !self.web_broadcast.is_active()
+        {
+            if let Ok(true) = self
+                .backend
+                .unload_module(st_snapshot.web_null_module, true)
+            {
+                removed.push(st_snapshot.web_null_module);
             }
         }
         if !st_snapshot.connected_source.is_empty() || !st_snapshot.mic_direction.is_empty() {
@@ -884,6 +912,9 @@ impl Controller {
         {
             let mut st = lock_or_recover(&self.state);
             st.clear_connection();
+            if st_snapshot.connected_peer == "web-broadcast" && !self.web_broadcast.is_active() {
+                st.clear_web_broadcast();
+            }
             if !keep_previous {
                 st.previous_default_sink.clear();
                 st.previous_default_source.clear();
@@ -927,6 +958,9 @@ impl Controller {
 
     fn connection_dict(&self) -> serde_json::Value {
         let st = lock_or_recover(&self.state);
+        if st.connected_peer == "web-broadcast" || !st.is_connected() {
+            return serde_json::Value::Null;
+        }
         let transport = if self.sht3_outbound_active() {
             "gst-srtp"
         } else {

@@ -119,7 +119,13 @@ fn make_stateful_mock_runner(state: Arc<Mutex<MockPulseState>>) -> Arc<MockRunne
             let id = st.next_module_id;
             st.modules.push((id, mod_name.clone(), mod_args.clone()));
 
-            if mod_name == "module-tunnel-sink" || mod_name == "module-tunnel-sink-new" {
+            if matches!(
+                mod_name.as_str(),
+                "module-tunnel-sink"
+                    | "module-tunnel-sink-new"
+                    | "module-null-sink"
+                    | "module-combine-sink"
+            ) {
                 if let Some(sink_arg) = args.iter().find_map(|a| a.strip_prefix("sink_name=")) {
                     let sink_name = sink_arg.trim_matches('"').to_string();
                     st.sinks.push((id, sink_name, mod_name));
@@ -523,4 +529,256 @@ fn test_ipc_controller_full_lifecycle_share_connect_disconnect_and_config_patch(
 
     server.stop();
     drop(mock_peer_listener);
+}
+
+#[test]
+fn test_daemon_web_broadcast_ipc_roundtrip_and_peer_coexistence() {
+    let dir = tempfile::tempdir().unwrap();
+    let cfg_path = dir.path().join("config.toml");
+    let state_path = dir.path().join("state.json");
+    let sock_path = dir.path().join("web-daemon.sock");
+
+    let pulse_state = Arc::new(Mutex::new(MockPulseState::new(
+        "alsa_output.local_speakers",
+    )));
+    let runner = make_stateful_mock_runner(Arc::clone(&pulse_state));
+    let backend = Arc::new(LinuxAudioBackend::with_runner(runner));
+
+    let mut cfg = Config::default();
+    cfg.device.name = "WebBroadcastHost".to_string();
+    cfg.sharing.enabled = false;
+    cfg.sharing.web_enabled = false;
+    cfg.sharing.web_port = 0;
+    cfg.sharing.webrtc_port = 0;
+    cfg.discovery.udp = false;
+    cfg.discovery.mdns = false;
+    cfg.connection.switch_default = true;
+    cfg.connection.restore_default = true;
+    cfg.save(Some(&cfg_path)).unwrap();
+
+    let controller = Arc::new(Controller::new(
+        Some(cfg),
+        Some(State::default()),
+        Some(backend),
+        Some(cfg_path),
+        Some(state_path),
+        false,
+    ));
+
+    let daemon = Daemon::with_controller(Arc::clone(&controller), Some(sock_path.clone()));
+    daemon
+        .start()
+        .expect("daemon with mock backend should start cleanly");
+
+    let timeout = Duration::from_secs(3);
+
+    // 1. Initial web_status / broadcast_status is inactive
+    let st0 = ipc::request(
+        "web_status",
+        serde_json::json!({}),
+        Some(&sock_path),
+        timeout,
+    )
+    .expect("web_status should succeed");
+    assert_eq!(st0["ok"], true);
+    assert_eq!(st0["web_broadcast"]["active"], false);
+
+    // 2. web_start binds HTTP + WebRTC ports, generates ephemeral token, and sets up Linux sinks
+    let started = ipc::request(
+        "web_start",
+        serde_json::json!({
+            "port": 0,
+            "keep_local": true,
+            "require_token": true
+        }),
+        Some(&sock_path),
+        timeout,
+    )
+    .expect("web_start should succeed");
+    assert_eq!(started["ok"], true);
+    assert_eq!(started["web_broadcast"]["active"], true);
+    assert_eq!(started["web_broadcast"]["keep_local"], true);
+    assert_eq!(started["web_broadcast"]["token_required"], true);
+    let http_port = started["web_broadcast"]["http_port"].as_u64().unwrap();
+    assert!(http_port > 0);
+    assert!(
+        started["web_broadcast"]["webrtc_udp_port"]
+            .as_u64()
+            .unwrap()
+            > 0
+    );
+    let tok1 = started["web_broadcast"]["token"]
+        .as_str()
+        .expect("token should be present")
+        .to_string();
+    assert_eq!(tok1.len(), 32);
+    assert!(started["web_broadcast"]["localhost_url"]
+        .as_str()
+        .unwrap()
+        .contains(&format!("#t={tok1}")));
+
+    #[cfg(target_os = "linux")]
+    {
+        let ps = pulse_state.lock().unwrap();
+        assert!(ps
+            .sinks
+            .iter()
+            .any(|(_, name, _)| name == soundhop_core::constants::WEB_BROADCAST_SINK_NAME));
+        assert!(ps
+            .sinks
+            .iter()
+            .any(|(_, name, _)| name == soundhop_core::constants::MULTIROOM_SINK_NAME));
+        assert_eq!(
+            ps.default_sink,
+            soundhop_core::constants::MULTIROOM_SINK_NAME
+        );
+    }
+
+    // 3. status exposes web_broadcast while keeping connection == null in standalone mode
+    let full_status = ipc::request("status", serde_json::json!({}), Some(&sock_path), timeout)
+        .expect("status should succeed");
+    assert_eq!(full_status["ok"], true);
+    assert_eq!(full_status["web_broadcast"]["active"], true);
+    assert!(full_status["connection"].is_null());
+
+    // 4. broadcast_status alias matches web_status
+    let b_status = ipc::request(
+        "broadcast_status",
+        serde_json::json!({}),
+        Some(&sock_path),
+        timeout,
+    )
+    .expect("broadcast_status should succeed");
+    assert_eq!(b_status["ok"], true);
+    assert_eq!(b_status["web_broadcast"]["active"], true);
+    assert_eq!(b_status["web_broadcast"]["http_port"], http_port);
+
+    // 5. web_rotate_token issues a fresh 32-char token and updates URLs
+    let rotated = ipc::request(
+        "web_rotate_token",
+        serde_json::json!({}),
+        Some(&sock_path),
+        timeout,
+    )
+    .expect("web_rotate_token should succeed");
+    assert_eq!(rotated["ok"], true);
+    let tok2 = rotated["token"].as_str().unwrap().to_string();
+    assert_eq!(tok2.len(), 32);
+    assert_ne!(tok1, tok2);
+    assert_eq!(rotated["web_broadcast"]["token"], tok2);
+
+    // 6. web_kick with unknown client returns ok: true, kicked: false
+    let kick_resp = ipc::request(
+        "web_kick",
+        serde_json::json!({ "client_id": "nonexistent" }),
+        Some(&sock_path),
+        timeout,
+    )
+    .expect("web_kick should succeed");
+    assert_eq!(kick_resp["ok"], true);
+    assert_eq!(kick_resp["kicked"], false);
+
+    // 7. disconnect IPC is a no-op while standalone Web Broadcast is active
+    let disc_resp = ipc::request(
+        "disconnect",
+        serde_json::json!({}),
+        Some(&sock_path),
+        timeout,
+    )
+    .expect("disconnect should return cleanly");
+    assert_eq!(disc_resp["disconnected"], false);
+    let st_after_disc = ipc::request(
+        "web_status",
+        serde_json::json!({}),
+        Some(&sock_path),
+        timeout,
+    )
+    .unwrap();
+    assert_eq!(st_after_disc["web_broadcast"]["active"], true);
+
+    // 8. config_patch changing web_require_token rebinds active Web Broadcast
+    let patched = ipc::request(
+        "config_patch",
+        serde_json::json!({
+            "patch": {
+                "sharing": { "web_require_token": false }
+            }
+        }),
+        Some(&sock_path),
+        timeout,
+    )
+    .expect("config_patch should succeed");
+    assert_eq!(patched["ok"], true);
+    let st_after_patch = ipc::request(
+        "web_status",
+        serde_json::json!({}),
+        Some(&sock_path),
+        timeout,
+    )
+    .unwrap();
+    assert_eq!(st_after_patch["web_broadcast"]["active"], true);
+    assert_eq!(st_after_patch["web_broadcast"]["token_required"], false);
+    assert!(st_after_patch["web_broadcast"]["token"].is_null());
+
+    // 9. web_stop stops servers and restores default sink
+    let stopped = ipc::request("web_stop", serde_json::json!({}), Some(&sock_path), timeout)
+        .expect("web_stop should succeed");
+    assert_eq!(stopped["ok"], true);
+    assert_eq!(stopped["web_broadcast"]["active"], false);
+    assert!(stopped["web_broadcast"]["token"].is_null());
+    #[cfg(target_os = "linux")]
+    assert_eq!(
+        pulse_state.lock().unwrap().default_sink,
+        "alsa_output.local_speakers"
+    );
+
+    // 10. Simultaneous peer session coexistence via broadcast_start / broadcast_stop aliases
+    let mock_peer_listener = TcpListener::bind("127.0.0.1:0").unwrap();
+    let mock_peer_port = mock_peer_listener.local_addr().unwrap().port();
+    let conn_resp = ipc::request(
+        "connect",
+        serde_json::json!({
+            "host": "127.0.0.1",
+            "port": mock_peer_port,
+            "name": "StudioPeer"
+        }),
+        Some(&sock_path),
+        timeout,
+    )
+    .expect("connect should succeed");
+    assert_eq!(conn_resp["ok"], true);
+
+    let b_started = ipc::request(
+        "broadcast_start",
+        serde_json::json!({ "port": 0 }),
+        Some(&sock_path),
+        timeout,
+    )
+    .expect("broadcast_start should succeed alongside active peer");
+    assert_eq!(b_started["ok"], true);
+    assert_eq!(b_started["web_broadcast"]["active"], true);
+
+    let st_both = ipc::request("status", serde_json::json!({}), Some(&sock_path), timeout).unwrap();
+    assert_eq!(st_both["connection"]["connected"], true);
+    assert_eq!(st_both["connection"]["name"], "StudioPeer");
+    assert_eq!(st_both["web_broadcast"]["active"], true);
+
+    let b_stopped = ipc::request(
+        "broadcast_stop",
+        serde_json::json!({}),
+        Some(&sock_path),
+        timeout,
+    )
+    .expect("broadcast_stop should succeed");
+    assert_eq!(b_stopped["ok"], true);
+    assert_eq!(b_stopped["web_broadcast"]["active"], false);
+
+    let st_peer_intact =
+        ipc::request("status", serde_json::json!({}), Some(&sock_path), timeout).unwrap();
+    assert_eq!(st_peer_intact["connection"]["connected"], true);
+    assert_eq!(st_peer_intact["connection"]["name"], "StudioPeer");
+
+    daemon.shutdown();
+    drop(mock_peer_listener);
+    assert!(!ipc::is_reachable(Some(&sock_path)));
 }

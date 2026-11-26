@@ -98,6 +98,7 @@ pub(super) fn apply_optimistic_update(snap: &mut GuiSnapshot, cmd: &GuiCommand) 
         GuiCommand::SaveConfigPatch { patch, .. } => {
             let _ = snap.config.apply_patch(patch);
             snap.audio_profile = snap.config.audio.profile.clone();
+            snap.web_keep_local = snap.config.sharing.web_keep_local;
         }
         GuiCommand::ApplyPairingPin { pin } => {
             if pin.trim().len() >= 6 {
@@ -145,6 +146,34 @@ pub(super) fn apply_optimistic_update(snap: &mut GuiSnapshot, cmd: &GuiCommand) 
         }
         GuiCommand::AndroidStop => {
             snap.android_session_active = false;
+        }
+        GuiCommand::StartWebBroadcast { keep_local } => {
+            snap.web_broadcast_active = true;
+            snap.web_keep_local = *keep_local;
+        }
+        GuiCommand::StopWebBroadcast => {
+            snap.web_broadcast_active = false;
+            snap.web_clients.clear();
+            snap.web_urls.clear();
+            snap.web_localhost_url.clear();
+            snap.web_token = None;
+            snap.web_adb_reversed.clear();
+        }
+        GuiCommand::RotateWebToken => {}
+        GuiCommand::KickWebClient { client_id } => {
+            snap.web_clients.retain(|c| c.id != *client_id);
+        }
+        GuiCommand::WebAdbReverse { serial, enable, .. } => {
+            let trimmed = serial.trim();
+            if *enable {
+                if !trimmed.is_empty() && !snap.web_adb_reversed.iter().any(|s| s == trimmed) {
+                    snap.web_adb_reversed.push(trimmed.to_string());
+                }
+            } else if trimmed.is_empty() {
+                snap.web_adb_reversed.clear();
+            } else {
+                snap.web_adb_reversed.retain(|s| s != trimmed);
+            }
         }
         GuiCommand::OpenFirewall => {
             snap.busy_message = Some("Opening firewall ports...".to_string());
@@ -291,5 +320,80 @@ mod tests {
             .apps
             .iter()
             .all(|a| !a.is_remote && a.routed_rule.is_empty() && !a.persistent));
+    }
+
+    #[test]
+    fn test_optimistic_web_broadcast_commands() {
+        use super::super::snapshot::WebClientView;
+
+        let ctrl = test_controller();
+        let mut initial = GuiSnapshot::from_controller(&ctrl);
+        initial.web_urls = vec!["http://192.168.1.42:4717/#t=abc".to_string()];
+        initial.web_localhost_url = "http://localhost:4717/#t=abc".to_string();
+        initial.web_token = Some("abc".to_string());
+        initial.web_clients = vec![
+            WebClientView {
+                id: "rtc-1".to_string(),
+                remote_addr: "192.168.1.50:50000".to_string(),
+                transport: "webrtc".to_string(),
+                user_agent: "Chrome".to_string(),
+                connected_since: 1.0,
+                bytes_sent: 100,
+                rtt_ms: Some(12.0),
+                dropped_frames: 0,
+            },
+            WebClientView {
+                id: "ws-2".to_string(),
+                remote_addr: "192.168.1.51:50001".to_string(),
+                transport: "ws".to_string(),
+                user_agent: "Firefox".to_string(),
+                connected_since: 2.0,
+                bytes_sent: 200,
+                rtt_ms: None,
+                dropped_frames: 1,
+            },
+        ];
+        let gui_backend = test_gui_backend(initial);
+
+        gui_backend.send(GuiCommand::StartWebBroadcast { keep_local: false });
+        {
+            let snap = gui_backend.read();
+            assert!(snap.web_broadcast_active);
+            assert!(!snap.web_keep_local);
+        }
+
+        gui_backend.send(GuiCommand::WebAdbReverse {
+            serial: "USB123".to_string(),
+            enable: true,
+            open_browser: false,
+        });
+        assert_eq!(gui_backend.read().web_adb_reversed, vec!["USB123"]);
+
+        gui_backend.send(GuiCommand::KickWebClient {
+            client_id: "rtc-1".to_string(),
+        });
+        {
+            let snap = gui_backend.read();
+            assert_eq!(snap.web_clients.len(), 1);
+            assert_eq!(snap.web_clients[0].id, "ws-2");
+        }
+
+        gui_backend.send(GuiCommand::WebAdbReverse {
+            serial: "USB123".to_string(),
+            enable: false,
+            open_browser: false,
+        });
+        assert!(gui_backend.read().web_adb_reversed.is_empty());
+
+        gui_backend.send(GuiCommand::StopWebBroadcast);
+        {
+            let snap = gui_backend.read();
+            assert!(!snap.web_broadcast_active);
+            assert!(snap.web_clients.is_empty());
+            assert!(snap.web_urls.is_empty());
+            assert!(snap.web_localhost_url.is_empty());
+            assert!(snap.web_token.is_none());
+            assert!(snap.web_adb_reversed.is_empty());
+        }
     }
 }

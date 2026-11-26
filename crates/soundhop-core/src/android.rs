@@ -1,6 +1,6 @@
 //! Android audio capture integration using `scrcpy` and `adb`.
 
-use std::collections::{BTreeMap, VecDeque};
+use std::collections::{BTreeMap, BTreeSet, VecDeque};
 use std::fs::{self, File};
 use std::io::{BufRead, BufReader, Read, Write};
 use std::path::{Path, PathBuf};
@@ -100,8 +100,16 @@ pub struct ToolStatus {
 }
 
 impl ToolStatus {
-    pub fn ready(&self) -> bool {
+    pub fn adb_ready(&self) -> bool {
+        self.adb_path.is_some()
+    }
+
+    pub fn scrcpy_ready(&self) -> bool {
         self.scrcpy_path.is_some() && self.adb_path.is_some()
+    }
+
+    pub fn ready(&self) -> bool {
+        self.scrcpy_ready()
     }
 }
 
@@ -335,6 +343,7 @@ pub struct AndroidManager {
     pub custom_scrcpy: String,
     pub custom_adb: String,
     runner: Arc<dyn ProcessRunner>,
+    reverse_tunnels: Mutex<BTreeSet<(String, u16)>>,
 }
 
 impl AndroidManager {
@@ -343,6 +352,7 @@ impl AndroidManager {
             custom_scrcpy: scrcpy_path.trim().to_string(),
             custom_adb: adb_path.trim().to_string(),
             runner: Arc::new(SystemRunner),
+            reverse_tunnels: Mutex::new(BTreeSet::new()),
         }
     }
 
@@ -351,6 +361,7 @@ impl AndroidManager {
             custom_scrcpy: scrcpy_path.trim().to_string(),
             custom_adb: adb_path.trim().to_string(),
             runner,
+            reverse_tunnels: Mutex::new(BTreeSet::new()),
         }
     }
 
@@ -665,14 +676,164 @@ impl AndroidManager {
             },
             None => None,
         };
+        let tracked_to_clean: Vec<(String, u16)> = {
+            let guard = lock_or_recover(&self.reverse_tunnels);
+            guard
+                .iter()
+                .filter(|(serial, _)| match clean_target {
+                    Some(t) => serial == t || (!t.contains(':') && serial == &format!("{t}:5555")),
+                    None => serial.contains(':') || serial.contains("._adb"),
+                })
+                .cloned()
+                .collect()
+        };
+        for (serial, port) in &tracked_to_clean {
+            let _ = self.remove_reverse_tunnel(serial, Some(*port));
+        }
+
         let args: Vec<&str> = match clean_target {
             Some(t) => vec!["disconnect", t],
             None => vec!["disconnect"],
         };
         match self.run_adb(&args, None) {
-            Ok(res) => (true, res.stdout.trim().to_string()),
+            Ok(res) => {
+                if !tracked_to_clean.is_empty() {
+                    let mut guard = lock_or_recover(&self.reverse_tunnels);
+                    for entry in &tracked_to_clean {
+                        guard.remove(entry);
+                    }
+                }
+                (true, res.stdout.trim().to_string())
+            }
             Err(e) => (false, e.to_string()),
         }
+    }
+
+    pub fn setup_reverse_tunnel(
+        &self,
+        serial: &str,
+        remote_port: u16,
+        local_port: u16,
+    ) -> Result<(), AndroidError> {
+        let clean_serial = validate_adb_target(serial)?;
+        if remote_port == 0 || local_port == 0 {
+            return Err(AndroidError::Message(format!(
+                "Invalid reverse tunnel ports: remote={remote_port}, local={local_port} (must be non-zero)"
+            )));
+        }
+        let remote_spec = format!("tcp:{remote_port}");
+        let local_spec = format!("tcp:{local_port}");
+        let res = self.run_adb(&["reverse", &remote_spec, &local_spec], Some(clean_serial))?;
+        if !res.ok() {
+            return Err(adb_command_error(
+                &format!("adb reverse {remote_spec} {local_spec}"),
+                &res,
+            ));
+        }
+        lock_or_recover(&self.reverse_tunnels).insert((clean_serial.to_string(), remote_port));
+        Ok(())
+    }
+
+    pub fn remove_reverse_tunnel(
+        &self,
+        serial: &str,
+        remote_port: Option<u16>,
+    ) -> Result<(), AndroidError> {
+        let clean_serial = validate_adb_target(serial)?;
+        let port_spec = match remote_port {
+            Some(0) => {
+                return Err(AndroidError::Message(
+                    "Invalid reverse tunnel remote port: 0 (must be non-zero)".to_string(),
+                ));
+            }
+            Some(port) => Some(format!("tcp:{port}")),
+            None => None,
+        };
+        let args: Vec<&str> = match port_spec.as_deref() {
+            Some(spec) => vec!["reverse", "--remove", spec],
+            None => vec!["reverse", "--remove-all"],
+        };
+        let clear_tracked = || {
+            let mut guard = lock_or_recover(&self.reverse_tunnels);
+            match remote_port {
+                Some(port) => {
+                    guard.remove(&(clean_serial.to_string(), port));
+                }
+                None => {
+                    guard.retain(|(s, _)| s != clean_serial);
+                }
+            }
+        };
+
+        match self.run_adb(&args, Some(clean_serial)) {
+            Ok(res) if res.ok() => {
+                clear_tracked();
+                Ok(())
+            }
+            Ok(res) => {
+                let detail = res.combined_output();
+                if is_benign_reverse_teardown_error(&detail) {
+                    clear_tracked();
+                    Ok(())
+                } else {
+                    Err(adb_command_error("adb reverse remove", &res))
+                }
+            }
+            Err(e) => {
+                if is_benign_reverse_teardown_error(&e.to_string()) {
+                    clear_tracked();
+                    Ok(())
+                } else {
+                    Err(e)
+                }
+            }
+        }
+    }
+
+    pub fn list_reverse_tunnels(&self, serial: &str) -> Result<Vec<String>, AndroidError> {
+        let clean_serial = validate_adb_target(serial)?;
+        let res = self.run_adb(&["reverse", "--list"], Some(clean_serial))?;
+        if !res.ok() {
+            return Err(adb_command_error("adb reverse --list", &res));
+        }
+        Ok(res
+            .stdout
+            .lines()
+            .map(str::trim)
+            .filter(|line| !line.is_empty())
+            .map(ToString::to_string)
+            .collect())
+    }
+
+    pub fn tracked_reverse_tunnels(&self) -> Vec<(String, u16)> {
+        lock_or_recover(&self.reverse_tunnels)
+            .iter()
+            .cloned()
+            .collect()
+    }
+
+    pub fn open_browser_url(&self, serial: &str, url: &str) -> Result<(), AndroidError> {
+        let clean_serial = validate_adb_target(serial)?;
+        validate_local_browser_url(url)?;
+        // Single-quote the validated URL (which cannot contain `'`) so characters
+        // like `&` remain literal when `adb shell` invokes Android `/system/bin/sh`.
+        let quoted_url = format!("'{url}'");
+        let res = self.run_adb(
+            &[
+                "shell",
+                "am",
+                "start",
+                "-a",
+                "android.intent.action.VIEW",
+                "-d",
+                &quoted_url,
+            ],
+            Some(clean_serial),
+        )?;
+        if !res.ok() {
+            return Err(adb_command_error("adb shell am start", &res));
+        }
+        Ok(())
     }
 
     /// Discover wireless Android ADB targets via `adb mdns services` and `mdns-sd`
@@ -842,6 +1003,74 @@ pub fn validate_adb_target(value: &str) -> Result<&str, AndroidError> {
         )));
     }
     Ok(trimmed)
+}
+
+fn validate_local_browser_url(url: &str) -> Result<(), AndroidError> {
+    if url.is_empty()
+        || !url.chars().all(|c| {
+            c.is_ascii_alphanumeric()
+                || matches!(c, '_' | '.' | '-' | '~' | ':' | '/' | '?' | '=' | '#' | '&')
+        })
+    {
+        return Err(AndroidError::Message(format!(
+            "Refusing browser URL with disallowed characters: {url:?}"
+        )));
+    }
+
+    let rest = url
+        .strip_prefix("http://localhost:")
+        .or_else(|| url.strip_prefix("http://127.0.0.1:"))
+        .ok_or_else(|| {
+            AndroidError::Message(format!(
+                "Browser URL must start with http://localhost:<port> or http://127.0.0.1:<port>: {url:?}"
+            ))
+        })?;
+
+    let port_end = rest
+        .find(|c: char| !c.is_ascii_digit())
+        .unwrap_or(rest.len());
+    let port_str = &rest[..port_end];
+    let after_port = &rest[port_end..];
+    let valid_port = !port_str.is_empty()
+        && !port_str.starts_with('0')
+        && port_str.parse::<u16>().is_ok_and(|p| p > 0);
+    let valid_boundary = after_port.is_empty()
+        || after_port.starts_with('/')
+        || after_port.starts_with('?')
+        || after_port.starts_with('#');
+
+    if !valid_port || !valid_boundary {
+        return Err(AndroidError::Message(format!(
+            "Browser URL has invalid localhost port or authority boundary: {url:?}"
+        )));
+    }
+
+    Ok(())
+}
+
+fn is_benign_reverse_teardown_error(msg: &str) -> bool {
+    let lower = msg.to_ascii_lowercase();
+    if lower.contains("adb command not found") {
+        return false;
+    }
+    lower.contains("device offline")
+        || lower.contains("device not found")
+        || lower.contains("no devices")
+        || (lower.contains("device '") && lower.contains("not found"))
+        || (lower.contains("listener") && lower.contains("not found"))
+        || (lower.contains("cannot remove") && lower.contains("not found"))
+}
+
+fn adb_command_error(context: &str, res: &CommandResult) -> AndroidError {
+    let detail = res.combined_output();
+    if detail.is_empty() {
+        AndroidError::Message(format!(
+            "{context} failed with exit code {}",
+            res.returncode
+        ))
+    } else {
+        AndroidError::Message(format!("{context} failed: {detail}"))
+    }
 }
 
 pub fn parse_adb_devices_output(stdout: &str) -> Vec<AdbDevice> {
@@ -1739,5 +1968,395 @@ mod tests {
         assert!(recorded
             .iter()
             .any(|c| c.contains("connect 192.168.1.64:5555")));
+    }
+
+    fn make_fake_adb(dir: &tempfile::TempDir) -> PathBuf {
+        let fake_adb = dir.path().join("adb");
+        fs::write(&fake_adb, b"#!/bin/sh\n").unwrap();
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            fs::set_permissions(&fake_adb, fs::Permissions::from_mode(0o755)).unwrap();
+        }
+        fake_adb
+    }
+
+    #[test]
+    fn test_tool_status_adb_ready_vs_scrcpy_ready() {
+        use crate::util::MockRunner;
+
+        let adb_only = ToolStatus {
+            scrcpy_path: None,
+            scrcpy_version: String::new(),
+            adb_path: Some(PathBuf::from("/usr/bin/adb")),
+            adb_version: "1.0.41".to_string(),
+            is_managed: false,
+        };
+        assert!(adb_only.adb_ready());
+        assert!(!adb_only.scrcpy_ready());
+        assert!(!adb_only.ready());
+
+        let scrcpy_only = ToolStatus {
+            scrcpy_path: Some(PathBuf::from("/usr/bin/scrcpy")),
+            scrcpy_version: "3.1".to_string(),
+            adb_path: None,
+            adb_version: String::new(),
+            is_managed: false,
+        };
+        assert!(!scrcpy_only.adb_ready());
+        assert!(!scrcpy_only.scrcpy_ready());
+        assert!(!scrcpy_only.ready());
+
+        let both = ToolStatus {
+            scrcpy_path: Some(PathBuf::from("/usr/bin/scrcpy")),
+            scrcpy_version: "3.1".to_string(),
+            adb_path: Some(PathBuf::from("/usr/bin/adb")),
+            adb_version: "1.0.41".to_string(),
+            is_managed: false,
+        };
+        assert!(both.adb_ready());
+        assert!(both.scrcpy_ready());
+        assert!(both.ready());
+
+        let neither = ToolStatus {
+            scrcpy_path: None,
+            scrcpy_version: String::new(),
+            adb_path: None,
+            adb_version: String::new(),
+            is_managed: false,
+        };
+        assert!(!neither.adb_ready());
+        assert!(!neither.scrcpy_ready());
+        assert!(!neither.ready());
+
+        let dir = tempfile::tempdir().unwrap();
+        let fake_adb = make_fake_adb(&dir);
+        let runner = Arc::new(MockRunner::new(move |args, _| {
+            let joined = args.join(" ");
+            if joined.ends_with(" version") {
+                return Ok(CommandResult {
+                    args: args.to_vec(),
+                    returncode: 0,
+                    stdout: "Android Debug Bridge version 1.0.41\nVersion 35.0.0\n".to_string(),
+                    stderr: String::new(),
+                });
+            }
+            Ok(CommandResult {
+                args: args.to_vec(),
+                returncode: 0,
+                stdout: String::new(),
+                stderr: String::new(),
+            })
+        }));
+        let mgr = AndroidManager::with_runner("", &fake_adb.to_string_lossy(), runner);
+        let status = mgr.get_tool_status();
+        assert!(status.adb_ready());
+        assert_eq!(status.adb_version, "1.0.41");
+        assert_eq!(status.ready(), status.scrcpy_ready());
+    }
+
+    #[test]
+    fn test_reverse_tunnel_setup_list_and_remove() {
+        use crate::util::MockRunner;
+
+        let dir = tempfile::tempdir().unwrap();
+        let fake_adb = make_fake_adb(&dir);
+
+        let calls: Arc<Mutex<Vec<Vec<String>>>> = Arc::new(Mutex::new(Vec::new()));
+        let calls_c = Arc::clone(&calls);
+        let mode = Arc::new(Mutex::new("ok".to_string()));
+        let mode_c = Arc::clone(&mode);
+
+        let runner = Arc::new(MockRunner::new(move |args, _| {
+            calls_c.lock().unwrap().push(args.to_vec());
+            let cur_mode = mode_c.lock().unwrap().clone();
+            if args.windows(2).any(|w| w == ["reverse", "--list"]) {
+                return Ok(CommandResult {
+                    args: args.to_vec(),
+                    returncode: 0,
+                    stdout: "host-1 tcp:4717 tcp:4717\nhost-1 tcp:4718 tcp:4718\n\n".to_string(),
+                    stderr: String::new(),
+                });
+            }
+            if args.iter().any(|a| a == "--remove" || a == "--remove-all") {
+                match cur_mode.as_str() {
+                    "offline" => {
+                        return Ok(CommandResult {
+                            args: args.to_vec(),
+                            returncode: 1,
+                            stdout: String::new(),
+                            stderr: "adb: error: device offline".to_string(),
+                        });
+                    }
+                    "not_found" => {
+                        return Ok(CommandResult {
+                            args: args.to_vec(),
+                            returncode: 1,
+                            stdout: String::new(),
+                            stderr: "adb: error: device 'R58M123' not found".to_string(),
+                        });
+                    }
+                    "listener_missing" => {
+                        return Ok(CommandResult {
+                            args: args.to_vec(),
+                            returncode: 1,
+                            stdout: String::new(),
+                            stderr: "adb: error: listener 'tcp:4717' not found".to_string(),
+                        });
+                    }
+                    "perm_denied" => {
+                        return Ok(CommandResult {
+                            args: args.to_vec(),
+                            returncode: 1,
+                            stdout: String::new(),
+                            stderr: "adb: error: insufficient permissions".to_string(),
+                        });
+                    }
+                    _ => {}
+                }
+            }
+            Ok(CommandResult {
+                args: args.to_vec(),
+                returncode: 0,
+                stdout: String::new(),
+                stderr: String::new(),
+            })
+        }));
+
+        let mgr = AndroidManager::with_runner("", &fake_adb.to_string_lossy(), runner);
+
+        // Input validation
+        assert!(mgr.setup_reverse_tunnel("-evil", 4717, 4717).is_err());
+        assert!(mgr.setup_reverse_tunnel("R58M123", 0, 4717).is_err());
+        assert!(mgr.setup_reverse_tunnel("R58M123", 4717, 0).is_err());
+        assert!(mgr.remove_reverse_tunnel("-evil", Some(4717)).is_err());
+        assert!(mgr.remove_reverse_tunnel("R58M123", Some(0)).is_err());
+        assert!(mgr.list_reverse_tunnels("bad serial").is_err());
+        assert!(calls.lock().unwrap().is_empty());
+
+        // Setup and list
+        mgr.setup_reverse_tunnel("R58M123", 4717, 4717).unwrap();
+        mgr.setup_reverse_tunnel("R58M123", 4718, 4718).unwrap();
+        assert_eq!(
+            mgr.tracked_reverse_tunnels(),
+            vec![("R58M123".to_string(), 4717), ("R58M123".to_string(), 4718)]
+        );
+
+        let listed = mgr.list_reverse_tunnels("R58M123").unwrap();
+        assert_eq!(
+            listed,
+            vec![
+                "host-1 tcp:4717 tcp:4717".to_string(),
+                "host-1 tcp:4718 tcp:4718".to_string()
+            ]
+        );
+
+        // Remove single port
+        mgr.remove_reverse_tunnel("R58M123", Some(4717)).unwrap();
+        assert_eq!(
+            mgr.tracked_reverse_tunnels(),
+            vec![("R58M123".to_string(), 4718)]
+        );
+
+        // Remove all ports for serial
+        mgr.remove_reverse_tunnel("R58M123", None).unwrap();
+        assert!(mgr.tracked_reverse_tunnels().is_empty());
+
+        // Benign offline/not-found errors during teardown are ignored and clear tracking
+        for err_mode in ["offline", "not_found", "listener_missing"] {
+            *mode.lock().unwrap() = "ok".to_string();
+            mgr.setup_reverse_tunnel("R58M123", 4717, 4717).unwrap();
+            *mode.lock().unwrap() = err_mode.to_string();
+            mgr.remove_reverse_tunnel("R58M123", Some(4717))
+                .expect("benign teardown error must be ignored");
+            assert!(mgr.tracked_reverse_tunnels().is_empty());
+        }
+
+        // Non-benign teardown errors still fail
+        *mode.lock().unwrap() = "ok".to_string();
+        mgr.setup_reverse_tunnel("R58M123", 4717, 4717).unwrap();
+        *mode.lock().unwrap() = "perm_denied".to_string();
+        assert!(mgr.remove_reverse_tunnel("R58M123", Some(4717)).is_err());
+
+        let recorded = calls.lock().unwrap().clone();
+        assert!(recorded.iter().any(|a| {
+            a.ends_with(&[
+                "-s".into(),
+                "R58M123".into(),
+                "reverse".into(),
+                "tcp:4717".into(),
+                "tcp:4717".into(),
+            ])
+        }));
+        assert!(recorded.iter().any(|a| {
+            a.ends_with(&[
+                "-s".into(),
+                "R58M123".into(),
+                "reverse".into(),
+                "--remove".into(),
+                "tcp:4717".into(),
+            ])
+        }));
+        assert!(recorded.iter().any(|a| {
+            a.ends_with(&[
+                "-s".into(),
+                "R58M123".into(),
+                "reverse".into(),
+                "--remove-all".into(),
+            ])
+        }));
+        assert!(recorded.iter().any(|a| {
+            a.ends_with(&[
+                "-s".into(),
+                "R58M123".into(),
+                "reverse".into(),
+                "--list".into(),
+            ])
+        }));
+    }
+
+    #[test]
+    fn test_disconnect_wifi_cleans_up_tracked_reverse_tunnels() {
+        use crate::util::MockRunner;
+
+        let dir = tempfile::tempdir().unwrap();
+        let fake_adb = make_fake_adb(&dir);
+
+        let calls: Arc<Mutex<Vec<String>>> = Arc::new(Mutex::new(Vec::new()));
+        let calls_c = Arc::clone(&calls);
+        let runner = Arc::new(MockRunner::new(move |args, _| {
+            calls_c.lock().unwrap().push(args.join(" "));
+            Ok(CommandResult {
+                args: args.to_vec(),
+                returncode: 0,
+                stdout: "disconnected everything".to_string(),
+                stderr: String::new(),
+            })
+        }));
+
+        let mgr = AndroidManager::with_runner("", &fake_adb.to_string_lossy(), runner);
+        mgr.setup_reverse_tunnel("192.168.1.50:5555", 4717, 4717)
+            .unwrap();
+        mgr.setup_reverse_tunnel("192.168.1.60:5555", 4717, 4717)
+            .unwrap();
+        mgr.setup_reverse_tunnel("R58M123456", 4717, 4717).unwrap();
+
+        // Disconnecting a specific Wi-Fi target cleans up only that target's tunnel.
+        let (ok, _) = mgr.disconnect_wifi(Some("192.168.1.50:5555"));
+        assert!(ok);
+        assert_eq!(
+            mgr.tracked_reverse_tunnels(),
+            vec![
+                ("192.168.1.60:5555".to_string(), 4717),
+                ("R58M123456".to_string(), 4717),
+            ]
+        );
+
+        // Disconnecting all Wi-Fi targets cleans remaining Wi-Fi tunnels while preserving USB.
+        let (ok, _) = mgr.disconnect_wifi(None);
+        assert!(ok);
+        assert_eq!(
+            mgr.tracked_reverse_tunnels(),
+            vec![("R58M123456".to_string(), 4717)]
+        );
+
+        let recorded = calls.lock().unwrap().clone();
+        assert!(recorded
+            .iter()
+            .any(|c| c.contains("-s 192.168.1.50:5555 reverse --remove tcp:4717")));
+        assert!(recorded
+            .iter()
+            .any(|c| c.contains("-s 192.168.1.60:5555 reverse --remove tcp:4717")));
+        assert!(!recorded
+            .iter()
+            .any(|c| c.contains("-s R58M123456 reverse --remove")));
+    }
+
+    #[test]
+    fn test_open_browser_url_allowlist_and_injection_rejection() {
+        use crate::util::MockRunner;
+
+        let dir = tempfile::tempdir().unwrap();
+        let fake_adb = make_fake_adb(&dir);
+
+        let calls: Arc<Mutex<Vec<Vec<String>>>> = Arc::new(Mutex::new(Vec::new()));
+        let calls_c = Arc::clone(&calls);
+        let runner = Arc::new(MockRunner::new(move |args, _| {
+            calls_c.lock().unwrap().push(args.to_vec());
+            Ok(CommandResult {
+                args: args.to_vec(),
+                returncode: 0,
+                stdout: "Starting: Intent { act=android.intent.action.VIEW }".to_string(),
+                stderr: String::new(),
+            })
+        }));
+
+        let mgr = AndroidManager::with_runner("", &fake_adb.to_string_lossy(), runner);
+
+        let valid_urls = [
+            "http://localhost:4717",
+            "http://localhost:4717/",
+            "http://localhost:4717/#t=0123456789abcdef0123456789abcdef",
+            "http://127.0.0.1:4717",
+            "http://127.0.0.1:4717/",
+            "http://127.0.0.1:4717/?foo=bar&v=1#t=abc_.-~",
+        ];
+        for url in valid_urls {
+            mgr.open_browser_url("R58M123456", url)
+                .unwrap_or_else(|e| panic!("expected valid URL {url:?} to succeed: {e}"));
+        }
+        assert_eq!(calls.lock().unwrap().len(), valid_urls.len());
+        assert_eq!(
+            calls.lock().unwrap()[2],
+            vec![
+                fake_adb.to_string_lossy().to_string(),
+                "-s".to_string(),
+                "R58M123456".to_string(),
+                "shell".to_string(),
+                "am".to_string(),
+                "start".to_string(),
+                "-a".to_string(),
+                "android.intent.action.VIEW".to_string(),
+                "-d".to_string(),
+                "'http://localhost:4717/#t=0123456789abcdef0123456789abcdef'".to_string(),
+            ]
+        );
+
+        calls.lock().unwrap().clear();
+        let rejected_urls = [
+            "",
+            "http://192.168.1.10:4717/#t=abc",
+            "http://evil.com/",
+            "https://localhost:4717/",
+            "javascript:alert(1)",
+            "http://localhost/",
+            "http://127.0.0.1/",
+            "http://localhost:0/",
+            "http://localhost:04717/",
+            "http://localhost:99999/",
+            "http://localhost:4717.evil.com/",
+            "http://127.0.0.1:4717.evil.com/",
+            "http://localhost:4717/#t=abc;id",
+            "http://localhost:4717/#t=$(id)",
+            "http://localhost:4717/#t=`id`",
+            "http://localhost:4717/#t=abc def",
+            "http://localhost:4717/#t=\"abc\"",
+            "http://localhost:4717/#t='abc'",
+            "http://localhost:4717/#t=abc\nid",
+            "http://localhost:4717/#t=abc|cat",
+        ];
+        for url in rejected_urls {
+            assert!(
+                mgr.open_browser_url("R58M123456", url).is_err(),
+                "expected malicious/disallowed URL {url:?} to be rejected"
+            );
+        }
+        assert!(mgr
+            .open_browser_url("-evil", "http://localhost:4717/")
+            .is_err());
+        assert!(
+            calls.lock().unwrap().is_empty(),
+            "rejected URLs/serials must never invoke adb"
+        );
     }
 }

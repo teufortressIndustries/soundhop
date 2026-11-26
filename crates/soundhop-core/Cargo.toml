@@ -42,6 +42,9 @@ ureq.workspace = true
 flate2.workspace = true
 tar.workspace = true
 zip.workspace = true
+str0m.workspace = true
+tungstenite.workspace = true
+qrcode.workspace = true
 
 [target.'cfg(unix)'.dependencies]
 libc.workspace = true

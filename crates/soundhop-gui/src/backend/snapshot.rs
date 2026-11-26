@@ -60,6 +60,23 @@ pub struct AppStreamView {
     pub active: bool,
 }
 
+#[derive(Debug, Clone, PartialEq, serde::Deserialize)]
+pub struct WebClientView {
+    pub id: String,
+    pub remote_addr: String,
+    pub transport: String,
+    #[serde(default)]
+    pub user_agent: String,
+    #[serde(default)]
+    pub connected_since: f64,
+    #[serde(default)]
+    pub bytes_sent: u64,
+    #[serde(default)]
+    pub rtt_ms: Option<f64>,
+    #[serde(default)]
+    pub dropped_frames: u32,
+}
+
 #[derive(Debug, Clone)]
 pub struct GuiToast {
     pub message: String,
@@ -128,6 +145,18 @@ pub struct GuiSnapshot {
     pub dropped_frames: Option<u32>,
     pub gstreamer_status: Option<GstreamerRuntimeStatus>,
     pub gstreamer_error: Option<String>,
+    pub adb_ready: bool,
+    pub scrcpy_ready: bool,
+    pub web_broadcast_active: bool,
+    pub web_http_port: u16,
+    pub web_webrtc_port: u16,
+    pub web_urls: Vec<String>,
+    pub web_localhost_url: String,
+    pub web_token: Option<String>,
+    pub web_token_required: bool,
+    pub web_clients: Vec<WebClientView>,
+    pub web_adb_reversed: Vec<String>,
+    pub web_keep_local: bool,
     pub hydrated: bool,
 }
 
@@ -135,6 +164,7 @@ impl GuiSnapshot {
     pub fn from_controller(controller: &Controller) -> Self {
         let cfg = lock_or_recover(&controller.config).clone();
         let st = lock_or_recover(&controller.state).clone();
+        let web_st = controller.web_broadcast_status();
         let trusted_peers = redact_trusted_peers(controller.trusted_peers());
         let pending_pair_requests = controller.pending_pair_requests();
         let mut paired_ids: HashSet<String> = st.paired_peers.keys().cloned().collect();
@@ -208,6 +238,43 @@ impl GuiSnapshot {
             dropped_frames: None,
             gstreamer_status: None,
             gstreamer_error: None,
+            adb_ready: false,
+            scrcpy_ready: false,
+            web_broadcast_active: web_st.active,
+            web_http_port: web_st.http_port,
+            web_webrtc_port: web_st.webrtc_udp_port,
+            web_urls: web_st.urls,
+            web_localhost_url: web_st.localhost_url,
+            web_token: web_st.token,
+            web_token_required: if web_st.active {
+                web_st.token_required
+            } else {
+                cfg.sharing.web_require_token
+            },
+            web_clients: web_st
+                .clients
+                .into_iter()
+                .map(|c| WebClientView {
+                    id: c.id,
+                    remote_addr: c.remote_addr,
+                    transport: c.transport,
+                    user_agent: c.user_agent,
+                    connected_since: c.connected_since,
+                    bytes_sent: c.bytes_sent,
+                    rtt_ms: c.rtt_ms,
+                    dropped_frames: c.dropped_frames,
+                })
+                .collect(),
+            web_adb_reversed: if web_st.active || !web_st.adb_reversed_serials.is_empty() {
+                web_st.adb_reversed_serials
+            } else {
+                st.web_adb_reverse_serials
+            },
+            web_keep_local: if web_st.active {
+                web_st.keep_local
+            } else {
+                cfg.sharing.web_keep_local
+            },
             hydrated: false,
         }
     }
@@ -389,6 +456,18 @@ pub(super) struct RefreshUpdate {
     connected_transport: String,
     jitter_buf_ms: Option<u16>,
     dropped_frames: Option<u32>,
+    adb_ready: Option<bool>,
+    scrcpy_ready: Option<bool>,
+    web_broadcast_active: bool,
+    web_http_port: u16,
+    web_webrtc_port: u16,
+    web_urls: Vec<String>,
+    web_localhost_url: String,
+    web_token: Option<String>,
+    web_token_required: bool,
+    web_clients: Vec<WebClientView>,
+    web_adb_reversed: Vec<String>,
+    web_keep_local: bool,
 }
 
 impl RefreshUpdate {
@@ -517,6 +596,75 @@ impl RefreshUpdate {
             .and_then(|v| v.as_str())
             .unwrap_or("")
             .to_string();
+        let tools_obj = status_json.get("android_tools").filter(|v| !v.is_null());
+        let adb_ready = tools_obj
+            .and_then(|t| t.get("adb_ready"))
+            .and_then(|v| v.as_bool());
+        let scrcpy_ready = tools_obj
+            .and_then(|t| t.get("scrcpy_ready"))
+            .and_then(|v| v.as_bool());
+
+        // Web Broadcast
+        let web_obj = status_json.get("web_broadcast").filter(|v| !v.is_null());
+        let web_broadcast_active = web_obj
+            .and_then(|w| w.get("active"))
+            .and_then(|v| v.as_bool())
+            .unwrap_or(st.web_broadcast_active);
+        let web_http_port = web_obj
+            .and_then(|w| w.get("http_port"))
+            .and_then(|v| v.as_u64())
+            .and_then(|p| u16::try_from(p).ok())
+            .unwrap_or(if web_broadcast_active { st.web_port } else { 0 });
+        let web_webrtc_port = web_obj
+            .and_then(|w| w.get("webrtc_udp_port"))
+            .and_then(|v| v.as_u64())
+            .and_then(|p| u16::try_from(p).ok())
+            .unwrap_or(0);
+        let web_urls: Vec<String> = web_obj
+            .and_then(|w| w.get("urls"))
+            .and_then(|v| v.as_array())
+            .map(|arr| {
+                arr.iter()
+                    .filter_map(|x| x.as_str().map(String::from))
+                    .collect()
+            })
+            .unwrap_or_default();
+        let web_localhost_url = web_obj
+            .and_then(|w| w.get("localhost_url"))
+            .and_then(|v| v.as_str())
+            .unwrap_or("")
+            .to_string();
+        let web_token_required = web_obj
+            .and_then(|w| w.get("token_required"))
+            .and_then(|v| v.as_bool())
+            .unwrap_or(cfg.sharing.web_require_token);
+        let web_token = web_obj
+            .and_then(|w| w.get("token"))
+            .and_then(|v| v.as_str())
+            .filter(|s| !s.is_empty())
+            .map(String::from);
+        let web_clients: Vec<WebClientView> = web_obj
+            .and_then(|w| w.get("clients"))
+            .and_then(|v| v.as_array())
+            .map(|arr| {
+                arr.iter()
+                    .filter_map(|c| serde_json::from_value::<WebClientView>(c.clone()).ok())
+                    .collect()
+            })
+            .unwrap_or_default();
+        let web_adb_reversed: Vec<String> = web_obj
+            .and_then(|w| w.get("adb_reversed_serials"))
+            .and_then(|v| v.as_array())
+            .map(|arr| {
+                arr.iter()
+                    .filter_map(|x| x.as_str().map(String::from))
+                    .collect()
+            })
+            .unwrap_or_else(|| st.web_adb_reverse_serials.clone());
+        let web_keep_local = web_obj
+            .and_then(|w| w.get("keep_local"))
+            .and_then(|v| v.as_bool())
+            .unwrap_or(cfg.sharing.web_keep_local);
 
         // Audio level (prefer local telemetry if active, else daemon snapshot)
         let daemon_audio = status_json.get("telemetry").and_then(|t| t.get("audio"));
@@ -696,6 +844,18 @@ impl RefreshUpdate {
             connected_transport,
             jitter_buf_ms,
             dropped_frames,
+            adb_ready,
+            scrcpy_ready,
+            web_broadcast_active,
+            web_http_port,
+            web_webrtc_port,
+            web_urls,
+            web_localhost_url,
+            web_token,
+            web_token_required,
+            web_clients,
+            web_adb_reversed,
+            web_keep_local,
         }
     }
 
@@ -740,6 +900,16 @@ impl RefreshUpdate {
             || guard.trusted_peers.len() != self.trusted_peers.len()
             || guard.pending_pair_requests.len() != self.pending_pair_requests.len()
             || guard.audio_profile != self.audio_profile
+            || guard.web_broadcast_active != self.web_broadcast_active
+            || guard.web_http_port != self.web_http_port
+            || guard.web_webrtc_port != self.web_webrtc_port
+            || guard.web_urls != self.web_urls
+            || guard.web_localhost_url != self.web_localhost_url
+            || guard.web_token != self.web_token
+            || guard.web_token_required != self.web_token_required
+            || guard.web_clients != self.web_clients
+            || guard.web_adb_reversed != self.web_adb_reversed
+            || guard.web_keep_local != self.web_keep_local
             || guard.config.device.name != self.config.device.name
             || guard.config.ui.theme != self.config.ui.theme
             || guard.config.sharing.security != self.config.sharing.security
@@ -747,11 +917,24 @@ impl RefreshUpdate {
             || guard.config.sharing.v3_port != self.config.sharing.v3_port
             || guard.config.sharing.pair_port != self.config.sharing.pair_port
             || guard.config.sharing.rtp_port != self.config.sharing.rtp_port
+            || guard.config.sharing.web_port != self.config.sharing.web_port
+            || guard.config.sharing.webrtc_port != self.config.sharing.webrtc_port
+            || guard.config.sharing.web_require_token != self.config.sharing.web_require_token
+            || guard.config.sharing.web_keep_local != self.config.sharing.web_keep_local
             || guard.config.connection.latency_ms != self.config.connection.latency_ms
             || guard.config.discovery.port != self.config.discovery.port
             || guard.config.discovery.mdns != self.config.discovery.mdns
             || guard.config.discovery.udp != self.config.discovery.udp
             || guard.config.routing.default_mode != self.config.routing.default_mode;
+
+        if let Some(adb) = self.adb_ready {
+            changed |= guard.adb_ready != adb;
+            guard.adb_ready = adb;
+        }
+        if let Some(scrcpy) = self.scrcpy_ready {
+            changed |= guard.scrcpy_ready != scrcpy;
+            guard.scrcpy_ready = scrcpy;
+        }
 
         guard.hydrated = true;
         guard.daemon_connected = self.daemon_connected;
@@ -793,6 +976,16 @@ impl RefreshUpdate {
         guard.trusted_peers = self.trusted_peers;
         guard.pending_pair_requests = self.pending_pair_requests;
         guard.audio_profile = self.audio_profile;
+        guard.web_broadcast_active = self.web_broadcast_active;
+        guard.web_http_port = self.web_http_port;
+        guard.web_webrtc_port = self.web_webrtc_port;
+        guard.web_urls = self.web_urls;
+        guard.web_localhost_url = self.web_localhost_url;
+        guard.web_token = self.web_token;
+        guard.web_token_required = self.web_token_required;
+        guard.web_clients = self.web_clients;
+        guard.web_adb_reversed = self.web_adb_reversed;
+        guard.web_keep_local = self.web_keep_local;
         changed
     }
 }
@@ -919,5 +1112,103 @@ mod tests {
             .find(|p| p.id == "live-paired-psk")
             .unwrap();
         assert!(paired_live.paired);
+    }
+
+    #[test]
+    fn test_web_broadcast_snapshot_hydration_and_apply_to() {
+        let cfg = Config::default();
+        let st = State::default();
+        let status_json = serde_json::json!({
+            "web_broadcast": {
+                "active": true,
+                "http_port": 4717,
+                "webrtc_udp_port": 4718,
+                "urls": ["http://192.168.1.42:4717/#t=tok123"],
+                "localhost_url": "http://localhost:4717/#t=tok123",
+                "token_required": true,
+                "token": "tok123",
+                "keep_local": false,
+                "adb_reversed_serials": ["USB123"],
+                "clients": [
+                    {
+                        "id": "rtc-1",
+                        "remote_addr": "192.168.1.99:54321",
+                        "transport": "webrtc",
+                        "user_agent": "Chrome Mobile",
+                        "connected_since": 12.0,
+                        "bytes_sent": 4096,
+                        "rtt_ms": 14.5,
+                        "dropped_frames": 2
+                    },
+                    {
+                        "id": "ws-2",
+                        "remote_addr": "127.0.0.1:44444",
+                        "transport": "ws",
+                        "user_agent": "Firefox",
+                        "connected_since": 20.0,
+                        "bytes_sent": 1024,
+                        "rtt_ms": null,
+                        "dropped_frames": 0
+                    }
+                ]
+            },
+            "android_tools": {
+                "adb_ready": true,
+                "scrcpy_ready": false
+            }
+        });
+
+        let update = RefreshUpdate::from_status(
+            true,
+            cfg.clone(),
+            st.clone(),
+            empty_telemetry(),
+            &status_json,
+            Vec::new(),
+            &[],
+            Vec::new(),
+            Vec::new(),
+        );
+
+        let mut guard = GuiSnapshot::from_controller(&Controller::new(
+            Some(cfg.clone()),
+            Some(st.clone()),
+            None,
+            None,
+            None,
+            false,
+        ));
+        assert!(!guard.web_broadcast_active);
+        assert!(update.apply_to(&mut guard, false));
+        assert!(guard.web_broadcast_active);
+        assert_eq!(guard.web_http_port, 4717);
+        assert_eq!(guard.web_webrtc_port, 4718);
+        assert_eq!(guard.web_urls, vec!["http://192.168.1.42:4717/#t=tok123"]);
+        assert_eq!(guard.web_localhost_url, "http://localhost:4717/#t=tok123");
+        assert_eq!(guard.web_token.as_deref(), Some("tok123"));
+        assert!(guard.web_token_required);
+        assert!(!guard.web_keep_local);
+        assert_eq!(guard.web_adb_reversed, vec!["USB123"]);
+        assert_eq!(guard.web_clients.len(), 2);
+        assert_eq!(guard.web_clients[0].transport, "webrtc");
+        assert_eq!(guard.web_clients[0].rtt_ms, Some(14.5));
+        assert_eq!(guard.web_clients[0].dropped_frames, 2);
+        assert_eq!(guard.web_clients[1].transport, "ws");
+        assert!(guard.adb_ready);
+        assert!(!guard.scrcpy_ready);
+
+        // Applying an identical status again reports no change
+        let update_same = RefreshUpdate::from_status(
+            true,
+            cfg,
+            st,
+            empty_telemetry(),
+            &status_json,
+            Vec::new(),
+            &[],
+            Vec::new(),
+            Vec::new(),
+        );
+        assert!(!update_same.apply_to(&mut guard, false));
     }
 }

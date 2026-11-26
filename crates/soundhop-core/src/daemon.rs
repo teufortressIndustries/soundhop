@@ -113,10 +113,7 @@ impl Daemon {
         Self::with_controller(controller, ipc_path)
     }
 
-    pub(crate) fn with_controller(
-        controller: Arc<Controller>,
-        ipc_path: Option<PathBuf>,
-    ) -> Arc<Self> {
+    pub fn with_controller(controller: Arc<Controller>, ipc_path: Option<PathBuf>) -> Arc<Self> {
         Arc::new(Self {
             controller,
             discovery: Mutex::new(None),
@@ -274,6 +271,7 @@ impl Daemon {
             srv.stop();
         }
         self.controller.sht3_manager.stop_listener();
+        let _ = self.controller.stop_web_broadcast();
         if let Some(disc) = lock_or_recover(&self.discovery).take() {
             disc.stop();
         }
@@ -300,15 +298,76 @@ impl Daemon {
 
     fn setup_sharing(&self) {
         self.advertising.store(false, Ordering::SeqCst);
-        let enabled = lock_or_recover(&self.controller.config).sharing.enabled;
-        if !enabled {
+        let cfg = lock_or_recover(&self.controller.config).sharing.clone();
+        if !cfg.enabled {
             let _ = self.controller.stop_listener(Some(false));
+        } else {
+            match self.controller.start_listener(Some(false)) {
+                Ok(_) => self.advertising.store(true, Ordering::SeqCst),
+                Err(e) => {
+                    let msg = format!("Could not start the audio listener: {e}");
+                    crate::util::append_log_line("WARN", &msg);
+                    lock_or_recover(&self.warnings).push(msg);
+                }
+            }
+        }
+
+        if !self.controller.web_broadcast.is_active() {
+            self.controller.cleanup_stale_web_adb_reverse();
+        }
+        if cfg.web_enabled && !self.controller.web_broadcast.is_active() {
+            match self.controller.start_web_broadcast(None, None, None) {
+                Ok(st) => {
+                    if cfg.web_adb_reverse {
+                        let _ =
+                            self.controller
+                                .web_adb_reverse(None, Some(st.http_port), true, false);
+                    }
+                }
+                Err(e) => {
+                    let msg = format!("Could not start Web Broadcast: {e}");
+                    crate::util::append_log_line("WARN", &msg);
+                    lock_or_recover(&self.warnings).push(msg);
+                }
+            }
+        }
+    }
+
+    fn sync_web_broadcast_on_config_change(
+        &self,
+        old_cfg: &crate::config::SharingConfig,
+        new_cfg: &crate::config::SharingConfig,
+    ) {
+        if !self.controller.web_broadcast.is_active() {
             return;
         }
-        match self.controller.start_listener(Some(false)) {
-            Ok(_) => self.advertising.store(true, Ordering::SeqCst),
+        if old_cfg.web_enabled && !new_cfg.web_enabled {
+            let _ = self.controller.stop_web_broadcast();
+            return;
+        }
+        let needs_rebind = old_cfg.web_port != new_cfg.web_port
+            || old_cfg.webrtc_port != new_cfg.webrtc_port
+            || old_cfg.web_require_token != new_cfg.web_require_token
+            || old_cfg.web_keep_local != new_cfg.web_keep_local
+            || old_cfg.web_max_clients != new_cfg.web_max_clients;
+        if !needs_rebind {
+            return;
+        }
+        let prev_serials = self.controller.web_broadcast_status().adb_reversed_serials;
+        let _ = self.controller.stop_web_broadcast();
+        match self.controller.start_web_broadcast(None, None, None) {
+            Ok(st) => {
+                for serial in prev_serials {
+                    let _ = self.controller.web_adb_reverse(
+                        Some(&serial),
+                        Some(st.http_port),
+                        true,
+                        false,
+                    );
+                }
+            }
             Err(e) => {
-                let msg = format!("Could not start the audio listener: {e}");
+                let msg = format!("Could not rebind Web Broadcast after config change: {e}");
                 crate::util::append_log_line("WARN", &msg);
                 lock_or_recover(&self.warnings).push(msg);
             }
@@ -501,7 +560,9 @@ impl Daemon {
             let cfg = lock_or_recover(&self.controller.config).clone();
 
             if st.is_connected() {
-                if self.controller.has_dead_sht3_session() {
+                if st.connected_peer == "web-broadcast" {
+                    offline_count = 0;
+                } else if self.controller.has_dead_sht3_session() {
                     let _ = self.controller.teardown_dead_sht3_session();
                     offline_count = 0;
                 } else {
@@ -562,8 +623,10 @@ impl Daemon {
     pub(crate) fn run_android_supervisor_tick(&self, tracker: &mut AndroidSupervisorState) {
         let cfg = lock_or_recover(&self.controller.config).clone();
 
-        // 1. Auto-switch newly connected USB Android devices to ADB TCP/IP Wi-Fi mode.
+        // 1. Auto-switch newly connected USB Android devices to ADB TCP/IP Wi-Fi mode,
+        // and prune any tracked Web Broadcast `adb reverse` serials whose device disappeared.
         const ANDROID_USB_SCAN_INTERVAL: Duration = Duration::from_secs(8);
+        let mut scanned_devices: Option<Vec<crate::android::AdbDevice>> = None;
         if cfg.android.auto_switch_wifi {
             if tracker
                 .last_usb_scan
@@ -623,11 +686,14 @@ impl Daemon {
                         }
                     }
                 }
+                scanned_devices = Some(devices);
             }
         } else {
             tracker.attempted_usb_switches.clear();
             tracker.last_usb_scan = None;
         }
+
+        self.prune_web_adb_reverse_serials(&cfg, scanned_devices.as_deref());
 
         // 2. Bounded auto-reconnect on Android audio session drop.
         if self.controller.android_session.is_active() {
@@ -752,6 +818,80 @@ impl Daemon {
                         tracker.reconnect_attempts, tracker.max_reconnect_attempts, target.serial
                     ),
                 );
+            }
+        }
+    }
+
+    fn prune_web_adb_reverse_serials(
+        &self,
+        cfg: &crate::config::Config,
+        scanned_devices: Option<&[crate::android::AdbDevice]>,
+    ) {
+        let tracked_state = lock_or_recover(&self.controller.state)
+            .web_adb_reverse_serials
+            .clone();
+        let tracked_mgr = self.controller.android_manager.tracked_reverse_tunnels();
+        let need_auto_usb =
+            cfg.sharing.web_adb_reverse && self.controller.web_broadcast.is_active();
+        if tracked_state.is_empty() && tracked_mgr.is_empty() && !need_auto_usb {
+            return;
+        }
+
+        let owned_devices;
+        let devices = match scanned_devices {
+            Some(list) => list,
+            None => {
+                owned_devices = self.controller.android_manager.list_devices();
+                &owned_devices
+            }
+        };
+        let live_serials: HashSet<&str> = devices.iter().map(|d| d.serial.as_str()).collect();
+
+        let mut all_tracked: std::collections::BTreeSet<String> =
+            tracked_state.iter().cloned().collect();
+        for (s, _) in tracked_mgr {
+            all_tracked.insert(s);
+        }
+
+        let mut removed_any = false;
+        for serial in &all_tracked {
+            if !live_serials.contains(serial.as_str()) {
+                let _ = self
+                    .controller
+                    .android_manager
+                    .remove_reverse_tunnel(serial, None);
+                removed_any = true;
+            }
+        }
+        if removed_any {
+            let updated = {
+                let mut st = lock_or_recover(&self.controller.state);
+                st.web_adb_reverse_serials
+                    .retain(|s| live_serials.contains(s.as_str()));
+                st.web_adb_reverse_serials.clone()
+            };
+            self.controller
+                .web_broadcast
+                .set_adb_reversed_serials(updated);
+            self.controller.save();
+        }
+
+        if need_auto_usb {
+            let active_port = self.controller.web_broadcast_status().http_port;
+            if active_port > 0 {
+                let current_reversed = lock_or_recover(&self.controller.state)
+                    .web_adb_reverse_serials
+                    .clone();
+                for dev in devices {
+                    if !dev.is_wifi && dev.is_ready() && !current_reversed.contains(&dev.serial) {
+                        let _ = self.controller.web_adb_reverse(
+                            Some(&dev.serial),
+                            Some(active_port),
+                            true,
+                            false,
+                        );
+                    }
+                }
             }
         }
     }
@@ -1513,11 +1653,14 @@ impl Daemon {
             }
             "config_patch" => {
                 if let Some(patch) = req.get("patch") {
+                    let old_sharing = lock_or_recover(&self.controller.config).sharing.clone();
                     let res = lock_or_recover(&self.controller.config).apply_patch(patch);
                     if let Err(e) = res {
                         return serde_json::json!({ "ok": false, "error": e.to_string() });
                     }
+                    let new_sharing = lock_or_recover(&self.controller.config).sharing.clone();
                     self.controller.save();
+                    self.sync_web_broadcast_on_config_change(&old_sharing, &new_sharing);
                     self.setup_sharing();
                     self.setup_discovery();
                     self.setup_android_mdns();
@@ -1525,15 +1668,19 @@ impl Daemon {
                 let cfg_json = lock_or_recover(&self.controller.config).to_json_value();
                 serde_json::json!({ "ok": true, "config": cfg_json })
             }
-            "reload" => match self.controller.reload_config() {
-                Ok(cfg) => {
-                    self.setup_sharing();
-                    self.setup_discovery();
-                    self.setup_android_mdns();
-                    serde_json::json!({ "ok": true, "config": cfg.to_json_value() })
+            "reload" => {
+                let old_sharing = lock_or_recover(&self.controller.config).sharing.clone();
+                match self.controller.reload_config() {
+                    Ok(cfg) => {
+                        self.sync_web_broadcast_on_config_change(&old_sharing, &cfg.sharing);
+                        self.setup_sharing();
+                        self.setup_discovery();
+                        self.setup_android_mdns();
+                        serde_json::json!({ "ok": true, "config": cfg.to_json_value() })
+                    }
+                    Err(e) => serde_json::json!({ "ok": false, "error": e.to_string() }),
                 }
-                Err(e) => serde_json::json!({ "ok": false, "error": e.to_string() }),
-            },
+            }
             "android_status" => {
                 serde_json::json!({
                     "ok": true,
@@ -1629,6 +1776,120 @@ impl Daemon {
                 }
                 self.controller.save();
                 serde_json::json!({ "ok": true, "session": st })
+            }
+            "web_start" | "broadcast_start" => {
+                let port = req
+                    .get("port")
+                    .and_then(|v| v.as_u64())
+                    .and_then(|p| u16::try_from(p).ok());
+                let keep_local = req.get("keep_local").and_then(|v| v.as_bool());
+                let require_token = req.get("require_token").and_then(|v| v.as_bool());
+                let adb_reverse_opt = req.get("adb_reverse").and_then(|v| v.as_bool());
+                let serial = req
+                    .get("serial")
+                    .and_then(|v| v.as_str())
+                    .map(str::trim)
+                    .filter(|s| !s.is_empty());
+                let open_browser = req
+                    .get("open_browser")
+                    .and_then(|v| v.as_bool())
+                    .unwrap_or(false);
+
+                match self
+                    .controller
+                    .start_web_broadcast(port, keep_local, require_token)
+                {
+                    Ok(mut status) => {
+                        if adb_reverse_opt == Some(true) {
+                            match self.controller.web_adb_reverse(
+                                serial,
+                                Some(status.http_port),
+                                true,
+                                open_browser,
+                            ) {
+                                Ok(next) => status = next,
+                                Err(e) => {
+                                    let _ = self.controller.stop_web_broadcast();
+                                    return serde_json::json!({
+                                        "ok": false,
+                                        "error": e.to_string(),
+                                    });
+                                }
+                            }
+                        } else if adb_reverse_opt.is_none()
+                            && lock_or_recover(&self.controller.config)
+                                .sharing
+                                .web_adb_reverse
+                        {
+                            if let Ok(next) = self.controller.web_adb_reverse(
+                                serial,
+                                Some(status.http_port),
+                                true,
+                                open_browser,
+                            ) {
+                                status = next;
+                            }
+                        }
+                        serde_json::json!({ "ok": true, "web_broadcast": status })
+                    }
+                    Err(e) => serde_json::json!({ "ok": false, "error": e.to_string() }),
+                }
+            }
+            "web_stop" | "broadcast_stop" => match self.controller.stop_web_broadcast() {
+                Ok(status) => serde_json::json!({ "ok": true, "web_broadcast": status }),
+                Err(e) => serde_json::json!({ "ok": false, "error": e.to_string() }),
+            },
+            "web_status" | "broadcast_status" => serde_json::json!({
+                "ok": true,
+                "web_broadcast": self.controller.web_broadcast_status(),
+            }),
+            "web_rotate_token" => match self.controller.rotate_web_token() {
+                Ok(status) => serde_json::json!({
+                    "ok": true,
+                    "token": status.token,
+                    "urls": status.urls,
+                    "web_broadcast": status,
+                }),
+                Err(e) => serde_json::json!({ "ok": false, "error": e.to_string() }),
+            },
+            "web_kick" => {
+                let client_id = req
+                    .get("client_id")
+                    .or_else(|| req.get("id"))
+                    .and_then(|v| v.as_str())
+                    .unwrap_or("");
+                match self.controller.kick_web_client(client_id) {
+                    Ok(kicked) => serde_json::json!({
+                        "ok": true,
+                        "kicked": kicked,
+                        "web_broadcast": self.controller.web_broadcast_status(),
+                    }),
+                    Err(e) => serde_json::json!({ "ok": false, "error": e.to_string() }),
+                }
+            }
+            "web_adb_reverse" => {
+                let serial = req
+                    .get("serial")
+                    .and_then(|v| v.as_str())
+                    .map(str::trim)
+                    .filter(|s| !s.is_empty());
+                let port = req
+                    .get("port")
+                    .and_then(|v| v.as_u64())
+                    .and_then(|p| u16::try_from(p).ok())
+                    .filter(|&p| p > 0);
+                let enable = req.get("enable").and_then(|v| v.as_bool()).unwrap_or(true);
+                let open_browser = req
+                    .get("open_browser")
+                    .and_then(|v| v.as_bool())
+                    .unwrap_or(false);
+                match self
+                    .controller
+                    .web_adb_reverse(serial, port, enable, open_browser)
+                {
+                    Ok(status) => serde_json::json!({ "ok": true, "web_broadcast": status }),
+                    Err(e) => serde_json::json!({ "ok": false, "error": e.to_string() }),
+                }
             }
             "logs" => {
                 let limit = req
@@ -2185,5 +2446,130 @@ mod tests {
         assert_eq!(client_res["ok"], false);
 
         resp_daemon.shutdown();
+    }
+
+    #[test]
+    fn test_daemon_prunes_disappeared_web_adb_reverse_serials_and_cleans_stale_on_startup() {
+        use crate::android::AndroidManager;
+        use crate::backend::linux::LinuxAudioBackend;
+        use crate::util::{CommandResult, MockRunner};
+
+        let dir = tempfile::tempdir().unwrap();
+        let cfg_path = dir.path().join("config.toml");
+        let state_path = dir.path().join("state.json");
+        let fake_adb = dir.path().join("adb");
+        fs::write(&fake_adb, b"#!/bin/sh\n").unwrap();
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            fs::set_permissions(&fake_adb, fs::Permissions::from_mode(0o755)).unwrap();
+        }
+
+        let show_device = Arc::new(AtomicBool::new(true));
+        let show_device_c = Arc::clone(&show_device);
+        let removed_cmds = Arc::new(Mutex::new(Vec::<String>::new()));
+        let removed_cmds_c = Arc::clone(&removed_cmds);
+
+        let runner = Arc::new(MockRunner::new(move |args, _| {
+            let joined = args.join(" ");
+            if joined.contains("devices -l") {
+                let stdout = if show_device_c.load(Ordering::SeqCst) {
+                    "List of devices attached\nUSB999\tdevice product:shiba model:Pixel_8 device:shiba transport_id:1\n"
+                        .to_string()
+                } else {
+                    "List of devices attached\n".to_string()
+                };
+                return Ok(CommandResult {
+                    args: args.to_vec(),
+                    returncode: 0,
+                    stdout,
+                    stderr: String::new(),
+                });
+            }
+            if joined.contains("reverse --remove") {
+                removed_cmds_c.lock().unwrap().push(joined);
+            }
+            Ok(CommandResult {
+                args: args.to_vec(),
+                returncode: 0,
+                stdout: String::new(),
+                stderr: String::new(),
+            })
+        }));
+
+        let backend = Arc::new(LinuxAudioBackend::with_runner(Arc::clone(&runner) as _));
+        let android_mgr = Arc::new(AndroidManager::with_runner(
+            "",
+            &fake_adb.to_string_lossy(),
+            runner,
+        ));
+        let mut controller = Controller::new(
+            None,
+            None,
+            Some(backend),
+            Some(cfg_path),
+            Some(state_path),
+            false,
+        );
+        controller.android_manager = android_mgr;
+        let controller = Arc::new(controller);
+        controller.set_save_enabled(false);
+        {
+            let mut cfg = lock_or_recover(&controller.config);
+            cfg.sharing.enabled = false;
+            cfg.sharing.web_enabled = false;
+            cfg.android.auto_switch_wifi = false;
+            cfg.android.auto_reconnect = false;
+        }
+        let daemon = Daemon::with_controller(Arc::clone(&controller), None);
+
+        // 1. Stale web_adb_reverse_serials from an unclean shutdown are cleaned up in setup_sharing().
+        {
+            let mut st = lock_or_recover(&daemon.controller.state);
+            st.web_adb_reverse_serials.push("STALE_USB".to_string());
+        }
+        daemon.setup_sharing();
+        assert!(lock_or_recover(&daemon.controller.state)
+            .web_adb_reverse_serials
+            .is_empty());
+        assert!(removed_cmds
+            .lock()
+            .unwrap()
+            .iter()
+            .any(|c| c.contains("STALE_USB") && c.contains("reverse --remove-all")));
+
+        // 2. Active reverse tunnel stays while USB999 is present, and is pruned when it disappears.
+        removed_cmds.lock().unwrap().clear();
+        daemon
+            .controller
+            .web_adb_reverse(Some("USB999"), Some(4717), true, false)
+            .unwrap();
+        assert_eq!(
+            lock_or_recover(&daemon.controller.state).web_adb_reverse_serials,
+            vec!["USB999".to_string()]
+        );
+
+        let mut tracker = AndroidSupervisorState::default();
+        daemon.run_android_supervisor_tick(&mut tracker);
+        assert_eq!(
+            lock_or_recover(&daemon.controller.state).web_adb_reverse_serials,
+            vec!["USB999".to_string()]
+        );
+
+        show_device.store(false, Ordering::SeqCst);
+        daemon.run_android_supervisor_tick(&mut tracker);
+        assert!(lock_or_recover(&daemon.controller.state)
+            .web_adb_reverse_serials
+            .is_empty());
+        assert!(daemon
+            .controller
+            .android_manager
+            .tracked_reverse_tunnels()
+            .is_empty());
+        assert!(removed_cmds
+            .lock()
+            .unwrap()
+            .iter()
+            .any(|c| c.contains("USB999") && c.contains("reverse --remove")));
     }
 }

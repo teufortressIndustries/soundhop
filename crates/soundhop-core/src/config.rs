@@ -10,7 +10,8 @@ use thiserror::Error;
 
 use crate::constants::{
     DEFAULT_AUDIO_BIT_RATE, DEFAULT_AUDIO_BUFFER_MS, DEFAULT_AUDIO_CODEC, DEFAULT_AUDIO_PORT,
-    DEFAULT_DISCOVERY_PORT, DEFAULT_LAN_NETWORKS, SECURITY_MODES,
+    DEFAULT_DISCOVERY_PORT, DEFAULT_LAN_NETWORKS, DEFAULT_WEBRTC_PORT, DEFAULT_WEB_MAX_CLIENTS,
+    DEFAULT_WEB_PORT, SECURITY_MODES,
 };
 use crate::pairing::DEFAULT_PAIR_PORT;
 use crate::transport::DEFAULT_V3_PORT;
@@ -21,6 +22,26 @@ pub const DEFAULT_RTP_PORT: u16 = 4716;
 
 fn default_rtp_port() -> u16 {
     DEFAULT_RTP_PORT
+}
+
+fn default_web_port() -> u16 {
+    DEFAULT_WEB_PORT
+}
+
+fn default_webrtc_port() -> u16 {
+    DEFAULT_WEBRTC_PORT
+}
+
+fn default_web_require_token() -> bool {
+    true
+}
+
+fn default_web_keep_local() -> bool {
+    true
+}
+
+fn default_web_max_clients() -> u16 {
+    DEFAULT_WEB_MAX_CLIENTS
 }
 
 /// Valid values for `audio.profile`.
@@ -79,6 +100,27 @@ pub struct SharingConfig {
     pub allowed_networks: Vec<String>,
     /// Optional SHA-256 / HMAC pre-shared key hash for `psk` / `pin` security mode.
     pub psk_hash: String,
+    /// Auto-start Web Broadcast when the daemon starts.
+    #[serde(default)]
+    pub web_enabled: bool,
+    /// HTTP + WebSocket TCP port (default `4717`).
+    #[serde(default = "default_web_port")]
+    pub web_port: u16,
+    /// Single multiplexed WebRTC ICE-Lite UDP port (default `4718`).
+    #[serde(default = "default_webrtc_port")]
+    pub webrtc_port: u16,
+    /// Require per-session bearer token (`#t=<token>`) for Web Broadcast access (default `true`).
+    #[serde(default = "default_web_require_token")]
+    pub web_require_token: bool,
+    /// Keep playing audio on local PC speakers while Web Broadcast is active (default `true`).
+    #[serde(default = "default_web_keep_local")]
+    pub web_keep_local: bool,
+    /// Automatically establish `adb reverse` when a USB Android device is ready (default `false`).
+    #[serde(default)]
+    pub web_adb_reverse: bool,
+    /// Maximum simultaneous browser listeners (default `8`, clamped `[1..=32]`).
+    #[serde(default = "default_web_max_clients")]
+    pub web_max_clients: u16,
 }
 
 impl Default for SharingConfig {
@@ -95,6 +137,13 @@ impl Default for SharingConfig {
                 .map(|s| (*s).to_string())
                 .collect(),
             psk_hash: String::new(),
+            web_enabled: false,
+            web_port: DEFAULT_WEB_PORT,
+            webrtc_port: DEFAULT_WEBRTC_PORT,
+            web_require_token: true,
+            web_keep_local: true,
+            web_adb_reverse: false,
+            web_max_clients: DEFAULT_WEB_MAX_CLIENTS,
         }
     }
 }
@@ -330,6 +379,13 @@ impl Config {
         if self.sharing.rtp_port == 0 {
             self.sharing.rtp_port = DEFAULT_RTP_PORT;
         }
+        if self.sharing.web_port == 0 {
+            self.sharing.web_port = DEFAULT_WEB_PORT;
+        }
+        if self.sharing.webrtc_port == 0 {
+            self.sharing.webrtc_port = DEFAULT_WEBRTC_PORT;
+        }
+        self.sharing.web_max_clients = self.sharing.web_max_clients.clamp(1, 32);
         self.sharing.security = normalize_security(&self.sharing.security)?;
         self.sharing.psk_hash = self.sharing.psk_hash.trim().to_string();
         self.audio.profile = normalize_audio_profile(&self.audio.profile)?;
@@ -802,5 +858,81 @@ mod tests {
 
         let reloaded = Config::load(Some(&legacy_file)).unwrap();
         assert_eq!(reloaded.sharing.rtp_port, 4816);
+    }
+
+    #[test]
+    fn test_web_broadcast_config_backwards_compat_normalize_and_round_trip() {
+        assert_eq!(DEFAULT_WEB_PORT, 4717);
+        assert_eq!(DEFAULT_WEBRTC_PORT, 4718);
+        assert_eq!(DEFAULT_WEB_MAX_CLIENTS, 8);
+
+        let default_cfg = Config::default();
+        assert!(!default_cfg.sharing.web_enabled);
+        assert_eq!(default_cfg.sharing.web_port, DEFAULT_WEB_PORT);
+        assert_eq!(default_cfg.sharing.webrtc_port, DEFAULT_WEBRTC_PORT);
+        assert!(default_cfg.sharing.web_require_token);
+        assert!(default_cfg.sharing.web_keep_local);
+        assert!(!default_cfg.sharing.web_adb_reverse);
+        assert_eq!(default_cfg.sharing.web_max_clients, DEFAULT_WEB_MAX_CLIENTS);
+
+        // Existing config.toml omitting sharing.web_* fields deserializes with defaults.
+        let dir = tempfile::tempdir().unwrap();
+        let legacy_file = dir.path().join("legacy_web.toml");
+        fs::write(
+            &legacy_file,
+            "[sharing]\nenabled = true\nport = 4713\nv3_port = 4714\npair_port = 4715\nsecurity = \"psk\"\n",
+        )
+        .unwrap();
+        let mut loaded = Config::load(Some(&legacy_file)).unwrap();
+        assert!(!loaded.sharing.web_enabled);
+        assert_eq!(loaded.sharing.web_port, DEFAULT_WEB_PORT);
+        assert_eq!(loaded.sharing.webrtc_port, DEFAULT_WEBRTC_PORT);
+        assert!(loaded.sharing.web_require_token);
+        assert!(loaded.sharing.web_keep_local);
+        assert!(!loaded.sharing.web_adb_reverse);
+        assert_eq!(loaded.sharing.web_max_clients, DEFAULT_WEB_MAX_CLIENTS);
+
+        // Zero ports reset to defaults and web_max_clients clamps to [1..=32].
+        loaded.sharing.web_port = 0;
+        loaded.sharing.webrtc_port = 0;
+        loaded.sharing.web_max_clients = 0;
+        loaded.normalize().unwrap();
+        assert_eq!(loaded.sharing.web_port, DEFAULT_WEB_PORT);
+        assert_eq!(loaded.sharing.webrtc_port, DEFAULT_WEBRTC_PORT);
+        assert_eq!(loaded.sharing.web_max_clients, 1);
+
+        loaded.sharing.web_max_clients = 99;
+        loaded.normalize().unwrap();
+        assert_eq!(loaded.sharing.web_max_clients, 32);
+
+        loaded.sharing.web_max_clients = 16;
+        loaded.normalize().unwrap();
+        assert_eq!(loaded.sharing.web_max_clients, 16);
+
+        // Dotted accessors & save/reload round-trip.
+        loaded.set_dotted("sharing.web_enabled", "true").unwrap();
+        loaded.set_dotted("sharing.web_port", "4817").unwrap();
+        loaded.set_dotted("sharing.webrtc_port", "4818").unwrap();
+        loaded
+            .set_dotted("sharing.web_require_token", "false")
+            .unwrap();
+        loaded
+            .set_dotted("sharing.web_keep_local", "false")
+            .unwrap();
+        loaded
+            .set_dotted("sharing.web_adb_reverse", "true")
+            .unwrap();
+        loaded.set_dotted("sharing.web_max_clients", "64").unwrap();
+        assert_eq!(loaded.sharing.web_max_clients, 32);
+        loaded.save(None).unwrap();
+
+        let reloaded = Config::load(Some(&legacy_file)).unwrap();
+        assert!(reloaded.sharing.web_enabled);
+        assert_eq!(reloaded.sharing.web_port, 4817);
+        assert_eq!(reloaded.sharing.webrtc_port, 4818);
+        assert!(!reloaded.sharing.web_require_token);
+        assert!(!reloaded.sharing.web_keep_local);
+        assert!(reloaded.sharing.web_adb_reverse);
+        assert_eq!(reloaded.sharing.web_max_clients, 32);
     }
 }
