@@ -156,6 +156,15 @@ impl Controller {
         if let Some(rtt) = tcp_probe_rtt(&peer.host, peer.port, Duration::from_millis(1500)) {
             self.telemetry.record_rtt(&peer.id, rtt);
         } else {
+            self.log_line(
+                "WARN",
+                &format!(
+                    "Connect failed: {} unreachable at {}:{}",
+                    peer.display_name(),
+                    peer.host,
+                    peer.port
+                ),
+            );
             return Err(ControllerError::Message(format!(
                 "{} is not accepting audio at {}:{}. Is it online and sharing?",
                 peer.display_name(),
@@ -194,6 +203,13 @@ impl Controller {
                 cookie_path,
             })
             .map_err(|e| {
+                self.log_line(
+                    "ERROR",
+                    &format!(
+                        "Connect failed: tunnel error to {}: {e}",
+                        peer.display_name()
+                    ),
+                );
                 ControllerError::Message(format!(
                     "Could not create an audio tunnel to {}: {e}",
                     peer.display_name()
@@ -242,6 +258,15 @@ impl Controller {
                 "normal",
             );
         }
+        self.log_line(
+            "INFO",
+            &format!(
+                "Connected to {} ({}:{}, transport=pa-tcp)",
+                peer.display_name(),
+                peer.host,
+                peer.port
+            ),
+        );
         Ok(self.connection_dict())
     }
 
@@ -352,6 +377,15 @@ impl Controller {
         if let Some(rtt) = tcp_probe_rtt(&peer.host, v3_port, Duration::from_millis(1500)) {
             self.telemetry.record_rtt(&peer.id, rtt);
         } else {
+            self.log_line(
+                "WARN",
+                &format!(
+                    "Connect failed: {} unreachable for SRTP at {}:{}",
+                    peer.display_name(),
+                    peer.host,
+                    v3_port
+                ),
+            );
             return Err(ControllerError::Message(format!(
                 "{} is not accepting encrypted GStreamer SRTP audio at {}:{}. Is it online and sharing?",
                 peer.display_name(),
@@ -390,6 +424,13 @@ impl Controller {
                 if module_id > 0 {
                     let _ = self.backend.unload_module(module_id, true);
                 }
+                self.log_line(
+                    "ERROR",
+                    &format!(
+                        "Connect failed: SRTP outbound error to {}: {e}",
+                        peer.display_name()
+                    ),
+                );
                 return Err(ControllerError::Message(format!(
                     "Could not establish encrypted GStreamer SRTP audio stream to {}: {e}",
                     peer.display_name()
@@ -450,6 +491,15 @@ impl Controller {
                 "normal",
             );
         }
+        self.log_line(
+            "INFO",
+            &format!(
+                "Connected to {} ({}:{}, transport=gst-srtp)",
+                peer.display_name(),
+                peer.host,
+                v3_port
+            ),
+        );
         Ok(self.connection_dict())
     }
 
@@ -733,6 +783,14 @@ impl Controller {
                 "normal",
             );
         }
+        self.log_line(
+            "INFO",
+            &format!(
+                "Multi-room connected: {label} (peers={}, keep_local={})",
+                peers.len(),
+                opts.keep_local
+            ),
+        );
         Ok(self.connection_dict())
     }
 
@@ -944,6 +1002,18 @@ impl Controller {
             } else {
                 notify("SoundHop", "Remote audio disconnected", "normal");
             }
+        }
+
+        if st_snapshot.is_connected() || !removed.is_empty() {
+            self.log_line(
+                "INFO",
+                &format!(
+                    "Disconnected from '{}' (removed_modules={}, restored_to='{}')",
+                    st_snapshot.connected_name,
+                    removed.len(),
+                    restored_to
+                ),
+            );
         }
 
         Ok(serde_json::json!({

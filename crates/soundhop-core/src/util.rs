@@ -409,7 +409,7 @@ pub fn state_dir() -> PathBuf {
     }
     #[cfg(windows)]
     {
-        if let Some(local) = env::var_os("LOCALAPPDATA") {
+        if let Some(local) = env::var_os("LOCALAPPDATA").filter(|v| !v.is_empty()) {
             return PathBuf::from(local).join(APP_SLUG);
         }
     }
@@ -422,7 +422,7 @@ pub fn data_dir() -> PathBuf {
     }
     #[cfg(windows)]
     {
-        if let Some(local) = env::var_os("LOCALAPPDATA") {
+        if let Some(local) = env::var_os("LOCALAPPDATA").filter(|v| !v.is_empty()) {
             return PathBuf::from(local).join(APP_SLUG);
         }
     }
@@ -566,6 +566,54 @@ pub fn rotate_log_if_needed(path: &Path, max_bytes: u64) {
     }
 }
 
+fn format_utc_timestamp(secs: u64) -> String {
+    let days = (secs / 86_400) as i64;
+    let rem = secs % 86_400;
+    let hour = rem / 3_600;
+    let min = (rem % 3_600) / 60;
+    let sec = rem % 60;
+    let z = days + 719_468;
+    let era = if z >= 0 { z } else { z - 146_096 } / 146_097;
+    let doe = (z - era * 146_097) as u64;
+    let yoe = (doe - doe / 1_460 + doe / 36_524 - doe / 146_096) / 365;
+    let y = (yoe as i64) + era * 400;
+    let doy = doe - (365 * yoe + yoe / 4 - yoe / 100);
+    let mp = (5 * doy + 2) / 153;
+    let d = doy - (153 * mp + 2) / 5 + 1;
+    let m = if mp < 10 { mp + 3 } else { mp - 9 };
+    let y = y + i64::from(m <= 2);
+    format!("{y:04}-{m:02}-{d:02} {hour:02}:{min:02}:{sec:02}")
+}
+
+#[cfg(unix)]
+fn format_local_timestamp(secs: u64) -> String {
+    let t = secs as libc::time_t;
+    let mut tm: libc::tm = unsafe { std::mem::zeroed() };
+    let res = unsafe { libc::localtime_r(&t, &mut tm) };
+    if !res.is_null() {
+        return format!(
+            "{:04}-{:02}-{:02} {:02}:{:02}:{:02}",
+            tm.tm_year + 1900,
+            tm.tm_mon + 1,
+            tm.tm_mday,
+            tm.tm_hour,
+            tm.tm_min,
+            tm.tm_sec
+        );
+    }
+    format_utc_timestamp(secs)
+}
+
+#[cfg(not(unix))]
+fn format_local_timestamp(secs: u64) -> String {
+    format_utc_timestamp(secs)
+}
+
+pub(crate) fn is_logging_disabled() -> bool {
+    env::var_os("SOUNDHOP_DISABLE_LOG")
+        .is_some_and(|v| !v.is_empty() && v != "0" && v != "false" && v != "FALSE")
+}
+
 /// Append a single timestamped log line to `path` with size-bounded rotation.
 pub fn append_log_line_to(path: &Path, level: &str, message: &str, max_bytes: u64) {
     let lock = LOG_FILE_LOCK.get_or_init(|| Mutex::new(()));
@@ -576,7 +624,7 @@ pub fn append_log_line_to(path: &Path, level: &str, message: &str, max_bytes: u6
         }
     }
     rotate_log_if_needed(path, max_bytes);
-    let ts = now_secs() as u64;
+    let ts = format_local_timestamp(now_secs() as u64);
     let clean_msg = message.replace(['\r', '\n'], " ");
     let line = format!("[{ts}] [{level}] {clean_msg}\n");
     if let Ok(mut file) = OpenOptions::new().create(true).append(true).open(path) {
@@ -587,6 +635,9 @@ pub fn append_log_line_to(path: &Path, level: &str, message: &str, max_bytes: u6
 /// Append a timestamped diagnostic line to `log_path()`.
 #[cfg(not(test))]
 pub fn append_log_line(level: &str, message: &str) {
+    if is_logging_disabled() {
+        return;
+    }
     append_log_line_to(&log_path(), level, message, MAX_LOG_FILE_BYTES);
 }
 
@@ -597,6 +648,9 @@ pub fn append_log_line(_level: &str, _message: &str) {}
 /// Initialize the daemon log file at `log_path()`, rotating if oversized and
 /// writing a startup marker.
 pub fn init_daemon_log() {
+    if is_logging_disabled() {
+        return;
+    }
     let path = log_path();
     append_log_line_to(
         &path,
@@ -1699,12 +1753,29 @@ mod tests {
     }
 
     #[test]
+    fn test_format_utc_timestamp_known_dates() {
+        assert_eq!(format_utc_timestamp(0), "1970-01-01 00:00:00");
+        assert_eq!(format_utc_timestamp(1_700_000_000), "2023-11-14 22:13:20");
+    }
+
+    #[test]
     fn test_daemon_log_append_and_rotation() {
         let dir = tempfile::tempdir().unwrap();
         let log_file = dir.path().join("soundhop.log");
         append_log_line_to(&log_file, "INFO", "first line", 64);
         let content1 = fs::read_to_string(&log_file).unwrap();
         assert!(content1.contains("[INFO] first line"));
+        // Verify YYYY-MM-DD HH:MM:SS timestamp prefix
+        let ts_part = content1
+            .strip_prefix('[')
+            .and_then(|s| s.split(']').next())
+            .expect("log line should start with [YYYY-MM-DD HH:MM:SS]");
+        assert_eq!(ts_part.len(), 19, "unexpected timestamp: {ts_part}");
+        assert_eq!(&ts_part[4..5], "-");
+        assert_eq!(&ts_part[7..8], "-");
+        assert_eq!(&ts_part[10..11], " ");
+        assert_eq!(&ts_part[13..14], ":");
+        assert_eq!(&ts_part[16..17], ":");
 
         // Exceed small rotation threshold (64 bytes) and ensure rotation creates `.log.old`.
         append_log_line_to(
@@ -1717,6 +1788,45 @@ mod tests {
         let content2 = fs::read_to_string(&log_file).unwrap();
         assert!(content2.contains("after rotation"));
         assert!(log_file.with_extension("log.old").exists());
+    }
+
+    #[test]
+    fn test_init_daemon_log_respects_state_dir_and_disable_env() {
+        static ENV_LOCK: Mutex<()> = Mutex::new(());
+        let _guard = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+
+        let prev_xdg = env::var_os("XDG_STATE_HOME");
+        let prev_disable = env::var_os("SOUNDHOP_DISABLE_LOG");
+
+        let dir = tempfile::tempdir().unwrap();
+        env::set_var("XDG_STATE_HOME", dir.path());
+        env::remove_var("SOUNDHOP_DISABLE_LOG");
+
+        init_daemon_log();
+        let expected_log = dir.path().join(APP_SLUG).join("soundhop.log");
+        assert!(
+            expected_log.exists(),
+            "init_daemon_log should write to XDG_STATE_HOME"
+        );
+        let content = fs::read_to_string(&expected_log).unwrap();
+        assert!(content.contains("SoundHop daemon v"));
+
+        fs::remove_file(&expected_log).unwrap();
+        env::set_var("SOUNDHOP_DISABLE_LOG", "1");
+        init_daemon_log();
+        assert!(
+            !expected_log.exists(),
+            "init_daemon_log must be a no-op when SOUNDHOP_DISABLE_LOG=1"
+        );
+
+        match prev_xdg {
+            Some(v) => env::set_var("XDG_STATE_HOME", v),
+            None => env::remove_var("XDG_STATE_HOME"),
+        }
+        match prev_disable {
+            Some(v) => env::set_var("SOUNDHOP_DISABLE_LOG", v),
+            None => env::remove_var("SOUNDHOP_DISABLE_LOG"),
+        }
     }
 
     #[cfg(windows)]

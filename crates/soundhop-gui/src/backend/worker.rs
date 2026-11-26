@@ -646,26 +646,73 @@ impl WorkerState {
 
     pub(super) fn handle_export_bug_report(&mut self) {
         self.set_busy(Some("Collecting bug report...".to_string()));
-        let cfg = lock_or_recover(&self.controller.config).clone();
-        let mut st = {
-            let _sync = lock_or_recover(&self.controller_sync_lock);
-            self.controller.status(None)
+        let daemon_up = self.use_ipc && ipc_is_running(None);
+        let (bundle, daemon_log) = self.collect_bug_report_bundle(&|cmd, payload| {
+            if !daemon_up {
+                return None;
+            }
+            ipc_request(cmd, payload, None, Duration::from_millis(800)).ok()
+        });
+
+        let pretty = serde_json::to_string_pretty(&bundle).unwrap_or_else(|_| bundle.to_string());
+        let report_path = daemon_log
+            .parent()
+            .map(|p| p.join("soundhop-bug-report.json"))
+            .unwrap_or_else(|| std::env::temp_dir().join("soundhop-bug-report.json"));
+        let saved_path = match atomic_write(&report_path, &pretty) {
+            Ok(()) => Some(report_path.to_string_lossy().into_owned()),
+            Err(_) => None,
         };
+
+        {
+            let mut guard = write_or_recover(&self.snapshot);
+            guard.bug_report_json = Some(pretty);
+            guard.bug_report_path = saved_path.clone();
+        }
+        self.set_busy(None);
+        if let Some(path) = saved_path {
+            self.push_toast(format!("Bug report exported to {path}"), false);
+        } else {
+            self.push_toast("Bug report collected and ready to copy.", false);
+        }
+    }
+
+    fn collect_bug_report_bundle(
+        &self,
+        fetch_ipc: &dyn Fn(&str, serde_json::Value) -> Option<serde_json::Value>,
+    ) -> (serde_json::Value, std::path::PathBuf) {
+        let cfg = lock_or_recover(&self.controller.config).clone();
+        let mut st = fetch_ipc("status", serde_json::json!({}))
+            .filter(|v| v.is_object() && v.get("ok").and_then(|o| o.as_bool()) != Some(false))
+            .unwrap_or_else(|| {
+                let _sync = lock_or_recover(&self.controller_sync_lock);
+                self.controller.status(None)
+            });
         soundhop_core::web::redact_web_broadcast_status_json(&mut st);
         let fw = detect_for_config(&cfg);
         let svc = service_status();
         let daemon_log = log_path();
-        let recent_logs: Vec<String> = std::fs::read_to_string(&daemon_log)
-            .ok()
-            .map(|content| {
-                let all: Vec<&str> = content.lines().collect();
-                let start = all.len().saturating_sub(50);
-                all[start..]
-                    .iter()
-                    .map(|s| redact_log_line_web_tokens(s))
+        let recent_logs: Vec<String> = fetch_ipc("logs", serde_json::json!({ "lines": 50 }))
+            .filter(|v| v.get("ok").and_then(|o| o.as_bool()) != Some(false))
+            .and_then(|v| v.get("lines").and_then(|l| l.as_array()).cloned())
+            .map(|arr| {
+                arr.into_iter()
+                    .filter_map(|item| item.as_str().map(redact_log_line_web_tokens))
                     .collect()
             })
-            .unwrap_or_default();
+            .unwrap_or_else(|| {
+                std::fs::read_to_string(&daemon_log)
+                    .ok()
+                    .map(|content| {
+                        let all: Vec<&str> = content.lines().collect();
+                        let start = all.len().saturating_sub(50);
+                        all[start..]
+                            .iter()
+                            .map(|s| redact_log_line_web_tokens(s))
+                            .collect()
+                    })
+                    .unwrap_or_default()
+            });
 
         let sanitized_config = serde_json::json!({
             "device_name": cfg.device.name,
@@ -697,28 +744,7 @@ impl WorkerState {
             "service": svc,
             "recent_logs": recent_logs,
         });
-
-        let pretty = serde_json::to_string_pretty(&bundle).unwrap_or_else(|_| bundle.to_string());
-        let report_path = daemon_log
-            .parent()
-            .map(|p| p.join("soundhop-bug-report.json"))
-            .unwrap_or_else(|| std::env::temp_dir().join("soundhop-bug-report.json"));
-        let saved_path = match atomic_write(&report_path, &pretty) {
-            Ok(()) => Some(report_path.to_string_lossy().into_owned()),
-            Err(_) => None,
-        };
-
-        {
-            let mut guard = write_or_recover(&self.snapshot);
-            guard.bug_report_json = Some(pretty);
-            guard.bug_report_path = saved_path.clone();
-        }
-        self.set_busy(None);
-        if let Some(path) = saved_path {
-            self.push_toast(format!("Bug report exported to {path}"), false);
-        } else {
-            self.push_toast("Bug report collected and ready to copy.", false);
-        }
+        (bundle, daemon_log)
     }
 
     pub(super) fn handle_set_autostart(&mut self, enabled: bool) {
@@ -1209,5 +1235,74 @@ mod tests {
             redact_log_line_web_tokens("opened 'http://192.168.1.2:4717/#token=secret123'"),
             "opened 'http://192.168.1.2:4717/#token=[REDACTED]'"
         );
+    }
+
+    #[test]
+    fn test_export_bug_report_uses_live_daemon_ipc_and_redacts_tokens() {
+        let (_dir, worker) = make_worker_with_temp_config("wb-ipc");
+        let (bundle, _) = worker.collect_bug_report_bundle(&|cmd, payload| match cmd {
+            "status" => Some(serde_json::json!({
+                "ok": true,
+                "v3_active": true,
+                "peers": [{ "id": "peer-gui-1", "name": "Studio" }],
+                "telemetry": { "rx_bytes": 4242 },
+                "web_broadcast": {
+                    "active": true,
+                    "http_port": 4717,
+                    "webrtc_udp_port": 4718,
+                    "token_required": true,
+                    "token": "gui-ipc-secret",
+                    "localhost_url": "http://localhost:4717/#t=gui-ipc-secret",
+                    "urls": ["http://127.0.0.1:4717/#t=gui-ipc-secret"],
+                },
+            })),
+            "logs" => {
+                assert_eq!(payload["lines"], 50);
+                Some(serde_json::json!({
+                    "ok": true,
+                    "lines": [
+                        "[daemon] memory warning",
+                        "android: streaming",
+                        "opened http://127.0.0.1:4717/#token=gui-ipc-secret"
+                    ]
+                }))
+            }
+            _ => None,
+        });
+
+        let serialized = serde_json::to_string(&bundle).unwrap();
+        assert!(!serialized.contains("gui-ipc-secret"));
+        assert!(!serialized.contains("super-secret-hash-should-not-leak"));
+        assert_eq!(bundle["config"]["has_psk_hash"], true);
+        assert_eq!(bundle["status"]["v3_active"], true);
+        assert_eq!(bundle["status"]["peers"][0]["id"], "peer-gui-1");
+        assert_eq!(bundle["status"]["telemetry"]["rx_bytes"], 4242);
+        assert_eq!(bundle["status"]["web_broadcast"]["token"], "[REDACTED]");
+        assert_eq!(
+            bundle["status"]["web_broadcast"]["localhost_url"],
+            "http://localhost:4717/#t=[REDACTED]"
+        );
+        assert_eq!(
+            bundle["recent_logs"],
+            serde_json::json!([
+                "[daemon] memory warning",
+                "android: streaming",
+                "opened http://127.0.0.1:4717/#token=[REDACTED]"
+            ])
+        );
+    }
+
+    #[test]
+    fn test_export_bug_report_falls_back_on_ipc_failure() {
+        let (_dir, worker) = make_worker_with_temp_config("wb-ipc-fallback");
+        let (bundle, _) = worker.collect_bug_report_bundle(&|_cmd, _payload| {
+            Some(serde_json::json!({ "ok": false, "error": "daemon busy" }))
+        });
+        let serialized = serde_json::to_string(&bundle).unwrap();
+        assert!(!serialized.contains("super-secret-hash-should-not-leak"));
+        assert_eq!(bundle["config"]["has_psk_hash"], true);
+        assert!(bundle["status"].is_object());
+        assert!(bundle["status"].get("ok").is_none());
+        assert!(bundle["recent_logs"].is_array());
     }
 }

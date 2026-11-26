@@ -7,7 +7,7 @@ use soundhop_core::controller::Controller;
 use soundhop_core::firewall::{
     detect_for_ports, open_ports, FirewallPorts, FirewallResult, FirewallState,
 };
-use soundhop_core::ipc::is_running as ipc_is_running;
+use soundhop_core::ipc::{is_running as ipc_is_running, request as ipc_request};
 use soundhop_core::service::{install as install_service, status as service_status};
 use soundhop_core::util::{config_path, local_addresses, log_path, state_path};
 
@@ -73,6 +73,7 @@ trait DoctorEnv {
     fn service_status(&self) -> serde_json::Value;
     fn install_service(&self) -> serde_json::Value;
     fn ipc_running(&self) -> bool;
+    fn ipc_request(&self, command: &str, payload: serde_json::Value) -> Option<serde_json::Value>;
     fn local_addresses(&self) -> Vec<String>;
     fn list_appimage_mounts(&self) -> Vec<String>;
     fn own_appimage_mount(&self) -> Option<String>;
@@ -101,6 +102,19 @@ impl DoctorEnv for SystemDoctorEnv {
 
     fn ipc_running(&self) -> bool {
         ipc_is_running(None)
+    }
+
+    fn ipc_request(&self, command: &str, payload: serde_json::Value) -> Option<serde_json::Value> {
+        if !self.ipc_running() {
+            return None;
+        }
+        ipc_request(
+            command,
+            payload,
+            None,
+            std::time::Duration::from_millis(800),
+        )
+        .ok()
     }
 
     fn local_addresses(&self) -> Vec<String> {
@@ -340,12 +354,91 @@ fn collect_doctor_report(
     }
 }
 
+fn redact_log_line_web_tokens(line: &str) -> String {
+    let mut out = String::with_capacity(line.len());
+    let mut rest = line;
+    while !rest.is_empty() {
+        let next_t = rest.find("#t=");
+        let next_tok = rest.find("#token=");
+        let hit = match (next_t, next_tok) {
+            (Some(a), Some(b)) => {
+                if a <= b {
+                    Some((a, "#t="))
+                } else {
+                    Some((b, "#token="))
+                }
+            }
+            (Some(a), None) => Some((a, "#t=")),
+            (None, Some(b)) => Some((b, "#token=")),
+            (None, None) => None,
+        };
+        let Some((idx, prefix)) = hit else {
+            out.push_str(rest);
+            break;
+        };
+        out.push_str(&rest[..idx]);
+        out.push_str(prefix);
+        let after = &rest[idx + prefix.len()..];
+        let end = after
+            .find(|c: char| c.is_whitespace() || matches!(c, '&' | '\'' | '"' | ')' | '>'))
+            .unwrap_or(after.len());
+        if end > 0 {
+            out.push_str("[REDACTED]");
+        }
+        rest = &after[end..];
+    }
+    out
+}
+
 fn collect_bug_report(controller: &Arc<Controller>, env: &dyn DoctorEnv) -> serde_json::Value {
     let cfg = lock_or_recover(&controller.config).clone();
-    let mut st = controller.status(None);
+    let mut st = env
+        .ipc_request("status", serde_json::json!({}))
+        .filter(|v| v.is_object() && v.get("ok").and_then(|o| o.as_bool()) != Some(false))
+        .unwrap_or_else(|| controller.status(None));
     soundhop_core::web::redact_web_broadcast_status_json(&mut st);
     let fw = env.detect_firewall(&FirewallPorts::from_config(&cfg));
     let svc = env.service_status();
+    let daemon_log = log_path();
+    let recent_logs: Vec<String> = env
+        .ipc_request("logs", serde_json::json!({ "lines": 50 }))
+        .filter(|v| v.get("ok").and_then(|o| o.as_bool()) != Some(false))
+        .and_then(|v| v.get("lines").and_then(|l| l.as_array()).cloned())
+        .map(|arr| {
+            arr.into_iter()
+                .filter_map(|item| item.as_str().map(redact_log_line_web_tokens))
+                .collect()
+        })
+        .unwrap_or_else(|| {
+            std::fs::read_to_string(&daemon_log)
+                .ok()
+                .map(|content| {
+                    let all: Vec<&str> = content.lines().collect();
+                    let start = all.len().saturating_sub(50);
+                    all[start..]
+                        .iter()
+                        .map(|s| redact_log_line_web_tokens(s))
+                        .collect()
+                })
+                .unwrap_or_default()
+        });
+
+    let sanitized_config = serde_json::json!({
+        "device_name": cfg.device.name,
+        "sharing_enabled": cfg.sharing.enabled,
+        "sharing_port": cfg.sharing.port,
+        "sharing_security": cfg.sharing.security,
+        "has_psk_hash": !cfg.sharing.psk_hash.is_empty(),
+        "auto_connect": cfg.connection.auto_connect,
+        "disconnect_on_quit": cfg.connection.disconnect_on_quit,
+        "keep_local_output": cfg.connection.keep_local_output,
+        "latency_ms": cfg.connection.latency_ms,
+        "discovery_mdns": cfg.discovery.mdns,
+        "discovery_udp": cfg.discovery.udp,
+        "discovery_port": cfg.discovery.port,
+        "routing_default_mode": cfg.routing.default_mode,
+    });
+
     serde_json::json!({
         "version": VERSION,
         "protocol": PROTOCOL_VERSION,
@@ -353,10 +446,12 @@ fn collect_bug_report(controller: &Arc<Controller>, env: &dyn DoctorEnv) -> serd
         "arch": std::env::consts::ARCH,
         "config_path": config_path().to_string_lossy(),
         "state_path": state_path().to_string_lossy(),
-        "log_path": log_path().to_string_lossy(),
+        "log_path": daemon_log.to_string_lossy(),
+        "config": sanitized_config,
         "status": st,
         "firewall": fw,
         "service": svc,
+        "recent_logs": recent_logs,
     })
 }
 
@@ -567,6 +662,8 @@ mod tests {
         install_svc_started: bool,
         install_svc_calls: Mutex<usize>,
         ipc_running: Mutex<bool>,
+        ipc_status: Mutex<Option<serde_json::Value>>,
+        ipc_logs: Mutex<Option<serde_json::Value>>,
         addresses: Vec<String>,
         mounts: Mutex<Vec<String>>,
         own_mount: Option<String>,
@@ -594,6 +691,8 @@ mod tests {
                 install_svc_started: true,
                 install_svc_calls: Mutex::new(0),
                 ipc_running: Mutex::new(true),
+                ipc_status: Mutex::new(None),
+                ipc_logs: Mutex::new(None),
                 addresses: vec!["192.168.1.42".to_string()],
                 mounts: Mutex::new(Vec::new()),
                 own_mount: None,
@@ -643,6 +742,21 @@ mod tests {
 
         fn ipc_running(&self) -> bool {
             *self.ipc_running.lock().unwrap()
+        }
+
+        fn ipc_request(
+            &self,
+            command: &str,
+            _payload: serde_json::Value,
+        ) -> Option<serde_json::Value> {
+            if !self.ipc_running() {
+                return None;
+            }
+            match command {
+                "status" => self.ipc_status.lock().unwrap().clone(),
+                "logs" => self.ipc_logs.lock().unwrap().clone(),
+                _ => None,
+            }
         }
 
         fn local_addresses(&self) -> Vec<String> {
@@ -902,10 +1016,91 @@ mod tests {
         assert!(bundle["config_path"].is_string());
         assert!(bundle["state_path"].is_string());
         assert!(bundle["log_path"].is_string());
+        assert!(bundle["config"].is_object());
+        assert_eq!(bundle["config"]["has_psk_hash"], false);
         assert!(bundle["status"].is_object());
         assert_eq!(bundle["firewall"]["kind"], "ufw");
         assert_eq!(bundle["firewall"]["active"], false);
         assert_eq!(bundle["service"]["active"], true);
+        assert!(bundle["recent_logs"].is_array());
+    }
+
+    #[test]
+    fn test_collect_bug_report_uses_live_daemon_ipc_and_redacts_tokens() {
+        let (_dir, ctrl) = make_test_controller(true);
+        ctrl.config.lock().unwrap().sharing.psk_hash =
+            "cli-secret-psk-hash-must-not-leak".to_string();
+
+        let env = MockDoctorEnv {
+            ipc_running: Mutex::new(true),
+            ipc_status: Mutex::new(Some(serde_json::json!({
+                "ok": true,
+                "v3_active": true,
+                "peers": [{ "id": "peer-1", "name": "Living Room" }],
+                "telemetry": { "rx_bytes": 1234, "tx_bytes": 5678 },
+                "web_broadcast": {
+                    "active": true,
+                    "http_port": 4717,
+                    "webrtc_udp_port": 4718,
+                    "token_required": true,
+                    "token": "ipc-secret-tok",
+                    "localhost_url": "http://localhost:4717/#t=ipc-secret-tok",
+                    "urls": ["http://192.168.1.42:4717/#t=ipc-secret-tok"],
+                },
+            }))),
+            ipc_logs: Mutex::new(Some(serde_json::json!({
+                "ok": true,
+                "lines": [
+                    "[daemon] warning line",
+                    "android: connected",
+                    "opened http://localhost:4717/#t=ipc-secret-tok&mode=rtc"
+                ]
+            }))),
+            ..Default::default()
+        };
+
+        let bundle = collect_bug_report(&ctrl, &env);
+        let serialized = serde_json::to_string(&bundle).unwrap();
+        assert!(!serialized.contains("ipc-secret-tok"));
+        assert!(!serialized.contains("cli-secret-psk-hash-must-not-leak"));
+
+        assert_eq!(bundle["config"]["has_psk_hash"], true);
+        assert_eq!(bundle["status"]["v3_active"], true);
+        assert_eq!(bundle["status"]["peers"][0]["id"], "peer-1");
+        assert_eq!(bundle["status"]["telemetry"]["rx_bytes"], 1234);
+        assert_eq!(bundle["status"]["web_broadcast"]["token"], "[REDACTED]");
+        assert_eq!(
+            bundle["status"]["web_broadcast"]["localhost_url"],
+            "http://localhost:4717/#t=[REDACTED]"
+        );
+        assert_eq!(
+            bundle["status"]["web_broadcast"]["urls"][0],
+            "http://192.168.1.42:4717/#t=[REDACTED]"
+        );
+        assert_eq!(
+            bundle["recent_logs"],
+            serde_json::json!([
+                "[daemon] warning line",
+                "android: connected",
+                "opened http://localhost:4717/#t=[REDACTED]&mode=rtc"
+            ])
+        );
+    }
+
+    #[test]
+    fn test_collect_bug_report_falls_back_when_ipc_unavailable() {
+        let (_dir, ctrl) = make_test_controller(true);
+        let env = MockDoctorEnv {
+            ipc_running: Mutex::new(false),
+            ipc_status: Mutex::new(Some(serde_json::json!({ "ok": true, "v3_active": true }))),
+            ..Default::default()
+        };
+
+        let bundle = collect_bug_report(&ctrl, &env);
+        assert!(bundle["status"].is_object());
+        assert!(bundle["status"].get("daemon").is_none());
+        assert!(bundle["recent_logs"].is_array());
+        assert!(bundle["config"].is_object());
     }
 
     #[test]

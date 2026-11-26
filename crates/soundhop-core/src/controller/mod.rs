@@ -115,6 +115,7 @@ pub struct Controller {
     pub(super) config_path: Option<PathBuf>,
     pub(super) state_path: Option<PathBuf>,
     pub(super) notify_enabled: bool,
+    pub(super) log_enabled: bool,
     pub(super) save_enabled: Mutex<bool>,
     pub(super) connect_lock: Mutex<()>,
     pub(super) file_mtimes: Mutex<DiskFileMtimes>,
@@ -129,6 +130,7 @@ impl Controller {
         state_path: Option<PathBuf>,
         notify_enabled: bool,
     ) -> Self {
+        let log_enabled = config.is_none() && state.is_none() && backend.is_none();
         let cfg =
             config.unwrap_or_else(|| Config::load(config_path.as_deref()).unwrap_or_default());
         let st = state.unwrap_or_else(|| State::load(state_path.as_deref()));
@@ -166,6 +168,7 @@ impl Controller {
             config_path,
             state_path,
             notify_enabled,
+            log_enabled,
             save_enabled: Mutex::new(true),
             connect_lock: Mutex::new(()),
             file_mtimes: Mutex::new(initial_mtimes),
@@ -794,6 +797,12 @@ impl Controller {
                 ));
             }
         }
+        if !actions.is_empty() {
+            self.log_line(
+                "INFO",
+                &format!("Reconcile actions: {}", actions.join("; ")),
+            );
+        }
         serde_json::json!({
             "available": true,
             "actions": actions,
@@ -801,6 +810,27 @@ impl Controller {
     }
 
     // -- Internal Helpers ------------------------------------------------
+
+    pub(super) fn log_line(&self, level: &str, message: &str) {
+        if !self.log_enabled {
+            return;
+        }
+        if let Some(ref sp) = self.state_path {
+            if crate::util::is_logging_disabled() {
+                return;
+            }
+            if let Some(dir) = sp.parent() {
+                crate::util::append_log_line_to(
+                    &dir.join("soundhop.log"),
+                    level,
+                    message,
+                    crate::util::MAX_LOG_FILE_BYTES,
+                );
+            }
+            return;
+        }
+        crate::util::append_log_line(level, message);
+    }
 
     pub(super) fn ensure_backend(&self) -> Result<(), ControllerError> {
         if !self.backend.available() {

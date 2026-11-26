@@ -176,8 +176,16 @@ fn make_stateful_mock_runner(state: Arc<Mutex<MockPulseState>>) -> Arc<MockRunne
     }))
 }
 
+fn isolate_test_logging() {
+    static ONCE: std::sync::Once = std::sync::Once::new();
+    ONCE.call_once(|| {
+        std::env::set_var("SOUNDHOP_DISABLE_LOG", "1");
+    });
+}
+
 #[test]
 fn test_daemon_real_ipc_ping_status_config_patch_and_stop() {
+    isolate_test_logging();
     let dir = tempfile::tempdir().unwrap();
     let cfg_path = dir.path().join("config.toml");
     let state_path = dir.path().join("state.json");
@@ -192,7 +200,7 @@ fn test_daemon_real_ipc_ping_status_config_patch_and_stop() {
     initial_cfg.discovery.mdns = false;
     initial_cfg.save(Some(&cfg_path)).unwrap();
 
-    let daemon = Daemon::new(
+    let daemon = Daemon::new_for_test(
         Some(cfg_path.clone()),
         Some(state_path),
         false,
@@ -565,7 +573,8 @@ fn test_daemon_web_broadcast_ipc_roundtrip_and_peer_coexistence() {
         false,
     ));
 
-    let daemon = Daemon::with_controller(Arc::clone(&controller), Some(sock_path.clone()));
+    isolate_test_logging();
+    let daemon = Daemon::with_controller_for_test(Arc::clone(&controller), Some(sock_path.clone()));
     daemon
         .start()
         .expect("daemon with mock backend should start cleanly");

@@ -93,6 +93,7 @@ pub struct Daemon {
     supervisor_thread: Mutex<Option<JoinHandle<()>>>,
     audio_monitor_thread: Mutex<Option<JoinHandle<()>>>,
     audio_monitor_child: Arc<Mutex<Option<std::process::Child>>>,
+    disable_log: bool,
 }
 
 impl Daemon {
@@ -114,6 +115,38 @@ impl Daemon {
     }
 
     pub fn with_controller(controller: Arc<Controller>, ipc_path: Option<PathBuf>) -> Arc<Self> {
+        Self::with_controller_inner(controller, ipc_path, false)
+    }
+
+    pub fn new_for_test(
+        config_path: Option<PathBuf>,
+        state_path: Option<PathBuf>,
+        notify_enabled: bool,
+        ipc_path: Option<PathBuf>,
+    ) -> Arc<Self> {
+        let controller = Arc::new(Controller::new(
+            None,
+            None,
+            None,
+            config_path,
+            state_path,
+            notify_enabled,
+        ));
+        Self::with_controller_for_test(controller, ipc_path)
+    }
+
+    pub fn with_controller_for_test(
+        controller: Arc<Controller>,
+        ipc_path: Option<PathBuf>,
+    ) -> Arc<Self> {
+        Self::with_controller_inner(controller, ipc_path, true)
+    }
+
+    fn with_controller_inner(
+        controller: Arc<Controller>,
+        ipc_path: Option<PathBuf>,
+        disable_log: bool,
+    ) -> Arc<Self> {
         Arc::new(Self {
             controller,
             discovery: Mutex::new(None),
@@ -130,6 +163,7 @@ impl Daemon {
             supervisor_thread: Mutex::new(None),
             audio_monitor_thread: Mutex::new(None),
             audio_monitor_child: Arc::new(Mutex::new(None)),
+            disable_log,
         })
     }
 
@@ -140,7 +174,9 @@ impl Daemon {
         if is_reachable(self.ipc_path.as_deref()) {
             return Err("SoundHop daemon is already running".to_string());
         }
-        crate::util::init_daemon_log();
+        if !self.disable_log {
+            crate::util::init_daemon_log();
+        }
         self.stop_flag.store(false, Ordering::SeqCst);
         let _ = self.controller.reconcile();
         self.setup_sharing();
@@ -460,6 +496,9 @@ impl Daemon {
             ctrl_clone.remember_peer(peer);
         });
         let warnings = disc.start(self.advertising.load(Ordering::SeqCst));
+        for w in &warnings {
+            crate::util::append_log_line("WARN", &format!("Discovery: {w}"));
+        }
         lock_or_recover(&self.warnings).extend(warnings);
         *lock_or_recover(&self.discovery) = Some(disc);
     }

@@ -191,6 +191,7 @@ impl Controller {
                 if web_null_module > 0 {
                     let _ = self.backend.unload_module(web_null_module, true);
                 }
+                self.log_line("ERROR", &format!("Web Broadcast start failed: {e}"));
                 return Err(ControllerError::Message(e.to_string()));
             }
         };
@@ -235,6 +236,14 @@ impl Controller {
             }
             self.save();
         }
+
+        self.log_line(
+            "INFO",
+            &format!(
+                "Web Broadcast started on port {} (keep_local={}, require_token={})",
+                status.http_port, eff_keep_local, eff_require_token
+            ),
+        );
 
         Ok(self.web_broadcast_status())
     }
@@ -294,6 +303,10 @@ impl Controller {
             lock_or_recover(&self.state).clear_web_broadcast();
         }
         self.save();
+
+        if st_snap.web_broadcast_active || st_snap.connected_peer == WEB_BROADCAST_PEER_ID {
+            self.log_line("INFO", "Web Broadcast stopped");
+        }
 
         Ok(self.web_broadcast_status())
     }

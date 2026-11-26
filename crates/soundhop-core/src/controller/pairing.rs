@@ -333,6 +333,13 @@ impl Controller {
             let _ = self.ensure_listener_internal();
         }
         self.save();
+        self.log_line(
+            "INFO",
+            &format!(
+                "Legacy pairing configured for peer '{}' ({})",
+                peer_name, peer_id_or_name
+            ),
+        );
 
         Ok(serde_json::json!({
             "paired": true,
@@ -367,6 +374,7 @@ impl Controller {
             let _ = self.ensure_listener_internal();
         }
         self.save();
+        self.log_line("INFO", "Cleared legacy pairing credentials");
         serde_json::json!({ "ok": true, "cleared": true })
     }
 
@@ -404,9 +412,15 @@ impl Controller {
 
     /// Persist a newly paired [`TrustedPeer`] into `State` and the live [`TrustStore`].
     pub fn record_trusted_peer(&self, peer: TrustedPeer) {
+        let peer_name = peer.display_name.clone();
+        let peer_id = peer.device_id.clone();
         self.pairing_manager().trust_store().upsert(peer.clone());
         lock_or_recover(&self.state).upsert_trusted_peer(peer);
         self.save();
+        self.log_line(
+            "INFO",
+            &format!("Trusted peer recorded: {peer_name} ({peer_id})"),
+        );
     }
 
     /// Initiate a Pairing v2 TCP handshake against `host:pair_port` (optionally using a
@@ -445,7 +459,13 @@ impl Controller {
             Some(&mgr),
             None,
         )
-        .map_err(|e| ControllerError::Message(e.to_string()))?;
+        .map_err(|e| {
+            self.log_line(
+                "WARN",
+                &format!("Pair request to {trimmed_host}:{port} failed: {e}"),
+            );
+            ControllerError::Message(e.to_string())
+        })?;
 
         self.record_trusted_peer(outcome.peer.clone());
         Ok(serde_json::json!({
@@ -468,6 +488,7 @@ impl Controller {
             .pairing_manager()
             .approve(id)
             .map_err(|e| ControllerError::Message(e.to_string()))?;
+        self.log_line("INFO", &format!("Approved pair request {id}"));
         Ok(serde_json::json!({
             "ok": true,
             "approved": true,
@@ -481,6 +502,7 @@ impl Controller {
             .pairing_manager()
             .deny(id)
             .map_err(|e| ControllerError::Message(e.to_string()))?;
+        self.log_line("INFO", &format!("Denied pair request {id}"));
         Ok(serde_json::json!({
             "ok": true,
             "denied": true,
@@ -529,6 +551,15 @@ impl Controller {
         };
         if removed_state {
             self.save();
+        }
+        if removed_store || removed_state {
+            self.log_line(
+                "INFO",
+                &format!(
+                    "Revoked trusted peer {target} (disconnected={})",
+                    disconnected_inbound || disconnected_outbound
+                ),
+            );
         }
         Ok(serde_json::json!({
             "ok": true,
