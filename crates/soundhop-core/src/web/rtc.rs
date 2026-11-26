@@ -525,6 +525,10 @@ impl MuxState {
                     self.ufrag_to_peer.insert(ufrag, id.clone());
                     self.peers.insert(id, *peer);
                     self.ensure_opus_subscription();
+                    // Publish the snapshot before acknowledging the offer, so callers
+                    // observing `accept_offer()` success also see the new peer in
+                    // `client_count()`/`list_clients()` instead of racing the mux loop.
+                    self.sync_snapshot();
                     changed = true;
                     let _ = reply_tx.send(Ok(()));
                 }
@@ -536,6 +540,9 @@ impl MuxState {
                 }) => {
                     let removed = self.remove_peer_internal(&peer_id, send_close, kick);
                     if removed {
+                        // Keep the public snapshot consistent before replying, mirroring
+                        // the AddPeer path so immediate client_count() checks are reliable.
+                        self.sync_snapshot();
                         changed = true;
                     }
                     let _ = reply_tx.send(removed);
