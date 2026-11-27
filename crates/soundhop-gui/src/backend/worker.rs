@@ -208,13 +208,28 @@ impl WorkerState {
 
         let daemon_up = self.use_ipc && ipc_is_running(None);
         let status_val = if daemon_up {
-            ipc_request(
+            match ipc_request(
                 "status",
                 serde_json::json!({}),
                 None,
-                Duration::from_millis(800),
-            )
-            .ok()
+                Duration::from_millis(2500),
+            ) {
+                Ok(v) if v.is_object() && v.get("ok").and_then(|o| o.as_bool()) != Some(false) => {
+                    Some(v)
+                }
+                Ok(v) => {
+                    let err = v
+                        .get("error")
+                        .and_then(|e| e.as_str())
+                        .unwrap_or("status IPC returned ok=false or non-object");
+                    tracing::warn!(error = %err, "daemon is running but status IPC failed; keeping previous snapshot");
+                    return false;
+                }
+                Err(e) => {
+                    tracing::warn!(error = %e, "daemon is running but status IPC request failed; keeping previous snapshot");
+                    return false;
+                }
+            }
         } else {
             None
         };
@@ -651,7 +666,13 @@ impl WorkerState {
             if !daemon_up {
                 return None;
             }
-            ipc_request(cmd, payload, None, Duration::from_millis(800)).ok()
+            match ipc_request(cmd, payload, None, Duration::from_millis(2500)) {
+                Ok(v) => Some(v),
+                Err(e) => {
+                    tracing::warn!(cmd, error = %e, "bug report IPC request failed");
+                    Some(serde_json::json!({ "ok": false, "error": e.to_string() }))
+                }
+            }
         });
 
         let pretty = serde_json::to_string_pretty(&bundle).unwrap_or_else(|_| bundle.to_string());
@@ -682,12 +703,28 @@ impl WorkerState {
         fetch_ipc: &dyn Fn(&str, serde_json::Value) -> Option<serde_json::Value>,
     ) -> (serde_json::Value, std::path::PathBuf) {
         let cfg = lock_or_recover(&self.controller.config).clone();
-        let st = fetch_ipc("status", serde_json::json!({}))
-            .filter(|v| v.is_object() && v.get("ok").and_then(|o| o.as_bool()) != Some(false))
-            .unwrap_or_else(|| {
+        let mut status_ipc_error: Option<String> = None;
+        let st = match fetch_ipc("status", serde_json::json!({})) {
+            Some(v) if v.is_object() && v.get("ok").and_then(|o| o.as_bool()) != Some(false) => v,
+            Some(v) => {
+                let err_msg = v
+                    .get("error")
+                    .and_then(|e| e.as_str())
+                    .unwrap_or("status IPC returned ok=false or non-object")
+                    .to_string();
+                tracing::warn!(
+                    error = %err_msg,
+                    "status IPC failed during bug report collection; falling back to local controller"
+                );
+                status_ipc_error = Some(err_msg);
                 let _sync = lock_or_recover(&self.controller_sync_lock);
                 self.controller.status(None)
-            });
+            }
+            None => {
+                let _sync = lock_or_recover(&self.controller_sync_lock);
+                self.controller.status(None)
+            }
+        };
         let fw = detect_for_config(&cfg);
         let svc = service_status();
         let daemon_log = log_path();
@@ -726,7 +763,7 @@ impl WorkerState {
             "routing_default_mode": cfg.routing.default_mode,
         });
 
-        let bundle = serde_json::json!({
+        let mut bundle = serde_json::json!({
             "version": VERSION,
             "protocol": PROTOCOL_VERSION,
             "os": std::env::consts::OS,
@@ -740,6 +777,9 @@ impl WorkerState {
             "service": svc,
             "recent_logs": recent_logs,
         });
+        if let Some(err) = status_ipc_error {
+            bundle["status_ipc_error"] = serde_json::Value::String(err);
+        }
         (bundle, daemon_log)
     }
 
@@ -1220,6 +1260,7 @@ mod tests {
         let serialized = serde_json::to_string(&bundle).unwrap();
         assert!(!serialized.contains("super-secret-hash-should-not-leak"));
         assert_eq!(bundle["config"]["has_psk_hash"], true);
+        assert!(bundle.get("status_ipc_error").is_none());
         assert_eq!(bundle["status"]["v3_active"], true);
         assert_eq!(bundle["status"]["peers"][0]["id"], "peer-gui-1");
         assert_eq!(bundle["status"]["telemetry"]["rx_bytes"], 4242);
@@ -1251,6 +1292,7 @@ mod tests {
         let serialized = serde_json::to_string(&bundle).unwrap();
         assert!(!serialized.contains("super-secret-hash-should-not-leak"));
         assert_eq!(bundle["config"]["has_psk_hash"], true);
+        assert_eq!(bundle["status_ipc_error"], "daemon busy");
         assert!(bundle["status"].is_object());
         assert!(bundle["status"].get("ok").is_none());
         assert!(bundle["recent_logs"].is_array());

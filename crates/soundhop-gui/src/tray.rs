@@ -1174,11 +1174,25 @@ fn handle_menu_action(
             } else {
                 "web_start"
             };
-            let _ = ipc_request(cmd, serde_json::json!({}), None, Duration::from_secs(6));
+            match ipc_request(cmd, serde_json::json!({}), None, Duration::from_secs(6)) {
+                Ok(v) if v.get("ok").and_then(|o| o.as_bool()) == Some(false) => {
+                    let err = v
+                        .get("error")
+                        .and_then(|e| e.as_str())
+                        .unwrap_or("unknown error");
+                    tracing::warn!(cmd, error = %err, "tray IPC command returned ok=false");
+                }
+                Ok(_) => {}
+                Err(e) => {
+                    tracing::warn!(cmd, error = %e, "tray IPC command failed");
+                }
+            }
         } else if ctrl.web_broadcast.is_active() {
-            let _ = ctrl.stop_web_broadcast();
-        } else {
-            let _ = ctrl.start_web_broadcast(None, None, None);
+            if let Err(e) = ctrl.stop_web_broadcast() {
+                tracing::warn!(error = %e, "tray failed to stop web broadcast");
+            }
+        } else if let Err(e) = ctrl.start_web_broadcast(None, None, None) {
+            tracing::warn!(error = %e, "tray failed to start web broadcast");
         }
         return;
     }
