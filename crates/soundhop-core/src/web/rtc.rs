@@ -30,6 +30,8 @@ const MAX_SDP_OFFER_BYTES: usize = 64 * 1024;
 const MUX_CMD_CHANNEL_CAPACITY: usize = 64;
 /// Default ICE/DTLS handshake deadline before an unestablished peer is evicted.
 const DEFAULT_HANDSHAKE_TIMEOUT: Duration = Duration::from_secs(10);
+/// Grace period before dropping a peer whose ICE connection transitioned to `Disconnected`.
+const ICE_DISCONNECTED_GRACE: Duration = Duration::from_secs(3);
 /// Periodic stats emission interval configured on each `str0m::Rtc` peer.
 const PEER_STATS_INTERVAL: Duration = Duration::from_secs(2);
 /// Maximum UDP read timeout when idle so `stop_flag` and deadlines stay responsive.
@@ -64,6 +66,7 @@ pub struct RtcOfferRequest {
     pub remote_addr: SocketAddr,
     pub user_agent: String,
     pub client_name: Option<String>,
+    pub potato: bool,
 }
 
 /// Answer payload returned by `web-rtc-mux` after accepting a browser SDP offer.
@@ -99,6 +102,7 @@ struct PeerRtc {
     audio_mid: Option<Mid>,
     opus_pt: Option<Pt>,
     ice_connected: bool,
+    ice_disconnected_deadline: Option<Instant>,
     connected_at: Option<Instant>,
     handshake_deadline: Instant,
     next_timeout: Instant,
@@ -136,7 +140,29 @@ impl PeerRtc {
     }
 
     fn is_handshake_complete(&self) -> bool {
-        self.ice_connected && self.rtc.is_connected()
+        self.connected_at.is_some() || (self.ice_connected && self.rtc.is_connected())
+    }
+
+    fn is_expired(&self, now: Instant) -> bool {
+        !self.rtc.is_alive()
+            || (!self.is_handshake_complete() && now >= self.handshake_deadline)
+            || self.ice_disconnected_deadline.is_some_and(|dl| now >= dl)
+    }
+
+    fn handle_ice_state_change(&mut self, state: IceConnectionState, now: Instant) {
+        match state {
+            IceConnectionState::Connected | IceConnectionState::Completed => {
+                self.ice_connected = true;
+                self.ice_disconnected_deadline = None;
+                self.connected_at.get_or_insert(now);
+            }
+            IceConnectionState::Disconnected => {
+                self.ice_connected = false;
+                self.ice_disconnected_deadline
+                    .get_or_insert(now + ICE_DISCONNECTED_GRACE);
+            }
+            IceConnectionState::New | IceConnectionState::Checking => {}
+        }
     }
 }
 
@@ -276,7 +302,7 @@ impl RtcMuxHandle {
         let (audio_mid, next_timeout, initial_transmits) = drain_initial_rtc(&mut rtc)?;
         let opus_pt = audio_mid.and_then(|mid| rtc.writer(mid).and_then(|w| select_opus_pt(&w)));
 
-        let answer_sdp = answer.to_sdp_string();
+        let answer_sdp = ensure_opus_sdp_fmtp(&answer.to_sdp_string());
         if !answer_has_sendable_opus_audio(&answer_sdp) {
             return Err(WebError::BadRequest(
                 "SDP offer does not include a compatible sendable 48 kHz Opus audio section".into(),
@@ -289,6 +315,7 @@ impl RtcMuxHandle {
 
         // Only start the lazy GStreamer broadcast pipeline after SDP validation succeeds.
         let listener_guard = self.runtime.acquire_listener()?;
+        self.runtime.set_potato_mode(req.potato);
 
         let peer_id = format!("rtc-{}", self.next_peer_seq.fetch_add(1, Ordering::Relaxed));
         let label = req
@@ -306,6 +333,7 @@ impl RtcMuxHandle {
             audio_mid,
             opus_pt,
             ice_connected: false,
+            ice_disconnected_deadline: None,
             connected_at: None,
             handshake_deadline: now + DEFAULT_HANDSHAKE_TIMEOUT,
             next_timeout,
@@ -692,15 +720,8 @@ impl MuxState {
         let to_evict: Vec<String> = self
             .peers
             .iter()
-            .filter_map(|(id, peer)| {
-                if !peer.rtc.is_alive()
-                    || (!peer.is_handshake_complete() && now >= peer.handshake_deadline)
-                {
-                    Some(id.clone())
-                } else {
-                    None
-                }
-            })
+            .filter(|&(_, peer)| peer.is_expired(now))
+            .map(|(id, _)| id.clone())
             .collect();
 
         let mut changed = false;
@@ -764,6 +785,12 @@ impl MuxState {
                 earliest = Some(match earliest {
                     Some(cur) => cur.min(peer.handshake_deadline),
                     None => peer.handshake_deadline,
+                });
+            }
+            if let Some(dl) = peer.ice_disconnected_deadline {
+                earliest = Some(match earliest {
+                    Some(cur) => cur.min(dl),
+                    None => dl,
                 });
             }
         }
@@ -971,19 +998,12 @@ fn drain_peer_output(peer: &mut PeerRtc, udp_socket: &UdpSocket) -> bool {
                         peer.audio_mid = None;
                     }
                 }
-                Event::IceConnectionStateChange(state) => match state {
-                    IceConnectionState::Connected | IceConnectionState::Completed => {
-                        peer.ice_connected = true;
-                        peer.connected_at.get_or_insert_with(Instant::now);
-                    }
-                    IceConnectionState::Disconnected => {
-                        peer.ice_connected = false;
-                        keep_alive = false;
-                    }
-                    IceConnectionState::New | IceConnectionState::Checking => {}
-                },
+                Event::IceConnectionStateChange(state) => {
+                    peer.handle_ice_state_change(state, Instant::now());
+                }
                 Event::Connected => {
                     peer.ice_connected = true;
+                    peer.ice_disconnected_deadline = None;
                     peer.connected_at.get_or_insert_with(Instant::now);
                 }
                 Event::PeerStats(stats) => {
@@ -1020,6 +1040,121 @@ fn drain_peer_output(peer: &mut PeerRtc, udp_socket: &UdpSocket) -> bool {
     }
 
     keep_alive && peer.rtc.is_alive()
+}
+
+/// Ensure every Opus `a=fmtp:<pt>` line in an SDP document enables `useinbandfec=1`
+/// and `stereo=1`, inserting an `a=fmtp:` line after `a=rtpmap:<pt>` when absent.
+fn ensure_opus_sdp_fmtp(sdp: &str) -> String {
+    let line_ending = if sdp.contains("\r\n") { "\r\n" } else { "\n" };
+    let trailing_ending = sdp.ends_with('\n');
+
+    let mut opus_pts: Vec<String> = Vec::new();
+    let mut existing_fmtp_pts: Vec<String> = Vec::new();
+    let mut in_audio = false;
+
+    for raw in sdp.lines() {
+        let line = raw.trim();
+        if let Some(m_rest) = line.strip_prefix("m=") {
+            in_audio = m_rest.starts_with("audio ");
+            continue;
+        }
+        if !in_audio {
+            continue;
+        }
+        if let Some(rtpmap) = line.strip_prefix("a=rtpmap:") {
+            if let Some((pt, codec)) = rtpmap.split_once(' ') {
+                if codec.to_ascii_lowercase().starts_with("opus/48000")
+                    && !opus_pts.iter().any(|p| p == pt)
+                {
+                    opus_pts.push(pt.to_string());
+                }
+            }
+        } else if let Some(fmtp) = line.strip_prefix("a=fmtp:") {
+            if let Some((pt, _)) = fmtp.split_once(' ') {
+                if !existing_fmtp_pts.iter().any(|p| p == pt) {
+                    existing_fmtp_pts.push(pt.to_string());
+                }
+            }
+        }
+    }
+
+    if opus_pts.is_empty() {
+        return sdp.to_string();
+    }
+
+    let mut out_lines: Vec<String> = Vec::with_capacity(sdp.lines().count() + opus_pts.len());
+    in_audio = false;
+
+    for raw in sdp.lines() {
+        let line = raw.trim_end_matches('\r');
+        if let Some(m_rest) = line.strip_prefix("m=") {
+            in_audio = m_rest.starts_with("audio ");
+            out_lines.push(line.to_string());
+            continue;
+        }
+        if in_audio {
+            if let Some(fmtp) = line.strip_prefix("a=fmtp:") {
+                if let Some((pt, params)) = fmtp.split_once(' ') {
+                    if opus_pts.iter().any(|p| p == pt) {
+                        out_lines.push(format!("a=fmtp:{pt} {}", upsert_opus_fmtp_params(params)));
+                        continue;
+                    }
+                }
+            } else if let Some(rtpmap) = line.strip_prefix("a=rtpmap:") {
+                if let Some((pt, _)) = rtpmap.split_once(' ') {
+                    out_lines.push(line.to_string());
+                    if opus_pts.iter().any(|p| p == pt)
+                        && !existing_fmtp_pts.iter().any(|p| p == pt)
+                    {
+                        out_lines.push(format!("a=fmtp:{pt} minptime=10;useinbandfec=1;stereo=1"));
+                    }
+                    continue;
+                }
+            }
+        }
+        out_lines.push(line.to_string());
+    }
+
+    let mut joined = out_lines.join(line_ending);
+    if trailing_ending {
+        joined.push_str(line_ending);
+    }
+    joined
+}
+
+fn upsert_opus_fmtp_params(params: &str) -> String {
+    let mut tokens: Vec<String> = Vec::new();
+    let mut has_fec = false;
+    let mut has_stereo = false;
+
+    for raw in params.split(';') {
+        let tok = raw.trim();
+        if tok.is_empty() {
+            continue;
+        }
+        if tok.eq_ignore_ascii_case("useinbandfec=1") || tok.eq_ignore_ascii_case("useinbandfec=0")
+        {
+            if !has_fec {
+                tokens.push("useinbandfec=1".to_string());
+                has_fec = true;
+            }
+        } else if tok.eq_ignore_ascii_case("stereo=1") || tok.eq_ignore_ascii_case("stereo=0") {
+            if !has_stereo {
+                tokens.push("stereo=1".to_string());
+                has_stereo = true;
+            }
+        } else {
+            tokens.push(tok.to_string());
+        }
+    }
+
+    if !has_fec {
+        tokens.push("useinbandfec=1".to_string());
+    }
+    if !has_stereo {
+        tokens.push("stereo=1".to_string());
+    }
+    tokens.join(";")
 }
 
 /// Extract the first `a=ice-ufrag:<value>` attribute from an SDP document.
@@ -1319,6 +1454,7 @@ mod tests {
                 remote_addr: "127.0.0.1:50000".parse().unwrap(),
                 user_agent: "test".into(),
                 client_name: None,
+                potato: false,
             })
             .expect_err("should fail without gstreamer");
         assert!(matches!(err, WebError::ServiceUnavailable(_)));
@@ -1367,10 +1503,13 @@ mod tests {
                 remote_addr: client_addr,
                 user_agent: "str0m-headless-test/1.0".into(),
                 client_name: Some("Test Phone".into()),
+                potato: false,
             })
             .expect("accept_offer succeeds");
         assert!(resp.ice_lite);
         assert!(resp.answer_sdp.contains("a=ice-lite"));
+        assert!(resp.answer_sdp.contains("useinbandfec=1"));
+        assert!(resp.answer_sdp.contains("stereo=1"));
         assert_eq!(mux.client_count(), 1);
         assert_eq!(rt.active_client_count(), 1);
 
@@ -1487,6 +1626,7 @@ mod tests {
                 remote_addr: "127.0.0.1:50001".parse().unwrap(),
                 user_agent: "bad".into(),
                 client_name: None,
+                potato: false,
             })
             .expect_err("invalid SDP should fail");
         assert!(matches!(bad_err, WebError::BadRequest(_)));
@@ -1504,6 +1644,7 @@ mod tests {
                 remote_addr: "127.0.0.1:50001".parse().unwrap(),
                 user_agent: "video-only".into(),
                 client_name: None,
+                potato: false,
             })
             .expect_err("video-only SDP should fail");
         assert!(matches!(video_err, WebError::BadRequest(_)));
@@ -1522,6 +1663,7 @@ mod tests {
                 remote_addr: "127.0.0.1:50002".parse().unwrap(),
                 user_agent: "stalled-client".into(),
                 client_name: None,
+                potato: false,
             })
             .expect("accept_offer");
         let local_ufrag = extract_ice_ufrag(&resp.answer_sdp).expect("local ufrag");
@@ -1549,6 +1691,105 @@ mod tests {
         assert_eq!(mux.client_count(), 0);
 
         mux.stop();
+        mgr.stop();
+    }
+
+    #[test]
+    fn ensure_opus_sdp_fmtp_adds_and_preserves_useinbandfec_and_stereo() {
+        // Case 1: existing fmtp without useinbandfec or stereo.
+        let sdp_with_fmtp = "v=0\r\nm=audio 9 UDP/TLS/RTP/SAVPF 111\r\na=rtpmap:111 opus/48000/2\r\na=fmtp:111 minptime=10\r\n";
+        let out = ensure_opus_sdp_fmtp(sdp_with_fmtp);
+        assert!(out.contains("a=fmtp:111 minptime=10;useinbandfec=1;stereo=1\r\n"));
+
+        // Case 2: missing fmtp line entirely -> inserted right after rtpmap.
+        let sdp_no_fmtp =
+            "v=0\r\nm=audio 9 UDP/TLS/RTP/SAVPF 109\r\na=rtpmap:109 opus/48000/2\r\na=sendonly\r\n";
+        let out_no_fmtp = ensure_opus_sdp_fmtp(sdp_no_fmtp);
+        assert!(out_no_fmtp.contains(
+            "a=rtpmap:109 opus/48000/2\r\na=fmtp:109 minptime=10;useinbandfec=1;stereo=1\r\n"
+        ));
+
+        // Case 3: explicit useinbandfec=0 / stereo=0 gets upgraded to 1 without duplication.
+        let sdp_disabled = "v=0\r\nm=audio 9 UDP/TLS/RTP/SAVPF 111\r\na=rtpmap:111 opus/48000/2\r\na=fmtp:111 minptime=10;useinbandfec=0;stereo=0\r\n";
+        let out_disabled = ensure_opus_sdp_fmtp(sdp_disabled);
+        assert!(out_disabled.contains("a=fmtp:111 minptime=10;useinbandfec=1;stereo=1\r\n"));
+        assert!(!out_disabled.contains("useinbandfec=0"));
+    }
+
+    #[test]
+    fn ice_disconnected_grace_period_recovers_before_deadline_and_evicts_after() {
+        let mgr = WebBroadcastManager::new();
+        let cfg = WebBroadcastConfig {
+            http_port: 0,
+            webrtc_udp_port: 0,
+            bind_ip: IpAddr::V4(Ipv4Addr::LOCALHOST),
+            max_clients: 2,
+            ..Default::default()
+        };
+        mgr.start(cfg, test_capture_factory()).expect("start mgr");
+        let rt = mgr.runtime().expect("runtime");
+
+        let t0 = Instant::now();
+        let rtc = RtcConfig::new().set_ice_lite(true).build(t0);
+        let slot_guard = rt.try_acquire_client_slot().expect("slot");
+        let listener_guard = rt.acquire_listener().expect("listener");
+
+        let mut peer = PeerRtc {
+            id: "rtc-test".into(),
+            rtc,
+            local_ufrag: "ufrag".into(),
+            audio_mid: None,
+            opus_pt: None,
+            ice_connected: false,
+            ice_disconnected_deadline: None,
+            connected_at: None,
+            handshake_deadline: t0 + DEFAULT_HANDSHAKE_TIMEOUT,
+            next_timeout: t0 + DEFAULT_HANDSHAKE_TIMEOUT,
+            sample_offset: 0,
+            last_frame_pts: None,
+            force_discontinuity: false,
+            control_channel: None,
+            remote_addr: "127.0.0.1:50000".into(),
+            user_agent: "test".into(),
+            connected_since: 0.0,
+            bytes_sent: 0,
+            rtt_ms: None,
+            dropped_frames: 0,
+            _slot_guard: slot_guard,
+            _listener_guard: listener_guard,
+        };
+
+        // Simulate initial connection.
+        peer.handle_ice_state_change(IceConnectionState::Connected, t0 + Duration::from_secs(1));
+        assert!(peer.ice_connected);
+        assert!(peer.ice_disconnected_deadline.is_none());
+        assert!(!peer.is_expired(t0 + Duration::from_secs(20)));
+
+        // Transition to Disconnected well after handshake_deadline: must NOT drop immediately.
+        let t_disc = t0 + Duration::from_secs(30);
+        peer.handle_ice_state_change(IceConnectionState::Disconnected, t_disc);
+        assert!(!peer.ice_connected);
+        assert_eq!(
+            peer.ice_disconnected_deadline,
+            Some(t_disc + ICE_DISCONNECTED_GRACE)
+        );
+        assert!(!peer.is_expired(t_disc));
+        assert!(!peer.is_expired(t_disc + Duration::from_secs(2)));
+
+        // Recovering to Connected before 3s cancels the grace deadline.
+        let t_rec = t_disc + Duration::from_secs(1);
+        peer.handle_ice_state_change(IceConnectionState::Connected, t_rec);
+        assert!(peer.ice_connected);
+        assert!(peer.ice_disconnected_deadline.is_none());
+        assert!(!peer.is_expired(t_disc + Duration::from_secs(10)));
+
+        // Staying Disconnected past 3s marks the peer expired.
+        let t_disc2 = t_disc + Duration::from_secs(15);
+        peer.handle_ice_state_change(IceConnectionState::Disconnected, t_disc2);
+        assert!(!peer.is_expired(t_disc2 + Duration::from_millis(2999)));
+        assert!(peer.is_expired(t_disc2 + ICE_DISCONNECTED_GRACE));
+
+        drop(peer);
         mgr.stop();
     }
 }

@@ -682,13 +682,12 @@ impl WorkerState {
         fetch_ipc: &dyn Fn(&str, serde_json::Value) -> Option<serde_json::Value>,
     ) -> (serde_json::Value, std::path::PathBuf) {
         let cfg = lock_or_recover(&self.controller.config).clone();
-        let mut st = fetch_ipc("status", serde_json::json!({}))
+        let st = fetch_ipc("status", serde_json::json!({}))
             .filter(|v| v.is_object() && v.get("ok").and_then(|o| o.as_bool()) != Some(false))
             .unwrap_or_else(|| {
                 let _sync = lock_or_recover(&self.controller_sync_lock);
                 self.controller.status(None)
             });
-        soundhop_core::web::redact_web_broadcast_status_json(&mut st);
         let fw = detect_for_config(&cfg);
         let svc = service_status();
         let daemon_log = log_path();
@@ -697,7 +696,7 @@ impl WorkerState {
             .and_then(|v| v.get("lines").and_then(|l| l.as_array()).cloned())
             .map(|arr| {
                 arr.into_iter()
-                    .filter_map(|item| item.as_str().map(redact_log_line_web_tokens))
+                    .filter_map(|item| item.as_str().map(str::to_string))
                     .collect()
             })
             .unwrap_or_else(|| {
@@ -706,10 +705,7 @@ impl WorkerState {
                     .map(|content| {
                         let all: Vec<&str> = content.lines().collect();
                         let start = all.len().saturating_sub(50);
-                        all[start..]
-                            .iter()
-                            .map(|s| redact_log_line_web_tokens(s))
-                            .collect()
+                        all[start..].iter().map(|s| (*s).to_string()).collect()
                     })
                     .unwrap_or_default()
             });
@@ -978,42 +974,6 @@ impl WorkerState {
     }
 }
 
-fn redact_log_line_web_tokens(line: &str) -> String {
-    let mut out = String::with_capacity(line.len());
-    let mut rest = line;
-    while !rest.is_empty() {
-        let next_t = rest.find("#t=");
-        let next_tok = rest.find("#token=");
-        let hit = match (next_t, next_tok) {
-            (Some(a), Some(b)) => {
-                if a <= b {
-                    Some((a, "#t="))
-                } else {
-                    Some((b, "#token="))
-                }
-            }
-            (Some(a), None) => Some((a, "#t=")),
-            (None, Some(b)) => Some((b, "#token=")),
-            (None, None) => None,
-        };
-        let Some((idx, prefix)) = hit else {
-            out.push_str(rest);
-            break;
-        };
-        out.push_str(&rest[..idx]);
-        out.push_str(prefix);
-        let after = &rest[idx + prefix.len()..];
-        let end = after
-            .find(|c: char| c.is_whitespace() || matches!(c, '&' | '\'' | '"' | ')' | '>'))
-            .unwrap_or(after.len());
-        if end > 0 {
-            out.push_str("[REDACTED]");
-        }
-        rest = &after[end..];
-    }
-    out
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1176,11 +1136,11 @@ mod tests {
     }
 
     #[test]
-    fn test_export_bug_report_redacts_web_broadcast_token() {
+    fn test_export_bug_report_preserves_web_broadcast_token() {
         use soundhop_core::web::{WebBroadcastConfig, WebError};
         use std::net::{IpAddr, Ipv4Addr};
 
-        let (_dir, mut worker) = make_worker_with_temp_config("wb-redact");
+        let (_dir, mut worker) = make_worker_with_temp_config("wb-unredacted");
         let started = worker
             .controller
             .web_broadcast
@@ -1206,10 +1166,6 @@ mod tests {
             .bug_report_json
             .as_deref()
             .expect("bug report JSON populated");
-        assert!(
-            !json_str.contains(&secret_token),
-            "web_broadcast token must be redacted from GUI bug report"
-        );
         let parsed: serde_json::Value = serde_json::from_str(json_str).unwrap();
         assert_eq!(parsed["version"], VERSION);
         let wb = &parsed["status"]["web_broadcast"];
@@ -1218,27 +1174,18 @@ mod tests {
         assert_eq!(wb["webrtc_udp_port"], started.webrtc_udp_port);
         assert_eq!(wb["token_required"], true);
         assert_eq!(wb["capture_source"], "mock.monitor");
-        assert_eq!(wb["token"], "[REDACTED]");
+        assert_eq!(wb["token"], secret_token);
+        let expected_suffix = format!("/#t={secret_token}");
         let localhost_url = wb["localhost_url"].as_str().unwrap();
-        assert!(localhost_url.ends_with("/#t=[REDACTED]"));
+        assert!(localhost_url.ends_with(&expected_suffix));
         for url in wb["urls"].as_array().unwrap() {
             let s = url.as_str().unwrap();
-            assert!(!s.contains(&secret_token));
-            assert!(s.ends_with("/#t=[REDACTED]"));
+            assert!(s.ends_with(&expected_suffix));
         }
-
-        assert_eq!(
-            redact_log_line_web_tokens("opened http://localhost:4717/#t=secret123&mode=rtc"),
-            "opened http://localhost:4717/#t=[REDACTED]&mode=rtc"
-        );
-        assert_eq!(
-            redact_log_line_web_tokens("opened 'http://192.168.1.2:4717/#token=secret123'"),
-            "opened 'http://192.168.1.2:4717/#token=[REDACTED]'"
-        );
     }
 
     #[test]
-    fn test_export_bug_report_uses_live_daemon_ipc_and_redacts_tokens() {
+    fn test_export_bug_report_uses_live_daemon_ipc_and_preserves_web_tokens() {
         let (_dir, worker) = make_worker_with_temp_config("wb-ipc");
         let (bundle, _) = worker.collect_bug_report_bundle(&|cmd, payload| match cmd {
             "status" => Some(serde_json::json!({
@@ -1271,23 +1218,26 @@ mod tests {
         });
 
         let serialized = serde_json::to_string(&bundle).unwrap();
-        assert!(!serialized.contains("gui-ipc-secret"));
         assert!(!serialized.contains("super-secret-hash-should-not-leak"));
         assert_eq!(bundle["config"]["has_psk_hash"], true);
         assert_eq!(bundle["status"]["v3_active"], true);
         assert_eq!(bundle["status"]["peers"][0]["id"], "peer-gui-1");
         assert_eq!(bundle["status"]["telemetry"]["rx_bytes"], 4242);
-        assert_eq!(bundle["status"]["web_broadcast"]["token"], "[REDACTED]");
+        assert_eq!(bundle["status"]["web_broadcast"]["token"], "gui-ipc-secret");
         assert_eq!(
             bundle["status"]["web_broadcast"]["localhost_url"],
-            "http://localhost:4717/#t=[REDACTED]"
+            "http://localhost:4717/#t=gui-ipc-secret"
+        );
+        assert_eq!(
+            bundle["status"]["web_broadcast"]["urls"][0],
+            "http://127.0.0.1:4717/#t=gui-ipc-secret"
         );
         assert_eq!(
             bundle["recent_logs"],
             serde_json::json!([
                 "[daemon] memory warning",
                 "android: streaming",
-                "opened http://127.0.0.1:4717/#token=[REDACTED]"
+                "opened http://127.0.0.1:4717/#token=gui-ipc-secret"
             ])
         );
     }

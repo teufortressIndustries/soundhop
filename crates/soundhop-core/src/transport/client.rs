@@ -21,6 +21,7 @@ use crate::transport::{
 };
 
 const DEFAULT_CONNECT_TIMEOUT: Duration = Duration::from_secs(3);
+const HANDSHAKE_TIMEOUT: Duration = Duration::from_secs(2);
 const DEFAULT_BOUNDED_WRITE_TIMEOUT: Duration = Duration::from_secs(2);
 const KEEPALIVE_IDLE_TIME: Duration = Duration::from_secs(5);
 const KEEPALIVE_INTERVAL: Duration = Duration::from_secs(2);
@@ -161,11 +162,14 @@ impl Sht3ClientConnection {
         k_pair: &[u8; 32],
     ) -> TransportResult<Self> {
         let mut stream = TcpStream::connect_timeout(&addr, config.connect_timeout)?;
-        configure_socket_defaults(
-            &stream,
-            config.io_timeout,
-            bounded_write_timeout(config.io_timeout),
-        )?;
+        // Use a >=2s handshake timeout while waiting for ServerHello (peer media
+        // pipeline cold-start can exceed steady-state io_timeout such as 200ms).
+        let handshake_timeout = Some(
+            config
+                .io_timeout
+                .map_or(HANDSHAKE_TIMEOUT, |d| d.max(HANDSHAKE_TIMEOUT)),
+        );
+        configure_socket_defaults(&stream, handshake_timeout, handshake_timeout)?;
 
         let client_eph = EphemeralKeypair::generate();
         let client_pk = client_eph.public_bytes();
@@ -189,6 +193,8 @@ impl Sht3ClientConnection {
         stream.flush()?;
 
         let (server_hello, server_body) = ServerHello::read_from(&mut stream)?;
+        stream.set_read_timeout(config.io_timeout)?;
+        stream.set_write_timeout(bounded_write_timeout(config.io_timeout))?;
         match server_hello.status {
             HandshakeStatus::Ok => {}
             HandshakeStatus::AuthFailed => {
@@ -715,5 +721,87 @@ mod tests {
             .expect("tampered rtp_port must fail ServerHello MAC verification");
         assert!(matches!(err, TransportError::AuthRejected(_)));
         mitm.join().unwrap();
+    }
+
+    #[test]
+    fn slow_server_hello_exceeding_io_timeout_succeeds_and_applies_io_timeout_after_handshake() {
+        let k_pair = [0x88; 32];
+        let raw_listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let addr = raw_listener.local_addr().unwrap();
+
+        let (done_tx, done_rx) = std::sync::mpsc::channel::<()>();
+
+        let server_handle = thread::spawn(move || {
+            let (mut stream, _) = raw_listener.accept().unwrap();
+            let (ch, client_transcript) = ClientHello::read_from(&mut stream).unwrap();
+            assert_eq!(ch.version, SHT4_VERSION);
+            assert!(crate::transport::crypto::verify_client_hello_mac(
+                &k_pair,
+                &client_transcript,
+                &ch.mac_c
+            ));
+
+            // Simulate peer media pipeline cold-start exceeding steady-state 200ms io_timeout.
+            thread::sleep(Duration::from_millis(350));
+
+            let s_eph = EphemeralKeypair::generate();
+            let mut sh = ServerHello {
+                status: HandshakeStatus::Ok,
+                server_device_id: "slow-srv".into(),
+                server_pk: s_eph.public_bytes(),
+                server_nonce: generate_nonce(),
+                audio_params: ch.audio_params,
+                initial_volume: 100,
+                initial_muted: false,
+                rtp_port: 4716,
+                srtp_suite: SRTP_SUITE_AES128_ICM_HMAC_SHA1_80,
+                mac_s: [0u8; 32],
+            };
+            let body = sh.encode_body().unwrap();
+            let mut full = Vec::with_capacity(client_transcript.len() + body.len());
+            full.extend_from_slice(&client_transcript);
+            full.extend_from_slice(&body);
+            sh.mac_s = crate::transport::crypto::compute_server_hello_mac(&k_pair, &full);
+            sh.write_to(&mut stream).unwrap();
+            stream.flush().unwrap();
+
+            // Hold socket open without sending frames until client verifies post-handshake io_timeout.
+            let _ = done_rx.recv();
+        });
+
+        let mut cfg = Sht3ClientConfig::new(
+            "slow-hello-client",
+            AudioProfile::OpusBalanced.to_audio_params(40),
+        );
+        cfg.io_timeout = Some(Duration::from_millis(200));
+
+        let mut client = Sht3ClientConnection::connect(addr, cfg, &k_pair)
+            .expect("handshake must use >=2s timeout and survive 350ms ServerHello");
+        assert_eq!(client.server_device_id(), "slow-srv");
+
+        // Post-handshake reads must honor the configured 200ms io_timeout, not the 2s handshake timeout.
+        let read_start = std::time::Instant::now();
+        let err = client
+            .recv_frame()
+            .expect_err("idle post-handshake read must time out at io_timeout");
+        assert!(
+            matches!(
+                err,
+                TransportError::Io(ref io_err)
+                    if matches!(
+                        io_err.kind(),
+                        std::io::ErrorKind::TimedOut | std::io::ErrorKind::WouldBlock
+                    )
+            ),
+            "expected timeout I/O error, got {err:?}"
+        );
+        assert!(
+            read_start.elapsed() < Duration::from_secs(1),
+            "post-handshake io_timeout took too long: {:?}",
+            read_start.elapsed()
+        );
+
+        let _ = done_tx.send(());
+        server_handle.join().unwrap();
     }
 }

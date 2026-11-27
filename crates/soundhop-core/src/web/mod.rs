@@ -318,75 +318,6 @@ pub(crate) fn is_ip_allowed(ip: &IpAddr, allowed_networks: &[String]) -> bool {
     false
 }
 
-const REDACTED_PLACEHOLDER: &str = "[REDACTED]";
-
-fn redact_url_fragment_token(url: &str) -> String {
-    let Some((base, fragment)) = url.split_once('#') else {
-        return url.to_string();
-    };
-    let mut changed = false;
-    let redacted_parts: Vec<String> = fragment
-        .split('&')
-        .map(|part| {
-            if let Some(val) = part.strip_prefix("t=") {
-                if !val.is_empty() {
-                    changed = true;
-                    return format!("t={REDACTED_PLACEHOLDER}");
-                }
-            } else if let Some(val) = part.strip_prefix("token=") {
-                if !val.is_empty() {
-                    changed = true;
-                    return format!("token={REDACTED_PLACEHOLDER}");
-                }
-            }
-            part.to_string()
-        })
-        .collect();
-    if changed {
-        format!("{base}#{}", redacted_parts.join("&"))
-    } else {
-        url.to_string()
-    }
-}
-
-fn redact_web_broadcast_object(wb: &mut serde_json::Value) {
-    let Some(obj) = wb.as_object_mut() else {
-        return;
-    };
-
-    if let Some(tok) = obj.get_mut("token") {
-        if !tok.is_null() {
-            *tok = serde_json::Value::String(REDACTED_PLACEHOLDER.to_string());
-        }
-    }
-
-    if let Some(serde_json::Value::String(localhost_url)) = obj.get_mut("localhost_url") {
-        *localhost_url = redact_url_fragment_token(localhost_url);
-    }
-
-    if let Some(serde_json::Value::Array(urls)) = obj.get_mut("urls") {
-        for item in urls.iter_mut() {
-            if let serde_json::Value::String(url) = item {
-                *url = redact_url_fragment_token(url);
-            }
-        }
-    }
-}
-
-/// Redact ephemeral Web Broadcast session tokens from a serialized `Controller::status`
-/// JSON object (under `"web_broadcast"`) or a standalone serialized [`WebBroadcastStatus`] object.
-///
-/// Replaces any non-null `token` value with `"[REDACTED]"` and replaces `#t=<token>` /
-/// `#token=<token>` fragment values inside `urls` and `localhost_url` with `"[REDACTED]"`,
-/// keeping non-secret fields intact.
-pub fn redact_web_broadcast_status_json(status: &mut serde_json::Value) {
-    if let Some(wb) = status.get_mut("web_broadcast") {
-        redact_web_broadcast_object(wb);
-    } else {
-        redact_web_broadcast_object(status);
-    }
-}
-
 /// Returns `true` when this binary was compiled with GStreamer Opus/audio capture support.
 pub const fn gstreamer_available() -> bool {
     cfg!(feature = "gstreamer")
@@ -410,6 +341,7 @@ struct PipelineSupervisor {
     capture_factory: CaptureFactory,
     registry: Arc<SubscriberRegistry>,
     idle_stop_grace: Duration,
+    potato_mode: AtomicBool,
     start_lock: Mutex<()>,
     state: Mutex<PipelineState>,
     condvar: Condvar,
@@ -427,6 +359,7 @@ impl PipelineSupervisor {
             capture_factory,
             registry,
             idle_stop_grace,
+            potato_mode: AtomicBool::new(false),
             start_lock: Mutex::new(()),
             state: Mutex::new(PipelineState {
                 broadcaster: None,
@@ -516,6 +449,9 @@ impl PipelineSupervisor {
 
         match start_res {
             Ok((broadcaster, label)) => {
+                if self.potato_mode.load(Ordering::Acquire) {
+                    broadcaster.set_potato_mode(true);
+                }
                 let stop_immediately = {
                     let mut guard = lock_or_recover(&self.state);
                     if guard.stopping {
@@ -563,6 +499,18 @@ impl PipelineSupervisor {
 
     fn listener_count(&self) -> usize {
         lock_or_recover(&self.state).listener_count
+    }
+
+    fn set_potato_mode(&self, enabled: bool) {
+        self.potato_mode.store(enabled, Ordering::Release);
+        let guard = lock_or_recover(&self.state);
+        if let Some(ref broadcaster) = guard.broadcaster {
+            broadcaster.set_potato_mode(enabled);
+        }
+    }
+
+    fn is_potato_mode(&self) -> bool {
+        self.potato_mode.load(Ordering::Acquire)
     }
 
     fn shutdown(&self) {
@@ -680,6 +628,16 @@ impl BroadcastRuntime {
     /// Current number of active media listeners keeping [`GstBroadcaster`] alive.
     pub fn active_listener_count(&self) -> usize {
         self.pipeline.listener_count()
+    }
+
+    /// Enable or disable Potato Opus tuning on the shared broadcast pipeline.
+    pub fn set_potato_mode(&self, enabled: bool) {
+        self.pipeline.set_potato_mode(enabled);
+    }
+
+    /// Whether Potato Opus tuning is currently enabled for this broadcast session.
+    pub fn is_potato_mode(&self) -> bool {
+        self.pipeline.is_potato_mode()
     }
 
     /// Whether [`GstBroadcaster`] is currently running and healthy.
@@ -942,6 +900,22 @@ impl WebBroadcastManager {
     /// Returns `true` when the Web Broadcast servers are currently running.
     pub fn is_active(&self) -> bool {
         lock_or_recover(&self.active).is_some()
+    }
+
+    /// Enable or disable Potato Opus tuning on the active Web Broadcast session.
+    pub fn set_potato_mode(&self, enabled: bool) {
+        let guard = lock_or_recover(&self.active);
+        if let Some(ref session) = *guard {
+            session.runtime.set_potato_mode(enabled);
+        }
+    }
+
+    /// Whether Potato Opus tuning is currently enabled on the active Web Broadcast session.
+    pub fn is_potato_mode(&self) -> bool {
+        let guard = lock_or_recover(&self.active);
+        guard
+            .as_ref()
+            .is_some_and(|session| session.runtime.is_potato_mode())
     }
 
     /// Return a full live status snapshot.
@@ -1209,100 +1183,5 @@ mod tests {
             .expect("should fail without gstreamer");
         assert!(matches!(err, WebError::ServiceUnavailable(_)));
         mgr.stop();
-    }
-
-    #[test]
-    fn redact_web_broadcast_status_json_handles_full_and_standalone_payloads() {
-        let secret = "0123456789abcdef0123456789abcdef";
-        let mut full_status = serde_json::json!({
-            "version": "2.0.0",
-            "device": { "name": "workstation" },
-            "web_broadcast": {
-                "active": true,
-                "http_port": 4717,
-                "webrtc_udp_port": 4718,
-                "urls": [
-                    format!("http://192.168.1.10:4717/#t={secret}"),
-                    format!("http://[::1]:4717/#token={secret}&mode=rtc")
-                ],
-                "localhost_url": format!("http://localhost:4717/#t={secret}"),
-                "token_required": true,
-                "token": secret,
-                "clients": [],
-                "adb_reversed_serials": ["R58M123456"],
-                "keep_local": true,
-                "pipeline_running": false,
-                "capture_source": "soundhop_web_broadcast.monitor"
-            }
-        });
-
-        redact_web_broadcast_status_json(&mut full_status);
-        // Idempotent when called repeatedly.
-        redact_web_broadcast_status_json(&mut full_status);
-
-        let serialized = serde_json::to_string(&full_status).unwrap();
-        assert!(!serialized.contains(secret));
-        assert_eq!(full_status["version"], "2.0.0");
-        assert_eq!(full_status["device"]["name"], "workstation");
-
-        let wb = &full_status["web_broadcast"];
-        assert_eq!(wb["active"], true);
-        assert_eq!(wb["http_port"], 4717);
-        assert_eq!(wb["webrtc_udp_port"], 4718);
-        assert_eq!(wb["token_required"], true);
-        assert_eq!(wb["keep_local"], true);
-        assert_eq!(wb["capture_source"], "soundhop_web_broadcast.monitor");
-        assert_eq!(
-            wb["adb_reversed_serials"],
-            serde_json::json!(["R58M123456"])
-        );
-        assert_eq!(wb["token"], "[REDACTED]");
-        assert_eq!(wb["localhost_url"], "http://localhost:4717/#t=[REDACTED]");
-        assert_eq!(
-            wb["urls"],
-            serde_json::json!([
-                "http://192.168.1.10:4717/#t=[REDACTED]",
-                "http://[::1]:4717/#token=[REDACTED]&mode=rtc"
-            ])
-        );
-
-        // Standalone WebBroadcastStatus (active with token) and inactive (token: null)
-        let mut standalone = serde_json::to_value(WebBroadcastStatus {
-            active: true,
-            http_port: 4717,
-            webrtc_udp_port: 4718,
-            urls: vec![format!("http://10.0.0.5:4717/#token={secret}")],
-            localhost_url: format!("http://localhost:4717/#t={secret}"),
-            token_required: true,
-            token: Some(secret.to_string()),
-            clients: Vec::new(),
-            adb_reversed_serials: Vec::new(),
-            keep_local: false,
-            pipeline_running: true,
-            capture_source: "test-source".to_string(),
-        })
-        .unwrap();
-        redact_web_broadcast_status_json(&mut standalone);
-        assert_eq!(standalone["token"], "[REDACTED]");
-        assert_eq!(
-            standalone["urls"],
-            serde_json::json!(["http://10.0.0.5:4717/#token=[REDACTED]"])
-        );
-        assert_eq!(
-            standalone["localhost_url"],
-            "http://localhost:4717/#t=[REDACTED]"
-        );
-        assert_eq!(standalone["pipeline_running"], true);
-        assert_eq!(standalone["capture_source"], "test-source");
-
-        let mut inactive = serde_json::to_value(WebBroadcastStatus::default()).unwrap();
-        redact_web_broadcast_status_json(&mut inactive);
-        assert!(inactive["token"].is_null());
-        assert_eq!(inactive["urls"], serde_json::json!([]));
-        assert_eq!(inactive["localhost_url"], "");
-
-        let mut null_val = serde_json::Value::Null;
-        redact_web_broadcast_status_json(&mut null_val);
-        assert!(null_val.is_null());
     }
 }

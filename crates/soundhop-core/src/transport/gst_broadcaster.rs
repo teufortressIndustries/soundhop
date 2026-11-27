@@ -54,6 +54,18 @@ const RESTART_MAX_BACKOFF_MS: u64 = 2_000;
 const MAX_CONSECUTIVE_RESTARTS: u32 = 8;
 #[cfg(feature = "gstreamer")]
 const HEALTHY_RUN_RESET_SECS: u64 = 5;
+#[cfg(feature = "gstreamer")]
+const NORMAL_OPUS_PACKET_LOSS_PCT: i32 = 10;
+#[cfg(feature = "gstreamer")]
+const NORMAL_OPUS_FRAME_SIZE: &str = "20";
+#[cfg(feature = "gstreamer")]
+const POTATO_OPUS_BITRATE_BPS: i32 = 48_000;
+#[cfg(feature = "gstreamer")]
+const POTATO_OPUS_PACKET_LOSS_PCT: i32 = 25;
+#[cfg(feature = "gstreamer")]
+const POTATO_OPUS_FRAME_SIZE: &str = "40";
+#[cfg(feature = "gstreamer")]
+const POTATO_OPUS_FRAME_SAMPLES: u32 = BROADCAST_FRAME_SAMPLES * 2;
 
 /// Immutable audio frame fanned out from [`GstBroadcaster`] to WebRTC and WebSocket subscribers.
 #[derive(Debug, Clone)]
@@ -396,6 +408,7 @@ struct PipelineCounters {
     pcm_frames_emitted: Arc<AtomicU64>,
     opus_frames_skipped: Arc<AtomicU64>,
     pcm_frames_skipped: Arc<AtomicU64>,
+    opus_frame_samples: Arc<AtomicU32>,
 }
 
 /// Single shared live GStreamer capture + Opus/PCM fan-out pipeline.
@@ -404,10 +417,13 @@ pub struct GstBroadcaster {
     registry: Arc<SubscriberRegistry>,
     stop_flag: Arc<AtomicBool>,
     healthy: Arc<AtomicBool>,
+    potato_mode: Arc<AtomicBool>,
+    base_bitrate_bps: i32,
     restart_count: Arc<AtomicU64>,
     counters: PipelineCounters,
     last_error: Arc<Mutex<Option<String>>>,
     active_bus: Arc<Mutex<Option<gst::Bus>>>,
+    active_opusenc: Arc<Mutex<Option<gst::Element>>>,
     bus_thread: Mutex<Option<JoinHandle<()>>>,
 }
 
@@ -434,6 +450,9 @@ impl GstBroadcaster {
             bitrate_kbps: audio_params.bitrate_kbps,
             jitter_ms: audio_params.jitter_ms,
         };
+        let base_bitrate_bps =
+            (i32::from(normalized_params.bitrate_kbps) * 1000).clamp(16_000, 510_000);
+        let potato_mode = Arc::new(AtomicBool::new(false));
 
         let counters = PipelineCounters {
             registry: Arc::clone(&registry),
@@ -443,10 +462,15 @@ impl GstBroadcaster {
             pcm_frames_emitted: Arc::new(AtomicU64::new(0)),
             opus_frames_skipped: Arc::new(AtomicU64::new(0)),
             pcm_frames_skipped: Arc::new(AtomicU64::new(0)),
+            opus_frame_samples: Arc::new(AtomicU32::new(BROADCAST_FRAME_SAMPLES)),
         };
 
-        let initial_pipeline =
-            start_broadcaster_pipeline(&endpoint, &normalized_params, &counters)?;
+        let (initial_pipeline, initial_opusenc) = start_broadcaster_pipeline(
+            &endpoint,
+            &normalized_params,
+            &counters,
+            potato_mode.load(Ordering::Acquire),
+        )?;
         let initial_bus = initial_pipeline.bus();
 
         let stop_flag = Arc::new(AtomicBool::new(false));
@@ -454,6 +478,7 @@ impl GstBroadcaster {
         let restart_count = Arc::new(AtomicU64::new(0));
         let last_error = Arc::new(Mutex::new(None));
         let active_bus = Arc::new(Mutex::new(initial_bus));
+        let active_opusenc = Arc::new(Mutex::new(Some(initial_opusenc)));
 
         let bus_thread = spawn_bus_watchdog(
             initial_pipeline,
@@ -462,19 +487,24 @@ impl GstBroadcaster {
             counters.clone(),
             Arc::clone(&stop_flag),
             Arc::clone(&healthy),
+            Arc::clone(&potato_mode),
             Arc::clone(&restart_count),
             Arc::clone(&last_error),
             Arc::clone(&active_bus),
+            Arc::clone(&active_opusenc),
         )?;
 
         Ok(Self {
             registry,
             stop_flag,
             healthy,
+            potato_mode,
+            base_bitrate_bps,
             restart_count,
             counters,
             last_error,
             active_bus,
+            active_opusenc,
             bus_thread: Mutex::new(Some(bus_thread)),
         })
     }
@@ -546,6 +576,28 @@ impl GstBroadcaster {
         self.registry.evicted_subscribers_total()
     }
 
+    /// Enable or disable Potato Opus tuning (`48 kbps`, `packet-loss-percentage=25`, `frame-size=40`).
+    pub fn set_potato_mode(&self, enabled: bool) {
+        self.potato_mode.store(enabled, Ordering::Release);
+        if let Some(ref opusenc) = *self
+            .active_opusenc
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+        {
+            apply_opus_tuning(
+                opusenc,
+                self.base_bitrate_bps,
+                enabled,
+                &self.counters.opus_frame_samples,
+            );
+        }
+    }
+
+    /// Whether Potato Opus tuning is currently enabled.
+    pub fn is_potato_mode(&self) -> bool {
+        self.potato_mode.load(Ordering::Acquire)
+    }
+
     /// Deadlock-free stop: mark stopped, clear subscribers, flush bus, and join watchdog thread.
     pub fn stop(&self) {
         self.stop_flag.store(true, Ordering::Release);
@@ -584,11 +636,32 @@ fn teardown_pipeline(pipeline: &gst::Pipeline) {
 }
 
 #[cfg(feature = "gstreamer")]
+fn apply_opus_tuning(
+    opusenc: &gst::Element,
+    base_bitrate_bps: i32,
+    potato: bool,
+    opus_frame_samples: &AtomicU32,
+) {
+    if potato {
+        opusenc.set_property("bitrate", POTATO_OPUS_BITRATE_BPS);
+        opusenc.set_property("packet-loss-percentage", POTATO_OPUS_PACKET_LOSS_PCT);
+        opusenc.set_property_from_str("frame-size", POTATO_OPUS_FRAME_SIZE);
+        opus_frame_samples.store(POTATO_OPUS_FRAME_SAMPLES, Ordering::Release);
+    } else {
+        opusenc.set_property("bitrate", base_bitrate_bps);
+        opusenc.set_property("packet-loss-percentage", NORMAL_OPUS_PACKET_LOSS_PCT);
+        opusenc.set_property_from_str("frame-size", NORMAL_OPUS_FRAME_SIZE);
+        opus_frame_samples.store(BROADCAST_FRAME_SAMPLES, Ordering::Release);
+    }
+}
+
+#[cfg(feature = "gstreamer")]
 fn start_broadcaster_pipeline(
     endpoint: &CaptureEndpoint,
     audio_params: &AudioParams,
     counters: &PipelineCounters,
-) -> TransportResult<gst::Pipeline> {
+    potato: bool,
+) -> TransportResult<(gst::Pipeline, gst::Element)> {
     let pipeline = gst::Pipeline::new();
     let (source, _netsim_cfg) = build_capture_source(endpoint, audio_params)?;
     let audioconvert = make_element("audioconvert", None)?;
@@ -624,10 +697,8 @@ fn start_broadcaster_pipeline(
     opusenc.set_property("complexity", 8i32);
     opusenc.set_property("dtx", false);
     opusenc.set_property("inband-fec", true);
-    opusenc.set_property("packet-loss-percentage", 10i32);
     let bitrate_bps = (i32::from(audio_params.bitrate_kbps) * 1000).clamp(16_000, 510_000);
-    opusenc.set_property("bitrate", bitrate_bps);
-    opusenc.set_property_from_str("frame-size", "20");
+    apply_opus_tuning(&opusenc, bitrate_bps, potato, &counters.opus_frame_samples);
 
     let opus_sink_elem = make_element("appsink", Some("opus_sink"))?;
     let opus_sink = opus_sink_elem
@@ -659,6 +730,7 @@ fn start_broadcaster_pipeline(
         let seq_counter = Arc::clone(&counters.opus_seq);
         let emitted_counter = Arc::clone(&counters.opus_frames_emitted);
         let skipped_counter = Arc::clone(&counters.opus_frames_skipped);
+        let frame_samples_atomic = Arc::clone(&counters.opus_frame_samples);
         let mut pts_samples: u64 = 0;
         let mut wakeup_scratch: Vec<WakeupHook> = Vec::with_capacity(2);
 
@@ -666,10 +738,10 @@ fn start_broadcaster_pipeline(
             gst_app::AppSinkCallbacks::builder()
                 .new_sample(move |sink| {
                     let sample = sink.pull_sample().map_err(|_| gst::FlowError::Eos)?;
+                    let frame_samples = frame_samples_atomic.load(Ordering::Acquire);
                     if reg.opus_count() == 0 {
                         skipped_counter.fetch_add(1, Ordering::Relaxed);
-                        pts_samples =
-                            pts_samples.saturating_add(u64::from(BROADCAST_FRAME_SAMPLES));
+                        pts_samples = pts_samples.saturating_add(u64::from(frame_samples));
                         return Ok(gst::FlowSuccess::Ok);
                     }
                     let buffer = sample.buffer().ok_or(gst::FlowError::Error)?;
@@ -681,11 +753,11 @@ fn start_broadcaster_pipeline(
                     let data: Arc<[u8]> = Arc::from(bytes);
                     let seq = seq_counter.fetch_add(1, Ordering::Relaxed);
                     let frame_pts = pts_samples;
-                    pts_samples = pts_samples.saturating_add(u64::from(BROADCAST_FRAME_SAMPLES));
+                    pts_samples = pts_samples.saturating_add(u64::from(frame_samples));
                     let frame = Arc::new(BroadcastFrame {
                         seq,
                         pts_samples: frame_pts,
-                        duration_samples: BROADCAST_FRAME_SAMPLES,
+                        duration_samples: frame_samples,
                         captured_at: Instant::now(),
                         data,
                     });
@@ -827,7 +899,7 @@ fn start_broadcaster_pipeline(
         )));
     }
 
-    Ok(pipeline)
+    Ok((pipeline, opusenc))
 }
 
 #[cfg(feature = "gstreamer")]
@@ -859,9 +931,11 @@ fn spawn_bus_watchdog(
     counters: PipelineCounters,
     stop_flag: Arc<AtomicBool>,
     healthy: Arc<AtomicBool>,
+    potato_mode: Arc<AtomicBool>,
     restart_count: Arc<AtomicU64>,
     last_error: Arc<Mutex<Option<String>>>,
     active_bus: Arc<Mutex<Option<gst::Bus>>>,
+    active_opusenc: Arc<Mutex<Option<gst::Element>>>,
 ) -> TransportResult<JoinHandle<()>> {
     let cleanup_pipeline = pipeline.clone();
     let cleanup_bus = Arc::clone(&active_bus);
@@ -915,6 +989,7 @@ fn spawn_bus_watchdog(
                 }
 
                 *active_bus.lock().unwrap_or_else(|e| e.into_inner()) = None;
+                *active_opusenc.lock().unwrap_or_else(|e| e.into_inner()) = None;
                 teardown_pipeline(&pipeline);
 
                 if pipeline_started_at.elapsed() >= Duration::from_secs(HEALTHY_RUN_RESET_SECS) {
@@ -934,10 +1009,17 @@ fn spawn_bus_watchdog(
                     if sleep_interruptible(delay, &stop_flag) {
                         return;
                     }
-                    match start_broadcaster_pipeline(&endpoint, &audio_params, &counters) {
-                        Ok(new_pipeline) => {
+                    match start_broadcaster_pipeline(
+                        &endpoint,
+                        &audio_params,
+                        &counters,
+                        potato_mode.load(Ordering::Acquire),
+                    ) {
+                        Ok((new_pipeline, new_opusenc)) => {
                             let new_bus = new_pipeline.bus();
                             *active_bus.lock().unwrap_or_else(|e| e.into_inner()) = new_bus;
+                            *active_opusenc.lock().unwrap_or_else(|e| e.into_inner()) =
+                                Some(new_opusenc);
                             pipeline = new_pipeline;
                             pipeline_started_at = Instant::now();
                             healthy.store(true, Ordering::Release);
@@ -955,6 +1037,7 @@ fn spawn_bus_watchdog(
             }
 
             *active_bus.lock().unwrap_or_else(|e| e.into_inner()) = None;
+            *active_opusenc.lock().unwrap_or_else(|e| e.into_inner()) = None;
             teardown_pipeline(&pipeline);
         })
         .map_err(|err| {
@@ -1065,6 +1148,12 @@ impl GstBroadcaster {
 
     pub fn evicted_subscribers(&self) -> u64 {
         0
+    }
+
+    pub fn set_potato_mode(&self, _enabled: bool) {}
+
+    pub fn is_potato_mode(&self) -> bool {
+        false
     }
 
     pub fn stop(&self) {
@@ -1365,5 +1454,52 @@ mod tests {
 
         broadcaster.stop();
         assert!(!broadcaster.is_healthy());
+    }
+
+    #[cfg(feature = "gstreamer")]
+    #[test]
+    fn potato_mode_tunes_running_opusenc_safely() {
+        let broadcaster = GstBroadcaster::start(
+            CaptureEndpoint::TestSineWave {
+                freq_hz: 440.0,
+                netsim: None,
+            },
+            AudioParams::default(),
+        )
+        .expect("GstBroadcaster must start");
+
+        let opus_sub = broadcaster.subscribe_opus(None);
+        assert!(!broadcaster.is_potato_mode());
+
+        // Receive at least one normal 20ms (960-sample) frame.
+        let normal_frame = opus_sub
+            .recv_timeout(Duration::from_secs(2))
+            .expect("normal opus frame");
+        assert_eq!(normal_frame.duration_samples, BROADCAST_FRAME_SAMPLES);
+
+        // Enable Potato mode on the running pipeline and verify 40ms (1920-sample) frames emit.
+        broadcaster.set_potato_mode(true);
+        assert!(broadcaster.is_potato_mode());
+
+        let deadline = Instant::now() + Duration::from_secs(3);
+        let mut saw_40ms = false;
+        while Instant::now() < deadline {
+            if let Ok(frame) = opus_sub.recv_timeout(Duration::from_millis(100)) {
+                if frame.duration_samples == 1920 {
+                    saw_40ms = true;
+                    break;
+                }
+            }
+        }
+        assert!(
+            saw_40ms,
+            "expected 40ms (1920-sample) Opus frames in Potato mode"
+        );
+
+        // Toggle back to normal mode safely.
+        broadcaster.set_potato_mode(false);
+        assert!(!broadcaster.is_potato_mode());
+
+        broadcaster.stop();
     }
 }

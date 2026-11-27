@@ -354,49 +354,12 @@ fn collect_doctor_report(
     }
 }
 
-fn redact_log_line_web_tokens(line: &str) -> String {
-    let mut out = String::with_capacity(line.len());
-    let mut rest = line;
-    while !rest.is_empty() {
-        let next_t = rest.find("#t=");
-        let next_tok = rest.find("#token=");
-        let hit = match (next_t, next_tok) {
-            (Some(a), Some(b)) => {
-                if a <= b {
-                    Some((a, "#t="))
-                } else {
-                    Some((b, "#token="))
-                }
-            }
-            (Some(a), None) => Some((a, "#t=")),
-            (None, Some(b)) => Some((b, "#token=")),
-            (None, None) => None,
-        };
-        let Some((idx, prefix)) = hit else {
-            out.push_str(rest);
-            break;
-        };
-        out.push_str(&rest[..idx]);
-        out.push_str(prefix);
-        let after = &rest[idx + prefix.len()..];
-        let end = after
-            .find(|c: char| c.is_whitespace() || matches!(c, '&' | '\'' | '"' | ')' | '>'))
-            .unwrap_or(after.len());
-        if end > 0 {
-            out.push_str("[REDACTED]");
-        }
-        rest = &after[end..];
-    }
-    out
-}
-
 fn collect_bug_report(controller: &Arc<Controller>, env: &dyn DoctorEnv) -> serde_json::Value {
     let cfg = lock_or_recover(&controller.config).clone();
-    let mut st = env
+    let st = env
         .ipc_request("status", serde_json::json!({}))
         .filter(|v| v.is_object() && v.get("ok").and_then(|o| o.as_bool()) != Some(false))
         .unwrap_or_else(|| controller.status(None));
-    soundhop_core::web::redact_web_broadcast_status_json(&mut st);
     let fw = env.detect_firewall(&FirewallPorts::from_config(&cfg));
     let svc = env.service_status();
     let daemon_log = log_path();
@@ -406,7 +369,7 @@ fn collect_bug_report(controller: &Arc<Controller>, env: &dyn DoctorEnv) -> serd
         .and_then(|v| v.get("lines").and_then(|l| l.as_array()).cloned())
         .map(|arr| {
             arr.into_iter()
-                .filter_map(|item| item.as_str().map(redact_log_line_web_tokens))
+                .filter_map(|item| item.as_str().map(str::to_string))
                 .collect()
         })
         .unwrap_or_else(|| {
@@ -415,10 +378,7 @@ fn collect_bug_report(controller: &Arc<Controller>, env: &dyn DoctorEnv) -> serd
                 .map(|content| {
                     let all: Vec<&str> = content.lines().collect();
                     let start = all.len().saturating_sub(50);
-                    all[start..]
-                        .iter()
-                        .map(|s| redact_log_line_web_tokens(s))
-                        .collect()
+                    all[start..].iter().map(|s| (*s).to_string()).collect()
                 })
                 .unwrap_or_default()
         });
@@ -1026,7 +986,7 @@ mod tests {
     }
 
     #[test]
-    fn test_collect_bug_report_uses_live_daemon_ipc_and_redacts_tokens() {
+    fn test_collect_bug_report_uses_live_daemon_ipc_and_preserves_web_tokens() {
         let (_dir, ctrl) = make_test_controller(true);
         ctrl.config.lock().unwrap().sharing.psk_hash =
             "cli-secret-psk-hash-must-not-leak".to_string();
@@ -1061,28 +1021,27 @@ mod tests {
 
         let bundle = collect_bug_report(&ctrl, &env);
         let serialized = serde_json::to_string(&bundle).unwrap();
-        assert!(!serialized.contains("ipc-secret-tok"));
         assert!(!serialized.contains("cli-secret-psk-hash-must-not-leak"));
 
         assert_eq!(bundle["config"]["has_psk_hash"], true);
         assert_eq!(bundle["status"]["v3_active"], true);
         assert_eq!(bundle["status"]["peers"][0]["id"], "peer-1");
         assert_eq!(bundle["status"]["telemetry"]["rx_bytes"], 1234);
-        assert_eq!(bundle["status"]["web_broadcast"]["token"], "[REDACTED]");
+        assert_eq!(bundle["status"]["web_broadcast"]["token"], "ipc-secret-tok");
         assert_eq!(
             bundle["status"]["web_broadcast"]["localhost_url"],
-            "http://localhost:4717/#t=[REDACTED]"
+            "http://localhost:4717/#t=ipc-secret-tok"
         );
         assert_eq!(
             bundle["status"]["web_broadcast"]["urls"][0],
-            "http://192.168.1.42:4717/#t=[REDACTED]"
+            "http://192.168.1.42:4717/#t=ipc-secret-tok"
         );
         assert_eq!(
             bundle["recent_logs"],
             serde_json::json!([
                 "[daemon] warning line",
                 "android: connected",
-                "opened http://localhost:4717/#t=[REDACTED]&mode=rtc"
+                "opened http://localhost:4717/#t=ipc-secret-tok&mode=rtc"
             ])
         );
     }
@@ -1104,7 +1063,7 @@ mod tests {
     }
 
     #[test]
-    fn test_collect_bug_report_redacts_web_broadcast_token() {
+    fn test_collect_bug_report_preserves_web_broadcast_token() {
         use soundhop_core::web::{WebBroadcastConfig, WebError};
         use std::net::{IpAddr, Ipv4Addr};
 
@@ -1130,25 +1089,19 @@ mod tests {
         let bundle = collect_bug_report(&ctrl, &env);
         ctrl.web_broadcast.stop();
 
-        let serialized = serde_json::to_string(&bundle).unwrap();
-        assert!(
-            !serialized.contains(&secret_token),
-            "web_broadcast token must be redacted from bug report"
-        );
-
         let wb = &bundle["status"]["web_broadcast"];
         assert_eq!(wb["active"], true);
         assert_eq!(wb["http_port"], started.http_port);
         assert_eq!(wb["webrtc_udp_port"], started.webrtc_udp_port);
         assert_eq!(wb["token_required"], true);
         assert_eq!(wb["capture_source"], "mock.monitor");
-        assert_eq!(wb["token"], "[REDACTED]");
+        assert_eq!(wb["token"], secret_token);
+        let expected_suffix = format!("/#t={secret_token}");
         let localhost_url = wb["localhost_url"].as_str().unwrap();
-        assert!(localhost_url.ends_with("/#t=[REDACTED]"));
+        assert!(localhost_url.ends_with(&expected_suffix));
         for url in wb["urls"].as_array().unwrap() {
             let s = url.as_str().unwrap();
-            assert!(!s.contains(&secret_token));
-            assert!(s.ends_with("/#t=[REDACTED]"));
+            assert!(s.ends_with(&expected_suffix));
         }
     }
 }

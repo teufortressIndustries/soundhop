@@ -605,6 +605,26 @@
       color: var(--accent);
     }
 
+    .potato-btn {
+      border: 1px solid var(--card-border);
+      background: rgba(11, 15, 23, 0.7);
+      color: var(--text-muted);
+      font-family: inherit;
+      font-size: 0.78rem;
+      font-weight: 600;
+      padding: 6px 13px;
+      border-radius: 9px;
+      cursor: pointer;
+      flex-shrink: 0;
+      transition: background 0.15s ease, color 0.15s ease, border-color 0.15s ease;
+    }
+
+    .potato-btn.active {
+      background: var(--amber-soft);
+      color: var(--amber);
+      border-color: rgba(251, 191, 36, 0.45);
+    }
+
     .switch {
       position: relative;
       display: inline-block;
@@ -770,8 +790,24 @@
         </div>
         <div class="segmented" role="group" aria-label="Transport selection">
           <button id="modeAutoBtn" class="seg-btn active" type="button" data-mode="auto">Auto</button>
+          <button id="modeWebrtcBtn" class="seg-btn" type="button" data-mode="webrtc">Force Opus</button>
           <button id="modeWsBtn" class="seg-btn" type="button" data-mode="ws">Force WS</button>
         </div>
+      </div>
+
+      <div class="control-row">
+        <div>
+          <div class="control-title">Potato Mode</div>
+          <div class="control-hint">Increases buffer &amp; lowers bitrate for congested Wi-Fi</div>
+        </div>
+        <button
+          id="potatoBtn"
+          class="potato-btn"
+          type="button"
+          aria-pressed="false"
+          title="Increases jitter buffer and lowers Opus bitrate for congested 2.4 GHz Wi-Fi"
+          aria-label="Potato mode: increases buffer and lowers bitrate for congested Wi-Fi"
+        >Potato</button>
       </div>
 
       <div class="control-row">
@@ -836,15 +872,15 @@
       // Inline AudioWorkletProcessor used when window.isSecureContext is true (e.g. http://localhost via adb reverse).
       const WORKLET_JS = `
         class SoundHopPcmProcessor extends AudioWorkletProcessor {
-          constructor() {
+          constructor(options) {
             super();
-            this.capacity = 16384; // stereo frames (~341 ms @ 48 kHz)
+            this.capacity = 32768; // stereo frames (~682 ms @ 48 kHz)
             this.ring = new Float32Array(this.capacity * 2);
             this.readIdx = 0;
             this.writeIdx = 0;
             this.count = 0;
-            this.targetFrames = 2880;   // 60 ms
-            this.hardMaxFrames = 7680;  // 160 ms
+            const potato = Boolean(options && options.processorOptions && options.processorOptions.potato);
+            this.applyConfig(potato);
             this.fadeFrames = 480;      // 10 ms — smoother fades on trim/underrun
             this.priming = true;
             this.fadeInRemaining = 0;
@@ -859,6 +895,11 @@
             this.port.onmessage = (ev) => {
               const msg = ev.data;
               if (!msg) return;
+              if (msg.type === "config") {
+                this.applyConfig(Boolean(msg.potato));
+                this.resetBuffer();
+                return;
+              }
               if (msg.type === "reset") {
                 this.resetBuffer();
                 return;
@@ -870,6 +911,16 @@
                 this.pushInterleaved(msg.samples);
               }
             };
+          }
+
+          applyConfig(potato) {
+            if (potato) {
+              this.targetFrames = 8640;   // 180 ms
+              this.hardMaxFrames = 17280; // 360 ms
+            } else {
+              this.targetFrames = 2880;   // 60 ms
+              this.hardMaxFrames = 7680;  // 160 ms
+            }
           }
 
           resetBuffer() {
@@ -1074,7 +1125,9 @@
         volumeSlider: document.getElementById("volumeSlider"),
         volumePct: document.getElementById("volumePct"),
         modeAutoBtn: document.getElementById("modeAutoBtn"),
+        modeWebrtcBtn: document.getElementById("modeWebrtcBtn"),
         modeWsBtn: document.getElementById("modeWsBtn"),
+        potatoBtn: document.getElementById("potatoBtn"),
         directOutputToggle: document.getElementById("directOutputToggle"),
         statusLine: document.getElementById("statusLine"),
         playerAudio: document.getElementById("playerAudio")
@@ -1085,7 +1138,10 @@
       let shouldListen = false;
       let kickedByHost = false;
       let sessionSeq = 0;
-      let transportPref = loadPref("soundhop_transport", "auto") === "ws" ? "ws" : "auto";
+      const savedTransportPref = loadPref("soundhop_transport", "auto");
+      let transportPref =
+        savedTransportPref === "ws" || savedTransportPref === "webrtc" ? savedTransportPref : "auto";
+      let potatoMode = loadPref("soundhop_potato", "0") === "1";
       let directOutput = loadPref("soundhop_direct_output", "0") === "1";
       let volume = clampNumber(parseFloat(loadPref("soundhop_volume", "1")), 0, 1, 1);
       let muted = false;
@@ -1483,8 +1539,14 @@
 
       function updateTransportPrefUI() {
         els.modeAutoBtn.classList.toggle("active", transportPref === "auto");
+        els.modeWebrtcBtn.classList.toggle("active", transportPref === "webrtc");
         els.modeWsBtn.classList.toggle("active", transportPref === "ws");
         els.directOutputToggle.checked = directOutput;
+      }
+
+      function updatePotatoUI() {
+        els.potatoBtn.classList.toggle("active", potatoMode);
+        els.potatoBtn.setAttribute("aria-pressed", potatoMode ? "true" : "false");
       }
 
       function ensureAudioGraphSync() {
@@ -1744,7 +1806,7 @@
         }
       }
 
-      function stopListening(reason, kicked) {
+      function stopListening(reason, kicked, isError) {
         kickedByHost = Boolean(kicked);
         shouldListen = false;
         sessionSeq++;
@@ -1755,7 +1817,7 @@
         setStateReadout("Stopped");
         els.bufferReadout.textContent = "--";
         els.rttReadout.textContent = "--";
-        setStatusLine(reason || "", false);
+        setStatusLine(reason || "", Boolean(isError));
         updateMediaSessionPlaybackState();
       }
 
@@ -1823,6 +1885,19 @@
           }
         }
 
+        if (transportPref === "webrtc") {
+          if (typeof window.RTCPeerConnection !== "function") {
+            stopListening("WebRTC Opus unavailable: RTCPeerConnection is not supported in this browser", false, true);
+            return;
+          }
+          if (serverInfo && serverInfo.webrtc === false) {
+            stopListening("WebRTC Opus unavailable: disabled on host", false, true);
+            return;
+          }
+          await connectWebRTC(mySeq);
+          return;
+        }
+
         const canWebRtc =
           transportPref === "auto" &&
           typeof window.RTCPeerConnection === "function" &&
@@ -1886,7 +1961,7 @@
           if (bufMs !== null) {
             els.bufferReadout.textContent = Math.round(bufMs) + " ms";
           } else {
-            els.bufferReadout.textContent = "~50 ms";
+            els.bufferReadout.textContent = potatoMode ? "~200 ms" : "~50 ms";
           }
         } catch (_) {}
       }
@@ -1902,16 +1977,20 @@
         activePc = pc;
         let settled = false;
 
-        const fallbackToWs = (reason) => {
+        const failOrFallbackWebRtc = (reason) => {
           if (settled || mySeq !== sessionSeq || !shouldListen) return;
           settled = true;
+          if (transportPref === "webrtc") {
+            stopListening("WebRTC Opus failed: " + reason, false, true);
+            return;
+          }
           cleanupWebRTC(true);
           setStatusLine("WebRTC fallback (" + reason + ") -> switching to WebSocket", false);
           connectWebSocket(mySeq);
         };
 
         webrtcFallbackTimer = setTimeout(() => {
-          fallbackToWs("3.0s timeout");
+          failOrFallbackWebRtc("3.0s timeout");
         }, WEBRTC_FALLBACK_MS);
 
         pc.addTransceiver("audio", { direction: "recvonly" });
@@ -1936,7 +2015,12 @@
           if (mySeq !== sessionSeq || activePc !== pc) return;
           if (event.receiver && "playoutDelayHint" in event.receiver) {
             try {
-              event.receiver.playoutDelayHint = 0.05;
+              event.receiver.playoutDelayHint = potatoMode ? 0.20 : 0.05;
+            } catch (_) {}
+          }
+          if (event.receiver && "jitterBufferTarget" in event.receiver) {
+            try {
+              event.receiver.jitterBufferTarget = potatoMode ? 200 : 50;
             } catch (_) {}
           }
           const stream = event.streams && event.streams[0]
@@ -1966,7 +2050,7 @@
               setListenButtonMode("live");
               setBadge("webrtc", "WebRTC · Opus");
               setStateReadout("Live");
-              els.bufferReadout.textContent = "~50 ms";
+              els.bufferReadout.textContent = potatoMode ? "~200 ms" : "~50 ms";
               setStatusLine("Streaming 48 kHz stereo Opus via WebRTC", false);
               updateMediaSessionPlaybackState();
               clearInterval(webrtcStatsTimer);
@@ -1977,7 +2061,11 @@
 
           if (!settled) {
             if (ice === "failed" || ice === "disconnected" || conn === "failed" || conn === "disconnected" || conn === "closed") {
-              fallbackToWs(conn || ice);
+              const reason =
+                conn === "failed" || conn === "disconnected" || conn === "closed"
+                  ? "connection " + conn
+                  : "ICE " + ice;
+              failOrFallbackWebRtc(reason);
             }
             return;
           }
@@ -2012,7 +2100,8 @@
             body: JSON.stringify({
               type: pc.localDescription.type,
               sdp: pc.localDescription.sdp,
-              clientName: detectClientName()
+              clientName: detectClientName(),
+              potato: potatoMode
             }),
             signal: activeOfferAbort.signal
           });
@@ -2027,7 +2116,7 @@
           }
 
           if (!res.ok) {
-            fallbackToWs("HTTP " + res.status);
+            failOrFallbackWebRtc("HTTP " + res.status);
             return;
           }
 
@@ -2045,7 +2134,7 @@
           handleStateChange();
         } catch (err) {
           if (err && err.name === "AbortError") return;
-          fallbackToWs(err && err.message ? err.message : "offer error");
+          failOrFallbackWebRtc(err && err.message ? err.message : "offer error");
         }
       }
 
@@ -2067,7 +2156,8 @@
           workletNode = new AudioWorkletNode(audioCtx, "soundhop-pcm-processor", {
             numberOfInputs: 0,
             numberOfOutputs: 1,
-            outputChannelCount: [2]
+            outputChannelCount: [2],
+            processorOptions: { potato: potatoMode }
           });
           workletNode.port.onmessage = (ev) => {
             const msg = ev.data;
@@ -2083,7 +2173,7 @@
         }
         try { workletNode.disconnect(); } catch (_) {}
         workletNode.connect(fadeGain);
-        workletNode.port.postMessage({ type: "reset" });
+        workletNode.port.postMessage({ type: "config", potato: potatoMode });
         return true;
       }
 
@@ -2099,12 +2189,27 @@
         );
       }
 
+      function getWsTargetBufferSec() {
+        return potatoMode ? 0.180 : TARGET_BUFFER_SEC;
+      }
+
+      function getWsMaxBufferSec() {
+        return potatoMode ? 0.360 : MAX_BUFFER_SEC;
+      }
+
+      function getWsHardReanchorSec() {
+        return potatoMode ? 0.480 : HARD_REANCHOR_SEC;
+      }
+
       function schedulePcmBuffer(view, numFrames, discontinuity) {
         if (!audioCtx || !fadeGain) return;
         const now = audioCtx.currentTime;
+        const targetSec = getWsTargetBufferSec();
+        const maxSec = getWsMaxBufferSec();
+        const hardReanchorSec = getWsHardReanchorSec();
 
         if (discontinuity || nextPlayTime === 0) {
-          nextPlayTime = now + TARGET_BUFFER_SEC;
+          nextPlayTime = now + targetSec;
           fadeGain.gain.cancelScheduledValues(now);
           fadeGain.gain.setValueAtTime(0.001, nextPlayTime);
           fadeGain.gain.linearRampToValueAtTime(1.0, nextPlayTime + 0.005);
@@ -2113,21 +2218,21 @@
         const lead = nextPlayTime - now;
 
         if (lead < MIN_BUFFER_SEC) {
-          // Underrun: re-anchor to 60ms target with 5ms micro-fade.
-          nextPlayTime = now + TARGET_BUFFER_SEC;
+          // Underrun: re-anchor to target buffer with 5ms micro-fade.
+          nextPlayTime = now + targetSec;
           fadeGain.gain.cancelScheduledValues(now);
           fadeGain.gain.setValueAtTime(0.001, nextPlayTime);
           fadeGain.gain.linearRampToValueAtTime(1.0, nextPlayTime + 0.005);
-        } else if (lead > HARD_REANCHOR_SEC) {
+        } else if (lead > hardReanchorSec) {
           // Severe bloat: 5ms micro-fade out & re-anchor.
           fadeGain.gain.cancelScheduledValues(now);
           fadeGain.gain.setValueAtTime(fadeGain.gain.value, now);
           fadeGain.gain.linearRampToValueAtTime(0.001, now + 0.005);
-          nextPlayTime = now + TARGET_BUFFER_SEC;
+          nextPlayTime = now + targetSec;
           fadeGain.gain.setValueAtTime(0.001, nextPlayTime);
           fadeGain.gain.linearRampToValueAtTime(1.0, nextPlayTime + 0.005);
-        } else if (lead > MAX_BUFFER_SEC) {
-          // Moderate drift above 160ms: drop incoming frame to drain toward 60ms.
+        } else if (lead > maxSec) {
+          // Moderate drift above max buffer: drop incoming frame to drain toward target.
           els.bufferReadout.textContent = Math.round(lead * 1000) + " ms";
           return;
         }
@@ -2222,7 +2327,7 @@
             setStatusLine("Streaming PCM16LE via WebSocket", false);
           }
           setStateReadout("Live");
-          els.bufferReadout.textContent = "60 ms";
+          els.bufferReadout.textContent = (potatoMode ? 180 : 60) + " ms";
           updateMediaSessionPlaybackState();
 
           if (audioCtx && audioCtx.state === "suspended") {
@@ -2322,6 +2427,7 @@
       });
 
       function setTransportPref(mode) {
+        if (mode !== "auto" && mode !== "webrtc" && mode !== "ws") return;
         if (transportPref === mode) return;
         transportPref = mode;
         savePref("soundhop_transport", mode);
@@ -2332,7 +2438,21 @@
       }
 
       els.modeAutoBtn.addEventListener("click", () => setTransportPref("auto"));
+      els.modeWebrtcBtn.addEventListener("click", () => setTransportPref("webrtc"));
       els.modeWsBtn.addEventListener("click", () => setTransportPref("ws"));
+
+      function setPotatoMode(enabled) {
+        const next = Boolean(enabled);
+        if (potatoMode === next) return;
+        potatoMode = next;
+        savePref("soundhop_potato", potatoMode ? "1" : "0");
+        updatePotatoUI();
+        if (shouldListen) {
+          startListening();
+        }
+      }
+
+      els.potatoBtn.addEventListener("click", () => setPotatoMode(!potatoMode));
 
       els.directOutputToggle.addEventListener("change", () => {
         directOutput = Boolean(els.directOutputToggle.checked);
@@ -2383,6 +2503,7 @@
       });
 
       updateTransportPrefUI();
+      updatePotatoUI();
       updateVolumeUI();
       fetchServerInfo();
     })();

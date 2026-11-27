@@ -516,6 +516,8 @@ struct OfferBody {
     sdp: String,
     #[serde(rename = "clientName", alias = "client_name")]
     client_name: Option<String>,
+    #[serde(default)]
+    potato: bool,
 }
 
 #[derive(Serialize)]
@@ -578,6 +580,7 @@ fn handle_webrtc_offer(
             .client_name
             .map(|s| s.trim().to_string())
             .filter(|s| !s.is_empty()),
+        potato: parsed.potato,
     };
 
     match ctx.rtc.accept_offer(offer_req) {
@@ -1201,6 +1204,7 @@ mod tests {
     struct MockRtc {
         removed_peers: Mutex<Vec<String>>,
         next_result: Mutex<Option<WebResult<RtcOfferResponse>>>,
+        potato_requests: Mutex<Vec<bool>>,
     }
 
     impl MockRtc {
@@ -1208,16 +1212,22 @@ mod tests {
             Self {
                 removed_peers: Mutex::new(Vec::new()),
                 next_result: Mutex::new(None),
+                potato_requests: Mutex::new(Vec::new()),
             }
         }
 
         fn set_next_result(&self, res: WebResult<RtcOfferResponse>) {
             *lock_or_recover(&self.next_result) = Some(res);
         }
+
+        fn take_potato_requests(&self) -> Vec<bool> {
+            std::mem::take(&mut *lock_or_recover(&self.potato_requests))
+        }
     }
 
     impl RtcBackend for MockRtc {
         fn accept_offer(&self, req: RtcOfferRequest) -> WebResult<RtcOfferResponse> {
+            lock_or_recover(&self.potato_requests).push(req.potato);
             if let Some(res) = lock_or_recover(&self.next_result).take() {
                 return res;
             }
@@ -1333,6 +1343,13 @@ mod tests {
         assert!(WEB_PLAYER_HTML.contains("id=\"scannerCapture\""));
         assert!(WEB_PLAYER_HTML.contains("capture=\"environment\""));
         assert!(WEB_PLAYER_HTML.contains("handleScannerFile(els.scannerCapture)"));
+    }
+
+    #[test]
+    fn root_html_has_force_opus_transport_toggle() {
+        assert!(WEB_PLAYER_HTML.contains("id=\"modeWebrtcBtn\""));
+        assert!(WEB_PLAYER_HTML.contains("data-mode=\"webrtc\""));
+        assert!(WEB_PLAYER_HTML.contains("Force Opus"));
     }
 
     #[test]
@@ -1580,6 +1597,34 @@ mod tests {
         let resp_429 = send_raw_http(port, req_ok.as_bytes());
         assert_eq!(resp_429.status, 429);
         assert_eq!(resp_429.header("retry-after"), Some("10"));
+
+        http.stop();
+        mgr.stop();
+    }
+
+    #[test]
+    fn post_webrtc_offer_parses_potato_true_false_and_omitted() {
+        let rtc = Arc::new(MockRtc::new());
+        let ws = Arc::new(MockWs::new(false));
+        let (mgr, _rt, http) =
+            start_mock_http_server(false, vec!["127.0.0.1".into()], rtc.clone(), ws);
+        let port = http.local_port();
+
+        let bodies = [
+            r#"{"type":"offer","sdp":"v=0\r\no=- 1 1 IN IP4 127.0.0.1\r\n"}"#,
+            r#"{"type":"offer","sdp":"v=0\r\no=- 1 1 IN IP4 127.0.0.1\r\n","potato":true}"#,
+            r#"{"type":"offer","sdp":"v=0\r\no=- 1 1 IN IP4 127.0.0.1\r\n","potato":false}"#,
+        ];
+
+        for body in bodies {
+            let req = format!(
+                "POST /webrtc/offer HTTP/1.1\r\nHost: 127.0.0.1:{port}\r\nContent-Type: application/json\r\nContent-Length: {}\r\n\r\n{body}",
+                body.len()
+            );
+            assert_eq!(send_raw_http(port, req.as_bytes()).status, 200);
+        }
+
+        assert_eq!(rtc.take_potato_requests(), vec![false, true, false]);
 
         http.stop();
         mgr.stop();
