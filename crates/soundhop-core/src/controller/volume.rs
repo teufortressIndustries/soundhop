@@ -36,6 +36,7 @@ impl Controller {
         &self,
         st: &State,
         backend_available: bool,
+        default_sink: &str,
     ) -> serde_json::Value {
         if !backend_available {
             return serde_json::Value::Null;
@@ -43,7 +44,7 @@ impl Controller {
         let active_sink = if !st.connected_sink.is_empty() {
             st.connected_sink.clone()
         } else {
-            self.backend.default_sink().unwrap_or_default()
+            default_sink.to_string()
         };
         let lvl = self.backend.get_sink_volume(&active_sink);
         let mute = self.backend.get_sink_mute(&active_sink);

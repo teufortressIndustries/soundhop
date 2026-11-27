@@ -18,7 +18,7 @@ use ipnet::IpNet;
 use sha2::{Digest, Sha256};
 
 use crate::backend::windows::audio::{
-    list_audio_endpoints, WindowsLoopbackRecorder, WindowsPlayer,
+    list_audio_endpoint_names, list_audio_endpoints, WindowsLoopbackRecorder, WindowsPlayer,
 };
 use crate::backend::windows::protocol::{
     default_channel_map, make_command_auth, make_command_create_playback_stream,
@@ -223,10 +223,10 @@ impl AudioBackend for WindowsAudioBackend {
                 return Ok(def);
             }
         }
-        let eps = list_audio_endpoints();
-        Ok(eps
-            .first()
-            .map(|e| e.name.clone())
+        let names = list_audio_endpoint_names();
+        Ok(names
+            .into_iter()
+            .next()
             .unwrap_or_else(|| "Default Output".to_string()))
     }
 
@@ -272,6 +272,18 @@ impl AudioBackend for WindowsAudioBackend {
             });
         }
         Ok(out)
+    }
+
+    fn sink_exists(&self, name: &str) -> Result<bool, BackendError> {
+        if self
+            .active_senders
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .contains_key(name)
+        {
+            return Ok(true);
+        }
+        Ok(list_audio_endpoint_names().iter().any(|n| n == name))
     }
 
     fn sources(&self) -> Result<Vec<Source>, BackendError> {

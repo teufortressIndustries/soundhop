@@ -24,6 +24,26 @@ pub struct AudioEndpoint {
     pub sample_rate: u32,
 }
 
+/// Lists only WASAPI output device names without querying `default_output_config()`.
+pub fn list_audio_endpoint_names() -> Vec<String> {
+    #[cfg(all(windows, not(test)))]
+    {
+        use cpal::traits::{DeviceTrait, HostTrait};
+        let host = cpal::default_host();
+        if let Ok(devices) = host.output_devices() {
+            let mut out = Vec::new();
+            for dev in devices {
+                let name = dev.name().unwrap_or_else(|_| "Speakers".to_string());
+                out.push(name);
+            }
+            if !out.is_empty() {
+                return out;
+            }
+        }
+    }
+    vec!["Speakers (Default Audio)".to_string()]
+}
+
 pub fn list_audio_endpoints() -> Vec<AudioEndpoint> {
     #[cfg(all(windows, not(test)))]
     {

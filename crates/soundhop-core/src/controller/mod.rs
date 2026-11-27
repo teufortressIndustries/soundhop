@@ -484,12 +484,17 @@ impl Controller {
         });
 
         let backend_available = self.backend.available();
+        let (sinks, default_sink) = if backend_available {
+            (
+                self.backend.sinks().unwrap_or_default(),
+                self.backend.default_sink().unwrap_or_default(),
+            )
+        } else {
+            (Vec::new(), String::new())
+        };
         let backend_json = if backend_available {
-            let sinks_json: Vec<serde_json::Value> = self
-                .backend
-                .sinks()
-                .unwrap_or_default()
-                .into_iter()
+            let sinks_json: Vec<serde_json::Value> = sinks
+                .iter()
                 .map(|s| {
                     serde_json::json!({
                         "name": s.name,
@@ -503,7 +508,7 @@ impl Controller {
                 "available": true,
                 "server": self.backend.server_label().unwrap_or_default(),
                 "pipewire": self.backend.is_pipewire().unwrap_or(false),
-                "default_sink": self.backend.default_sink().unwrap_or_default(),
+                "default_sink": default_sink,
                 "sinks": sinks_json,
             })
         } else {
@@ -512,10 +517,8 @@ impl Controller {
 
         let connection_json = if st.is_connected() && st.connected_peer != "web-broadcast" {
             let sht3_out_active = self.sht3_outbound_active();
-            let sink_present = self
-                .backend
-                .sink_exists(&st.connected_sink)
-                .unwrap_or(false);
+            let sink_present =
+                backend_available && sinks.iter().any(|s| s.name == st.connected_sink);
             let module_present = if st.connected_module > 0 {
                 self.backend
                     .module(st.connected_module)
@@ -564,7 +567,7 @@ impl Controller {
             serde_json::Value::Null
         };
 
-        let volume_json = self.status_volume_json(&st, backend_available);
+        let volume_json = self.status_volume_json(&st, backend_available, &default_sink);
 
         let peers_json: Vec<serde_json::Value> =
             peers.unwrap_or(&[]).iter().map(|p| p.to_json()).collect();
@@ -1376,5 +1379,50 @@ mod tests {
             .disconnect(false, Some(false), false, Some(false), false, false)
             .unwrap();
         server_ctrl.stop_listener(Some(false)).unwrap();
+    }
+
+    #[test]
+    fn test_status_populates_backend_connection_and_volume_sinks() {
+        let ctrl = Controller::new(
+            Some(Config::default()),
+            Some(State::default()),
+            Some(Arc::new(crate::backend::windows::WindowsAudioBackend::new())),
+            None,
+            None,
+            false,
+        );
+        ctrl.set_save_enabled(false);
+
+        let st_disconnected = ctrl.status(None);
+        assert_eq!(st_disconnected["backend"]["available"], true);
+        assert_eq!(
+            st_disconnected["backend"]["default_sink"],
+            "Speakers (Default Audio)"
+        );
+        assert_eq!(
+            st_disconnected["volume"]["sink"],
+            "Speakers (Default Audio)"
+        );
+        assert!(st_disconnected["connection"].is_null());
+
+        {
+            let mut st = lock_or_recover(&ctrl.state);
+            st.connected_peer = "peer-1".to_string();
+            st.connected_sink = "Speakers (Default Audio)".to_string();
+        }
+        let st_connected_present = ctrl.status(None);
+        assert_eq!(st_connected_present["connection"]["sink_present"], true);
+        assert_eq!(
+            st_connected_present["volume"]["sink"],
+            "Speakers (Default Audio)"
+        );
+
+        {
+            let mut st = lock_or_recover(&ctrl.state);
+            st.connected_sink = "nonexistent-sink".to_string();
+        }
+        let st_connected_missing = ctrl.status(None);
+        assert_eq!(st_connected_missing["connection"]["sink_present"], false);
+        assert_eq!(st_connected_missing["volume"]["sink"], "nonexistent-sink");
     }
 }
