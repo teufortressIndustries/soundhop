@@ -87,7 +87,7 @@ if ! pacman -Q mesa-mini >/dev/null 2>&1 && ! pacman -Q mesa-nano >/dev/null 2>&
     rm -rf "$debloat_dir"
 fi
 
-if ! command -v cargo >/dev/null 2>&1; then
+if ! cargo --version >/dev/null 2>&1; then
     echo "0. Initializing Rust stable toolchain via rustup..."
     rustup default stable
     export PATH="$HOME/.cargo/bin:/root/.cargo/bin:$PATH"

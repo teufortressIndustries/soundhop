@@ -165,7 +165,7 @@ jobs:
 
       - name: Initialize Rust toolchain & linker
         run: |
-          if ! command -v cargo >/dev/null 2>&1; then
+          if ! cargo --version >/dev/null 2>&1; then
             rustup default stable
             echo "$HOME/.cargo/bin" >> "$GITHUB_PATH"
           fi
