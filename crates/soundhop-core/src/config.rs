@@ -44,6 +44,10 @@ fn default_web_max_clients() -> u16 {
     DEFAULT_WEB_MAX_CLIENTS
 }
 
+fn default_web_https() -> bool {
+    true
+}
+
 /// Valid values for `audio.profile`.
 pub const VALID_AUDIO_PROFILES: &[&str] = &[
     "opus-balanced",
@@ -121,6 +125,15 @@ pub struct SharingConfig {
     /// Maximum simultaneous browser listeners (default `8`, clamped `[1..=32]`).
     #[serde(default = "default_web_max_clients")]
     pub web_max_clients: u16,
+    /// Serve LAN Web Broadcast over HTTPS with an auto-generated local CA/cert (default `true`).
+    #[serde(default = "default_web_https")]
+    pub web_https: bool,
+    /// Optional path to a user-supplied PEM certificate chain for Web Broadcast HTTPS.
+    #[serde(default)]
+    pub web_tls_cert_path: String,
+    /// Optional path to a user-supplied PEM private key for Web Broadcast HTTPS.
+    #[serde(default)]
+    pub web_tls_key_path: String,
 }
 
 impl Default for SharingConfig {
@@ -144,6 +157,9 @@ impl Default for SharingConfig {
             web_keep_local: true,
             web_adb_reverse: false,
             web_max_clients: DEFAULT_WEB_MAX_CLIENTS,
+            web_https: true,
+            web_tls_cert_path: String::new(),
+            web_tls_key_path: String::new(),
         }
     }
 }

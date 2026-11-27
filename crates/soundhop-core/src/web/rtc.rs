@@ -17,7 +17,7 @@ use str0m::net::{Protocol, Receive, Transmit};
 use str0m::{Candidate, Event, IceConnectionState, Input, Output, Rtc, RtcConfig};
 
 use crate::transport::{udp_poke_hook, BroadcastFrame, BroadcastSubscription, WakeupHook};
-use crate::util::{local_addresses, lock_or_recover, now_secs};
+use crate::util::{is_virtual_bridge_interface, local_addresses, lock_or_recover, now_secs};
 
 use super::{
     gstreamer_available, BroadcastRuntime, ClientSlotGuard, ListenerGuard, WebClientInfo, WebError,
@@ -99,6 +99,7 @@ struct PeerRtc {
     id: String,
     rtc: Rtc,
     local_ufrag: String,
+    local_candidate_addrs: Vec<SocketAddr>,
     audio_mid: Option<Mid>,
     opus_pt: Option<Pt>,
     ice_connected: bool,
@@ -290,7 +291,10 @@ impl RtcMuxHandle {
             .set_stats_interval(Some(PEER_STATS_INTERVAL))
             .build(now);
 
-        for candidate in build_local_candidates(self.bind_ip, self.local_port) {
+        let local_candidates = build_local_candidates(self.bind_ip, self.local_port);
+        let local_candidate_addrs: Vec<SocketAddr> =
+            local_candidates.iter().map(|c| c.addr()).collect();
+        for candidate in local_candidates {
             let _ = rtc.add_local_candidate(candidate);
         }
 
@@ -330,6 +334,7 @@ impl RtcMuxHandle {
             id: peer_id.clone(),
             rtc,
             local_ufrag,
+            local_candidate_addrs,
             audio_mid,
             opus_pt,
             ice_connected: false,
@@ -452,7 +457,7 @@ struct MuxState {
     opus_poke_hook: WakeupHook,
     opus_sub: Option<BroadcastSubscription>,
     peers: HashMap<String, PeerRtc>,
-    addr_to_peer: HashMap<SocketAddr, String>,
+    addr_to_peer: HashMap<SocketAddr, (String, SocketAddr)>,
     ufrag_to_peer: HashMap<String, String>,
     client_count: Arc<AtomicUsize>,
     clients_snapshot: Arc<RwLock<Vec<WebClientInfo>>>,
@@ -734,20 +739,28 @@ impl MuxState {
     }
 
     fn handle_udp_packet(&mut self, recv_time: Instant, source: SocketAddr, pkt: &[u8]) -> bool {
-        let peer_id = if let Some(existing) = self.addr_to_peer.get(&source) {
-            existing.clone()
+        let (peer_id, local_dest) = if let Some((existing_id, existing_dest)) =
+            self.addr_to_peer.get(&source)
+        {
+            (existing_id.clone(), *existing_dest)
         } else if let Some(local_ufrag) = extract_stun_binding_local_ufrag(pkt) {
             let Some(matched_id) = self.ufrag_to_peer.get(local_ufrag).cloned() else {
                 return false;
             };
-            self.addr_to_peer.insert(source, matched_id.clone());
-            matched_id
+            let Some(peer) = self.peers.get(&matched_id) else {
+                return false;
+            };
+            let resolved_dest =
+                resolve_local_destination(self.local_udp_addr, source, &peer.local_candidate_addrs);
+            self.addr_to_peer
+                .insert(source, (matched_id.clone(), resolved_dest));
+            (matched_id, resolved_dest)
         } else {
             // Drop unrecognized non-STUN packets from unknown remote addresses.
             return false;
         };
 
-        let Ok(receive) = Receive::new(Protocol::Udp, source, self.local_udp_addr, pkt) else {
+        let Ok(receive) = Receive::new(Protocol::Udp, source, local_dest, pkt) else {
             return false;
         };
         let input = Input::Receive(recv_time, receive);
@@ -822,7 +835,7 @@ impl MuxState {
             let _ = peer.rtc.close();
             let _ = drain_peer_output(&mut peer, &self.udp_socket);
         }
-        self.addr_to_peer.retain(|_, id| id != peer_id);
+        self.addr_to_peer.retain(|_, (id, _)| id != peer_id);
         self.ufrag_to_peer.retain(|_, id| id != peer_id);
         if self.peers.is_empty() {
             self.opus_sub = None;
@@ -907,6 +920,46 @@ fn next_rtp_timestamp(
     (sample_offset.saturating_add(pts), discontinuity)
 }
 
+fn resolve_local_destination(
+    local_udp_addr: SocketAddr,
+    source: SocketAddr,
+    local_candidates: &[SocketAddr],
+) -> SocketAddr {
+    if !local_udp_addr.ip().is_unspecified() {
+        return local_udp_addr;
+    }
+
+    if let Some(routed) = resolve_route_local_addr(local_udp_addr.port(), source) {
+        if local_candidates.contains(&routed) {
+            return routed;
+        }
+    }
+
+    local_candidates
+        .iter()
+        .copied()
+        .find(|cand| cand.is_ipv4() == source.is_ipv4())
+        .or_else(|| local_candidates.first().copied())
+        .unwrap_or(local_udp_addr)
+}
+
+fn resolve_route_local_addr(local_port: u16, source: SocketAddr) -> Option<SocketAddr> {
+    let bind_addr = match source {
+        SocketAddr::V4(_) => SocketAddr::new(IpAddr::V4(Ipv4Addr::UNSPECIFIED), 0),
+        SocketAddr::V6(_) => SocketAddr::new(IpAddr::V6(Ipv6Addr::UNSPECIFIED), 0),
+    };
+    let probe = UdpSocket::bind(bind_addr).ok()?;
+    probe.connect(source).ok()?;
+    let mut local = probe.local_addr().ok()?;
+    local.set_port(local_port);
+    Some(local)
+}
+
+fn is_cgnat_v4(v4: Ipv4Addr) -> bool {
+    let oct = v4.octets();
+    oct[0] == 100 && (oct[1] & 0b1100_0000) == 64
+}
+
 fn build_local_candidates(bind_ip: IpAddr, udp_port: u16) -> Vec<Candidate> {
     let mut addrs: Vec<IpAddr> = Vec::new();
     if bind_ip.is_unspecified() {
@@ -915,6 +968,21 @@ fn build_local_candidates(bind_ip: IpAddr, udp_port: u16) -> Vec<Candidate> {
                 let ip = IpAddr::V4(v4);
                 if !addrs.contains(&ip) {
                     addrs.push(ip);
+                }
+            }
+        }
+        if let Ok(interfaces) = if_addrs::get_if_addrs() {
+            for iface in interfaces {
+                if is_virtual_bridge_interface(&iface.name) {
+                    continue;
+                }
+                if let IpAddr::V4(v4) = iface.ip() {
+                    if is_cgnat_v4(v4) {
+                        let ip = IpAddr::V4(v4);
+                        if !addrs.contains(&ip) {
+                            addrs.push(ip);
+                        }
+                    }
                 }
             }
         }
@@ -1464,15 +1532,14 @@ mod tests {
     }
 
     #[cfg(feature = "gstreamer")]
-    #[test]
-    fn headless_str0m_peer_negotiates_and_receives_opus_rtp_frames() {
+    fn run_headless_str0m_opus_delivery_test(bind_ip: IpAddr) {
         use str0m::media::Direction;
 
         let mgr = WebBroadcastManager::new();
         let cfg = WebBroadcastConfig {
             http_port: 0,
             webrtc_udp_port: 0,
-            bind_ip: IpAddr::V4(Ipv4Addr::LOCALHOST),
+            bind_ip,
             max_clients: 2,
             idle_stop_grace: Duration::from_millis(80),
             ..Default::default()
@@ -1481,7 +1548,7 @@ mod tests {
         let rt = mgr.runtime().expect("runtime");
 
         let mux = RtcMuxHandle::start(RtcMuxConfig {
-            bind_ip: IpAddr::V4(Ipv4Addr::LOCALHOST),
+            bind_ip,
             udp_port: 0,
             runtime: Arc::clone(&rt),
         })
@@ -1573,7 +1640,7 @@ mod tests {
 
         assert!(
             received_opus_frames >= 5,
-            "expected >= 5 Opus RTP frames on headless str0m peer, got {received_opus_frames}"
+            "expected >= 5 Opus RTP frames on headless str0m peer (bind_ip={bind_ip}), got {received_opus_frames}"
         );
 
         let clients = mux.list_clients();
@@ -1590,6 +1657,40 @@ mod tests {
 
         mux.stop();
         mgr.stop();
+    }
+
+    #[cfg(feature = "gstreamer")]
+    #[test]
+    fn headless_str0m_peer_negotiates_and_receives_opus_rtp_frames() {
+        run_headless_str0m_opus_delivery_test(IpAddr::V4(Ipv4Addr::LOCALHOST));
+    }
+
+    #[cfg(feature = "gstreamer")]
+    #[test]
+    fn headless_str0m_peer_negotiates_and_receives_opus_rtp_frames_on_unspecified_bind() {
+        run_headless_str0m_opus_delivery_test(IpAddr::V4(Ipv4Addr::UNSPECIFIED));
+    }
+
+    #[test]
+    fn resolve_local_destination_matches_concrete_candidate_for_unspecified_bind() {
+        let unspecified: SocketAddr = "0.0.0.0:4718".parse().unwrap();
+        let loopback_cand: SocketAddr = "127.0.0.1:4718".parse().unwrap();
+        let lan_cand: SocketAddr = "192.168.1.166:4718".parse().unwrap();
+        let loopback_peer: SocketAddr = "127.0.0.1:54321".parse().unwrap();
+
+        let resolved =
+            resolve_local_destination(unspecified, loopback_peer, &[lan_cand, loopback_cand]);
+        assert_eq!(resolved, loopback_cand);
+
+        // Specific bind address is preserved verbatim.
+        assert_eq!(
+            resolve_local_destination(lan_cand, loopback_peer, &[lan_cand, loopback_cand]),
+            lan_cand
+        );
+
+        // Fallback picks a same-family candidate when routed IP is not in candidate list.
+        let fallback = resolve_local_destination(unspecified, loopback_peer, &[lan_cand]);
+        assert_eq!(fallback, lan_cand);
     }
 
     #[cfg(feature = "gstreamer")]
@@ -1738,6 +1839,7 @@ mod tests {
             id: "rtc-test".into(),
             rtc,
             local_ufrag: "ufrag".into(),
+            local_candidate_addrs: Vec::new(),
             audio_mid: None,
             opus_pt: None,
             ice_connected: false,

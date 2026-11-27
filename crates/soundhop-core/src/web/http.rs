@@ -14,7 +14,8 @@ use crate::constants::VERSION;
 use crate::util::{local_addresses, lock_or_recover};
 
 use super::rtc::{RtcMuxHandle, RtcOfferRequest, RtcOfferResponse};
-use super::ws::{WsFanoutHandle, WsUpgradeRequest, WS_SUBPROTOCOL};
+use super::tls::{is_loopback_ip, TlsServerMaterial};
+use super::ws::{WsFanoutHandle, WsStream, WsUpgradeRequest, WS_SUBPROTOCOL};
 use super::{BearerAuthResult, BroadcastRuntime, WebError, WebResult};
 
 /// Embedded single-page browser player HTML served at `GET /`.
@@ -52,6 +53,7 @@ pub struct HttpServerConfig {
     pub runtime: Arc<BroadcastRuntime>,
     pub rtc: Arc<RtcMuxHandle>,
     pub ws: Arc<WsFanoutHandle>,
+    pub tls: Option<TlsServerMaterial>,
 }
 
 /// Handle to the running `web-http-accept` thread and bounded worker pool.
@@ -100,6 +102,7 @@ struct ServerContext {
     runtime: Arc<BroadcastRuntime>,
     rtc: Arc<dyn RtcBackend>,
     ws: Arc<dyn WsBackend>,
+    tls: Option<TlsServerMaterial>,
     offer_rate_limiter: Arc<RateLimiter>,
 }
 
@@ -155,6 +158,7 @@ impl HttpServerHandle {
             config.runtime,
             config.rtc,
             config.ws,
+            config.tls,
         )
     }
 
@@ -164,6 +168,7 @@ impl HttpServerHandle {
         runtime: Arc<BroadcastRuntime>,
         rtc: Arc<dyn RtcBackend>,
         ws: Arc<dyn WsBackend>,
+        tls: Option<TlsServerMaterial>,
     ) -> WebResult<Self> {
         let listener = TcpListener::bind(SocketAddr::new(bind_ip, http_port))?;
         listener.set_nonblocking(true)?;
@@ -184,6 +189,7 @@ impl HttpServerHandle {
             runtime,
             rtc,
             ws,
+            tls,
             offer_rate_limiter: Arc::new(RateLimiter::new()),
         };
 
@@ -282,7 +288,7 @@ fn accept_loop(
 ) {
     while !stop_flag.load(Ordering::Acquire) {
         match listener.accept() {
-            Ok((mut stream, peer_addr)) => {
+            Ok((stream, peer_addr)) => {
                 let pushed = {
                     let (lock, cvar) = &*queue;
                     let mut guard = lock_or_recover(lock);
@@ -296,8 +302,9 @@ fn accept_loop(
                 };
                 if !pushed {
                     let _ = stream.set_write_timeout(Some(Duration::from_millis(100)));
+                    let mut plain = HttpStream::Plain(stream);
                     let _ = send_json_error(
-                        &mut stream,
+                        &mut plain,
                         503,
                         "Service Unavailable",
                         "HTTP worker pool busy",
@@ -337,60 +344,168 @@ fn worker_loop(queue: Arc<(Mutex<WorkerQueue>, Condvar)>, ctx: ServerContext) {
     }
 }
 
-fn handle_connection(mut stream: TcpStream, peer_addr: SocketAddr, ctx: &ServerContext) {
+enum HttpStream {
+    Plain(TcpStream),
+    Tls(Box<rustls::StreamOwned<rustls::ServerConnection, TcpStream>>),
+}
+
+impl HttpStream {
+    fn shutdown_write(&mut self) {
+        match self {
+            Self::Plain(s) => {
+                let _ = s.shutdown(Shutdown::Write);
+            }
+            Self::Tls(s) => {
+                s.conn.send_close_notify();
+                let _ = s.flush();
+                let _ = s.get_ref().shutdown(Shutdown::Write);
+            }
+        }
+    }
+
+    fn into_ws_stream(self) -> WsStream {
+        match self {
+            Self::Plain(s) => WsStream::Plain(s),
+            Self::Tls(s) => WsStream::Tls(s),
+        }
+    }
+}
+
+impl Read for HttpStream {
+    fn read(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
+        match self {
+            Self::Plain(s) => s.read(buf),
+            Self::Tls(s) => s.read(buf),
+        }
+    }
+}
+
+impl Write for HttpStream {
+    fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+        match self {
+            Self::Plain(s) => s.write(buf),
+            Self::Tls(s) => s.write(buf),
+        }
+    }
+
+    fn flush(&mut self) -> std::io::Result<()> {
+        match self {
+            Self::Plain(s) => s.flush(),
+            Self::Tls(s) => s.flush(),
+        }
+    }
+}
+
+fn handle_connection(stream: TcpStream, peer_addr: SocketAddr, ctx: &ServerContext) {
     let _ = stream.set_nonblocking(false);
     let _ = stream.set_read_timeout(Some(HTTP_SOCKET_TIMEOUT));
     let _ = stream.set_write_timeout(Some(HTTP_SOCKET_TIMEOUT));
     let _ = stream.set_nodelay(true);
 
     if !ctx.runtime.is_ip_allowed(&peer_addr.ip()) {
-        let _ = send_json_error(&mut stream, 403, "Forbidden", "peer IP not allowed");
+        let mut plain = HttpStream::Plain(stream);
+        let _ = send_json_error(&mut plain, 403, "Forbidden", "peer IP not allowed");
         return;
     }
 
-    let req = match read_http_request(&mut stream) {
+    let stream_local_ip = stream.local_addr().ok().map(|addr| normalize_ip(addr.ip()));
+
+    let (mut http_stream, is_tls) = if let Some(ref tls) = ctx.tls {
+        let mut peek = [0u8; 1];
+        match stream.peek(&mut peek) {
+            Ok(1) if peek[0] == 0x16 => {
+                let Ok(conn) = rustls::ServerConnection::new(Arc::clone(&tls.server_config)) else {
+                    return;
+                };
+                (
+                    HttpStream::Tls(Box::new(rustls::StreamOwned::new(conn, stream))),
+                    true,
+                )
+            }
+            Ok(_) => (HttpStream::Plain(stream), false),
+            Err(_) => return,
+        }
+    } else {
+        (HttpStream::Plain(stream), false)
+    };
+
+    let req = match read_http_request(&mut http_stream) {
         Ok(Some(req)) => req,
         Ok(None) => return,
         Err(ParseError::BadRequest(msg)) => {
-            let _ = send_json_error(&mut stream, 400, "Bad Request", &msg);
+            let _ = send_json_error(&mut http_stream, 400, "Bad Request", &msg);
             return;
         }
         Err(ParseError::PayloadTooLarge(msg)) => {
-            let _ = send_json_error(&mut stream, 413, "Payload Too Large", &msg);
+            let _ = send_json_error(&mut http_stream, 413, "Payload Too Large", &msg);
             return;
         }
         Err(ParseError::Io) => return,
     };
 
-    let stream_local_ip = stream.local_addr().ok().map(|addr| normalize_ip(addr.ip()));
-
     match req.header("host") {
         None => {
             if req.version == "HTTP/1.1" {
-                let _ = send_json_error(&mut stream, 400, "Bad Request", "missing Host header");
+                let _ =
+                    send_json_error(&mut http_stream, 400, "Bad Request", "missing Host header");
                 return;
             }
         }
         Some(host) => {
             if !is_valid_host(host, ctx.local_port, stream_local_ip, ctx.bind_ip) {
-                let _ = send_json_error(&mut stream, 403, "Forbidden", "invalid Host header");
+                let _ = send_json_error(&mut http_stream, 403, "Forbidden", "invalid Host header");
                 return;
             }
         }
     }
 
     if let Some(origin) = req.header("origin") {
-        if !is_valid_origin(origin, ctx.local_port, stream_local_ip, ctx.bind_ip) {
-            let _ = send_json_error(&mut stream, 403, "Forbidden", "invalid Origin header");
+        if !is_valid_origin(origin, is_tls, ctx.local_port, stream_local_ip, ctx.bind_ip) {
+            let _ = send_json_error(&mut http_stream, 403, "Forbidden", "invalid Origin header");
             return;
         }
     }
 
-    dispatch_request(stream, peer_addr, req, ctx);
+    if ctx.tls.is_some()
+        && !is_tls
+        && should_redirect_plain_http_to_https(&peer_addr.ip(), &req.path)
+    {
+        let authority = build_redirect_authority(
+            req.header("host"),
+            stream_local_ip,
+            ctx.bind_ip,
+            ctx.local_port,
+        );
+        let location = format!("https://{authority}{}", req.path);
+        let _ = send_redirect_https(&mut http_stream, &location);
+        return;
+    }
+
+    dispatch_request(http_stream, peer_addr, req, ctx);
+}
+
+fn should_redirect_plain_http_to_https(peer_ip: &IpAddr, path: &str) -> bool {
+    !is_loopback_ip(*peer_ip) && path != "/ca.crt"
+}
+
+fn build_redirect_authority(
+    host_header: Option<&str>,
+    stream_local_ip: Option<IpAddr>,
+    bind_ip: IpAddr,
+    local_port: u16,
+) -> String {
+    if let Some(host) = host_header.map(str::trim).filter(|h| !h.is_empty()) {
+        return host.to_string();
+    }
+    let ip = stream_local_ip.unwrap_or_else(|| normalize_ip(bind_ip));
+    match ip {
+        IpAddr::V6(v6) => format!("[{v6}]:{local_port}"),
+        IpAddr::V4(v4) => format!("{v4}:{local_port}"),
+    }
 }
 
 fn dispatch_request(
-    mut stream: TcpStream,
+    mut stream: HttpStream,
     peer_addr: SocketAddr,
     req: ParsedRequest,
     ctx: &ServerContext,
@@ -416,6 +531,28 @@ fn dispatch_request(
                 JSQR_JS.as_bytes(),
             );
         }
+        ("GET", "/ca.crt") => {
+            if let Some(pem) = ctx.tls.as_ref().and_then(|t| t.ca_cert_pem.as_ref()) {
+                let _ = send_response(
+                    &mut stream,
+                    200,
+                    "OK",
+                    "application/x-x509-ca-cert",
+                    &[(
+                        "Content-Disposition",
+                        "attachment; filename=\"soundhop-ca.crt\"",
+                    )],
+                    pem,
+                );
+            } else {
+                let _ = send_json_error(
+                    &mut stream,
+                    404,
+                    "Not Found",
+                    "CA certificate not available",
+                );
+            }
+        }
         ("GET", "/api/info") => {
             handle_api_info(&mut stream, &req, &ctx.runtime);
         }
@@ -428,9 +565,14 @@ fn dispatch_request(
         ("GET", "/ws") => {
             handle_ws_upgrade(stream, peer_addr, req, ctx);
         }
-        (_, "/") | (_, "/jsqr.js") | (_, "/api/info") | (_, "/webrtc/offer") | (_, "/ws") => {
+        (_, "/")
+        | (_, "/jsqr.js")
+        | (_, "/ca.crt")
+        | (_, "/api/info")
+        | (_, "/webrtc/offer")
+        | (_, "/ws") => {
             let allow = match req.path.as_str() {
-                "/" | "/jsqr.js" | "/api/info" | "/ws" => "GET",
+                "/" | "/jsqr.js" | "/ca.crt" | "/api/info" | "/ws" => "GET",
                 "/webrtc/offer" => "POST",
                 _ => "GET",
             };
@@ -478,7 +620,7 @@ struct ApiInfoFull<'a> {
     auth_required: bool,
 }
 
-fn handle_api_info(stream: &mut TcpStream, req: &ParsedRequest, runtime: &BroadcastRuntime) {
+fn handle_api_info(stream: &mut HttpStream, req: &ParsedRequest, runtime: &BroadcastRuntime) {
     match runtime.verify_http_bearer(req.header("authorization")) {
         BearerAuthResult::Missing => {
             let body = serde_json::to_vec(&ApiInfoAuthRequired {
@@ -531,7 +673,7 @@ struct OfferAnswerBody {
 }
 
 fn handle_webrtc_offer(
-    stream: &mut TcpStream,
+    stream: &mut HttpStream,
     peer_addr: SocketAddr,
     req: &ParsedRequest,
     ctx: &ServerContext,
@@ -636,7 +778,7 @@ fn handle_webrtc_offer(
 }
 
 fn handle_delete_peer(
-    stream: &mut TcpStream,
+    stream: &mut HttpStream,
     path: &str,
     req: &ParsedRequest,
     ctx: &ServerContext,
@@ -657,7 +799,7 @@ fn handle_delete_peer(
 }
 
 fn handle_ws_upgrade(
-    mut stream: TcpStream,
+    mut stream: HttpStream,
     peer_addr: SocketAddr,
     req: ParsedRequest,
     ctx: &ServerContext,
@@ -728,7 +870,7 @@ fn handle_ws_upgrade(
 
     let user_agent = req.header("user-agent").unwrap_or("").to_string();
     let upgrade_req = WsUpgradeRequest {
-        stream,
+        stream: stream.into_ws_stream(),
         remote_addr: peer_addr,
         user_agent,
         sec_websocket_key,
@@ -775,7 +917,7 @@ fn find_header_end(buf: &[u8]) -> Option<usize> {
     buf.windows(4).position(|w| w == b"\r\n\r\n")
 }
 
-fn read_http_request(stream: &mut TcpStream) -> Result<Option<ParsedRequest>, ParseError> {
+fn read_http_request(stream: &mut HttpStream) -> Result<Option<ParsedRequest>, ParseError> {
     let mut buf = Vec::with_capacity(2048);
     let mut chunk = [0u8; 2048];
     let header_end = loop {
@@ -996,18 +1138,25 @@ fn is_valid_host(
 
 fn is_valid_origin(
     origin: &str,
+    is_tls: bool,
     local_port: u16,
     stream_local_ip: Option<IpAddr>,
     bind_ip: IpAddr,
 ) -> bool {
     let trimmed = origin.trim();
-    let Some(prefix) = trimmed.get(..7) else {
+    let expected_prefix = if is_tls { "https://" } else { "http://" };
+    let Some(prefix) = trimmed.get(..expected_prefix.len()) else {
         return false;
     };
-    if !prefix.eq_ignore_ascii_case("http://") {
+    if !prefix.eq_ignore_ascii_case(expected_prefix) {
         return false;
     }
-    is_allowed_authority(&trimmed[7..], local_port, stream_local_ip, bind_ip)
+    is_allowed_authority(
+        &trimmed[expected_prefix.len()..],
+        local_port,
+        stream_local_ip,
+        bind_ip,
+    )
 }
 
 #[derive(Serialize)]
@@ -1015,7 +1164,7 @@ struct ErrorBody<'a> {
     error: &'a str,
 }
 
-fn send_unauthorized(stream: &mut TcpStream) -> std::io::Result<()> {
+fn send_unauthorized(stream: &mut HttpStream) -> std::io::Result<()> {
     send_json_error_with_headers(
         stream,
         401,
@@ -1026,7 +1175,7 @@ fn send_unauthorized(stream: &mut TcpStream) -> std::io::Result<()> {
 }
 
 fn send_json_error(
-    stream: &mut TcpStream,
+    stream: &mut HttpStream,
     status: u16,
     reason: &str,
     message: &str,
@@ -1035,7 +1184,7 @@ fn send_json_error(
 }
 
 fn send_json_error_with_headers(
-    stream: &mut TcpStream,
+    stream: &mut HttpStream,
     status: u16,
     reason: &str,
     message: &str,
@@ -1053,7 +1202,7 @@ fn send_json_error_with_headers(
     )
 }
 
-fn send_no_content(stream: &mut TcpStream) -> std::io::Result<()> {
+fn send_no_content(stream: &mut HttpStream) -> std::io::Result<()> {
     let headers = "HTTP/1.1 204 No Content\r\n\
          Cache-Control: no-store\r\n\
          X-Content-Type-Options: nosniff\r\n\
@@ -1061,12 +1210,26 @@ fn send_no_content(stream: &mut TcpStream) -> std::io::Result<()> {
          Connection: close\r\n\r\n";
     stream.write_all(headers.as_bytes())?;
     let _ = stream.flush();
-    let _ = stream.shutdown(Shutdown::Write);
+    stream.shutdown_write();
+    Ok(())
+}
+
+fn send_redirect_https(stream: &mut HttpStream, location: &str) -> std::io::Result<()> {
+    let headers = format!(
+        "HTTP/1.1 308 Permanent Redirect\r\n\
+         Location: {location}\r\n\
+         Cache-Control: no-store\r\n\
+         Content-Length: 0\r\n\
+         Connection: close\r\n\r\n"
+    );
+    stream.write_all(headers.as_bytes())?;
+    let _ = stream.flush();
+    stream.shutdown_write();
     Ok(())
 }
 
 fn send_response(
-    stream: &mut TcpStream,
+    stream: &mut HttpStream,
     status: u16,
     reason: &str,
     content_type: &str,
@@ -1095,7 +1258,7 @@ fn send_response(
         stream.write_all(body)?;
     }
     let _ = stream.flush();
-    let _ = stream.shutdown(Shutdown::Write);
+    stream.shutdown_write();
     Ok(())
 }
 
@@ -1193,6 +1356,7 @@ mod tests {
             webrtc_udp_port: 0,
             bind_ip: IpAddr::V4(Ipv4Addr::LOCALHOST),
             require_token,
+            https_enabled: false,
             ..Default::default()
         };
         let status = mgr
@@ -1284,7 +1448,7 @@ mod tests {
                             Sec-WebSocket-Protocol: soundhop.v1\r\n\r\n";
                 let _ = req.stream.write_all(resp.as_bytes());
                 let _ = req.stream.flush();
-                let _ = req.stream.shutdown(Shutdown::Write);
+                let _ = req.stream.tcp().shutdown(Shutdown::Write);
             }
             Ok("ws-1".into())
         }
@@ -1304,6 +1468,7 @@ mod tests {
             require_token,
             allowed_networks,
             device_name: "SoundHop-TestBox".into(),
+            https_enabled: false,
             ..Default::default()
         };
         mgr.start(cfg, dummy_capture_factory()).expect("start mgr");
@@ -1314,6 +1479,7 @@ mod tests {
             Arc::clone(&rt),
             rtc,
             ws,
+            None,
         )
         .expect("start mock http");
         (mgr, rt, handle)
@@ -1486,6 +1652,7 @@ mod tests {
             runtime: rt2,
             rtc,
             ws,
+            tls: None,
             offer_rate_limiter: Arc::new(RateLimiter::new()),
         };
 
@@ -1737,5 +1904,142 @@ mod tests {
             t.join().expect("worker request thread");
         }
         mgr.stop();
+    }
+
+    #[test]
+    fn https_serves_html_ca_cert_wss_and_enforces_https_origin() {
+        use rustls_pki_types::pem::PemObject;
+        use rustls_pki_types::{CertificateDer, ServerName};
+        use tempfile::TempDir;
+
+        let dir = TempDir::new().expect("tempdir");
+        let mgr = WebBroadcastManager::new();
+        let cfg = WebBroadcastConfig {
+            http_port: 0,
+            webrtc_udp_port: 0,
+            bind_ip: IpAddr::V4(Ipv4Addr::LOCALHOST),
+            require_token: false,
+            device_name: "SoundHop-TlsTest".into(),
+            https_enabled: true,
+            tls_dir: Some(dir.path().to_path_buf()),
+            ..Default::default()
+        };
+        let status = mgr
+            .start(cfg, dummy_capture_factory())
+            .expect("start https mgr");
+        let port = status.http_port;
+        assert!(status.localhost_url.starts_with("http://localhost:"));
+
+        // Plain HTTP on loopback (adb reverse path) continues to work and serves /ca.crt.
+        let ca_resp = send_raw_http(
+            port,
+            format!("GET /ca.crt HTTP/1.1\r\nHost: localhost:{port}\r\n\r\n").as_bytes(),
+        );
+        assert_eq!(ca_resp.status, 200);
+        assert_eq!(
+            ca_resp.header("content-type"),
+            Some("application/x-x509-ca-cert")
+        );
+
+        let mut root_store = rustls::RootCertStore::empty();
+        for cert in CertificateDer::pem_slice_iter(&ca_resp.body) {
+            root_store
+                .add(cert.expect("parse CA cert"))
+                .expect("add CA cert");
+        }
+        let client_cfg = Arc::new(
+            rustls::ClientConfig::builder_with_provider(Arc::new(
+                rustls::crypto::ring::default_provider(),
+            ))
+            .with_safe_default_protocol_versions()
+            .expect("protocol versions")
+            .with_root_certificates(root_store)
+            .with_no_client_auth(),
+        );
+
+        let send_https = |raw_req: &[u8]| -> TestHttpResponse {
+            let tcp = TcpStream::connect(("127.0.0.1", port)).expect("connect tls");
+            tcp.set_read_timeout(Some(Duration::from_secs(5)))
+                .expect("read timeout");
+            let server_name = ServerName::try_from("localhost").expect("server name");
+            let conn = rustls::ClientConnection::new(Arc::clone(&client_cfg), server_name)
+                .expect("client conn");
+            let mut tls = rustls::StreamOwned::new(conn, tcp);
+            tls.write_all(raw_req).expect("write tls req");
+            tls.flush().expect("flush tls req");
+            let mut buf = Vec::new();
+            let _ = tls.read_to_end(&mut buf);
+            parse_raw_http_response(&buf)
+        };
+
+        // HTTPS GET / returns player HTML.
+        let root_resp =
+            send_https(format!("GET / HTTP/1.1\r\nHost: localhost:{port}\r\n\r\n").as_bytes());
+        assert_eq!(root_resp.status, 200);
+        assert_eq!(root_resp.body_str(), WEB_PLAYER_HTML);
+
+        // HTTPS Origin accepted, plain HTTP Origin rejected on TLS connection.
+        let good_origin = send_https(
+            format!(
+                "GET /api/info HTTP/1.1\r\nHost: localhost:{port}\r\nOrigin: https://localhost:{port}\r\n\r\n"
+            )
+            .as_bytes(),
+        );
+        assert_eq!(good_origin.status, 200);
+
+        let bad_origin = send_https(
+            format!(
+                "GET /api/info HTTP/1.1\r\nHost: localhost:{port}\r\nOrigin: http://localhost:{port}\r\n\r\n"
+            )
+            .as_bytes(),
+        );
+        assert_eq!(bad_origin.status, 403);
+
+        // Real wss:// WebSocket upgrade over TLS.
+        let tcp = TcpStream::connect(("127.0.0.1", port)).expect("connect wss");
+        tcp.set_read_timeout(Some(Duration::from_secs(5)))
+            .expect("wss read timeout");
+        let server_name = ServerName::try_from("localhost").expect("wss server name");
+        let conn =
+            rustls::ClientConnection::new(Arc::clone(&client_cfg), server_name).expect("wss conn");
+        let tls = rustls::StreamOwned::new(conn, tcp);
+        let req = tungstenite::http::Request::builder()
+            .uri(format!("wss://localhost:{port}/ws"))
+            .header("Host", format!("localhost:{port}"))
+            .header("Origin", format!("https://localhost:{port}"))
+            .header("Connection", "Upgrade")
+            .header("Upgrade", "websocket")
+            .header("Sec-WebSocket-Version", "13")
+            .header(
+                "Sec-WebSocket-Key",
+                tungstenite::handshake::client::generate_key(),
+            )
+            .header("Sec-WebSocket-Protocol", WS_SUBPROTOCOL)
+            .body(())
+            .expect("build wss request");
+        let (_ws_client, ws_resp) = tungstenite::client(req, tls).expect("wss handshake");
+        assert_eq!(ws_resp.status(), 101);
+
+        mgr.stop();
+    }
+
+    #[test]
+    fn non_loopback_http_redirect_helper_skips_loopback_and_ca_cert() {
+        let lan_ip: IpAddr = "192.168.1.50".parse().expect("lan ip");
+        let loopback_ip: IpAddr = "127.0.0.1".parse().expect("loopback ip");
+
+        assert!(should_redirect_plain_http_to_https(&lan_ip, "/"));
+        assert!(should_redirect_plain_http_to_https(&lan_ip, "/api/info"));
+        assert!(!should_redirect_plain_http_to_https(&lan_ip, "/ca.crt"));
+        assert!(!should_redirect_plain_http_to_https(&loopback_ip, "/"));
+
+        assert_eq!(
+            build_redirect_authority(Some("192.168.1.10:4717"), None, lan_ip, 4717),
+            "192.168.1.10:4717"
+        );
+        assert_eq!(
+            build_redirect_authority(None, Some(lan_ip), lan_ip, 4717),
+            "192.168.1.50:4717"
+        );
     }
 }

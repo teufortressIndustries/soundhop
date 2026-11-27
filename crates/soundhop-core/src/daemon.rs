@@ -385,7 +385,10 @@ impl Daemon {
             || old_cfg.webrtc_port != new_cfg.webrtc_port
             || old_cfg.web_require_token != new_cfg.web_require_token
             || old_cfg.web_keep_local != new_cfg.web_keep_local
-            || old_cfg.web_max_clients != new_cfg.web_max_clients;
+            || old_cfg.web_max_clients != new_cfg.web_max_clients
+            || old_cfg.web_https != new_cfg.web_https
+            || old_cfg.web_tls_cert_path != new_cfg.web_tls_cert_path
+            || old_cfg.web_tls_key_path != new_cfg.web_tls_key_path;
         if !needs_rebind {
             return;
         }

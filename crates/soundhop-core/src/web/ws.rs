@@ -64,9 +64,63 @@ pub struct WsFanoutConfig {
     pub runtime: Arc<BroadcastRuntime>,
 }
 
-/// Accepted TCP connection handed off from `web-http-accept` on `GET /ws`.
+/// Transport stream for WebSocket connections (plaintext TCP or `rustls` TLS).
+pub enum WsStream {
+    Plain(TcpStream),
+    Tls(Box<rustls::StreamOwned<rustls::ServerConnection, TcpStream>>),
+}
+
+impl WsStream {
+    /// Access the underlying `TcpStream` (for socket options, timeouts, and shutdown).
+    pub fn tcp(&self) -> &TcpStream {
+        match self {
+            Self::Plain(s) => s,
+            Self::Tls(s) => s.get_ref(),
+        }
+    }
+
+    /// Mutable access to the underlying `TcpStream`.
+    pub fn tcp_mut(&mut self) -> &mut TcpStream {
+        match self {
+            Self::Plain(s) => s,
+            Self::Tls(s) => s.get_mut(),
+        }
+    }
+
+    /// Clone the underlying `TcpStream` handle (used to force-close the socket on shutdown).
+    pub fn try_clone_tcp(&self) -> io::Result<TcpStream> {
+        self.tcp().try_clone()
+    }
+}
+
+impl Read for WsStream {
+    fn read(&mut self, buf: &mut [u8]) -> io::Result<usize> {
+        match self {
+            Self::Plain(s) => s.read(buf),
+            Self::Tls(s) => s.read(buf),
+        }
+    }
+}
+
+impl Write for WsStream {
+    fn write(&mut self, buf: &[u8]) -> io::Result<usize> {
+        match self {
+            Self::Plain(s) => s.write(buf),
+            Self::Tls(s) => s.write(buf),
+        }
+    }
+
+    fn flush(&mut self) -> io::Result<()> {
+        match self {
+            Self::Plain(s) => s.flush(),
+            Self::Tls(s) => s.flush(),
+        }
+    }
+}
+
+/// Accepted TCP/TLS connection handed off from `web-http-accept` on `GET /ws`.
 pub struct WsUpgradeRequest {
-    pub stream: TcpStream,
+    pub stream: WsStream,
     pub remote_addr: SocketAddr,
     pub user_agent: String,
     pub sec_websocket_key: String,
@@ -75,14 +129,14 @@ pub struct WsUpgradeRequest {
     pub leftover_bytes: Vec<u8>,
 }
 
-/// Stream wrapper that replays already-buffered HTTP bytes before reading from `TcpStream`.
+/// Stream wrapper that replays already-buffered HTTP bytes before reading from `WsStream`.
 struct PrefixedStream {
     head: Cursor<Vec<u8>>,
-    inner: TcpStream,
+    inner: WsStream,
 }
 
 impl PrefixedStream {
-    fn new(leftover_bytes: Vec<u8>, inner: TcpStream) -> Self {
+    fn new(leftover_bytes: Vec<u8>, inner: WsStream) -> Self {
         Self {
             head: Cursor::new(leftover_bytes),
             inner,
@@ -90,7 +144,7 @@ impl PrefixedStream {
     }
 
     fn inner_mut(&mut self) -> &mut TcpStream {
-        &mut self.inner
+        self.inner.tcp_mut()
     }
 }
 
@@ -221,13 +275,16 @@ impl WsFanoutHandle {
             }
         };
 
-        let _ = req.stream.set_nodelay(true);
-        let _ = req.stream.set_write_timeout(Some(WS_WRITE_TIMEOUT));
-        let _ = req.stream.set_read_timeout(Some(WS_AUTH_POLL_INTERVAL));
+        let _ = req.stream.tcp().set_nodelay(true);
+        let _ = req.stream.tcp().set_write_timeout(Some(WS_WRITE_TIMEOUT));
+        let _ = req
+            .stream
+            .tcp()
+            .set_read_timeout(Some(WS_AUTH_POLL_INTERVAL));
 
         write_switching_protocols(&mut req.stream, ws_key, req.client_sent_soundhop_protocol)?;
 
-        let kick_stream = req.stream.try_clone()?;
+        let kick_stream = req.stream.try_clone_tcp()?;
         let prefixed = PrefixedStream::new(req.leftover_bytes, req.stream);
         let mut ws = WebSocket::from_raw_socket(prefixed, Role::Server, Some(ws_config()));
 
@@ -386,7 +443,7 @@ fn ws_config() -> WebSocketConfig {
         .max_frame_size(Some(WS_MAX_INCOMING_MSG_BYTES))
 }
 
-fn write_http_error(stream: &mut TcpStream, status: &str, body: &str) {
+fn write_http_error(stream: &mut WsStream, status: &str, body: &str) {
     let resp = format!(
         "HTTP/1.1 {status}\r\n\
          Content-Type: text/plain; charset=utf-8\r\n\
@@ -397,11 +454,11 @@ fn write_http_error(stream: &mut TcpStream, status: &str, body: &str) {
     );
     let _ = stream.write_all(resp.as_bytes());
     let _ = stream.flush();
-    let _ = stream.shutdown(Shutdown::Both);
+    let _ = stream.tcp().shutdown(Shutdown::Both);
 }
 
 fn write_switching_protocols(
-    stream: &mut TcpStream,
+    stream: &mut WsStream,
     sec_websocket_key: &str,
     echo_subprotocol: bool,
 ) -> WebResult<()> {
@@ -773,7 +830,7 @@ mod tests {
         }
 
         let leftover_bytes = reader.buffer().to_vec();
-        let stream = reader.into_inner();
+        let stream = WsStream::Plain(reader.into_inner());
         let req = WsUpgradeRequest {
             stream,
             remote_addr,

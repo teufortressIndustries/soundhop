@@ -43,6 +43,10 @@ flate2.workspace = true
 tar.workspace = true
 zip.workspace = true
 str0m.workspace = true
+rustls.workspace = true
+rustls-pki-types.workspace = true
+rcgen.workspace = true
+time.workspace = true
 tungstenite.workspace = true
 qrcode.workspace = true
 

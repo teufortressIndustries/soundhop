@@ -6,9 +6,11 @@
 pub mod http;
 pub mod qr;
 pub mod rtc;
+pub mod tls;
 pub mod ws;
 
 use std::net::{IpAddr, Ipv4Addr};
+use std::path::PathBuf;
 use std::sync::atomic::{AtomicBool, AtomicU16, AtomicUsize, Ordering};
 use std::sync::{Arc, Condvar, Mutex, RwLock};
 use std::thread::{self, JoinHandle};
@@ -122,6 +124,10 @@ pub struct WebBroadcastConfig {
     pub audio_params: AudioParams,
     pub capture_source_label: String,
     pub idle_stop_grace: Duration,
+    pub https_enabled: bool,
+    pub tls_cert_path: Option<PathBuf>,
+    pub tls_key_path: Option<PathBuf>,
+    pub tls_dir: Option<PathBuf>,
 }
 
 impl Default for WebBroadcastConfig {
@@ -141,6 +147,10 @@ impl Default for WebBroadcastConfig {
             audio_params: AudioParams::default(),
             capture_source_label: String::new(),
             idle_stop_grace: DEFAULT_IDLE_STOP_GRACE,
+            https_enabled: true,
+            tls_cert_path: None,
+            tls_key_path: None,
+            tls_dir: None,
         }
     }
 }
@@ -160,6 +170,12 @@ impl WebBroadcastConfig {
         } else {
             cfg.sharing.allowed_networks.clone()
         };
+        let tls_cert_path = Some(cfg.sharing.web_tls_cert_path.trim())
+            .filter(|s| !s.is_empty())
+            .map(PathBuf::from);
+        let tls_key_path = Some(cfg.sharing.web_tls_key_path.trim())
+            .filter(|s| !s.is_empty())
+            .map(PathBuf::from);
         Self {
             http_port: cfg.sharing.web_port,
             webrtc_udp_port: cfg.sharing.webrtc_port,
@@ -172,6 +188,10 @@ impl WebBroadcastConfig {
             audio_params,
             capture_source_label: capture_source_label.into(),
             idle_stop_grace: DEFAULT_IDLE_STOP_GRACE,
+            https_enabled: cfg.sharing.web_https,
+            tls_cert_path,
+            tls_key_path,
+            tls_dir: None,
         }
     }
 
@@ -268,27 +288,50 @@ pub fn verify_token(expected: &str, provided: &str) -> bool {
     !expected.is_empty() && constant_time_eq(expected.as_bytes(), provided.as_bytes())
 }
 
-/// Format a browser listen URL for `host` and `http_port`, embedding `#t=<token>` if present.
-pub fn format_listen_url(host: &str, http_port: u16, token: Option<&str>) -> String {
+/// Format a browser listen URL for `scheme`, `host`, and `http_port`, embedding `#t=<token>` if present.
+pub fn format_listen_url_with_scheme(
+    scheme: &str,
+    host: &str,
+    http_port: u16,
+    token: Option<&str>,
+) -> String {
     let formatted_host = if host.contains(':') && !host.starts_with('[') {
         format!("[{host}]")
     } else {
         host.to_string()
     };
     match token.filter(|t| !t.is_empty()) {
-        Some(tok) => format!("http://{formatted_host}:{http_port}/#t={tok}"),
-        None => format!("http://{formatted_host}:{http_port}/"),
+        Some(tok) => format!("{scheme}://{formatted_host}:{http_port}/#t={tok}"),
+        None => format!("{scheme}://{formatted_host}:{http_port}/"),
     }
+}
+
+/// Format a browser listen URL for `host` and `http_port`, embedding `#t=<token>` if present.
+pub fn format_listen_url(host: &str, http_port: u16, token: Option<&str>) -> String {
+    format_listen_url_with_scheme("http", host, http_port, token)
+}
+
+/// Build `(lan_urls, localhost_url)` for the current machine's non-loopback LAN interfaces.
+///
+/// When `https_enabled` is `true`, LAN URLs use `https://` while `localhost_url` remains
+/// `http://localhost:...` so USB `adb reverse` continues to work without a certificate warning.
+pub fn build_listen_urls_with_https(
+    http_port: u16,
+    token: Option<&str>,
+    https_enabled: bool,
+) -> (Vec<String>, String) {
+    let lan_scheme = if https_enabled { "https" } else { "http" };
+    let lan_urls = local_addresses(false)
+        .into_iter()
+        .map(|ip| format_listen_url_with_scheme(lan_scheme, &ip, http_port, token))
+        .collect();
+    let localhost_url = format_listen_url("localhost", http_port, token);
+    (lan_urls, localhost_url)
 }
 
 /// Build `(lan_urls, localhost_url)` for the current machine's non-loopback LAN interfaces.
 pub fn build_listen_urls(http_port: u16, token: Option<&str>) -> (Vec<String>, String) {
-    let lan_urls = local_addresses(false)
-        .into_iter()
-        .map(|ip| format_listen_url(&ip, http_port, token))
-        .collect();
-    let localhost_url = format_listen_url("localhost", http_port, token);
-    (lan_urls, localhost_url)
+    build_listen_urls_with_https(http_port, token, false)
 }
 
 /// Return `true` when `ip` is loopback or belongs to `allowed_networks`.
@@ -757,6 +800,7 @@ struct ActiveBroadcast {
     rtc: Arc<RtcMuxHandle>,
     ws: Arc<WsFanoutHandle>,
     http: HttpServerHandle,
+    https_enabled: bool,
 }
 
 /// Top-level Web Broadcast lifecycle manager owned by `Controller`.
@@ -798,6 +842,24 @@ impl WebBroadcastManager {
         }
 
         let cfg = config.normalized();
+        let tls_material = if cfg.https_enabled {
+            let material = match (&cfg.tls_cert_path, &cfg.tls_key_path) {
+                (Some(cert), Some(key)) => tls::load_custom_tls(cert, key)?,
+                (None, None) => {
+                    let dir = cfg.tls_dir.clone().unwrap_or_else(tls::default_web_tls_dir);
+                    tls::load_or_generate_lan_tls(&dir, &cfg.device_name, &[])?
+                }
+                _ => {
+                    return Err(WebError::InvalidConfig(
+                        "both web_tls_cert_path and web_tls_key_path must be set together".into(),
+                    ));
+                }
+            };
+            Some(material)
+        } else {
+            None
+        };
+
         let registry = Arc::new(SubscriberRegistry::new());
         let pipeline = PipelineSupervisor::new(
             capture_factory,
@@ -854,6 +916,7 @@ impl WebBroadcastManager {
             runtime: Arc::clone(&runtime),
             rtc: Arc::clone(&rtc),
             ws: Arc::clone(&ws),
+            tls: tls_material,
         }) {
             Ok(h) => h,
             Err(err) => {
@@ -874,6 +937,7 @@ impl WebBroadcastManager {
             rtc,
             ws,
             http,
+            https_enabled: cfg.https_enabled,
         };
         let status = self.build_active_status(&session);
         *lock_or_recover(&self.active) = Some(session);
@@ -984,7 +1048,8 @@ impl WebBroadcastManager {
         let webrtc_udp_port = session.runtime.webrtc_udp_port();
         let token = session.runtime.current_token();
         let token_required = session.runtime.token_required();
-        let (urls, localhost_url) = build_listen_urls(http_port, token.as_deref());
+        let (urls, localhost_url) =
+            build_listen_urls_with_https(http_port, token.as_deref(), session.https_enabled);
         let adb_reversed_serials = lock_or_recover(&self.adb_reversed_serials).clone();
 
         WebBroadcastStatus {
@@ -1086,6 +1151,7 @@ mod tests {
             bind_ip: IpAddr::V4(Ipv4Addr::LOCALHOST),
             max_clients: 2,
             idle_stop_grace: Duration::from_millis(80),
+            https_enabled: false,
             ..Default::default()
         };
 
@@ -1138,6 +1204,7 @@ mod tests {
             webrtc_udp_port: 0,
             bind_ip: IpAddr::V4(Ipv4Addr::LOCALHOST),
             idle_stop_grace: Duration::from_millis(80),
+            https_enabled: false,
             ..Default::default()
         };
 
@@ -1173,6 +1240,7 @@ mod tests {
             http_port: 0,
             webrtc_udp_port: 0,
             bind_ip: IpAddr::V4(Ipv4Addr::LOCALHOST),
+            https_enabled: false,
             ..Default::default()
         };
         mgr.start(cfg, dummy_capture_factory()).expect("start");

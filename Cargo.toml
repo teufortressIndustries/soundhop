@@ -47,6 +47,10 @@ hex = "0.4"
 rand = "0.8"
 ureq = { version = "2.10", default-features = false, features = ["tls"] }
 str0m = { version = "0.25", default-features = false, features = ["rust-crypto"] }
+rustls = { version = "0.23", default-features = false, features = ["ring", "std", "tls12"] }
+rustls-pki-types = "1.15"
+rcgen = { version = "0.14", features = ["x509-parser"] }
+time = "0.3"
 tungstenite = { version = "0.30", default-features = false, features = ["handshake"] }
 qrcode = { version = "0.15", default-features = false }
 flate2 = "1.0"
