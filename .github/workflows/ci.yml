@@ -35,8 +35,27 @@ env:
   CARGO_TERM_COLOR: always
 
 jobs:
+  preflight:
+    name: Preflight (Format & Version Check)
+    runs-on: ubuntu-latest
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          components: rustfmt
+
+      - name: Check formatting (rustfmt)
+        run: cargo fmt --all -- --check
+
+      - name: Verify packaging version consistency
+        run: cargo xtask bump-version --check
+
   test:
     name: Rust Lint & Test (${{ matrix.os }})
+    needs: [preflight]
     runs-on: ${{ matrix.os }}
     strategy:
       fail-fast: false
@@ -49,13 +68,12 @@ jobs:
       - name: Install Linux system libraries
         if: runner.os == 'Linux'
         run: |
-          sudo apt-get update -qq
           sudo apt-get remove -y 'libunwind-*-dev' || true
           ok=0
           for i in 1 2 3; do
             if sudo DEBIAN_FRONTEND=noninteractive NEEDRESTART_MODE=l apt-get update -qq && \
                sudo DEBIAN_FRONTEND=noninteractive NEEDRESTART_MODE=l apt-get install -y --no-install-recommends \
-                 pkg-config libgtk-3-dev libayatana-appindicator3-dev libxdo-dev \
+                 lld pkg-config libgtk-3-dev libayatana-appindicator3-dev libxdo-dev \
                  libxcb1-dev libxkbcommon-dev libxkbcommon-x11-dev libwayland-dev \
                  libgl1-mesa-dev \
                  libgstreamer1.0-dev libgstreamer-plugins-base1.0-dev \
@@ -67,143 +85,100 @@ jobs:
             sleep 3
           done
           [ "$ok" -eq 1 ]
+          echo "RUSTFLAGS=-C link-arg=-fuse-ld=lld" >> "$GITHUB_ENV"
           pkg-config --modversion gstreamer-1.0 gstreamer-audio-1.0 gstreamer-app-1.0 gstreamer-rtp-1.0
 
-      - name: Install GStreamer (MSVC x86_64)
+      - name: Setup GStreamer (MSVC x86_64)
         if: runner.os == 'Windows'
-        shell: pwsh
-        run: |
-          $ErrorActionPreference = "Stop"
-          $gstVersion = "1.24.13"
-          $installRoot = "C:\gstreamer"
-          $baseUrl = "https://gstreamer.freedesktop.org/data/pkg/windows/$gstVersion/msvc"
-          $runtimeMsi = Join-Path $env:RUNNER_TEMP "gstreamer-1.0-msvc-x86_64-$gstVersion.msi"
-          $develMsi = Join-Path $env:RUNNER_TEMP "gstreamer-1.0-devel-msvc-x86_64-$gstVersion.msi"
-
-          foreach ($item in @(
-            @{ Url = "$baseUrl/gstreamer-1.0-msvc-x86_64-$gstVersion.msi"; Out = $runtimeMsi; Label = "runtime" },
-            @{ Url = "$baseUrl/gstreamer-1.0-devel-msvc-x86_64-$gstVersion.msi"; Out = $develMsi; Label = "devel" }
-          )) {
-            for ($attempt = 1; $attempt -le 3; $attempt++) {
-              try {
-                Write-Host "Downloading GStreamer $($item.Label) MSI (attempt $attempt)..."
-                Invoke-WebRequest -Uri $item.Url -OutFile $item.Out -UseBasicParsing
-                break
-              } catch {
-                if ($attempt -eq 3) { throw }
-                Start-Sleep -Seconds 5
-              }
-            }
-          }
-
-          Write-Host "Installing GStreamer runtime MSI..."
-          $p1 = Start-Process msiexec.exe -ArgumentList "/i", "`"$runtimeMsi`"", "INSTALLDIR=`"$installRoot`"", "ADDLOCAL=ALL", "/qn", "/norestart" -Wait -PassThru -NoNewWindow
-          if ($p1.ExitCode -ne 0) { throw "GStreamer runtime MSI install failed with exit code $($p1.ExitCode)" }
-
-          Write-Host "Installing GStreamer devel MSI..."
-          $p2 = Start-Process msiexec.exe -ArgumentList "/i", "`"$develMsi`"", "INSTALLDIR=`"$installRoot`"", "ADDLOCAL=ALL", "/qn", "/norestart" -Wait -PassThru -NoNewWindow
-          if ($p2.ExitCode -ne 0) { throw "GStreamer devel MSI install failed with exit code $($p2.ExitCode)" }
-
-          $machineGstRoot = [System.Environment]::GetEnvironmentVariable("GSTREAMER_1_0_ROOT_MSVC_X86_64", "Machine")
-          $candidates = @()
-          if (-not [string]::IsNullOrWhiteSpace($machineGstRoot)) { $candidates += $machineGstRoot }
-          $candidates += @(
-            "C:\gstreamer\1.0\msvc_x86_64",
-            "D:\gstreamer\1.0\msvc_x86_64",
-            "C:\Program Files\gstreamer\1.0\msvc_x86_64",
-            "D:\Program Files\gstreamer\1.0\msvc_x86_64"
-          )
-          $gstRoot = $null
-          foreach ($cand in $candidates) {
-            $trimmed = $cand.TrimEnd('\', '/')
-            if (Test-Path (Join-Path $trimmed "lib\pkgconfig\gstreamer-1.0.pc")) {
-              $gstRoot = $trimmed
-              break
-            }
-          }
-          if (-not $gstRoot) {
-            Write-Host "Machine GSTREAMER_1_0_ROOT_MSVC_X86_64: '$machineGstRoot'"
-            Get-ChildItem "C:\gstreamer*", "D:\gstreamer*", "C:\Program Files\gstreamer*", "D:\Program Files\gstreamer*" -ErrorAction SilentlyContinue | Out-String | Write-Host
-            throw "Expected gstreamer-1.0.pc not found under any candidate GStreamer root."
-          }
-
-          "GSTREAMER_1_0_ROOT_MSVC_X86_64=$gstRoot" | Out-File -FilePath $env:GITHUB_ENV -Encoding utf8 -Append
-          "PKG_CONFIG_PATH=$gstRoot\lib\pkgconfig" | Out-File -FilePath $env:GITHUB_ENV -Encoding utf8 -Append
-          if (Test-Path "$gstRoot\bin\pkg-config.exe") {
-            "PKG_CONFIG=$gstRoot\bin\pkg-config.exe" | Out-File -FilePath $env:GITHUB_ENV -Encoding utf8 -Append
-            & "$gstRoot\bin\pkg-config.exe" --with-path="$gstRoot\lib\pkgconfig" --modversion gstreamer-1.0 gstreamer-audio-1.0 gstreamer-app-1.0 gstreamer-rtp-1.0
-          }
-          "$gstRoot\bin" | Out-File -FilePath $env:GITHUB_PATH -Encoding utf8 -Append
-          & "$gstRoot\bin\gst-inspect-1.0.exe" --version
-          Remove-Item -Force $runtimeMsi, $develMsi -ErrorAction SilentlyContinue
+        uses: ./.github/actions/setup-gstreamer-windows
 
       - name: Install Rust toolchain
         uses: dtolnay/rust-toolchain@stable
         with:
-          components: rustfmt, clippy
+          components: clippy
+
+      - name: Install cargo-nextest
+        uses: taiki-e/install-action@nextest
 
       - name: Cache Cargo registry and target
         uses: Swatinem/rust-cache@v2
-
-      - name: Check formatting (rustfmt)
-        run: cargo fmt --all -- --check
-
-      - name: Verify packaging version consistency
-        run: cargo xtask bump-version --check
+        with:
+          shared-key: "${{ runner.os == 'Windows' && 'windows-crates' || 'linux-x64-test' }}"
+          cache-on-failure: true
 
       - name: Static analysis & linting (clippy)
         run: cargo clippy --workspace --all-targets --locked -- -D warnings
 
       - name: Run unit & integration test suite
-        run: cargo test --workspace --locked
+        run: |
+          cargo nextest run --workspace --locked
+          cargo test --workspace --doc --locked
 
       - name: Verify headless CLI build & unit tests (no GUI feature)
         run: |
           cargo check -p soundhop-cli --no-default-features --bin soundhop --locked
-          cargo test -p soundhop-cli --no-default-features --lib --locked
+          cargo nextest run -p soundhop-cli --no-default-features --lib --locked --no-tests=pass
 
   build-appimage:
     name: Build AnyLinux AppImage
-    needs: [test]
+    needs: [preflight]
+    if: >-
+      github.event_name == 'workflow_dispatch' ||
+      startsWith(github.ref, 'refs/tags/v') ||
+      (github.event_name == 'push' && github.ref == 'refs/heads/main') ||
+      (github.event_name == 'pull_request' && contains(github.event.pull_request.labels.*.name, 'build-artifacts'))
     runs-on: ubuntu-latest
     env:
       GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
     container:
-      image: archlinux:base-devel
+      # Set repository variable APPIMAGE_BUILDER_IMAGE to
+      # ghcr.io/<owner>/soundhop-appimage-builder:latest after running build-appimage-base.yml
+      image: ${{ vars.APPIMAGE_BUILDER_IMAGE || 'archlinux:base-devel' }}
       options: --privileged
 
     steps:
       - uses: actions/checkout@v4
 
-      - name: Install Arch Linux build dependencies
+      - name: Install Arch Linux build dependencies (if not pre-baked)
         run: |
-          ok=0
-          for i in 1 2 3; do
-            if pacman -Sy --noconfirm --needed archlinux-keyring && \
-               pacman -Syu --noconfirm --needed \
-                 base-devel rustup pkgconf wget curl file strace binutils patchelf zsync \
-                 squashfs-tools desktop-file-utils appstream xorg-server-xvfb \
-                 gtk3 libayatana-appindicator xdotool libxcb libxcursor libxi libxrandr \
-                 libxkbcommon libxkbcommon-x11 wayland mesa \
-                 gstreamer gst-plugins-base-libs gst-plugins-base gst-plugins-good gst-plugins-bad \
-                 git; then
-              ok=1
-              break
-            fi
-            sleep 3
-          done
-          [ "$ok" -eq 1 ]
+          if ! command -v patchelf >/dev/null 2>&1 || \
+             ! command -v zsyncmake >/dev/null 2>&1 || \
+             ! command -v ld.lld >/dev/null 2>&1 || \
+             ! pkg-config --exists gtk+-3.0 gstreamer-1.0 2>/dev/null; then
+            ok=0
+            for i in 1 2 3; do
+              if pacman -Sy --noconfirm --needed archlinux-keyring && \
+                 pacman -Syu --noconfirm --needed \
+                   base-devel rustup pkgconf wget curl file strace binutils patchelf zsync \
+                   squashfs-tools desktop-file-utils appstream xorg-server-xvfb \
+                   gtk3 libayatana-appindicator xdotool libxcb libxcursor libxi libxrandr \
+                   libxkbcommon libxkbcommon-x11 wayland mesa lld \
+                   gstreamer gst-plugins-base-libs gst-plugins-base gst-plugins-good gst-plugins-bad \
+                   git; then
+                ok=1
+                break
+              fi
+              sleep 3
+            done
+            [ "$ok" -eq 1 ]
+          fi
 
-      - name: Initialize Rust toolchain
+      - name: Initialize Rust toolchain & linker
         run: |
-          rustup default stable
-          echo "$HOME/.cargo/bin" >> "$GITHUB_PATH"
+          if ! command -v cargo >/dev/null 2>&1; then
+            rustup default stable
+            echo "$HOME/.cargo/bin" >> "$GITHUB_PATH"
+          fi
+          if command -v ld.lld >/dev/null 2>&1; then
+            echo "RUSTFLAGS=-C link-arg=-fuse-ld=lld" >> "$GITHUB_ENV"
+          fi
 
       - name: Cache Cargo registry and target
         uses: Swatinem/rust-cache@v2
         with:
           workspaces: |
             . -> build/appimage-container/cargo-target
+          cache-on-failure: true
 
       - name: Build AnyLinux AppImage
         run: |
@@ -236,87 +211,28 @@ jobs:
 
   build-windows:
     name: Build Windows Installer & Portable ZIP
-    needs: [test]
+    needs: [preflight]
+    if: >-
+      github.event_name == 'workflow_dispatch' ||
+      startsWith(github.ref, 'refs/tags/v') ||
+      (github.event_name == 'push' && github.ref == 'refs/heads/main') ||
+      (github.event_name == 'pull_request' && contains(github.event.pull_request.labels.*.name, 'build-artifacts'))
     runs-on: windows-latest
 
     steps:
       - uses: actions/checkout@v4
 
-      - name: Install GStreamer (MSVC x86_64)
-        shell: pwsh
-        run: |
-          $ErrorActionPreference = "Stop"
-          $gstVersion = "1.24.13"
-          $installRoot = "C:\gstreamer"
-          $baseUrl = "https://gstreamer.freedesktop.org/data/pkg/windows/$gstVersion/msvc"
-          $runtimeMsi = Join-Path $env:RUNNER_TEMP "gstreamer-1.0-msvc-x86_64-$gstVersion.msi"
-          $develMsi = Join-Path $env:RUNNER_TEMP "gstreamer-1.0-devel-msvc-x86_64-$gstVersion.msi"
-
-          foreach ($item in @(
-            @{ Url = "$baseUrl/gstreamer-1.0-msvc-x86_64-$gstVersion.msi"; Out = $runtimeMsi; Label = "runtime" },
-            @{ Url = "$baseUrl/gstreamer-1.0-devel-msvc-x86_64-$gstVersion.msi"; Out = $develMsi; Label = "devel" }
-          )) {
-            for ($attempt = 1; $attempt -le 3; $attempt++) {
-              try {
-                Write-Host "Downloading GStreamer $($item.Label) MSI (attempt $attempt)..."
-                Invoke-WebRequest -Uri $item.Url -OutFile $item.Out -UseBasicParsing
-                break
-              } catch {
-                if ($attempt -eq 3) { throw }
-                Start-Sleep -Seconds 5
-              }
-            }
-          }
-
-          Write-Host "Installing GStreamer runtime MSI..."
-          $p1 = Start-Process msiexec.exe -ArgumentList "/i", "`"$runtimeMsi`"", "INSTALLDIR=`"$installRoot`"", "ADDLOCAL=ALL", "/qn", "/norestart" -Wait -PassThru -NoNewWindow
-          if ($p1.ExitCode -ne 0) { throw "GStreamer runtime MSI install failed with exit code $($p1.ExitCode)" }
-
-          Write-Host "Installing GStreamer devel MSI..."
-          $p2 = Start-Process msiexec.exe -ArgumentList "/i", "`"$develMsi`"", "INSTALLDIR=`"$installRoot`"", "ADDLOCAL=ALL", "/qn", "/norestart" -Wait -PassThru -NoNewWindow
-          if ($p2.ExitCode -ne 0) { throw "GStreamer devel MSI install failed with exit code $($p2.ExitCode)" }
-
-          $machineGstRoot = [System.Environment]::GetEnvironmentVariable("GSTREAMER_1_0_ROOT_MSVC_X86_64", "Machine")
-          $candidates = @()
-          if (-not [string]::IsNullOrWhiteSpace($machineGstRoot)) { $candidates += $machineGstRoot }
-          $candidates += @(
-            "C:\gstreamer\1.0\msvc_x86_64",
-            "D:\gstreamer\1.0\msvc_x86_64",
-            "C:\Program Files\gstreamer\1.0\msvc_x86_64",
-            "D:\Program Files\gstreamer\1.0\msvc_x86_64"
-          )
-          $gstRoot = $null
-          foreach ($cand in $candidates) {
-            $trimmed = $cand.TrimEnd('\', '/')
-            if (Test-Path (Join-Path $trimmed "lib\pkgconfig\gstreamer-1.0.pc")) {
-              $gstRoot = $trimmed
-              break
-            }
-          }
-          if (-not $gstRoot) {
-            Write-Host "Machine GSTREAMER_1_0_ROOT_MSVC_X86_64: '$machineGstRoot'"
-            Get-ChildItem "C:\gstreamer*", "D:\gstreamer*", "C:\Program Files\gstreamer*", "D:\Program Files\gstreamer*" -ErrorAction SilentlyContinue | Out-String | Write-Host
-            throw "Expected gstreamer-1.0.pc not found under any candidate GStreamer root."
-          }
-
-          "GSTREAMER_1_0_ROOT_MSVC_X86_64=$gstRoot" | Out-File -FilePath $env:GITHUB_ENV -Encoding utf8 -Append
-          "PKG_CONFIG_PATH=$gstRoot\lib\pkgconfig" | Out-File -FilePath $env:GITHUB_ENV -Encoding utf8 -Append
-          if (Test-Path "$gstRoot\bin\pkg-config.exe") {
-            "PKG_CONFIG=$gstRoot\bin\pkg-config.exe" | Out-File -FilePath $env:GITHUB_ENV -Encoding utf8 -Append
-            & "$gstRoot\bin\pkg-config.exe" --with-path="$gstRoot\lib\pkgconfig" --modversion gstreamer-1.0 gstreamer-audio-1.0 gstreamer-app-1.0 gstreamer-rtp-1.0
-          }
-          "$gstRoot\bin" | Out-File -FilePath $env:GITHUB_PATH -Encoding utf8 -Append
-          & "$gstRoot\bin\gst-inspect-1.0.exe" --version
-          Remove-Item -Force $runtimeMsi, $develMsi -ErrorAction SilentlyContinue
+      - name: Setup GStreamer (MSVC x86_64)
+        uses: ./.github/actions/setup-gstreamer-windows
 
       - name: Install Rust toolchain
         uses: dtolnay/rust-toolchain@stable
 
       - name: Cache Cargo registry and target
         uses: Swatinem/rust-cache@v2
-
-      - name: Verify packaging version consistency
-        run: cargo xtask bump-version --check
+        with:
+          shared-key: "windows-crates"
+          cache-on-failure: true
 
       - name: Build & Package Windows Release (Installer + Portable ZIP)
         shell: pwsh
@@ -425,21 +341,27 @@ jobs:
 
   build-linux-aarch64:
     name: Build Linux aarch64 Headless CLI
-    needs: [test]
+    needs: [preflight]
+    if: >-
+      github.event_name == 'workflow_dispatch' ||
+      startsWith(github.ref, 'refs/tags/v') ||
+      (github.event_name == 'push' && github.ref == 'refs/heads/main') ||
+      (github.event_name == 'pull_request' && contains(github.event.pull_request.labels.*.name, 'build-artifacts'))
     runs-on: ubuntu-24.04-arm
+    env:
+      RUSTFLAGS: "-C link-arg=-fuse-ld=lld"
 
     steps:
       - uses: actions/checkout@v4
 
       - name: Install Linux aarch64 GStreamer dependencies
         run: |
-          sudo apt-get update -qq
           sudo apt-get remove -y 'libunwind-*-dev' || true
           ok=0
           for i in 1 2 3; do
             if sudo DEBIAN_FRONTEND=noninteractive NEEDRESTART_MODE=l apt-get update -qq && \
                sudo DEBIAN_FRONTEND=noninteractive NEEDRESTART_MODE=l apt-get install -y --no-install-recommends \
-                 pkg-config libgstreamer1.0-dev libgstreamer-plugins-base1.0-dev \
+                 lld pkg-config libgstreamer1.0-dev libgstreamer-plugins-base1.0-dev \
                  gstreamer1.0-plugins-base gstreamer1.0-plugins-good \
                  gstreamer1.0-plugins-bad gstreamer1.0-pulseaudio; then
               ok=1
@@ -455,6 +377,8 @@ jobs:
 
       - name: Cache Cargo registry and target
         uses: Swatinem/rust-cache@v2
+        with:
+          cache-on-failure: true
 
       - name: Build headless CLI binary (aarch64-unknown-linux-gnu)
         run: cargo build --release -p soundhop-cli --no-default-features --features gstreamer --bin soundhop --locked
@@ -511,7 +435,13 @@ jobs:
       contents: write
 
     steps:
-      - uses: actions/checkout@v4
+      - name: Checkout Cargo.toml for beta version lookup
+        if: github.event_name == 'workflow_dispatch'
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 1
+          sparse-checkout: Cargo.toml
+          sparse-checkout-cone-mode: false
 
       - name: Resolve release metadata
         id: meta
@@ -555,23 +485,12 @@ jobs:
           echo "prerelease=true" >> "$GITHUB_OUTPUT"
           echo "make_latest=false" >> "$GITHUB_OUTPUT"
 
-      - name: Download AppImage Artifact
+      - name: Download build artifacts
         uses: actions/download-artifact@v4
         with:
-          name: SoundHop-x86_64.AppImage
+          pattern: SoundHop-*
           path: dist
-
-      - name: Download Windows Artifacts
-        uses: actions/download-artifact@v4
-        with:
-          name: SoundHop-Windows-x86_64
-          path: dist
-
-      - name: Download Linux aarch64 Headless Artifact
-        uses: actions/download-artifact@v4
-        with:
-          name: SoundHop-Linux-aarch64-headless
-          path: dist
+          merge-multiple: true
 
       - name: Generate SHA256 Checksums
         run: |

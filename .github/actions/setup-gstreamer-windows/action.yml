@@ -1,0 +1,91 @@
+name: Setup GStreamer (Windows MSVC x86_64)
+description: Install and cache GStreamer MSVC x86_64 runtime and development libraries on Windows runners
+
+inputs:
+  version:
+    description: GStreamer version to install
+    required: false
+    default: "1.24.13"
+
+runs:
+  using: composite
+  steps:
+    - name: Cache GStreamer installation
+      id: gst-cache
+      uses: actions/cache@v4
+      with:
+        path: C:\gstreamer
+        key: gstreamer-msvc-x86_64-${{ inputs.version }}-v1
+
+    - name: Download & Install GStreamer MSIs
+      if: steps.gst-cache.outputs.cache-hit != 'true'
+      shell: pwsh
+      run: |
+        $ErrorActionPreference = "Stop"
+        $gstVersion = "${{ inputs.version }}"
+        $installRoot = "C:\gstreamer"
+        $baseUrl = "https://gstreamer.freedesktop.org/data/pkg/windows/$gstVersion/msvc"
+        $runtimeMsi = Join-Path $env:RUNNER_TEMP "gstreamer-1.0-msvc-x86_64-$gstVersion.msi"
+        $develMsi = Join-Path $env:RUNNER_TEMP "gstreamer-1.0-devel-msvc-x86_64-$gstVersion.msi"
+
+        foreach ($item in @(
+          @{ Url = "$baseUrl/gstreamer-1.0-msvc-x86_64-$gstVersion.msi"; Out = $runtimeMsi; Label = "runtime" },
+          @{ Url = "$baseUrl/gstreamer-1.0-devel-msvc-x86_64-$gstVersion.msi"; Out = $develMsi; Label = "devel" }
+        )) {
+          for ($attempt = 1; $attempt -le 3; $attempt++) {
+            try {
+              Write-Host "Downloading GStreamer $($item.Label) MSI (attempt $attempt)..."
+              Invoke-WebRequest -Uri $item.Url -OutFile $item.Out -UseBasicParsing
+              break
+            } catch {
+              if ($attempt -eq 3) { throw }
+              Start-Sleep -Seconds 5
+            }
+          }
+        }
+
+        Write-Host "Installing GStreamer runtime MSI..."
+        $p1 = Start-Process msiexec.exe -ArgumentList "/i", "`"$runtimeMsi`"", "INSTALLDIR=`"$installRoot`"", "ADDLOCAL=ALL", "/qn", "/norestart" -Wait -PassThru -NoNewWindow
+        if ($p1.ExitCode -ne 0) { throw "GStreamer runtime MSI install failed with exit code $($p1.ExitCode)" }
+
+        Write-Host "Installing GStreamer devel MSI..."
+        $p2 = Start-Process msiexec.exe -ArgumentList "/i", "`"$develMsi`"", "INSTALLDIR=`"$installRoot`"", "ADDLOCAL=ALL", "/qn", "/norestart" -Wait -PassThru -NoNewWindow
+        if ($p2.ExitCode -ne 0) { throw "GStreamer devel MSI install failed with exit code $($p2.ExitCode)" }
+
+        Remove-Item -Force $runtimeMsi, $develMsi -ErrorAction SilentlyContinue
+
+    - name: Configure GStreamer Environment
+      shell: pwsh
+      run: |
+        $ErrorActionPreference = "Stop"
+        $machineGstRoot = [System.Environment]::GetEnvironmentVariable("GSTREAMER_1_0_ROOT_MSVC_X86_64", "Machine")
+        $candidates = @()
+        if (-not [string]::IsNullOrWhiteSpace($machineGstRoot)) { $candidates += $machineGstRoot }
+        $candidates += @(
+          "C:\gstreamer\1.0\msvc_x86_64",
+          "D:\gstreamer\1.0\msvc_x86_64",
+          "C:\Program Files\gstreamer\1.0\msvc_x86_64",
+          "D:\Program Files\gstreamer\1.0\msvc_x86_64"
+        )
+        $gstRoot = $null
+        foreach ($cand in $candidates) {
+          $trimmed = $cand.TrimEnd('\', '/')
+          if (Test-Path (Join-Path $trimmed "lib\pkgconfig\gstreamer-1.0.pc")) {
+            $gstRoot = $trimmed
+            break
+          }
+        }
+        if (-not $gstRoot) {
+          Write-Host "Machine GSTREAMER_1_0_ROOT_MSVC_X86_64: '$machineGstRoot'"
+          Get-ChildItem "C:\gstreamer*", "D:\gstreamer*", "C:\Program Files\gstreamer*", "D:\Program Files\gstreamer*" -ErrorAction SilentlyContinue | Out-String | Write-Host
+          throw "Expected gstreamer-1.0.pc not found under any candidate GStreamer root."
+        }
+
+        "GSTREAMER_1_0_ROOT_MSVC_X86_64=$gstRoot" | Out-File -FilePath $env:GITHUB_ENV -Encoding utf8 -Append
+        "PKG_CONFIG_PATH=$gstRoot\lib\pkgconfig" | Out-File -FilePath $env:GITHUB_ENV -Encoding utf8 -Append
+        if (Test-Path "$gstRoot\bin\pkg-config.exe") {
+          "PKG_CONFIG=$gstRoot\bin\pkg-config.exe" | Out-File -FilePath $env:GITHUB_ENV -Encoding utf8 -Append
+          & "$gstRoot\bin\pkg-config.exe" --with-path="$gstRoot\lib\pkgconfig" --modversion gstreamer-1.0 gstreamer-audio-1.0 gstreamer-app-1.0 gstreamer-rtp-1.0
+        }
+        "$gstRoot\bin" | Out-File -FilePath $env:GITHUB_PATH -Encoding utf8 -Append
+        & "$gstRoot\bin\gst-inspect-1.0.exe" --version
