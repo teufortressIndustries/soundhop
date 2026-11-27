@@ -1,5 +1,5 @@
 #define MyAppName "SoundHop"
-#define MyAppVersion "2.8.4"
+#define MyAppVersion "2.8.5"
 #define MyAppPublisher "SoundHop Contributors"
 #define MyAppURL "https://github.com/teufortressIndustries/soundhop"
 #define MyAppExeName "soundhop-gui.exe"
